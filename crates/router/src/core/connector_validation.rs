@@ -561,6 +561,10 @@ impl ConnectorAuthTypeAndMetadataValidation<'_> {
                 paytm::transformers::PaytmAuthType::try_from(self.auth_type)?;
                 Ok(())
             }
+            api_enums::Connector::Payway => {
+                payway::transformers::PaywayAuthType::try_from(self.auth_type)?;
+                Ok(())
+            }
         }
     }
 }

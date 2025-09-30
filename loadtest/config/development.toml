@@ -173,6 +173,8 @@ paysafe.base_url = "https://api.test.paysafe.com/paymenthub/"
 paystack.base_url = "https://api.paystack.co"
 paytm.base_url = "https://securegw-stage.paytm.in/"
 payu.base_url = "https://secure.snd.payu.com/"
+payway.base_url = "https://ventasonline.payway.com.ar/api/v2"
+payway.secondary_base_url = "https://developers.decidir.com/api/v2"
 peachpayments.base_url = "https://apitest.bankint.ppay.io/v/1"
 phonepe.base_url = "https://api.phonepe.com/apis/hermes/"
 placetopay.base_url = "https://test.placetopay.com/rest/gateway"
@@ -679,6 +681,9 @@ credit = { country = "US,CA,IL,GB", currency = "ILS,USD,EUR" }
 debit = { country = "US,CA,IL,GB", currency = "ILS,USD,EUR" }
 apple_pay = { country = "US,CA,IL,GB", currency = "ILS,USD,EUR" }
 
+[pm_filters.payway]
+credit = { country = "AR", currency = "ARS" }
+
 #tokenization configuration which describe token lifetime and payment method for specific connector
 [tokenization]
 stripe = { long_lived_token = false, payment_method = "wallet", payment_method_type = { type = "disable_only", list = "google_pay" } }
@@ -689,6 +694,7 @@ gocardless = { long_lived_token = true, payment_method = "bank_debit" }
 billwerk = { long_lived_token = false, payment_method = "card" }
 globalpay = { long_lived_token = false, payment_method = "card", flow = "mandates" }
 dwolla = { long_lived_token = true, payment_method = "bank_debit" }
+payway = { long_lived_token = false, payment_method = "card" }
 
 [connector_customer]
 connector_list = "authorizedotnet,dwolla,facilitapay,gocardless,hyperswitch_vault,stax,stripe"

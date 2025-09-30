@@ -395,6 +395,9 @@ impl FeatureMatrixConnectorData {
                 enums::Connector::Taxjar => {
                     Ok(ConnectorEnum::Old(Box::new(connector::Taxjar::new())))
                 }
+                enums::Connector::Payway => {
+                    Ok(ConnectorEnum::Old(Box::new(connector::Payway::new())))
+                }
             },
             Err(_) => Err(report!(errors::ConnectorError::InvalidConnectorName)
                 .attach_printable(format!("invalid connector name: {connector_name}")))

@@ -87,6 +87,7 @@ pub mod paysafe;
 pub mod paystack;
 pub mod paytm;
 pub mod payu;
+pub mod payway;
 pub mod peachpayments;
 pub mod phonepe;
 pub mod placetopay;
@@ -150,7 +151,7 @@ pub use self::{
     netcetera::Netcetera, nexinets::Nexinets, nexixpay::Nexixpay, nmi::Nmi, nomupay::Nomupay,
     noon::Noon, nordea::Nordea, novalnet::Novalnet, nuvei::Nuvei, opayo::Opayo, opennode::Opennode,
     paybox::Paybox, payeezy::Payeezy, payload::Payload, payme::Payme, payone::Payone,
-    paypal::Paypal, paysafe::Paysafe, paystack::Paystack, paytm::Paytm, payu::Payu,
+    paypal::Paypal, paysafe::Paysafe, paystack::Paystack, paytm::Paytm, payu::Payu, payway::Payway,
     peachpayments::Peachpayments, phonepe::Phonepe, placetopay::Placetopay, plaid::Plaid,
     powertranz::Powertranz, prophetpay::Prophetpay, rapyd::Rapyd, razorpay::Razorpay,
     recurly::Recurly, redsys::Redsys, riskified::Riskified, santander::Santander, shift4::Shift4,
