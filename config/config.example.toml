@@ -280,6 +280,8 @@ paysafe.base_url = "https://api.test.paysafe.com/paymenthub/"
 paystack.base_url = "https://api.paystack.co"
 paytm.base_url = "https://securegw-stage.paytm.in/"
 payu.base_url = "https://secure.snd.payu.com/"
+payway.base_url = "https://ventasonline.payway.com.ar/api/v2"
+payway.secondary_base_url = "https://developers.decidir.com/api/v2"
 peachpayments.base_url = "https://apitest.bankint.ppay.io/v/1"
 phonepe.base_url = "https://api.phonepe.com/apis/hermes/"
 placetopay.base_url = "https://test.placetopay.com/rest/gateway"
@@ -504,6 +506,7 @@ deutschebank = { payment_method = "bank_debit" }
 paybox = { payment_method = "card" }
 nexixpay = { payment_method = "card" }
 redsys = { payment_method = "card" }
+payway = { payment_method = "card" }
 
 [dummy_connector]
 enabled = true                                  # Whether dummy connector is enabled or not

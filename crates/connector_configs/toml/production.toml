@@ -5512,3 +5512,7 @@ type="Text"
 [peachpayments]
 [peachpayments.connector_auth.HeaderKey]
 api_key = "API Key"
+
+[payway]
+[payway.connector_auth.HeaderKey]
+api_key = "API Key"

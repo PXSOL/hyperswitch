@@ -194,6 +194,7 @@ impl ForeignTryFrom<api_enums::Connector> for common_enums::RoutableConnectors {
             }
             api_enums::Connector::Phonepe => Self::Phonepe,
             api_enums::Connector::Paytm => Self::Paytm,
+            api_enums::Connector::Payway => Self::Payway,
         })
     }
 }

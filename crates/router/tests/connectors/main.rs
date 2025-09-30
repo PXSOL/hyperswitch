@@ -91,6 +91,7 @@ mod paysafe;
 mod paystack;
 mod paytm;
 mod payu;
+mod payway;
 mod peachpayments;
 mod phonepe;
 mod placetopay;
