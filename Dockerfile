@@ -38,6 +38,24 @@ RUN cargo build \
     --features ${VERSION_FEATURE_SET} \
     ${EXTRA_FEATURES}
 
+FROM rust:bookworm as migrator
+
+WORKDIR /router
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libpq-dev \
+        pkg-config \
+        curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash \
+    && cargo binstall diesel_cli --no-confirm
+
+COPY . .
+
+ENV DATABASE_URL=${POSTGRES_URL}
+
+CMD ["diesel", "migration", "run"]
 
 
 FROM debian:bookworm
