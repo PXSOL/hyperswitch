@@ -53,7 +53,7 @@ RUN apt-get update \
 
 COPY . .
 
-ENV DATABASE_URL=${POSTGRES_URL}
+ENV DATABASE_URL=postgres://postgres:ShQCXwA0Gok3zQUSM0OJVPEVYBLmuf4EFq7i6Ye20xxZZYLChflMLLBCHMqYSvXi@d4o04480o880s44c4s4s4sc0:5432/postgres
 
 CMD ["diesel", "migration", "run"]
 
