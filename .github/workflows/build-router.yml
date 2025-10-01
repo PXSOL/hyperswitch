@@ -1,0 +1,102 @@
+name: docker-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      docker_tag:
+        description: Docker image tag to publish
+        default: latest
+        required: true
+      version_feature_set:
+        description: Value for the VERSION_FEATURE_SET build arg
+        default: v1
+        required: true
+      extra_features:
+        description: Additional cargo feature flags (empty string keeps default)
+        default: ""
+        required: true
+      runner:
+        description: GitHub-hosted runner label (pick a larger runner as needed)
+        default: ubuntu-latest
+        required: true
+  push:
+    tags:
+      - "v*"
+      - "release-*"
+  release:
+    types:
+      - published
+
+jobs:
+  router:
+    name: Build router image (${{ inputs.docker_tag || (github.event_name == 'release' && github.event.release.tag_name) || github.ref_name }})
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    env:
+      DOCKER_IMAGE: ${{ secrets.ROUTER_IMAGE_NAME || secrets.IMAGE_NAME }}
+      DOCKER_TAG: ${{ inputs.docker_tag || (github.event_name == 'release' && github.event.release.tag_name) || github.ref_name }}
+      VERSION_FEATURE_SET: ${{ inputs.version_feature_set || 'v1' }}
+      EXTRA_FEATURES: ${{ inputs.extra_features || '' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker registry
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push router image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }}
+          build-args: |
+            BINARY=router
+            VERSION_FEATURE_SET=${{ env.VERSION_FEATURE_SET }}
+            EXTRA_FEATURES=${{ env.EXTRA_FEATURES }}
+          cache-from: type=registry,ref=${{ env.DOCKER_IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.DOCKER_IMAGE }}:buildcache,mode=max
+          provenance: false
+
+  scheduler:
+    name: Build scheduler image (${{ inputs.docker_tag || (github.event_name == 'release' && github.event.release.tag_name) || github.ref_name }})
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    env:
+      DOCKER_IMAGE: ${{ secrets.SCHEDULER_IMAGE_NAME || secrets.IMAGE_NAME }}
+      DOCKER_TAG: ${{ inputs.docker_tag || (github.event_name == 'release' && github.event.release.tag_name) || github.ref_name }}
+      VERSION_FEATURE_SET: ${{ inputs.version_feature_set || 'v1' }}
+      EXTRA_FEATURES: ${{ inputs.extra_features || '' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker registry
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push scheduler image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }}
+          build-args: |
+            BINARY=scheduler
+            SCHEDULER_FLOW=consumer
+            VERSION_FEATURE_SET=${{ env.VERSION_FEATURE_SET }}
+            EXTRA_FEATURES=${{ env.EXTRA_FEATURES }}
+          cache-from: type=registry,ref=${{ env.DOCKER_IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.DOCKER_IMAGE }}:buildcache,mode=max
+          provenance: false
