@@ -48,9 +48,10 @@ ARG BIN_DIR=/local/bin
 
 # Copy this required fields config file
 COPY --from=builder /router/config/payment_required_fields_v2.toml ${CONFIG_DIR}/payment_required_fields_v2.toml
+COPY --from=builder /router/config/production.toml ${CONFIG_DIR}/production.toml
 
 # RUN_ENV decides the corresponding config file to be used
-ARG RUN_ENV=sandbox
+ARG RUN_ENV=production
 
 # args for deciding the executable to export. three binaries:
 # 1. BINARY=router - for main application
