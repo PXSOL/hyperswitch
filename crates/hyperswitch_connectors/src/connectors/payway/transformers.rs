@@ -411,19 +411,17 @@ impl<F, T> TryFrom<ResponseRouterData<F, PaywayPaymentsResponse, T, PaymentsResp
     }
 }
 
-//TODO: Fill the struct with respective fields
-// REFUND :
-// Type definition for RefundRequest
 #[derive(Default, Debug, Serialize)]
 pub struct PaywayRefundRequest {
-    pub amount: StringMinorUnit,
+    pub amount: i64,
 }
 
 impl<F> TryFrom<&PaywayRouterData<&RefundsRouterData<F>>> for PaywayRefundRequest {
     type Error = error_stack::Report<errors::ConnectorError>;
     fn try_from(item: &PaywayRouterData<&RefundsRouterData<F>>) -> Result<Self, Self::Error> {
+        let amount = item.router_data.request.minor_refund_amount.get_amount_as_i64();
         Ok(Self {
-            amount: item.amount.to_owned(),
+            amount,
         })
     }
 }
@@ -431,8 +429,11 @@ impl<F> TryFrom<&PaywayRouterData<&RefundsRouterData<F>>> for PaywayRefundReques
 // Type definition for Refund Response
 #[allow(dead_code)]
 #[derive(Debug, Copy, Serialize, Default, Deserialize, Clone)]
+#[serde(rename_all = "lowercase")]
 pub enum RefundStatus {
+    #[serde(rename = "approved")]
     Succeeded,
+    #[serde(rename = "rejected")]
     Failed,
     #[default]
     Processing,
@@ -444,15 +445,17 @@ impl From<RefundStatus> for enums::RefundStatus {
             RefundStatus::Succeeded => Self::Success,
             RefundStatus::Failed => Self::Failure,
             RefundStatus::Processing => Self::Pending,
-            //TODO: Review mapping
         }
     }
 }
 
-//TODO: Fill the struct with respective fields
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct RefundResponse {
-    id: String,
+    id: i32,
+    amount: i64,
+    sub_payments: Option<Vec<serde_json::Value>>,
+    error: Option<serde_json::Value>,
+    status_details: Option<serde_json::Value>,
     status: RefundStatus,
 }
 

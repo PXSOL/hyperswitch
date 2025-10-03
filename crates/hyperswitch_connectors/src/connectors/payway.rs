@@ -40,7 +40,7 @@ use hyperswitch_interfaces::{
     configs::Connectors,
     errors,
     events::connector_api_logs::ConnectorEvent,
-    types::{self, Response},
+    types::{self, Response,},
     webhooks,
 };
 use masking::{ExposeInterface, Mask};
@@ -228,6 +228,10 @@ impl ConnectorCommon for Payway {
     ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
 
         if res.status_code >= 500 {
+            router_env::logger::error!(
+                connector_error_response=?res,
+                "Payway returned 5xx server error"
+            );
             return Ok(ErrorResponse {
                 status_code: res.status_code,
                 code: "CE_00".to_string(),
@@ -243,6 +247,30 @@ impl ConnectorCommon for Payway {
         }
 
         if res.status_code == 401 {
+            router_env::logger::warn!(
+                status_code=res.status_code,
+                "Payway authentication failed - Invalid credentials (401)"
+            );
+            return Ok(ErrorResponse {
+                status_code: res.status_code,
+                code: "CE_00".to_string(),
+                message: "invalid authentication credentials".to_string(),
+                reason: Some("connector_config_error".to_string()),
+                attempt_status: Some(AttemptStatus::Failure),
+                connector_transaction_id: None,
+                network_advice_code: None,
+                network_decline_code: None,
+                network_error_message: None,
+                connector_metadata: None,
+            });
+        }
+
+        if res.status_code == 403 {
+            router_env::logger::warn!(
+                status_code=res.status_code,
+                response_body=?res.response,
+                "Payway access forbidden - Invalid or insufficient permissions (403)"
+            );
             return Ok(ErrorResponse {
                 status_code: res.status_code,
                 code: "CE_00".to_string(),
@@ -278,6 +306,13 @@ impl ConnectorCommon for Payway {
                         msgs.join(", ")
                     };
 
+                    router_env::logger::warn!(
+                        status_code=res.status_code,
+                        validation_errors=?msgs,
+                        error_message=%message,
+                        "Payway validation error - Invalid request parameters (400)"
+                    );
+
                     return Ok(ErrorResponse {
                         status_code: res.status_code,
                         code: "IR_19".to_string(),
@@ -304,8 +339,7 @@ impl ConnectorCommon for Payway {
                     .and_then(|v| v.get("error"))
                     .and_then(|v| v.get("type"))
                     .and_then(|v| v.as_str())
-                    .map(|s| s.to_lowercase())
-                    .unwrap_or("payment_error".to_string());
+                    .unwrap_or("payment_error");
 
                 let reason = err_json
                     .get("status_details")
@@ -314,37 +348,48 @@ impl ConnectorCommon for Payway {
 
                 let reason_id = reason
                     .and_then(|r| r.get("id"))
-                    .map(|v| v.to_string())
-                    .map(|s| s.trim_matches('"').to_string())
+                    .and_then(|v| v.as_i64())
+                    .map(|id| id.to_string())
                     .unwrap_or_default();
 
                 let reason_desc = reason
                     .and_then(|r| r.get("description"))
                     .and_then(|v| v.as_str())
-                    .map(|s| s.to_lowercase())
-                    .unwrap_or("review card information".to_string());
+                    .unwrap_or("Payment declined");
 
-                let prefix = if reason_id.is_empty() { String::new() } else { format!("[{}] ", reason_id) };
-                let message = format!("{}{}: {}", prefix, error_type, reason_desc);
+                let message = if !reason_id.is_empty() && !reason_desc.is_empty() {
+                    format!("[Code: {}] {}: {}", reason_id, error_type, reason_desc)
+                } else if !reason_desc.is_empty() {
+                    format!("{}: {}", error_type, reason_desc)
+                } else {
+                    error_type.to_string()
+                };
 
                 let external_transaction_id = err_json
                     .get("id")
-                    .map(|v| v.to_string())
-                    .and_then(|s| {
-                        let trimmed = s.trim_matches('"').to_string();
-                        if trimmed.is_empty() { None } else { Some(trimmed) }
-                    });
+                    .and_then(|v| v.as_i64())
+                    .map(|id| id.to_string());
+
+                router_env::logger::info!(
+                    status_code=res.status_code,
+                    error_type=%error_type,
+                    reason_id=%reason_id,
+                    reason_description=%reason_desc,
+                    transaction_id=?external_transaction_id,
+                    error_message=%message,
+                    "Payway payment declined (402)"
+                );
 
                 return Ok(ErrorResponse {
                     status_code: res.status_code,
-                    code: "CE_01".to_string(),
+                    code: format!("PD_{}", reason_id),
                     message,
-                    reason: Some("processing_error".to_string()),
+                    reason: Some("payment_declined".to_string()),
                     attempt_status: Some(AttemptStatus::Failure),
                     connector_transaction_id: external_transaction_id,
                     network_advice_code: None,
-                    network_decline_code: None,
-                    network_error_message: None,
+                    network_decline_code: Some(reason_id),
+                    network_error_message: Some(reason_desc.to_string()),
                     connector_metadata: None,
                 });
             }
@@ -657,9 +702,15 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Payway 
     fn get_headers(
         &self,
         req: &RefundsRouterData<Execute>,
-        connectors: &Connectors,
+        _connectors: &Connectors,
     ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
-        self.build_headers(req, connectors)
+        let auth = payway::PaywayAuthType::try_from(&req.connector_auth_type)
+            .change_context(errors::ConnectorError::FailedToObtainAuthType)?;
+        Ok(vec![
+            (headers::CONTENT_TYPE.to_string(), types::RefundExecuteType::get_content_type(self).to_string().into()),
+            ("apikey".to_string(), auth.secret_key.expose().into_masked()),
+            ("X-Source".to_string(), Self::x_source().to_string().into()),
+        ])
     }
 
     fn get_content_type(&self) -> &'static str {
@@ -668,10 +719,10 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Payway 
 
     fn get_url(
         &self,
-        _req: &RefundsRouterData<Execute>,
-        _connectors: &Connectors,
+        req: &RefundsRouterData<Execute>,
+        connectors: &Connectors,
     ) -> CustomResult<String, errors::ConnectorError> {
-        Err(errors::ConnectorError::NotImplemented("get_url method".to_string()).into())
+        Ok(format!("{}/payments/{}/refunds", determine_endpoint(connectors, req.test_mode)?, req.request.connector_transaction_id))
     }
 
     fn get_request_body(
