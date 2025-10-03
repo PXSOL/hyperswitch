@@ -204,20 +204,22 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
 }
 
 fn map_network_to_payway_id(bin: &str) -> i32 {
-    if is_amex(bin) {
+    if is_tarjeta_naranja(bin) {
+        24
+    } else if is_tarjeta_cencosud(bin) {
+        43
+    } else if is_tuya(bin) {
+        59
+    } else if is_amex(bin) {
         65
     } else if is_cabal(bin) {
         63
     } else if is_mastercard(bin) {
         104
     } else if is_discover(bin) {
-        1 // FIXME: Confirm ID
+        139
     } else if is_diners_club(bin) {
-        1 // FIXME: Confirm ID
-    } else if is_jcb(bin) {
-        1 // FIXME: Confirm ID
-    } else if is_unionpay(bin) {
-        1 // FIXME: Confirm ID
+        8
     } else if is_maestro(bin) {
         105
     } else if is_visa(bin) {
@@ -258,18 +260,6 @@ fn is_diners_club(bin: &str) -> bool {
     p3 >= 300 && p3 <= 305 || p2 == 36 || p2 == 38 || p2 == 39
 }
 
-fn is_jcb(bin: &str) -> bool {
-    if bin.len() < 4 {
-        return false;
-    }
-    let p4: u32 = bin[0..4].parse().unwrap_or(0);
-    (3528..=3589).contains(&p4)
-}
-
-fn is_unionpay(bin: &str) -> bool {
-    bin.starts_with("62")
-}
-
 fn is_visa(bin: &str) -> bool {
     bin.starts_with('4')
 }
@@ -301,7 +291,7 @@ fn is_maestro(bin: &str) -> bool {
 
 fn is_cabal(bin: &str) -> bool {
     // TODO: add more BINs of Cabal AR when available
-    const KNOWN_CABAL_P6: &[&str] = &["589657"];
+    const KNOWN_CABAL_P6: &[&str] = &["589657", "604201"];
     const KNOWN_CABAL_P5: &[&str] = &["60420"]; // prefix
     if bin.len() >= 6 {
         let p6 = &bin[0..6];
@@ -310,6 +300,43 @@ fn is_cabal(bin: &str) -> bool {
     if bin.len() >= 5 {
         let p5 = &bin[0..5];
         if KNOWN_CABAL_P5.contains(&p5) { return true; }
+    }
+    false
+}
+
+fn is_tarjeta_naranja(bin: &str) -> bool {
+    const KNOWN: &[&str] = &[
+        "589562", "589244", "589262", "565333", "569562", // Naranja propios
+        "402917", "402918", "404471", "414427"           // Visa Naranja
+    ];
+    if bin.len() >= 6 {
+        let p6 = &bin[0..6];
+        return KNOWN.contains(&p6);
+    }
+    false
+}
+
+fn is_tarjeta_cencosud(bin: &str) -> bool {
+    const KNOWN: &[&str] = &[
+        "905050", "905051", // private-label
+        "510541", "559198", "559137", "557935", "523793" // MasterCard Cencosud
+    ];
+    if bin.len() >= 6 {
+        let p6 = &bin[0..6];
+        return KNOWN.contains(&p6);
+    }
+    false
+}
+
+fn is_tuya(bin: &str) -> bool {
+    const KNOWN: &[&str] = &[
+        "589657", // Tuya Argentina
+        "603522", // also seen in BIN DB
+        "555845"  // MasterCard Tuya
+    ];
+    if bin.len() >= 6 {
+        let p6 = &bin[0..6];
+        return KNOWN.contains(&p6);
     }
     false
 }
