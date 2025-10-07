@@ -235,13 +235,13 @@ impl ConnectorCommon for Payway {
             return Ok(ErrorResponse {
                 status_code: res.status_code,
                 code: "CE_00".to_string(),
-                message: "internal server error".to_string(),
+                message: "connector internal server error".to_string(),
                 reason: Some("connector_error".to_string()),
                 attempt_status: Some(AttemptStatus::Failure),
                 connector_transaction_id: None,
                 network_advice_code: None,
-                network_decline_code: None,
-                network_error_message: None,
+                network_decline_code: Some("500".to_string()),
+                network_error_message: Some("connector internal server error".to_string()),
                 connector_metadata: None,
             });
         }
@@ -259,8 +259,8 @@ impl ConnectorCommon for Payway {
                 attempt_status: Some(AttemptStatus::Failure),
                 connector_transaction_id: None,
                 network_advice_code: None,
-                network_decline_code: None,
-                network_error_message: None,
+                network_decline_code: Some("401".to_string()),
+                network_error_message: Some("invalid authentication credentials".to_string()),
                 connector_metadata: None,
             });
         }
@@ -279,8 +279,8 @@ impl ConnectorCommon for Payway {
                 attempt_status: Some(AttemptStatus::Failure),
                 connector_transaction_id: None,
                 network_advice_code: None,
-                network_decline_code: None,
-                network_error_message: None,
+                network_decline_code: Some("403".to_string()),
+                network_error_message: Some("invalid authentication credentials".to_string()),
                 connector_metadata: None,
             });
         }
@@ -316,13 +316,13 @@ impl ConnectorCommon for Payway {
                     return Ok(ErrorResponse {
                         status_code: res.status_code,
                         code: "IR_19".to_string(),
-                        message,
+                        message: message.clone(),
                         reason: Some("invalid_request_error".to_string()),
                         attempt_status: Some(AttemptStatus::Failure),
                         connector_transaction_id: None,
                         network_advice_code: None,
-                        network_decline_code: None,
-                        network_error_message: None,
+                        network_decline_code: Some(err_type.unwrap_or("400").to_string()),
+                        network_error_message: Some(message),
                         connector_metadata: None,
                     });
                 }
@@ -411,8 +411,8 @@ impl ConnectorCommon for Payway {
             attempt_status: Some(AttemptStatus::Failure),
             connector_transaction_id: None,
             network_advice_code: None,
-            network_decline_code: None,
-            network_error_message: None,
+            network_decline_code: "unknown".to_string(),
+            network_error_message: Some("unknown error".to_string()),
             connector_metadata: None,
         })
     }
