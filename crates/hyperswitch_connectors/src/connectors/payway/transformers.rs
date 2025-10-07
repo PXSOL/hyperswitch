@@ -149,6 +149,8 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
 
         let amount = item.router_data.request.minor_amount.get_amount_as_i64();
 
+        let installments = meta.installments.unwrap_or(1);
+
         let currency = item.router_data.request.currency.to_string();
 
         let bin = match &item.router_data.request.payment_method_data {
@@ -196,7 +198,7 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
             currency,
             description: item.router_data.description.clone(),
             payment_type: "single".to_string(),
-            installments: 1,
+            installments,
             sub_payments: vec![],
             fraud_detection,
         })
@@ -523,6 +525,7 @@ pub struct FraudDetection {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct PaywayMetadataObject {
     pub token: Option<String>,
+    pub installments: Option<i32>,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub bill_to: Option<PaywayBillTo>,
 }
