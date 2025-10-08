@@ -1,3 +1,13 @@
+[log.file]
+enabled = false # Whether you want to store log in log files.
+path = "logs"   # Where to store log files.
+level = "DEBUG" # What gets into log files.
+# rotation = "60"           # mins # current framework doesn't support configuring rotation. set to hourly rotation.
+
+[log.console]
+enabled = true  # Whether you want to see log in your terminal.
+level = "DEBUG" # What you see in your terminal.
+
 # Bank redirect configs for allowed banks
 [bank_config]
 eps.adyen.banks = "bank_austria,bawag_psk_ag,dolomitenbank,easybank_ag,erste_bank_und_sparkassen,hypo_tirol_bank_ag,posojilnica_bank_e_gen,raiffeisen_bankengruppe_osterreich,schoellerbank_ag,sparda_bank_wien,volksbank_gruppe,volkskreditbank_ag"
