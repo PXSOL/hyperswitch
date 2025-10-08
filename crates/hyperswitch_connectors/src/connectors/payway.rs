@@ -411,7 +411,7 @@ impl ConnectorCommon for Payway {
             attempt_status: Some(AttemptStatus::Failure),
             connector_transaction_id: None,
             network_advice_code: None,
-            network_decline_code: "unknown".to_string(),
+            network_decline_code: Some("unknown".to_string()),
             network_error_message: Some("unknown error".to_string()),
             connector_metadata: None,
         })
