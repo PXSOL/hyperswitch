@@ -214,16 +214,24 @@ fn map_network_to_payway_id(bin: &str) -> i32 {
         59
     } else if is_amex(bin) {
         65
+    } else if is_cabal_debit(bin) {
+        108
     } else if is_cabal(bin) {
         63
+    } else if is_mastercard_debit(bin) {
+        105
     } else if is_mastercard(bin) {
         104
     } else if is_discover(bin) {
         139
     } else if is_diners_club(bin) {
         8
+    } else if is_maestro_payway(bin) {
+        106 
     } else if is_maestro(bin) {
         105
+    } else if is_visa_debit(bin) {
+        31
     } else if is_visa(bin) {
         1
     } else {
@@ -321,7 +329,7 @@ fn is_tarjeta_naranja(bin: &str) -> bool {
 fn is_tarjeta_cencosud(bin: &str) -> bool {
     const KNOWN: &[&str] = &[
         "905050", "905051", // private-label
-        "510541", "559198", "559137", "557935", "523793" // MasterCard Cencosud
+        "510541", "559198", "557935", "523793" // MasterCard Cencosud
     ];
     if bin.len() >= 6 {
         let p6 = &bin[0..6];
@@ -339,6 +347,72 @@ fn is_tuya(bin: &str) -> bool {
     if bin.len() >= 6 {
         let p6 = &bin[0..6];
         return KNOWN.contains(&p6);
+    }
+    false
+}
+
+fn is_visa_debit(bin: &str) -> bool {
+    const KNOWN_DEBIT_BINS: &[&str] = &[
+        "450799", "488234", "455782", "451377", "451378",
+        "402917", "450072", "455183", "409230",
+        // códigos chequeados
+        "411197", "427836", "477053", "451761", "404031",
+        "451769", "434532", "451751", "407874"
+    ];
+    
+    if bin.len() >= 6 {
+        let prefix6 = &bin[0..6];
+        return KNOWN_DEBIT_BINS.contains(&prefix6);
+    }
+    false
+}
+
+fn is_mastercard_debit(bin: &str) -> bool {
+    const KNOWN_DEBIT_BINS: &[&str] = &[
+        "517720", "552767", "527682", "516404", "552626",
+        "527571", "230729",
+        // códigos chequeados
+        "525855", "525562", "554730", "553771", "559137",
+        "551219", "540573", "533305", "521219"
+    ];
+    
+    if bin.len() >= 6 {
+        let prefix6 = &bin[0..6];
+        return KNOWN_DEBIT_BINS.contains(&prefix6);
+    }
+    false
+}
+
+fn is_maestro_payway(bin: &str) -> bool {
+    if bin.len() >= 6 {
+        let prefix4 = &bin[0..4];
+        let prefix4_int: u32 = prefix4.parse().unwrap_or(0);
+        
+        if [5018, 5020, 5038, 5893, 6304, 6759, 6761, 6762, 6763].contains(&prefix4_int) {
+            return true;
+        }
+        
+        const KNOWN_MAESTRO_BINS: &[&str] = &[
+            "501800", "502000", "503800", "589300",
+            "630400", "675900", "676100", "676200", "676300"
+        ];
+        
+        let prefix6 = &bin[0..6];
+        if KNOWN_MAESTRO_BINS.contains(&prefix6) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_cabal_debit(bin: &str) -> bool {
+    const KNOWN_DEBIT_BINS: &[&str] = &[
+        "604203", "604229", "627170"
+    ];
+    
+    if bin.len() >= 6 {
+        let prefix6 = &bin[0..6];
+        return KNOWN_DEBIT_BINS.contains(&prefix6);
     }
     false
 }
