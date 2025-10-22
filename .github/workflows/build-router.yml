@@ -19,6 +19,18 @@ on:
         description: GitHub-hosted runner label (pick a larger runner as needed)
         default: ubuntu-latest
         required: true
+      router_image:
+        description: Docker Hub image name for the router (fallback to repository variables)
+        default: "mithras-hyper-router"
+        required: false
+      scheduler_image:
+        description: Docker Hub image name for the scheduler (fallback to repository variables)
+        default: "mithras-hyper-scheduler"
+        required: false
+      drainer_image:
+        description: Docker Hub image name for the drainer (fallback to repository variables)
+        default: "mithras-hyper-drainer"
+        required: false
   push:
     tags:
       - "v*"
@@ -32,7 +44,7 @@ jobs:
     name: Build router image (${{ inputs.docker_tag || (github.event_name == 'release' && github.event.release.tag_name) || github.ref_name }})
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     env:
-      DOCKER_IMAGE: ${{ secrets.ROUTER_IMAGE_NAME || secrets.IMAGE_NAME }}
+      DOCKER_IMAGE: ${{ inputs.router_image || vars.ROUTER_IMAGE_NAME || vars.IMAGE_NAME }}
       DOCKER_TAG: ${{ inputs.docker_tag || (github.event_name == 'release' && github.event.release.tag_name) || github.ref_name }}
       VERSION_FEATURE_SET: ${{ inputs.version_feature_set || 'v1' }}
       EXTRA_FEATURES: ${{ inputs.extra_features || '' }}
@@ -65,10 +77,13 @@ jobs:
           provenance: false
 
   scheduler:
-    name: Build scheduler image (${{ inputs.docker_tag || (github.event_name == 'release' && github.event.release.tag_name) || github.ref_name }})
+    name: Build scheduler image (${{ inputs.docker_tag || (github.event_name == 'release' && github.event.release.tag_name) || github.ref_name }} - ${{ matrix.scheduler_flow }})
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    strategy:
+      matrix:
+        scheduler_flow: [consumer, producer]
     env:
-      DOCKER_IMAGE: ${{ secrets.SCHEDULER_IMAGE_NAME || secrets.IMAGE_NAME }}
+      DOCKER_IMAGE: ${{ inputs.scheduler_image || vars.SCHEDULER_IMAGE_NAME || vars.IMAGE_NAME }}
       DOCKER_TAG: ${{ inputs.docker_tag || (github.event_name == 'release' && github.event.release.tag_name) || github.ref_name }}
       VERSION_FEATURE_SET: ${{ inputs.version_feature_set || 'v1' }}
       EXTRA_FEATURES: ${{ inputs.extra_features || '' }}
@@ -91,10 +106,46 @@ jobs:
           context: .
           file: Dockerfile
           push: true
-          tags: ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }}
+          tags: ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }}-${{ matrix.scheduler_flow }}
           build-args: |
             BINARY=scheduler
-            SCHEDULER_FLOW=consumer
+            SCHEDULER_FLOW=${{ matrix.scheduler_flow }}
+            VERSION_FEATURE_SET=${{ env.VERSION_FEATURE_SET }}
+            EXTRA_FEATURES=${{ env.EXTRA_FEATURES }}
+          cache-from: type=registry,ref=${{ env.DOCKER_IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.DOCKER_IMAGE }}:buildcache,mode=max
+          provenance: false
+
+  drainer:
+    name: Build drainer image (${{ inputs.docker_tag || (github.event_name == 'release' && github.event.release.tag_name) || github.ref_name }})
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    env:
+      DOCKER_IMAGE: ${{ inputs.drainer_image || vars.DRAINER_IMAGE_NAME || vars.IMAGE_NAME }}
+      DOCKER_TAG: ${{ inputs.docker_tag || (github.event_name == 'release' && github.event.release.tag_name) || github.ref_name }}
+      VERSION_FEATURE_SET: ${{ inputs.version_feature_set || 'v1' }}
+      EXTRA_FEATURES: ${{ inputs.extra_features || '' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker registry
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push drainer image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }}
+          build-args: |
+            BINARY=drainer
             VERSION_FEATURE_SET=${{ env.VERSION_FEATURE_SET }}
             EXTRA_FEATURES=${{ env.EXTRA_FEATURES }}
           cache-from: type=registry,ref=${{ env.DOCKER_IMAGE }}:buildcache
