@@ -47,10 +47,6 @@ jobs:
   registry_access:
     name: Validate Docker registry credentials
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
-    outputs:
-      router_image: ${{ steps.resolve.outputs.router_image }}
-      scheduler_image: ${{ steps.resolve.outputs.scheduler_image }}
-      drainer_image: ${{ steps.resolve.outputs.drainer_image }}
     steps:
       - name: Ensure Docker Hub secrets present
         shell: bash
@@ -61,7 +57,6 @@ jobs:
           fi
 
       - name: Resolve image names
-        id: resolve
         shell: bash
         env:
           INPUT_ROUTER_IMAGE: ${{ inputs.router_image }}
@@ -108,10 +103,6 @@ jobs:
           printf 'ROUTER_IMAGE=%s\n' "$ROUTER_IMAGE" >> "$GITHUB_ENV"
           printf 'SCHEDULER_IMAGE=%s\n' "$SCHEDULER_IMAGE" >> "$GITHUB_ENV"
           printf 'DRAINER_IMAGE=%s\n' "$DRAINER_IMAGE" >> "$GITHUB_ENV"
-
-          printf 'router_image=%s\n' "$ROUTER_IMAGE" >> "$GITHUB_OUTPUT"
-          printf 'scheduler_image=%s\n' "$SCHEDULER_IMAGE" >> "$GITHUB_OUTPUT"
-          printf 'drainer_image=%s\n' "$DRAINER_IMAGE" >> "$GITHUB_OUTPUT"
 
           echo "Resolved images:"
           echo "  Router   -> $ROUTER_IMAGE"
@@ -161,11 +152,57 @@ jobs:
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     needs: registry_access
     env:
-      DOCKER_IMAGE: ${{ needs.registry_access.outputs.router_image }}
       DOCKER_TAG: ${{ inputs.docker_tag || (github.event_name == 'release' && github.event.release.tag_name) || github.ref_name }}
       VERSION_FEATURE_SET: ${{ inputs.version_feature_set || 'v1' }}
       EXTRA_FEATURES: ${{ inputs.extra_features || '' }}
     steps:
+      - name: Resolve router image
+        shell: bash
+        env:
+          INPUT_IMAGE: ${{ inputs.router_image }}
+          VAR_IMAGE: ${{ vars.ROUTER_IMAGE_NAME }}
+          SHARED_IMAGE: ${{ vars.IMAGE_NAME }}
+          DEFAULT_REPO: mithras-hyper-router
+          NAMESPACE: ${{ inputs.docker_namespace || vars.DOCKER_NAMESPACE || 'lucasdpxsol' }}
+        run: |
+          resolve_image() {
+            local candidate="$1"
+            local namespace="$2"
+            if [ -n "$candidate" ]; then
+              if [[ "$candidate" == */* ]]; then
+                printf '%s' "$candidate"
+              else
+                printf '%s/%s' "$namespace" "$candidate"
+              fi
+              return 0
+            fi
+            return 1
+          }
+
+          pick_image() {
+            local explicit="$1"
+            local scoped="$2"
+            local shared="$3"
+            local default_repo="$4"
+            local namespace="$5"
+            local value=""
+
+            value=$(resolve_image "$explicit" "$namespace") && { printf '%s' "$value"; return; }
+            value=$(resolve_image "$scoped" "$namespace") && { printf '%s' "$value"; return; }
+            value=$(resolve_image "$shared" "$namespace") && { printf '%s' "$value"; return; }
+            printf '%s/%s' "$namespace" "$default_repo"
+          }
+
+          DOCKER_IMAGE=$(pick_image "$INPUT_IMAGE" "$VAR_IMAGE" "$SHARED_IMAGE" "$DEFAULT_REPO" "$NAMESPACE")
+          CACHE_REF="${DOCKER_IMAGE}:buildcache"
+
+          {
+            printf 'DOCKER_IMAGE=%s\n' "$DOCKER_IMAGE"
+            printf 'DOCKER_CACHE_REF=%s\n' "$CACHE_REF"
+          } >> "$GITHUB_ENV"
+
+          echo "Router image -> $DOCKER_IMAGE"
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -189,8 +226,8 @@ jobs:
             BINARY=router
             VERSION_FEATURE_SET=${{ env.VERSION_FEATURE_SET }}
             EXTRA_FEATURES=${{ env.EXTRA_FEATURES }}
-          cache-from: type=registry,ref=${{ env.DOCKER_IMAGE }}:buildcache
-          cache-to: type=registry,ref=${{ env.DOCKER_IMAGE }}:buildcache,mode=max
+          cache-from: type=registry,ref=${{ env.DOCKER_CACHE_REF }}
+          cache-to: type=registry,ref=${{ env.DOCKER_CACHE_REF }},mode=max
           provenance: false
 
   scheduler:
@@ -201,11 +238,57 @@ jobs:
         scheduler_flow: [consumer, producer]
     needs: registry_access
     env:
-      DOCKER_IMAGE: ${{ needs.registry_access.outputs.scheduler_image }}
       DOCKER_TAG: ${{ inputs.docker_tag || (github.event_name == 'release' && github.event.release.tag_name) || github.ref_name }}
       VERSION_FEATURE_SET: ${{ inputs.version_feature_set || 'v1' }}
       EXTRA_FEATURES: ${{ inputs.extra_features || '' }}
     steps:
+      - name: Resolve scheduler image
+        shell: bash
+        env:
+          INPUT_IMAGE: ${{ inputs.scheduler_image }}
+          VAR_IMAGE: ${{ vars.SCHEDULER_IMAGE_NAME }}
+          SHARED_IMAGE: ${{ vars.IMAGE_NAME }}
+          DEFAULT_REPO: mithras-hyper-scheduler
+          NAMESPACE: ${{ inputs.docker_namespace || vars.DOCKER_NAMESPACE || 'lucasdpxsol' }}
+        run: |
+          resolve_image() {
+            local candidate="$1"
+            local namespace="$2"
+            if [ -n "$candidate" ]; then
+              if [[ "$candidate" == */* ]]; then
+                printf '%s' "$candidate"
+              else
+                printf '%s/%s' "$namespace" "$candidate"
+              fi
+              return 0
+            fi
+            return 1
+          }
+
+          pick_image() {
+            local explicit="$1"
+            local scoped="$2"
+            local shared="$3"
+            local default_repo="$4"
+            local namespace="$5"
+            local value=""
+
+            value=$(resolve_image "$explicit" "$namespace") && { printf '%s' "$value"; return; }
+            value=$(resolve_image "$scoped" "$namespace") && { printf '%s' "$value"; return; }
+            value=$(resolve_image "$shared" "$namespace") && { printf '%s' "$value"; return; }
+            printf '%s/%s' "$namespace" "$default_repo"
+          }
+
+          DOCKER_IMAGE=$(pick_image "$INPUT_IMAGE" "$VAR_IMAGE" "$SHARED_IMAGE" "$DEFAULT_REPO" "$NAMESPACE")
+          CACHE_REF="${DOCKER_IMAGE}:buildcache"
+
+          {
+            printf 'DOCKER_IMAGE=%s\n' "$DOCKER_IMAGE"
+            printf 'DOCKER_CACHE_REF=%s\n' "$CACHE_REF"
+          } >> "$GITHUB_ENV"
+
+          echo "Scheduler image -> $DOCKER_IMAGE"
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -230,8 +313,8 @@ jobs:
             SCHEDULER_FLOW=${{ matrix.scheduler_flow }}
             VERSION_FEATURE_SET=${{ env.VERSION_FEATURE_SET }}
             EXTRA_FEATURES=${{ env.EXTRA_FEATURES }}
-          cache-from: type=registry,ref=${{ env.DOCKER_IMAGE }}:buildcache
-          cache-to: type=registry,ref=${{ env.DOCKER_IMAGE }}:buildcache,mode=max
+          cache-from: type=registry,ref=${{ env.DOCKER_CACHE_REF }}
+          cache-to: type=registry,ref=${{ env.DOCKER_CACHE_REF }},mode=max
           provenance: false
 
   drainer:
@@ -239,11 +322,57 @@ jobs:
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     needs: registry_access
     env:
-      DOCKER_IMAGE: ${{ needs.registry_access.outputs.drainer_image }}
       DOCKER_TAG: ${{ inputs.docker_tag || (github.event_name == 'release' && github.event.release.tag_name) || github.ref_name }}
       VERSION_FEATURE_SET: ${{ inputs.version_feature_set || 'v1' }}
       EXTRA_FEATURES: ${{ inputs.extra_features || '' }}
     steps:
+      - name: Resolve drainer image
+        shell: bash
+        env:
+          INPUT_IMAGE: ${{ inputs.drainer_image }}
+          VAR_IMAGE: ${{ vars.DRAINER_IMAGE_NAME }}
+          SHARED_IMAGE: ${{ vars.IMAGE_NAME }}
+          DEFAULT_REPO: mithras-hyper-drainer
+          NAMESPACE: ${{ inputs.docker_namespace || vars.DOCKER_NAMESPACE || 'lucasdpxsol' }}
+        run: |
+          resolve_image() {
+            local candidate="$1"
+            local namespace="$2"
+            if [ -n "$candidate" ]; then
+              if [[ "$candidate" == */* ]]; then
+                printf '%s' "$candidate"
+              else
+                printf '%s/%s' "$namespace" "$candidate"
+              fi
+              return 0
+            fi
+            return 1
+          }
+
+          pick_image() {
+            local explicit="$1"
+            local scoped="$2"
+            local shared="$3"
+            local default_repo="$4"
+            local namespace="$5"
+            local value=""
+
+            value=$(resolve_image "$explicit" "$namespace") && { printf '%s' "$value"; return; }
+            value=$(resolve_image "$scoped" "$namespace") && { printf '%s' "$value"; return; }
+            value=$(resolve_image "$shared" "$namespace") && { printf '%s' "$value"; return; }
+            printf '%s/%s' "$namespace" "$default_repo"
+          }
+
+          DOCKER_IMAGE=$(pick_image "$INPUT_IMAGE" "$VAR_IMAGE" "$SHARED_IMAGE" "$DEFAULT_REPO" "$NAMESPACE")
+          CACHE_REF="${DOCKER_IMAGE}:buildcache"
+
+          {
+            printf 'DOCKER_IMAGE=%s\n' "$DOCKER_IMAGE"
+            printf 'DOCKER_CACHE_REF=%s\n' "$CACHE_REF"
+          } >> "$GITHUB_ENV"
+
+          echo "Drainer image -> $DOCKER_IMAGE"
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -267,6 +396,6 @@ jobs:
             BINARY=drainer
             VERSION_FEATURE_SET=${{ env.VERSION_FEATURE_SET }}
             EXTRA_FEATURES=${{ env.EXTRA_FEATURES }}
-          cache-from: type=registry,ref=${{ env.DOCKER_IMAGE }}:buildcache
-          cache-to: type=registry,ref=${{ env.DOCKER_IMAGE }}:buildcache,mode=max
+          cache-from: type=registry,ref=${{ env.DOCKER_CACHE_REF }}
+          cache-to: type=registry,ref=${{ env.DOCKER_CACHE_REF }},mode=max
           provenance: false
