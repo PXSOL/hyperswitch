@@ -14,7 +14,7 @@ on:
       extra_features:
         description: Additional cargo feature flags (empty string keeps default)
         default: ""
-        required: true
+        required: false
       runner:
         description: GitHub-hosted runner label (pick a larger runner as needed)
         default: ubuntu-latest
