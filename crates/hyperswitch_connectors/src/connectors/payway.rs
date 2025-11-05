@@ -352,10 +352,34 @@ impl ConnectorCommon for Payway {
                     .map(|id| id.to_string())
                     .unwrap_or_default();
 
-                let reason_desc = reason
+                let mut reason_desc = reason
                     .and_then(|r| r.get("description"))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("Payment declined");
+                    .unwrap_or("")
+                    .to_string();
+
+                if reason_id == "-1" && reason_desc.is_empty() {
+                    if let Some(fraud_detection) = err_json.get("fraud_detection").and_then(|fd| fd.get("status")) {
+                        let decision = fraud_detection
+                            .get("decision")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let reason_code = fraud_detection
+                            .get("reason_code")
+                            .and_then(|v| v.as_i64())
+                            .map(|c| c.to_string())
+                            .unwrap_or_default();
+                        let description = fraud_detection
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        
+                        if !decision.is_empty() && !reason_code.is_empty() {
+                            reason_desc = format!("cyber_source {{status = {}}} {{code = {}}} {{desc = {}}}", 
+                                decision, reason_code, description);
+                        }
+                    }
+                }
 
                 let message = if !reason_id.is_empty() && !reason_desc.is_empty() {
                     format!("[Code: {}] {}: {}", reason_id, error_type, reason_desc)
@@ -383,13 +407,13 @@ impl ConnectorCommon for Payway {
                 return Ok(ErrorResponse {
                     status_code: res.status_code,
                     code: format!("PD_{}", reason_id),
-                    message,
+                    message: message.clone(),
                     reason: Some("payment_declined".to_string()),
                     attempt_status: Some(AttemptStatus::Failure),
                     connector_transaction_id: external_transaction_id,
                     network_advice_code: None,
                     network_decline_code: Some(reason_id),
-                    network_error_message: Some(reason_desc.to_string()),
+                    network_error_message: Some(if reason_desc.is_empty() { message } else { reason_desc }),
                     connector_metadata: None,
                 });
             }

@@ -79,6 +79,25 @@ pub struct PaywayServicesTransactionData {
 }
 
 #[derive(Debug, Serialize)]
+pub struct PaywayShipTo {
+    pub country: String,
+    pub city: Option<String>,
+    pub email: Option<String>,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub phone_number: Option<String>,
+    pub postal_code: Option<String>,
+    pub state: Option<String>,
+    pub street1: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PaywayRetailTransactionData {
+    pub ship_to: PaywayShipTo,
+    pub items: Vec<PaywayServicesItem>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct PaywayCustomerInSite {
     pub days_in_site: i32,
     pub is_guest: bool,
@@ -93,6 +112,7 @@ pub struct PaywayFraudDetectionAuth {
     pub bill_to: PaywayBillTo,
     pub customer_in_site: PaywayCustomerInSite,
     pub services_transaction_data: PaywayServicesTransactionData,
+    pub retail_transaction_data: PaywayRetailTransactionData,
 }
 
 #[derive(Debug, Serialize)]
@@ -129,10 +149,18 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
             .as_ref()
             .ok_or(errors::ConnectorError::MissingRequiredField { field_name: "metadata.bill_to" })?;
 
+        let device_id = item.router_data.connector_request_reference_id.clone();
+        
+        let customer_id = if let Some(stripped) = device_id.strip_prefix("pay_") {
+            format!("customer_{}", stripped)
+        } else {
+            device_id.clone()
+        };
+
         let bill_to = PaywayBillTo {
             country: "AR".to_string(),
             city: bill_to_meta.city.clone(),
-            customer_id: bill_to_meta.customer_id.clone(),
+            customer_id: Some(customer_id),
             email: bill_to_meta.email.clone(),
             first_name: bill_to_meta.first_name.clone(),
             last_name: bill_to_meta.last_name.clone(),
@@ -165,7 +193,17 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
             }
         };
 
-        let device_id = item.router_data.connector_request_reference_id.clone();
+        let ship_to = PaywayShipTo {
+            country: "AR".to_string(),
+            city: bill_to_meta.city.clone(),
+            email: bill_to_meta.email.clone(),
+            first_name: bill_to_meta.first_name.clone(),
+            last_name: bill_to_meta.last_name.clone(),
+            phone_number: bill_to_meta.phone_number.clone(),
+            postal_code: bill_to_meta.postal_code.clone(),
+            state: bill_to_meta.state.clone(),
+            street1: bill_to_meta.street1.clone(),
+        };
 
         let fraud_detection = PaywayFraudDetectionAuth {
             channel: "Web".to_string(),
@@ -175,6 +213,18 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
             customer_in_site: PaywayCustomerInSite { days_in_site: 1, is_guest: true, num_of_transactions: 0 },
             services_transaction_data: PaywayServicesTransactionData {
                 service_type: "payment".to_string(),
+                items: vec![PaywayServicesItem {
+                    code: "SERVICE".to_string(),
+                    description: item.router_data.description.clone().unwrap_or_else(|| "Payment".to_string()),
+                    name: "Payment service".to_string(),
+                    sku: "SERVICE".to_string(),
+                    total_amount: amount,
+                    quantity: 1,
+                    unit_price: amount,
+                }],
+            },
+            retail_transaction_data: PaywayRetailTransactionData {
+                ship_to,
                 items: vec![PaywayServicesItem {
                     code: "SERVICE".to_string(),
                     description: item.router_data.description.clone().unwrap_or_else(|| "Payment".to_string()),
