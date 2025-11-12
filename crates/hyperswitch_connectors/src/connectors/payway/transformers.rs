@@ -107,6 +107,7 @@ pub struct PaywayCustomerInSite {
 #[derive(Debug, Serialize)]
 pub struct PaywayFraudDetectionAuth {
     pub channel: String,
+    pub send_to_cs: bool,
     pub device_unique_identifier: String,
     pub purchase_totals: PaywayPurchaseTotals,
     pub bill_to: PaywayBillTo,
@@ -207,6 +208,7 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
 
         let fraud_detection = PaywayFraudDetectionAuth {
             channel: "Web".to_string(),
+            send_to_cs: false,
             device_unique_identifier: device_id,
             purchase_totals: PaywayPurchaseTotals { currency: currency.clone(), amount: amount },
             bill_to,
