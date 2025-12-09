@@ -241,10 +241,14 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
 
         let transaction_id = item.router_data.connector_request_reference_id.clone();
 
+        let payment_method_id = meta
+            .payment_method_id
+            .ok_or(errors::ConnectorError::MissingRequiredField { field_name: "metadata.payment_method_id" })?;
+
         Ok(Self {
             site_transaction_id: transaction_id,
             token,
-            payment_method_id: map_network_to_payway_id(&bin),
+            payment_method_id,
             bin,
             amount,
             currency,
@@ -255,218 +259,6 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
             fraud_detection,
         })
     }
-}
-
-fn map_network_to_payway_id(bin: &str) -> i32 {
-    if is_tarjeta_naranja(bin) {
-        24
-    } else if is_tarjeta_cencosud(bin) {
-        43
-    } else if is_tuya(bin) {
-        59
-    } else if is_amex(bin) {
-        65
-    } else if is_cabal_debit(bin) {
-        108
-    } else if is_cabal(bin) {
-        63
-    } else if is_mastercard_debit(bin) {
-        105
-    } else if is_mastercard(bin) {
-        104
-    } else if is_discover(bin) {
-        139
-    } else if is_diners_club(bin) {
-        8
-    } else if is_maestro_payway(bin) {
-        106 
-    } else if is_maestro(bin) {
-        105
-    } else if is_visa_debit(bin) {
-        31
-    } else if is_visa(bin) {
-        1
-    } else {
-        1
-    }
-}
-
-fn is_discover(bin: &str) -> bool {
-    if bin.len() >= 6 {
-        let p6 = &bin[0..6];
-        let p6_int: u32 = p6.parse().unwrap_or(0);
-
-        let p4 = &bin[0..4];
-        let _p4_int: u32 = p4.parse().unwrap_or(0);
-
-        let p3 = &bin[0..3];
-        let p3_int: u32 = p3.parse().unwrap_or(0);
-
-        let p2 = &bin[0..2];
-        let p2_int: u32 = p2.parse().unwrap_or(0);
-
-        return p4 == "6011"
-            || (622126..=622925).contains(&p6_int)
-            || (644..=649).contains(&p3_int)
-            || p2_int == 65;
-    }
-    false
-}
-
-fn is_diners_club(bin: &str) -> bool {
-    if bin.len() < 3 {
-        return false;
-    }
-    let p3: u32 = bin[0..3].parse().unwrap_or(0);
-    let p2: u32 = bin[0..2].parse().unwrap_or(0);
-    p3 >= 300 && p3 <= 305 || p2 == 36 || p2 == 38 || p2 == 39
-}
-
-fn is_visa(bin: &str) -> bool {
-    bin.starts_with('4')
-}
-
-fn is_mastercard(bin: &str) -> bool {
-    if bin.len() < 2 { return false; }
-    let prefix2: u32 = bin[0..2].parse().unwrap_or(0);
-    if (51..=55).contains(&prefix2) { return true; }
-    if bin.len() >= 6 {
-        let prefix6: u32 = bin[0..6].parse().unwrap_or(0);
-        return (222100..=272099).contains(&prefix6);
-    }
-    false
-}
-
-fn is_amex(bin: &str) -> bool {
-    bin.starts_with("34") || bin.starts_with("37")
-}
-
-fn is_maestro(bin: &str) -> bool {
-    if bin.len() < 2 { return false; }
-    let prefix2: u32 = bin[0..2].parse().unwrap_or(0);
-    if prefix2 == 50 || (56..=58).contains(&prefix2) || (60..=69).contains(&prefix2) {
-        // Avoid collision with Mastercard and Amex already filtered above
-        return !is_mastercard(bin) && !is_amex(bin) && !is_visa(bin);
-    }
-    false
-}
-
-fn is_cabal(bin: &str) -> bool {
-    // TODO: add more BINs of Cabal AR when available
-    const KNOWN_CABAL_P6: &[&str] = &["589657", "604201"];
-    const KNOWN_CABAL_P5: &[&str] = &["60420"]; // prefix
-    if bin.len() >= 6 {
-        let p6 = &bin[0..6];
-        if KNOWN_CABAL_P6.contains(&p6) { return true; }
-    }
-    if bin.len() >= 5 {
-        let p5 = &bin[0..5];
-        if KNOWN_CABAL_P5.contains(&p5) { return true; }
-    }
-    false
-}
-
-fn is_tarjeta_naranja(bin: &str) -> bool {
-    const KNOWN: &[&str] = &[
-        "589562", "589244", "589262", "565333", "569562", // Naranja propios
-        "402917", "402918", "404471", "414427"           // Visa Naranja
-    ];
-    if bin.len() >= 6 {
-        let p6 = &bin[0..6];
-        return KNOWN.contains(&p6);
-    }
-    false
-}
-
-fn is_tarjeta_cencosud(bin: &str) -> bool {
-    const KNOWN: &[&str] = &[
-        "905050", "905051", // private-label
-        "510541", "559198", "557935", "523793" // MasterCard Cencosud
-    ];
-    if bin.len() >= 6 {
-        let p6 = &bin[0..6];
-        return KNOWN.contains(&p6);
-    }
-    false
-}
-
-fn is_tuya(bin: &str) -> bool {
-    const KNOWN: &[&str] = &[
-        "589657", // Tuya Argentina
-        "603522", // also seen in BIN DB
-        "555845"  // MasterCard Tuya
-    ];
-    if bin.len() >= 6 {
-        let p6 = &bin[0..6];
-        return KNOWN.contains(&p6);
-    }
-    false
-}
-
-fn is_visa_debit(bin: &str) -> bool {
-    const KNOWN_DEBIT_BINS: &[&str] = &[
-        "450799", "488234", "455782", "451377", "451378",
-        "402917", "450072", "455183", "409230",
-        // códigos chequeados
-        "411197", "427836", "477053", "451761", "404031",
-        "451769", "434532", "451751", "407874"
-    ];
-    
-    if bin.len() >= 6 {
-        let prefix6 = &bin[0..6];
-        return KNOWN_DEBIT_BINS.contains(&prefix6);
-    }
-    false
-}
-
-fn is_mastercard_debit(bin: &str) -> bool {
-    const KNOWN_DEBIT_BINS: &[&str] = &[
-        "517720", "552767", "527682", "516404", "552626",
-        "527571", "230729",
-        // códigos chequeados
-        "525855", "525562", "554730", "553771", "559137",
-        "551219", "540573", "533305", "521219"
-    ];
-    
-    if bin.len() >= 6 {
-        let prefix6 = &bin[0..6];
-        return KNOWN_DEBIT_BINS.contains(&prefix6);
-    }
-    false
-}
-
-fn is_maestro_payway(bin: &str) -> bool {
-    if bin.len() >= 6 {
-        let prefix4 = &bin[0..4];
-        let prefix4_int: u32 = prefix4.parse().unwrap_or(0);
-        
-        if [5018, 5020, 5038, 5893, 6304, 6759, 6761, 6762, 6763].contains(&prefix4_int) {
-            return true;
-        }
-        
-        const KNOWN_MAESTRO_BINS: &[&str] = &[
-            "501800", "502000", "503800", "589300",
-            "630400", "675900", "676100", "676200", "676300"
-        ];
-        
-        let prefix6 = &bin[0..6];
-        if KNOWN_MAESTRO_BINS.contains(&prefix6) {
-            return true;
-        }
-    }
-    false
-}
-
-fn is_cabal_debit(bin: &str) -> bool {
-    const KNOWN_DEBIT_BINS: &[&str] = &[
-        "604203", "604229", "627170"
-    ];
-    
-    if bin.len() >= 6 {
-        let prefix6 = &bin[0..6];
-        return KNOWN_DEBIT_BINS.contains(&prefix6);
-    }
-    false
 }
 
 // Auth Struct
@@ -652,6 +444,7 @@ pub struct FraudDetection {
 pub struct PaywayMetadataObject {
     pub token: Option<String>,
     pub installments: Option<i32>,
+    pub payment_method_id: Option<i32>,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub bill_to: Option<PaywayBillTo>,
 }
