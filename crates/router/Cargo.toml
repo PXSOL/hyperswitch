@@ -56,7 +56,7 @@ async-trait = "0.1.88"
 base64 = "0.22.1"
 bb8 = "0.8"
 blake3 = "1.8.2"
-bytes = "1.10.1"
+bytes = "1.11.1"
 clap = { version = "4.5.38", default-features = false, features = ["std", "derive", "help", "usage"] }
 config = { version = "0.14.1", features = ["toml"] }
 prost-types = { version = "0.13", optional = true }
