@@ -68,6 +68,51 @@ pub struct MercadopagoIdentification {
 }
 
 #[derive(Debug, Serialize)]
+pub struct MercadopagoAdditionalInfoPayerPhone {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub number: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MercadopagoAdditionalInfoPayerAddress {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub street_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zip_code: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MercadopagoAdditionalInfoPayer {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phone: Option<MercadopagoAdditionalInfoPayerPhone>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<MercadopagoAdditionalInfoPayerAddress>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MercadopagoAdditionalInfoItem {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub quantity: i32,
+    pub unit_price: FloatMajorUnit,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MercadopagoAdditionalInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payer: Option<MercadopagoAdditionalInfoPayer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items: Option<Vec<MercadopagoAdditionalInfoItem>>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct MercadopagoPaymentsRequest {
     pub transaction_amount: FloatMajorUnit,
     pub token: Secret<String>,
@@ -86,6 +131,8 @@ pub struct MercadopagoPaymentsRequest {
     pub notification_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub statement_descriptor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additional_info: Option<MercadopagoAdditionalInfo>,
 }
 
 impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for MercadopagoPaymentsRequest {
@@ -96,7 +143,7 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
     ) -> Result<Self, Self::Error> {
         let router_data = item.router_data;
 
-        let (token, payment_method_id, issuer_id, installments, identification_type, identification_number) =
+        let (token, payment_method_id, issuer_id, installments, identification_type, identification_number, sdk_payer, sdk_item) =
             match &router_data.request.payment_method_data {
                 PaymentMethodData::Wallet(WalletData::MercadoPagoSdk(mp_data)) => {
                     let issuer_id_parsed = mp_data
@@ -104,12 +151,17 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
                         .as_ref()
                         .and_then(|id| id.parse::<i64>().ok());
                     (
-                        Secret::new(mp_data.token.clone()),
+                        mp_data.token.clone(),
                         mp_data.payment_method_id.clone(),
                         issuer_id_parsed,
-                        mp_data.installments.unwrap_or(1),
+                        i32::from(mp_data.installments.unwrap_or(1)),
                         mp_data.identification_type.clone(),
-                        mp_data.identification_number.clone(),
+                        mp_data
+                            .identification_number
+                            .as_ref()
+                            .map(|id| id.peek().to_string()),
+                        mp_data.payer.as_ref(),
+                        mp_data.item.as_ref(),
                     )
                 }
                 _ => {
@@ -165,6 +217,49 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
             None
         };
 
+        // Build additional_info for anti-fraud if SDK provided extra data
+        let additional_info = {
+            let has_payer_info = sdk_payer.is_some();
+            let has_item_info = sdk_item.is_some();
+
+            if has_payer_info || has_item_info {
+                let additional_payer = sdk_payer.map(|p| {
+                    MercadopagoAdditionalInfoPayer {
+                        first_name: p.first_name.clone(),
+                        last_name: p.last_name.clone(),
+                        phone: p.phone.as_ref().map(|ph| MercadopagoAdditionalInfoPayerPhone {
+                            number: Some(ph.clone()),
+                        }),
+                        address: if p.address.is_some() || p.zip_code.is_some() {
+                            Some(MercadopagoAdditionalInfoPayerAddress {
+                                street_name: p.address.clone(),
+                                zip_code: p.zip_code.clone(),
+                            })
+                        } else {
+                            None
+                        },
+                    }
+                });
+
+                let additional_items = sdk_item.map(|i| {
+                    vec![MercadopagoAdditionalInfoItem {
+                        id: "1".to_string(),
+                        title: i.title.clone(),
+                        description: i.description.clone(),
+                        quantity: 1,
+                        unit_price: transaction_amount,
+                    }]
+                });
+
+                Some(MercadopagoAdditionalInfo {
+                    payer: additional_payer,
+                    items: additional_items,
+                })
+            } else {
+                None
+            }
+        };
+
         Ok(Self {
             transaction_amount,
             token,
@@ -183,6 +278,7 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
             binary_mode: Some(true),
             notification_url,
             statement_descriptor: router_data.request.statement_descriptor.clone(),
+            additional_info,
         })
     }
 }
@@ -190,13 +286,26 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
 #[derive(Debug, Serialize)]
 pub struct MercadopagoCaptureRequest {
     pub capture: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transaction_amount: Option<FloatMajorUnit>,
 }
 
-impl TryFrom<&PaymentsCaptureRouterData> for MercadopagoCaptureRequest {
+impl TryFrom<&MercadopagoRouterData<&PaymentsCaptureRouterData>> for MercadopagoCaptureRequest {
     type Error = error_stack::Report<errors::ConnectorError>;
 
-    fn try_from(_item: &PaymentsCaptureRouterData) -> Result<Self, Self::Error> {
-        Ok(Self { capture: true })
+    fn try_from(item: &MercadopagoRouterData<&PaymentsCaptureRouterData>) -> Result<Self, Self::Error> {
+        let router_data = item.router_data;
+        
+        let transaction_amount = if router_data.request.amount_to_capture != router_data.request.payment_amount {
+            Some(item.amount)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            capture: true,
+            transaction_amount,
+        })
     }
 }
 
@@ -670,11 +779,21 @@ impl From<&str> for MercadopagoWebhookAction {
 
 impl From<MercadopagoWebhookAction> for api_models::webhooks::IncomingWebhookEvent {
     fn from(action: MercadopagoWebhookAction) -> Self {
+        // NOTE: MercadoPago webhooks only contain the resource ID, not the actual status.
+        // The action (e.g., "payment.updated") doesn't indicate whether the payment succeeded,
+        // failed, or was cancelled. Therefore, we map to processing/pending states and rely
+        // on the sync mechanism to fetch the actual status from MercadoPago's API.
+        //
+        // For refunds, since IncomingWebhookEvent doesn't have a RefundProcessing variant,
+        // we map to EventNotSupported so the system triggers a refund sync to get the real status.
         match action {
-            MercadopagoWebhookAction::PaymentCreated => Self::PaymentIntentProcessing,
-            MercadopagoWebhookAction::PaymentUpdated => Self::PaymentIntentSuccess,
-            MercadopagoWebhookAction::RefundCreated | MercadopagoWebhookAction::RefundUpdated => {
-                Self::RefundSuccess
+            MercadopagoWebhookAction::PaymentCreated
+            | MercadopagoWebhookAction::PaymentUpdated => Self::PaymentIntentProcessing,
+            MercadopagoWebhookAction::RefundCreated
+            | MercadopagoWebhookAction::RefundUpdated => {
+                // No RefundProcessing variant exists, so we use EventNotSupported
+                // to trigger a sync that will fetch the actual refund status
+                Self::EventNotSupported
             }
             MercadopagoWebhookAction::ChargebackCreated
             | MercadopagoWebhookAction::ChargebackUpdated => Self::DisputeOpened,

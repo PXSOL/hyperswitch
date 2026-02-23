@@ -5920,7 +5920,7 @@ impl WalletData for payment_method_data::WalletData {
             Self::GooglePay(data) => Ok(data.get_googlepay_encrypted_payment_data()?),
             Self::ApplePay(data) => Ok(data.get_applepay_decoded_payment_data()?),
             Self::PaypalSdk(data) => Ok(Secret::new(data.token.clone())),
-            Self::MercadoPagoSdk(data) => Ok(Secret::new(data.token.clone())),
+            Self::MercadoPagoSdk(data) => Ok(data.token.clone()),
             _ => Err(errors::ConnectorError::InvalidWallet.into()),
         }
     }
