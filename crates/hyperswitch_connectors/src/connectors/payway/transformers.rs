@@ -1,9 +1,5 @@
 use common_enums::enums;
-use hyperswitch_domain_models::types;
-use common_utils::pii::SecretSerdeValue;
-use common_utils::types::{
-    StringMinorUnit,
-};
+use common_utils::{pii::SecretSerdeValue, types::StringMinorUnit};
 use hyperswitch_domain_models::{
     payment_method_data::PaymentMethodData,
     router_data::{ConnectorAuthType, RouterData},
@@ -13,6 +9,7 @@ use hyperswitch_domain_models::{
     },
     router_request_types::ResponseId,
     router_response_types::{PaymentsResponseData, RefundsResponseData},
+    types,
     types::{PaymentsAuthorizeRouterData, RefundsRouterData},
 };
 use hyperswitch_interfaces::errors;
@@ -22,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     types::{RefundsResponseRouterData, ResponseRouterData},
     utils,
+    utils::RouterData as _,
 };
-use crate::utils::RouterData as _;
 
 //TODO: Fill the struct with respective fields
 pub struct PaywayRouterData<T> {
@@ -133,25 +130,33 @@ pub struct PaywayPaymentsRequest {
 
 impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPaymentsRequest {
     type Error = error_stack::Report<errors::ConnectorError>;
-    fn try_from(item: &PaywayRouterData<&PaymentsAuthorizeRouterData>) -> Result<Self, Self::Error> {
+    fn try_from(
+        item: &PaywayRouterData<&PaymentsAuthorizeRouterData>,
+    ) -> Result<Self, Self::Error> {
         let capture_method = item.router_data.request.capture_method.unwrap_or_default();
-            match capture_method {
+        match capture_method {
             enums::CaptureMethod::Automatic => {}
             enums::CaptureMethod::Manual => {}
-            enums::CaptureMethod::Scheduled | enums::CaptureMethod::ManualMultiple | enums::CaptureMethod::SequentialAutomatic => {
-                return Err(errors::ConnectorError::NotImplemented("Capture Method".to_string()).into());
+            enums::CaptureMethod::Scheduled
+            | enums::CaptureMethod::ManualMultiple
+            | enums::CaptureMethod::SequentialAutomatic => {
+                return Err(
+                    errors::ConnectorError::NotImplemented("Capture Method".to_string()).into(),
+                );
             }
         }
 
         let meta = PaywayMetadataObject::try_from(&item.router_data.request.metadata)?;
 
-        let bill_to_meta = meta
-            .bill_to
-            .as_ref()
-            .ok_or(errors::ConnectorError::MissingRequiredField { field_name: "metadata.bill_to" })?;
+        let bill_to_meta =
+            meta.bill_to
+                .as_ref()
+                .ok_or(errors::ConnectorError::MissingRequiredField {
+                    field_name: "metadata.bill_to",
+                })?;
 
         let device_id = item.router_data.connector_request_reference_id.clone();
-        
+
         let customer_id = if let Some(stripped) = device_id.strip_prefix("pay_") {
             format!("customer_{}", stripped)
         } else {
@@ -172,8 +177,15 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
         };
 
         let token = match item.router_data.get_payment_method_token()? {
-            hyperswitch_domain_models::router_data::PaymentMethodToken::Token(t) => t.peek().to_string(),
-            _ => return Err(errors::ConnectorError::MissingRequiredField { field_name: "payment_method_token" }.into()),
+            hyperswitch_domain_models::router_data::PaymentMethodToken::Token(t) => {
+                t.peek().to_string()
+            }
+            _ => {
+                return Err(errors::ConnectorError::MissingRequiredField {
+                    field_name: "payment_method_token",
+                }
+                .into())
+            }
         };
 
         let amount = item.router_data.request.minor_amount.get_amount_as_i64();
@@ -185,12 +197,10 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
         let bin = match &item.router_data.request.payment_method_data {
             PaymentMethodData::Card(card) => card.card_number.get_card_isin(),
             _ => {
-                return Err(
-                    errors::ConnectorError::MissingRequiredField {
-                        field_name: "payment_method_data.card",
-                    }
-                    .into(),
-                )
+                return Err(errors::ConnectorError::MissingRequiredField {
+                    field_name: "payment_method_data.card",
+                }
+                .into())
             }
         };
 
@@ -210,14 +220,25 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
             channel: "Web".to_string(),
             send_to_cs: false,
             device_unique_identifier: device_id,
-            purchase_totals: PaywayPurchaseTotals { currency: currency.clone(), amount: amount },
+            purchase_totals: PaywayPurchaseTotals {
+                currency: currency.clone(),
+                amount: amount,
+            },
             bill_to,
-            customer_in_site: PaywayCustomerInSite { days_in_site: 1, is_guest: true, num_of_transactions: 0 },
+            customer_in_site: PaywayCustomerInSite {
+                days_in_site: 1,
+                is_guest: true,
+                num_of_transactions: 0,
+            },
             services_transaction_data: PaywayServicesTransactionData {
                 service_type: "payment".to_string(),
                 items: vec![PaywayServicesItem {
                     code: "SERVICE".to_string(),
-                    description: item.router_data.description.clone().unwrap_or_else(|| "Payment".to_string()),
+                    description: item
+                        .router_data
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| "Payment".to_string()),
                     name: "Payment service".to_string(),
                     sku: "SERVICE".to_string(),
                     total_amount: amount,
@@ -229,7 +250,11 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
                 ship_to,
                 items: vec![PaywayServicesItem {
                     code: "SERVICE".to_string(),
-                    description: item.router_data.description.clone().unwrap_or_else(|| "Payment".to_string()),
+                    description: item
+                        .router_data
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| "Payment".to_string()),
                     name: "Payment service".to_string(),
                     sku: "SERVICE".to_string(),
                     total_amount: amount,
@@ -241,9 +266,11 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
 
         let transaction_id = item.router_data.connector_request_reference_id.clone();
 
-        let payment_method_id = meta
-            .payment_method_id
-            .ok_or(errors::ConnectorError::MissingRequiredField { field_name: "metadata.payment_method_id" })?;
+        let payment_method_id =
+            meta.payment_method_id
+                .ok_or(errors::ConnectorError::MissingRequiredField {
+                    field_name: "metadata.payment_method_id",
+                })?;
 
         Ok(Self {
             site_transaction_id: transaction_id,
@@ -339,10 +366,12 @@ pub struct PaywayRefundRequest {
 impl<F> TryFrom<&PaywayRouterData<&RefundsRouterData<F>>> for PaywayRefundRequest {
     type Error = error_stack::Report<errors::ConnectorError>;
     fn try_from(item: &PaywayRouterData<&RefundsRouterData<F>>) -> Result<Self, Self::Error> {
-        let amount = item.router_data.request.minor_refund_amount.get_amount_as_i64();
-        Ok(Self {
-            amount,
-        })
+        let amount = item
+            .router_data
+            .request
+            .minor_refund_amount
+            .get_amount_as_i64();
+        Ok(Self { amount })
     }
 }
 
@@ -451,12 +480,12 @@ pub struct PaywayMetadataObject {
 
 impl TryFrom<&Option<SecretSerdeValue>> for PaywayMetadataObject {
     type Error = error_stack::Report<errors::ConnectorError>;
-    fn try_from(
-        meta_data: &Option<SecretSerdeValue>,
-    ) -> Result<Self, Self::Error> {
+    fn try_from(meta_data: &Option<SecretSerdeValue>) -> Result<Self, Self::Error> {
         match meta_data {
-            Some(metadata) => Ok(utils::to_connector_meta_from_secret::<Self>(Some(metadata.clone()))
-                .map_err(|_e| errors::ConnectorError::InvalidConnectorConfig { config: "metadata" })?),
+            Some(metadata) => Ok(utils::to_connector_meta_from_secret::<Self>(Some(
+                metadata.clone(),
+            ))
+            .map_err(|_e| errors::ConnectorError::InvalidConnectorConfig { config: "metadata" })?),
             None => Ok(Self::default()),
         }
     }
@@ -465,7 +494,8 @@ impl TryFrom<&Option<SecretSerdeValue>> for PaywayMetadataObject {
 impl TryFrom<&Option<serde_json::Value>> for PaywayMetadataObject {
     type Error = error_stack::Report<errors::ConnectorError>;
     fn try_from(meta_data: &Option<serde_json::Value>) -> Result<Self, Self::Error> {
-        let secret_meta: Option<SecretSerdeValue> = meta_data.as_ref().map(|v| Secret::new(v.clone()));
+        let secret_meta: Option<SecretSerdeValue> =
+            meta_data.as_ref().map(|v| Secret::new(v.clone()));
         let metadata = utils::to_connector_meta_from_secret::<Self>(secret_meta)
             .map_err(|_e| errors::ConnectorError::InvalidConnectorConfig { config: "metadata" })?;
         Ok(metadata)
@@ -482,7 +512,10 @@ impl TryFrom<&types::TokenizationRouterData> for PaywayTokenRequest {
                 card_number: card.card_number.clone(),
                 card_expiration_month: card.card_exp_month.clone(),
                 card_expiration_year: card.card_exp_year.clone(),
-                card_holder_name: card.card_holder_name.clone().unwrap_or_else(|| Secret::new("".to_string())),
+                card_holder_name: card
+                    .card_holder_name
+                    .clone()
+                    .unwrap_or_else(|| Secret::new("".to_string())),
                 security_code: card.card_cvc,
                 card_holder_identification: vec![],
                 fraud_detection: FraudDetection {
@@ -500,11 +533,29 @@ pub struct PaywayTokenResponse {
     status: String,
 }
 
-impl<T> TryFrom<ResponseRouterData<payments::PaymentMethodToken, PaywayTokenResponse, T, PaymentsResponseData>> for RouterData<payments::PaymentMethodToken, T, PaymentsResponseData> {
+impl<T>
+    TryFrom<
+        ResponseRouterData<
+            payments::PaymentMethodToken,
+            PaywayTokenResponse,
+            T,
+            PaymentsResponseData,
+        >,
+    > for RouterData<payments::PaymentMethodToken, T, PaymentsResponseData>
+{
     type Error = error_stack::Report<errors::ConnectorError>;
-    fn try_from(item: ResponseRouterData<payments::PaymentMethodToken, PaywayTokenResponse, T, PaymentsResponseData>) -> Result<Self, Self::Error> {
+    fn try_from(
+        item: ResponseRouterData<
+            payments::PaymentMethodToken,
+            PaywayTokenResponse,
+            T,
+            PaymentsResponseData,
+        >,
+    ) -> Result<Self, Self::Error> {
         Ok(Self {
-            response: Ok(PaymentsResponseData::TokenizationResponse { token: item.response.id.peek().to_string() }),
+            response: Ok(PaymentsResponseData::TokenizationResponse {
+                token: item.response.id.peek().to_string(),
+            }),
             ..item.data
         })
     }
@@ -524,7 +575,9 @@ impl<F, T> TryFrom<ResponseRouterData<F, PaywayAuthorizeResponse, T, PaymentsRes
     for RouterData<F, T, PaymentsResponseData>
 {
     type Error = error_stack::Report<errors::ConnectorError>;
-    fn try_from(item: ResponseRouterData<F, PaywayAuthorizeResponse, T, PaymentsResponseData>) -> Result<Self, Self::Error> {
+    fn try_from(
+        item: ResponseRouterData<F, PaywayAuthorizeResponse, T, PaymentsResponseData>,
+    ) -> Result<Self, Self::Error> {
         let status = match item.response.status.as_deref() {
             Some("approved") => common_enums::AttemptStatus::Charged,
             Some(_) => common_enums::AttemptStatus::Failure,

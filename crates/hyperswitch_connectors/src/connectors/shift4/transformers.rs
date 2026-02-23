@@ -422,7 +422,8 @@ impl TryFrom<&WalletData> for PaymentMethodType {
             | WalletData::CashappQr(_)
             | WalletData::SwishQr(_)
             | WalletData::Mifinity(_)
-            | WalletData::RevolutPay(_) => Err(errors::ConnectorError::NotImplemented(
+            | WalletData::RevolutPay(_)
+                | WalletData::MercadoPagoSdk(_) => Err(errors::ConnectorError::NotImplemented(
                 utils::get_unimplemented_payment_method_error_message("Shift4"),
             )
             .into()),

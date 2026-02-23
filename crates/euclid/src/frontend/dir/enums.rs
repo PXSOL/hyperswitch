@@ -86,6 +86,7 @@ pub enum WalletType {
     AliPay,
     AliPayHk,
     MbWay,
+    MercadoPago,
     MobilePay,
     WeChatPay,
     SamsungPay,

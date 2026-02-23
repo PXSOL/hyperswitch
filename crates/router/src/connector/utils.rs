@@ -1773,6 +1773,7 @@ impl WalletData for domain::WalletData {
             Self::GooglePay(data) => Ok(data.get_googlepay_encrypted_payment_data()?),
             Self::ApplePay(data) => Ok(data.get_applepay_decoded_payment_data()?),
             Self::PaypalSdk(data) => Ok(Secret::new(data.token.clone())),
+            Self::MercadoPagoSdk(data) => Ok(Secret::new(data.token.clone())),
             _ => Err(errors::ConnectorError::InvalidWallet.into()),
         }
     }
@@ -2573,6 +2574,7 @@ pub enum PaymentMethodDataType {
     MobilePayRedirect,
     PaypalRedirect,
     PaypalSdk,
+    MercadoPagoSdk,
     Paze,
     SamsungPay,
     TwintRedirect,
@@ -2707,6 +2709,7 @@ impl From<domain::payments::PaymentMethodData> for PaymentMethodDataType {
                 domain::payments::WalletData::MobilePayRedirect(_) => Self::MobilePayRedirect,
                 domain::payments::WalletData::PaypalRedirect(_) => Self::PaypalRedirect,
                 domain::payments::WalletData::PaypalSdk(_) => Self::PaypalSdk,
+                domain::payments::WalletData::MercadoPagoSdk(_) => Self::MercadoPagoSdk,
                 domain::payments::WalletData::Paze(_) => Self::Paze,
                 domain::payments::WalletData::SamsungPay(_) => Self::SamsungPay,
                 domain::payments::WalletData::TwintRedirect {} => Self::TwintRedirect,

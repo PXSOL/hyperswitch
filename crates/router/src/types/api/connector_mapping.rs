@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use error_stack::{report, ResultExt};
-use hyperswitch_connectors::connectors::{Paytm, Phonepe, Payway};
+use hyperswitch_connectors::connectors::{Paytm, Payway, Phonepe};
 
 use crate::{
     configs::settings::Connectors,
@@ -411,6 +411,9 @@ impl ConnectorData {
                 }
                 enums::Connector::Mifinity => {
                     Ok(ConnectorEnum::Old(Box::new(connector::Mifinity::new())))
+                }
+                enums::Connector::Mercadopago => {
+                    Ok(ConnectorEnum::Old(Box::new(connector::Mercadopago::new())))
                 }
                 enums::Connector::Multisafepay => {
                     Ok(ConnectorEnum::Old(Box::new(connector::Multisafepay::new())))

@@ -61,6 +61,7 @@ pub mod jpmorgan;
 pub mod juspaythreedsserver;
 pub mod katapult;
 pub mod klarna;
+pub mod mercadopago;
 pub mod mifinity;
 pub mod mollie;
 pub mod moneris;
@@ -147,17 +148,18 @@ pub use self::{
     hyperswitch_vault::HyperswitchVault, hyperwallet::Hyperwallet, iatapay::Iatapay,
     inespay::Inespay, itaubank::Itaubank, jpmorgan::Jpmorgan,
     juspaythreedsserver::Juspaythreedsserver, katapult::Katapult, klarna::Klarna,
-    mifinity::Mifinity, mollie::Mollie, moneris::Moneris, mpgs::Mpgs, multisafepay::Multisafepay,
-    netcetera::Netcetera, nexinets::Nexinets, nexixpay::Nexixpay, nmi::Nmi, nomupay::Nomupay,
-    noon::Noon, nordea::Nordea, novalnet::Novalnet, nuvei::Nuvei, opayo::Opayo, opennode::Opennode,
-    paybox::Paybox, payeezy::Payeezy, payload::Payload, payme::Payme, payone::Payone,
-    paypal::Paypal, paysafe::Paysafe, paystack::Paystack, paytm::Paytm, payu::Payu, payway::Payway,
-    peachpayments::Peachpayments, phonepe::Phonepe, placetopay::Placetopay, plaid::Plaid,
-    powertranz::Powertranz, prophetpay::Prophetpay, rapyd::Rapyd, razorpay::Razorpay,
-    recurly::Recurly, redsys::Redsys, riskified::Riskified, santander::Santander, shift4::Shift4,
-    sift::Sift, signifyd::Signifyd, silverflow::Silverflow, square::Square, stax::Stax,
-    stripe::Stripe, stripebilling::Stripebilling, taxjar::Taxjar, threedsecureio::Threedsecureio,
-    thunes::Thunes, tokenio::Tokenio, trustpay::Trustpay, trustpayments::Trustpayments, tsys::Tsys,
+    mercadopago::Mercadopago, mifinity::Mifinity, mollie::Mollie, moneris::Moneris, mpgs::Mpgs,
+    multisafepay::Multisafepay, netcetera::Netcetera, nexinets::Nexinets, nexixpay::Nexixpay,
+    nmi::Nmi, nomupay::Nomupay, noon::Noon, nordea::Nordea, novalnet::Novalnet, nuvei::Nuvei,
+    opayo::Opayo, opennode::Opennode, paybox::Paybox, payeezy::Payeezy, payload::Payload,
+    payme::Payme, payone::Payone, paypal::Paypal, paysafe::Paysafe, paystack::Paystack,
+    paytm::Paytm, payu::Payu, payway::Payway, peachpayments::Peachpayments, phonepe::Phonepe,
+    placetopay::Placetopay, plaid::Plaid, powertranz::Powertranz, prophetpay::Prophetpay,
+    rapyd::Rapyd, razorpay::Razorpay, recurly::Recurly, redsys::Redsys, riskified::Riskified,
+    santander::Santander, shift4::Shift4, sift::Sift, signifyd::Signifyd, silverflow::Silverflow,
+    square::Square, stax::Stax, stripe::Stripe, stripebilling::Stripebilling, taxjar::Taxjar,
+    threedsecureio::Threedsecureio, thunes::Thunes, tokenio::Tokenio, trustpay::Trustpay,
+    trustpayments::Trustpayments, tsys::Tsys,
     unified_authentication_service::UnifiedAuthenticationService, vgs::Vgs, volt::Volt,
     wellsfargo::Wellsfargo, wellsfargopayout::Wellsfargopayout, wise::Wise, worldline::Worldline,
     worldpay::Worldpay, worldpayvantiv::Worldpayvantiv, worldpayxml::Worldpayxml, xendit::Xendit,

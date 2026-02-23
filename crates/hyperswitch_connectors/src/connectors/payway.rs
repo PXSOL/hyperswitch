@@ -24,8 +24,8 @@ use hyperswitch_domain_models::{
         RefundsData, SetupMandateRequestData,
     },
     router_response_types::{
-        ConnectorInfo, PaymentsResponseData, RefundsResponseData, SupportedPaymentMethods,
-        PaymentMethodDetails, SupportedPaymentMethodsExt,
+        ConnectorInfo, PaymentMethodDetails, PaymentsResponseData, RefundsResponseData,
+        SupportedPaymentMethods, SupportedPaymentMethodsExt,
     },
     types::{
         PaymentsAuthorizeRouterData, PaymentsCaptureRouterData, PaymentsSyncRouterData,
@@ -40,7 +40,7 @@ use hyperswitch_interfaces::{
     configs::Connectors,
     errors,
     events::connector_api_logs::ConnectorEvent,
-    types::{self, Response,},
+    types::{self, Response},
     webhooks,
 };
 use masking::{ExposeInterface, Mask};
@@ -53,7 +53,11 @@ fn determine_endpoint(
     test_mode: Option<bool>,
 ) -> CustomResult<String, errors::ConnectorError> {
     if test_mode.unwrap_or(true) {
-        Ok(connectors.payway.secondary_base_url.clone().unwrap_or(connectors.payway.base_url.to_string()))
+        Ok(connectors
+            .payway
+            .secondary_base_url
+            .clone()
+            .unwrap_or(connectors.payway.base_url.to_string()))
     } else {
         Ok(connectors.payway.base_url.to_string())
     }
@@ -100,7 +104,10 @@ impl ConnectorIntegration<PaymentMethodToken, PaymentMethodTokenizationData, Pay
         let auth = payway::PaywayAuthType::try_from(&req.connector_auth_type)
             .change_context(errors::ConnectorError::FailedToObtainAuthType)?;
         Ok(vec![
-            (headers::CONTENT_TYPE.to_string(), self.common_get_content_type().to_string().into()),
+            (
+                headers::CONTENT_TYPE.to_string(),
+                self.common_get_content_type().to_string().into(),
+            ),
             ("apikey".to_string(), auth.public_key.expose().into_masked()),
             ("X-Source".to_string(), Self::x_source().to_string().into()),
         ])
@@ -115,7 +122,10 @@ impl ConnectorIntegration<PaymentMethodToken, PaymentMethodTokenizationData, Pay
         req: &TokenizationRouterData,
         connectors: &Connectors,
     ) -> CustomResult<String, errors::ConnectorError> {
-        Ok(format!("{}/tokens", determine_endpoint(connectors, req.test_mode)?))
+        Ok(format!(
+            "{}/tokens",
+            determine_endpoint(connectors, req.test_mode)?
+        ))
     }
 
     fn get_request_body(
@@ -123,7 +133,9 @@ impl ConnectorIntegration<PaymentMethodToken, PaymentMethodTokenizationData, Pay
         req: &TokenizationRouterData,
         _connectors: &Connectors,
     ) -> CustomResult<RequestContent, errors::ConnectorError> {
-        Ok(RequestContent::Json(Box::new(payway::PaywayTokenRequest::try_from(req)?)))
+        Ok(RequestContent::Json(Box::new(
+            payway::PaywayTokenRequest::try_from(req)?,
+        )))
     }
 
     fn build_request(
@@ -137,7 +149,9 @@ impl ConnectorIntegration<PaymentMethodToken, PaymentMethodTokenizationData, Pay
                 .url(&types::TokenizationType::get_url(self, req, connectors)?)
                 .attach_default_headers()
                 .headers(types::TokenizationType::get_headers(self, req, connectors)?)
-                .set_body(types::TokenizationType::get_request_body(self, req, connectors)?)
+                .set_body(types::TokenizationType::get_request_body(
+                    self, req, connectors,
+                )?)
                 .build(),
         ))
     }
@@ -217,7 +231,10 @@ impl ConnectorCommon for Payway {
             .change_context(errors::ConnectorError::FailedToObtainAuthType)?;
         Ok(vec![
             ("apikey".to_string(), auth.public_key.expose().into_masked()),
-            (headers::AUTHORIZATION.to_string(), auth.secret_key.expose().into_masked()),
+            (
+                headers::AUTHORIZATION.to_string(),
+                auth.secret_key.expose().into_masked(),
+            ),
         ])
     }
 
@@ -226,7 +243,6 @@ impl ConnectorCommon for Payway {
         res: Response,
         event_builder: Option<&mut ConnectorEvent>,
     ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
-
         if res.status_code >= 500 {
             router_env::logger::error!(
                 connector_error_response=?res,
@@ -248,7 +264,7 @@ impl ConnectorCommon for Payway {
 
         if res.status_code == 401 {
             router_env::logger::warn!(
-                status_code=res.status_code,
+                status_code = res.status_code,
                 "Payway authentication failed - Invalid credentials (401)"
             );
             return Ok(ErrorResponse {
@@ -286,7 +302,10 @@ impl ConnectorCommon for Payway {
         }
 
         if res.status_code == 400 {
-            if let Ok(err_json) = res.response.parse_struct::<serde_json::Value>("PaywayErrorJson") {
+            if let Ok(err_json) = res
+                .response
+                .parse_struct::<serde_json::Value>("PaywayErrorJson")
+            {
                 let err_type = err_json.get("error_type").and_then(|v| v.as_str());
                 if matches!(err_type, Some("invalid_request_error")) {
                     let msgs: Vec<String> = err_json
@@ -359,7 +378,10 @@ impl ConnectorCommon for Payway {
                     .to_string();
 
                 if reason_id == "-1" && reason_desc.is_empty() {
-                    if let Some(fraud_detection) = err_json.get("fraud_detection").and_then(|fd| fd.get("status")) {
+                    if let Some(fraud_detection) = err_json
+                        .get("fraud_detection")
+                        .and_then(|fd| fd.get("status"))
+                    {
                         let decision = fraud_detection
                             .get("decision")
                             .and_then(|v| v.as_str())
@@ -373,10 +395,12 @@ impl ConnectorCommon for Payway {
                             .get("description")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
-                        
+
                         if !decision.is_empty() && !reason_code.is_empty() {
-                            reason_desc = format!("cyber_source {{status = {}}} {{code = {}}} {{desc = {}}}", 
-                                decision, reason_code, description);
+                            reason_desc = format!(
+                                "cyber_source {{status = {}}} {{code = {}}} {{desc = {}}}",
+                                decision, reason_code, description
+                            );
                         }
                     }
                 }
@@ -413,7 +437,11 @@ impl ConnectorCommon for Payway {
                     connector_transaction_id: external_transaction_id,
                     network_advice_code: None,
                     network_decline_code: Some(reason_id),
-                    network_error_message: Some(if reason_desc.is_empty() { message } else { reason_desc }),
+                    network_error_message: Some(if reason_desc.is_empty() {
+                        message
+                    } else {
+                        reason_desc
+                    }),
                     connector_metadata: None,
                 });
             }
@@ -495,7 +523,10 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         let auth = payway::PaywayAuthType::try_from(&req.connector_auth_type)
             .change_context(errors::ConnectorError::FailedToObtainAuthType)?;
         Ok(vec![
-            (headers::CONTENT_TYPE.to_string(), self.common_get_content_type().to_string().into()),
+            (
+                headers::CONTENT_TYPE.to_string(),
+                self.common_get_content_type().to_string().into(),
+            ),
             ("apikey".to_string(), auth.secret_key.expose().into_masked()),
             ("X-Source".to_string(), Self::x_source().to_string().into()),
         ])
@@ -510,7 +541,10 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         req: &PaymentsAuthorizeRouterData,
         connectors: &Connectors,
     ) -> CustomResult<String, errors::ConnectorError> {
-        Ok(format!("{}/payments", determine_endpoint(connectors, req.test_mode)?))
+        Ok(format!(
+            "{}/payments",
+            determine_endpoint(connectors, req.test_mode)?
+        ))
     }
 
     fn get_request_body(
@@ -731,7 +765,12 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Payway 
         let auth = payway::PaywayAuthType::try_from(&req.connector_auth_type)
             .change_context(errors::ConnectorError::FailedToObtainAuthType)?;
         Ok(vec![
-            (headers::CONTENT_TYPE.to_string(), types::RefundExecuteType::get_content_type(self).to_string().into()),
+            (
+                headers::CONTENT_TYPE.to_string(),
+                types::RefundExecuteType::get_content_type(self)
+                    .to_string()
+                    .into(),
+            ),
             ("apikey".to_string(), auth.secret_key.expose().into_masked()),
             ("X-Source".to_string(), Self::x_source().to_string().into()),
         ])
@@ -746,7 +785,11 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Payway 
         req: &RefundsRouterData<Execute>,
         connectors: &Connectors,
     ) -> CustomResult<String, errors::ConnectorError> {
-        Ok(format!("{}/payments/{}/refunds", determine_endpoint(connectors, req.test_mode)?, req.request.connector_transaction_id))
+        Ok(format!(
+            "{}/payments/{}/refunds",
+            determine_endpoint(connectors, req.test_mode)?,
+            req.request.connector_transaction_id
+        ))
     }
 
     fn get_request_body(
@@ -903,38 +946,37 @@ impl webhooks::IncomingWebhook for Payway {
     }
 }
 
-static PAYWAY_SUPPORTED_PAYMENT_METHODS: LazyLock<SupportedPaymentMethods> =
-    LazyLock::new(|| {
-        let mut methods = SupportedPaymentMethods::new();
-        let supported_capture_methods = vec![
-            enums::CaptureMethod::Automatic,
-            enums::CaptureMethod::Manual,
-        ];
+static PAYWAY_SUPPORTED_PAYMENT_METHODS: LazyLock<SupportedPaymentMethods> = LazyLock::new(|| {
+    let mut methods = SupportedPaymentMethods::new();
+    let supported_capture_methods = vec![
+        enums::CaptureMethod::Automatic,
+        enums::CaptureMethod::Manual,
+    ];
 
-        methods.add(
-            enums::PaymentMethod::Card,
-            common_enums::PaymentMethodType::Credit,
-            PaymentMethodDetails {
-                mandates: enums::FeatureStatus::NotSupported,
-                refunds: enums::FeatureStatus::Supported,
-                supported_capture_methods: supported_capture_methods.clone(),
-                specific_features: None,
-            },
-        );
+    methods.add(
+        enums::PaymentMethod::Card,
+        common_enums::PaymentMethodType::Credit,
+        PaymentMethodDetails {
+            mandates: enums::FeatureStatus::NotSupported,
+            refunds: enums::FeatureStatus::Supported,
+            supported_capture_methods: supported_capture_methods.clone(),
+            specific_features: None,
+        },
+    );
 
-        methods.add(
-            enums::PaymentMethod::Card,
-            common_enums::PaymentMethodType::Debit,
-            PaymentMethodDetails {
-                mandates: enums::FeatureStatus::NotSupported,
-                refunds: enums::FeatureStatus::Supported,
-                supported_capture_methods,
-                specific_features: None,
-            },
-        );
+    methods.add(
+        enums::PaymentMethod::Card,
+        common_enums::PaymentMethodType::Debit,
+        PaymentMethodDetails {
+            mandates: enums::FeatureStatus::NotSupported,
+            refunds: enums::FeatureStatus::Supported,
+            supported_capture_methods,
+            specific_features: None,
+        },
+    );
 
-        methods
-    });
+    methods
+});
 
 static PAYWAY_CONNECTOR_INFO: ConnectorInfo = ConnectorInfo {
     display_name: "Payway",

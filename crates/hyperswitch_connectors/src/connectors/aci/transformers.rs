@@ -199,7 +199,8 @@ impl TryFrom<(&WalletData, &PaymentsAuthorizeRouterData)> for PaymentDetails {
             | WalletData::ApplePayRedirect(_)
             | WalletData::GooglePayRedirect(_)
             | WalletData::Mifinity(_)
-            | WalletData::RevolutPay(_) => Err(errors::ConnectorError::NotImplemented(
+            | WalletData::RevolutPay(_)
+                | WalletData::MercadoPagoSdk(_) => Err(errors::ConnectorError::NotImplemented(
                 "Payment method".to_string(),
             ))?,
         };

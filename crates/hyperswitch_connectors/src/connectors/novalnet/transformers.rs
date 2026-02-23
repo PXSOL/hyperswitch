@@ -409,7 +409,8 @@ impl TryFrom<&NovalnetRouterData<&PaymentsAuthorizeRouterData>> for NovalnetPaym
                     | WalletDataPaymentMethod::CashappQr(_)
                     | WalletDataPaymentMethod::SwishQr(_)
                     | WalletDataPaymentMethod::WeChatPayQr(_)
-                    | WalletDataPaymentMethod::Mifinity(_) => {
+                    | WalletDataPaymentMethod::Mifinity(_)
+                    | WalletDataPaymentMethod::MercadoPagoSdk(_) => {
                         Err(errors::ConnectorError::NotImplemented(
                             utils::get_unimplemented_payment_method_error_message("novalnet"),
                         )
@@ -1674,7 +1675,8 @@ impl TryFrom<&SetupMandateRouterData> for NovalnetPaymentsRequest {
                 | WalletDataPaymentMethod::CashappQr(_)
                 | WalletDataPaymentMethod::SwishQr(_)
                 | WalletDataPaymentMethod::WeChatPayQr(_)
-                | WalletDataPaymentMethod::Mifinity(_) => {
+                | WalletDataPaymentMethod::Mifinity(_)
+                | WalletDataPaymentMethod::MercadoPagoSdk(_) => {
                     Err(errors::ConnectorError::NotImplemented(
                         utils::get_unimplemented_payment_method_error_message("novalnet"),
                     ))?

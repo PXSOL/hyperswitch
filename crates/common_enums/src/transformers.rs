@@ -1844,6 +1844,7 @@ impl From<PaymentMethodType> for PaymentMethod {
             PaymentMethodType::Knet => Self::CardRedirect,
             PaymentMethodType::LocalBankRedirect => Self::BankRedirect,
             PaymentMethodType::MbWay => Self::Wallet,
+            PaymentMethodType::MercadoPago => Self::Wallet,
             PaymentMethodType::MobilePay => Self::Wallet,
             PaymentMethodType::Momo => Self::Wallet,
             PaymentMethodType::MomoAtm => Self::CardRedirect,
