@@ -826,12 +826,29 @@ impl webhooks::IncomingWebhook for Mercadopago {
             .parse_struct("MercadopagoWebhookBody")
             .change_context(errors::ConnectorError::WebhookReferenceIdNotFound)?;
 
-        // The webhook data.id contains the payment_id from Mercado Pago
-        Ok(api_models::webhooks::ObjectReferenceId::PaymentId(
-            api_models::payments::PaymentIdType::ConnectorTransactionId(
-                webhook_body.data.id,
-            ),
-        ))
+        let action = mercadopago::MercadopagoWebhookAction::from(webhook_body.action.as_str());
+
+        match action {
+            mercadopago::MercadopagoWebhookAction::PaymentCreated
+            | mercadopago::MercadopagoWebhookAction::PaymentUpdated
+            | mercadopago::MercadopagoWebhookAction::ChargebackCreated
+            | mercadopago::MercadopagoWebhookAction::ChargebackUpdated => {
+                Ok(api_models::webhooks::ObjectReferenceId::PaymentId(
+                    api_models::payments::PaymentIdType::ConnectorTransactionId(
+                        webhook_body.data.id,
+                    ),
+                ))
+            }
+            mercadopago::MercadopagoWebhookAction::RefundCreated
+            | mercadopago::MercadopagoWebhookAction::RefundUpdated => {
+                Ok(api_models::webhooks::ObjectReferenceId::RefundId(
+                    api_models::webhooks::RefundIdType::ConnectorRefundId(webhook_body.data.id),
+                ))
+            }
+            mercadopago::MercadopagoWebhookAction::Unknown => {
+                Err(errors::ConnectorError::WebhookReferenceIdNotFound.into())
+            }
+        }
     }
 
     fn get_webhook_event_type(
