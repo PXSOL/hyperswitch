@@ -150,8 +150,8 @@ impl ConnectorCommon for Mercadopago {
             attempt_status: None,
             connector_transaction_id: None,
             network_advice_code: None,
-            network_decline_code: None,
-            network_error_message: None,
+            network_decline_code: Some(response.get_error_code()),
+            network_error_message: Some(response.get_error_message()),
             connector_metadata: None,
         })
     }

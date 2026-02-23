@@ -288,14 +288,14 @@ impl<F, T> TryFrom<ResponseRouterData<F, MercadopagoPaymentsResponse, T, Payment
             Err(ErrorResponse {
                 code: error_code.clone(),
                 message: error_message.clone(),
-                reason: Some(error_message),
+                reason: Some(error_message.clone()),
                 status_code: item.http_code,
                 attempt_status: Some(status),
                 connector_transaction_id: Some(connector_transaction_id.clone()),
                 connector_metadata: None,
                 network_advice_code: None,
-                network_decline_code: None,
-                network_error_message: None,
+                network_decline_code: Some(error_code),
+                network_error_message: Some(error_message),
             })
         } else {
             Ok(PaymentsResponseData::TransactionResponse {
