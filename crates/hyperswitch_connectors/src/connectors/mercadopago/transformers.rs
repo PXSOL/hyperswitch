@@ -225,15 +225,15 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
             if has_payer_info || has_item_info {
                 let additional_payer = sdk_payer.map(|p| {
                     MercadopagoAdditionalInfoPayer {
-                        first_name: p.first_name.clone(),
-                        last_name: p.last_name.clone(),
+                        first_name: p.first_name.as_ref().map(|s| s.peek().to_string()),
+                        last_name: p.last_name.as_ref().map(|s| s.peek().to_string()),
                         phone: p.phone.as_ref().map(|ph| MercadopagoAdditionalInfoPayerPhone {
-                            number: Some(ph.clone()),
+                            number: Some(ph.peek().to_string()),
                         }),
                         address: if p.address.is_some() || p.zip_code.is_some() {
                             Some(MercadopagoAdditionalInfoPayerAddress {
-                                street_name: p.address.clone(),
-                                zip_code: p.zip_code.clone(),
+                                street_name: p.address.as_ref().map(|s| s.peek().to_string()),
+                                zip_code: p.zip_code.as_ref().map(|s| s.peek().to_string()),
                             })
                         } else {
                             None

@@ -492,11 +492,11 @@ pub struct PayPalWalletData {
 /// Additional payer information for Mercado Pago anti-fraud system
 #[derive(Eq, PartialEq, Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct MercadoPagoPayerInfo {
-    pub first_name: Option<String>,
-    pub last_name: Option<String>,
-    pub phone: Option<String>,
-    pub address: Option<String>,
-    pub zip_code: Option<String>,
+    pub first_name: Option<Secret<String>>,
+    pub last_name: Option<Secret<String>>,
+    pub phone: Option<Secret<String>>,
+    pub address: Option<Secret<String>>,
+    pub zip_code: Option<Secret<String>>,
 }
 
 /// Item information for Mercado Pago anti-fraud system

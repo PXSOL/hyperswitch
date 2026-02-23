@@ -4246,15 +4246,20 @@ pub struct PayPalWalletData {
 #[derive(Eq, PartialEq, Clone, Debug, serde::Deserialize, serde::Serialize, ToSchema)]
 pub struct MercadoPagoPayerInfo {
     /// Payer's first name
-    pub first_name: Option<String>,
+    #[schema(value_type = Option<String>)]
+    pub first_name: Option<Secret<String>>,
     /// Payer's last name
-    pub last_name: Option<String>,
+    #[schema(value_type = Option<String>)]
+    pub last_name: Option<Secret<String>>,
     /// Payer's phone number (e.g., "1155551234")
-    pub phone: Option<String>,
+    #[schema(value_type = Option<String>)]
+    pub phone: Option<Secret<String>>,
     /// Payer's address (e.g., "Calle 123 #456")
-    pub address: Option<String>,
+    #[schema(value_type = Option<String>)]
+    pub address: Option<Secret<String>>,
     /// Payer's zip/postal code
-    pub zip_code: Option<String>,
+    #[schema(value_type = Option<String>)]
+    pub zip_code: Option<Secret<String>>,
 }
 
 /// Item information for Mercado Pago anti-fraud system
