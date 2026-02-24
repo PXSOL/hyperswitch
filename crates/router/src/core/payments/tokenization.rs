@@ -1376,7 +1376,9 @@ pub fn update_router_data_with_payment_method_token_result<F: Clone, T>(
 
                     const CONNECTORS_THAT_FAIL_ON_TOKENIZATION_ERROR: &[&str] = &["payway"];
 
-                    if CONNECTORS_THAT_FAIL_ON_TOKENIZATION_ERROR.contains(&router_data.connector.as_str()) {
+                    if CONNECTORS_THAT_FAIL_ON_TOKENIZATION_ERROR
+                        .contains(&router_data.connector.as_str())
+                    {
                         router_data.response = Err(err);
                         false
                     } else {

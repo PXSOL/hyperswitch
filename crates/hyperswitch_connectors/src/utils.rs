@@ -5559,6 +5559,7 @@ pub enum PaymentMethodDataType {
     MobilePayRedirect,
     PaypalRedirect,
     PaypalSdk,
+    MercadoPagoSdk,
     Paze,
     SamsungPay,
     TwintRedirect,
@@ -5694,6 +5695,7 @@ impl From<PaymentMethodData> for PaymentMethodDataType {
                 payment_method_data::WalletData::MobilePayRedirect(_) => Self::MobilePayRedirect,
                 payment_method_data::WalletData::PaypalRedirect(_) => Self::PaypalRedirect,
                 payment_method_data::WalletData::PaypalSdk(_) => Self::PaypalSdk,
+                payment_method_data::WalletData::MercadoPagoSdk(_) => Self::MercadoPagoSdk,
                 payment_method_data::WalletData::Paze(_) => Self::Paze,
                 payment_method_data::WalletData::SamsungPay(_) => Self::SamsungPay,
                 payment_method_data::WalletData::TwintRedirect {} => Self::TwintRedirect,
@@ -5918,6 +5920,7 @@ impl WalletData for payment_method_data::WalletData {
             Self::GooglePay(data) => Ok(data.get_googlepay_encrypted_payment_data()?),
             Self::ApplePay(data) => Ok(data.get_applepay_decoded_payment_data()?),
             Self::PaypalSdk(data) => Ok(Secret::new(data.token.clone())),
+            Self::MercadoPagoSdk(data) => Ok(data.token.clone()),
             _ => Err(errors::ConnectorError::InvalidWallet.into()),
         }
     }

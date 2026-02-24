@@ -51,6 +51,7 @@ impl From<enums::WalletType> for global_enums::PaymentMethodType {
             enums::WalletType::AliPay => Self::AliPay,
             enums::WalletType::AliPayHk => Self::AliPayHk,
             enums::WalletType::MbWay => Self::MbWay,
+            enums::WalletType::MercadoPago => Self::MercadoPago,
             enums::WalletType::MobilePay => Self::MobilePay,
             enums::WalletType::WeChatPay => Self::WeChatPay,
             enums::WalletType::SamsungPay => Self::SamsungPay,

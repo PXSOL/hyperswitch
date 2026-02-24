@@ -649,7 +649,8 @@ impl TryFrom<(&PaymentMethodData, Option<&PaymentsAuthorizeRouterData>)> for Pay
                 | WalletData::CashappQr(_)
                 | WalletData::SwishQr(_)
                 | WalletData::Mifinity(_)
-                | WalletData::RevolutPay(_) => Err(report!(ConnectorError::NotImplemented(
+                | WalletData::RevolutPay(_)
+                | WalletData::MercadoPagoSdk(_) => Err(report!(ConnectorError::NotImplemented(
                     get_unimplemented_payment_method_error_message("nmi"),
                 ))),
             },

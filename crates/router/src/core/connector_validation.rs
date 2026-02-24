@@ -324,6 +324,10 @@ impl ConnectorAuthTypeAndMetadataValidation<'_> {
                 )?;
                 Ok(())
             }
+            api_enums::Connector::Mercadopago => {
+                mercadopago::transformers::MercadopagoAuthType::try_from(self.auth_type)?;
+                Ok(())
+            }
             api_enums::Connector::Mollie => {
                 mollie::transformers::MollieAuthType::try_from(self.auth_type)?;
                 Ok(())

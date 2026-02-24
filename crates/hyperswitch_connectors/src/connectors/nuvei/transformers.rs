@@ -1606,7 +1606,8 @@ where
                 | WalletData::SwishQr(_)
                 | WalletData::WeChatPayQr(_)
                 | WalletData::RevolutPay(_)
-                | WalletData::Mifinity(_) => Err(errors::ConnectorError::NotImplemented(
+                | WalletData::Mifinity(_)
+                | WalletData::MercadoPagoSdk(_) => Err(errors::ConnectorError::NotImplemented(
                     utils::get_unimplemented_payment_method_error_message("nuvei"),
                 )
                 .into()),

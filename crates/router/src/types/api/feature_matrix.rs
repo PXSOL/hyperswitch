@@ -331,6 +331,9 @@ impl FeatureMatrixConnectorData {
                 enums::Connector::Mifinity => {
                     Ok(ConnectorEnum::Old(Box::new(connector::Mifinity::new())))
                 }
+                enums::Connector::Mercadopago => {
+                    Ok(ConnectorEnum::Old(Box::new(connector::Mercadopago::new())))
+                }
                 enums::Connector::Multisafepay => {
                     Ok(ConnectorEnum::Old(Box::new(connector::Multisafepay::new())))
                 }

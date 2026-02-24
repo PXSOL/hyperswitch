@@ -895,7 +895,8 @@ impl TryFrom<enums::PaymentMethodType> for StripePaymentMethodType {
             | enums::PaymentMethodType::IndonesianBankTransfer
             | enums::PaymentMethodType::Flexiti
             | enums::PaymentMethodType::Mifinity
-            | enums::PaymentMethodType::Breadpay => Err(ConnectorError::NotImplemented(
+            | enums::PaymentMethodType::Breadpay
+            | enums::PaymentMethodType::MercadoPago => Err(ConnectorError::NotImplemented(
                 get_unimplemented_payment_method_error_message("stripe"),
             )
             .into()),
@@ -1209,7 +1210,8 @@ fn get_stripe_payment_method_type_from_wallet_data(
         | WalletData::TouchNGoRedirect(_)
         | WalletData::SwishQr(_)
         | WalletData::WeChatPayRedirect(_)
-        | WalletData::Mifinity(_) => Err(ConnectorError::NotImplemented(
+        | WalletData::Mifinity(_)
+        | WalletData::MercadoPagoSdk(_) => Err(ConnectorError::NotImplemented(
             get_unimplemented_payment_method_error_message("stripe"),
         )),
     }
@@ -1688,7 +1690,8 @@ impl TryFrom<(&WalletData, Option<PaymentMethodToken>)> for StripePaymentMethodD
             | WalletData::TouchNGoRedirect(_)
             | WalletData::SwishQr(_)
             | WalletData::WeChatPayRedirect(_)
-            | WalletData::Mifinity(_) => Err(ConnectorError::NotImplemented(
+            | WalletData::Mifinity(_)
+            | WalletData::MercadoPagoSdk(_) => Err(ConnectorError::NotImplemented(
                 get_unimplemented_payment_method_error_message("stripe"),
             )
             .into()),

@@ -76,6 +76,7 @@ pub struct Connectors {
     pub juspaythreedsserver: ConnectorParams,
     pub katapult: ConnectorParams,
     pub klarna: ConnectorParams,
+    pub mercadopago: ConnectorParams,
     pub mifinity: ConnectorParams,
     pub mollie: ConnectorParams,
     pub moneris: ConnectorParams,
@@ -256,3 +257,4 @@ pub struct ConnectorParamsWithThreeUrls {
     /// third base url
     pub third_base_url: String,
 }
+
