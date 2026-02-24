@@ -929,17 +929,7 @@ impl ForeignTryFrom<domain::MerchantConnectorAccount>
             payment_methods_enabled,
             metadata: item.metadata,
             frm_configs,
-            connector_webhook_details: item
-                .connector_webhook_details
-                .map(|webhook_details| {
-                    serde_json::Value::parse_value(
-                        webhook_details.expose(),
-                        "MerchantConnectorWebhookDetails",
-                    )
-                    .attach_printable("Unable to deserialize connector_webhook_details")
-                    .change_context(errors::ApiErrorResponse::InternalServerError)
-                })
-                .transpose()?,
+            connector_webhook_details: None,
             profile_id: item.profile_id,
             applepay_verified_domains: item.applepay_verified_domains,
             pm_auth_config: item.pm_auth_config,
@@ -985,17 +975,7 @@ impl ForeignTryFrom<domain::MerchantConnectorAccount>
             business_label: item.business_label,
             business_sub_label: item.business_sub_label,
             frm_configs,
-            connector_webhook_details: item
-                .connector_webhook_details
-                .map(|webhook_details| {
-                    serde_json::Value::parse_value(
-                        webhook_details.expose(),
-                        "MerchantConnectorWebhookDetails",
-                    )
-                    .attach_printable("Unable to deserialize connector_webhook_details")
-                    .change_context(errors::ApiErrorResponse::InternalServerError)
-                })
-                .transpose()?,
+            connector_webhook_details: None,
             profile_id: item.profile_id,
             applepay_verified_domains: item.applepay_verified_domains,
             pm_auth_config: item.pm_auth_config,
@@ -1086,17 +1066,7 @@ impl ForeignTryFrom<domain::MerchantConnectorAccount>
             payment_methods_enabled: item.payment_methods_enabled,
             metadata: item.metadata,
             frm_configs,
-            connector_webhook_details: item
-                .connector_webhook_details
-                .map(|webhook_details| {
-                    serde_json::Value::parse_value(
-                        webhook_details.expose(),
-                        "MerchantConnectorWebhookDetails",
-                    )
-                    .attach_printable("Unable to deserialize connector_webhook_details")
-                    .change_context(errors::ApiErrorResponse::InternalServerError)
-                })
-                .transpose()?,
+            connector_webhook_details: None,
             profile_id: item.profile_id,
             applepay_verified_domains: item.applepay_verified_domains,
             pm_auth_config: item.pm_auth_config,
