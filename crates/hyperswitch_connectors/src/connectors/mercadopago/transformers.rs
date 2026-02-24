@@ -100,6 +100,8 @@ pub struct MercadopagoAdditionalInfoItem {
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category_id: Option<String>,
     pub quantity: i32,
     pub unit_price: FloatMajorUnit,
 }
@@ -243,6 +245,7 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
                         id: "1".to_string(),
                         title: i.title.clone(),
                         description: i.description.clone(),
+                        category_id: i.category_id.clone(),
                         quantity: 1,
                         unit_price: transaction_amount,
                     }]
@@ -724,13 +727,16 @@ impl MercadopagoErrorResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MercadopagoWebhookBody {
-    pub id: Option<i64>,
+    #[serde(default)]
+    pub id: Option<serde_json::Value>,
     pub live_mode: Option<bool>,
     #[serde(rename = "type")]
     pub webhook_type: Option<String>,
     pub date_created: Option<String>,
-    pub application_id: Option<i64>,
-    pub user_id: Option<i64>,
+    #[serde(default)]
+    pub application_id: Option<serde_json::Value>,
+    #[serde(default)]
+    pub user_id: Option<serde_json::Value>,
     pub api_version: Option<String>,
     pub action: String,
     pub data: MercadopagoWebhookData,
