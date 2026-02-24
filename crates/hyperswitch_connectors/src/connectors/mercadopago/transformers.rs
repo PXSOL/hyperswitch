@@ -727,13 +727,16 @@ impl MercadopagoErrorResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MercadopagoWebhookBody {
-    pub id: Option<i64>,
+    #[serde(default)]
+    pub id: Option<serde_json::Value>,
     pub live_mode: Option<bool>,
     #[serde(rename = "type")]
     pub webhook_type: Option<String>,
     pub date_created: Option<String>,
-    pub application_id: Option<i64>,
-    pub user_id: Option<i64>,
+    #[serde(default)]
+    pub application_id: Option<serde_json::Value>,
+    #[serde(default)]
+    pub user_id: Option<serde_json::Value>,
     pub api_version: Option<String>,
     pub action: String,
     pub data: MercadopagoWebhookData,
