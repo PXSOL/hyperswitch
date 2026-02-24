@@ -504,6 +504,8 @@ pub struct MercadoPagoPayerInfo {
 pub struct MercadoPagoItemInfo {
     pub title: Option<String>,
     pub description: Option<String>,
+    /// Item category ID for fraud prevention (e.g., "travel", "electronics", "services")
+    pub category_id: Option<String>,
 }
 
 #[derive(Eq, PartialEq, Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -1275,6 +1277,7 @@ impl From<api_models::payments::WalletData> for WalletData {
                     item: mp_sdk_data.item.map(|i| MercadoPagoItemInfo {
                         title: i.title,
                         description: i.description,
+                        category_id: i.category_id,
                     }),
                 })
             }

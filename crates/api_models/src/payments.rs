@@ -4269,6 +4269,9 @@ pub struct MercadoPagoItemInfo {
     pub title: Option<String>,
     /// Item description
     pub description: Option<String>,
+    /// Item category ID (e.g., "electronics", "services", "travel", "food", "entertainment")
+    /// Used by Mercado Pago's fraud prevention system to improve approval rates
+    pub category_id: Option<String>,
 }
 
 #[derive(Eq, PartialEq, Clone, Debug, serde::Deserialize, serde::Serialize, ToSchema)]

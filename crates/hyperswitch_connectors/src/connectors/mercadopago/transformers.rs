@@ -100,6 +100,8 @@ pub struct MercadopagoAdditionalInfoItem {
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category_id: Option<String>,
     pub quantity: i32,
     pub unit_price: FloatMajorUnit,
 }
@@ -243,6 +245,7 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
                         id: "1".to_string(),
                         title: i.title.clone(),
                         description: i.description.clone(),
+                        category_id: i.category_id.clone(),
                         quantity: 1,
                         unit_price: transaction_amount,
                     }]
