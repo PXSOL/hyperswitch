@@ -64,7 +64,7 @@ pub struct MercadopagoPayer {
 pub struct MercadopagoIdentification {
     #[serde(rename = "type")]
     pub id_type: Option<String>,
-    pub number: Option<String>,
+    pub number: Option<Secret<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -156,10 +156,7 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
                         issuer_id_parsed,
                         i32::from(mp_data.installments.unwrap_or(1)),
                         mp_data.identification_type.clone(),
-                        mp_data
-                            .identification_number
-                            .as_ref()
-                            .map(|id| id.peek().to_string()),
+                        mp_data.identification_number.clone(),
                         mp_data.payer.as_ref(),
                         mp_data.item.as_ref(),
                     )
@@ -785,14 +782,17 @@ impl From<MercadopagoWebhookAction> for api_models::webhooks::IncomingWebhookEve
         // on the sync mechanism to fetch the actual status from MercadoPago's API.
         //
         // For refunds, since IncomingWebhookEvent doesn't have a RefundProcessing variant,
-        // we map to EventNotSupported so the system triggers a refund sync to get the real status.
+        // we map to EventNotSupported. Refund status is updated via periodic sync (RSync) calls.
         match action {
             MercadopagoWebhookAction::PaymentCreated
             | MercadopagoWebhookAction::PaymentUpdated => Self::PaymentIntentProcessing,
             MercadopagoWebhookAction::RefundCreated
             | MercadopagoWebhookAction::RefundUpdated => {
-                // No RefundProcessing variant exists, so we use EventNotSupported
-                // to trigger a sync that will fetch the actual refund status
+                // MercadoPago webhook payloads only contain the resource ID (no status).
+                // Since there is no RefundProcessing event variant, refund status changes
+                // are NOT tracked via webhooks. Refund state is updated exclusively through
+                // periodic sync (RSync) calls. EventNotSupported causes this webhook to be
+                // acknowledged and discarded without modifying refund state.
                 Self::EventNotSupported
             }
             MercadopagoWebhookAction::ChargebackCreated
