@@ -208,6 +208,15 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
             "X-Idempotency-Key".to_string(),
             req.connector_request_reference_id.clone().into(),
         ));
+        // Add X-meli-session-id header if device_id is provided (for anti-fraud)
+        if let PaymentMethodData::Wallet(hyperswitch_domain_models::payment_method_data::WalletData::MercadoPagoSdk(mp_data)) = &req.request.payment_method_data {
+            if let Some(device_id) = &mp_data.device_id {
+                headers.push((
+                    "X-meli-session-id".to_string(),
+                    device_id.peek().to_string().into_masked(),
+                ));
+            }
+        }
         Ok(headers)
     }
 
