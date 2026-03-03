@@ -769,7 +769,7 @@ fn parse_mercadopago_signature_header(
     Ok((ts, v1))
 }
 
-/// Extract the data.id from query params
+/// Extract the data.id from query params (for Webhooks v2)
 fn extract_data_id_from_query(query_params: &str) -> Option<String> {
     for param in query_params.split('&') {
         let mut kv = param.splitn(2, '=');
@@ -780,6 +780,41 @@ fn extract_data_id_from_query(query_params: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Extract the id from query params (for IPN legacy notifications)
+fn extract_ipn_id_from_query(query_params: &str) -> Option<String> {
+    for param in query_params.split('&') {
+        let mut kv = param.splitn(2, '=');
+        if let (Some(key), Some(value)) = (kv.next(), kv.next()) {
+            if key == "id" {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Extract the topic from query params (for IPN legacy notifications)
+fn extract_topic_from_query(query_params: &str) -> Option<String> {
+    for param in query_params.split('&') {
+        let mut kv = param.splitn(2, '=');
+        if let (Some(key), Some(value)) = (kv.next(), kv.next()) {
+            if key == "topic" {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Convert IPN topic to webhook action
+fn ipn_topic_to_action(topic: &str) -> mercadopago::MercadopagoWebhookAction {
+    match topic {
+        "payment" => mercadopago::MercadopagoWebhookAction::PaymentUpdated,
+        "chargebacks" => mercadopago::MercadopagoWebhookAction::ChargebackUpdated,
+        _ => mercadopago::MercadopagoWebhookAction::Unknown,
+    }
 }
 
 #[async_trait::async_trait]
@@ -807,6 +842,8 @@ impl webhooks::IncomingWebhook for Mercadopago {
         _merchant_id: &common_utils::id_type::MerchantId,
         _connector_webhook_secrets: &api_models::webhooks::ConnectorWebhookSecrets,
     ) -> CustomResult<Vec<u8>, errors::ConnectorError> {
+        // Check if this is a Webhooks v2 notification (has x-signature header)
+        // IPN legacy notifications don't support signature verification
         let (ts, _v1) = parse_mercadopago_signature_header(request.headers)?;
 
         let x_request_id = request
@@ -815,7 +852,8 @@ impl webhooks::IncomingWebhook for Mercadopago {
             .and_then(|v| v.to_str().ok())
             .ok_or(errors::ConnectorError::WebhookSignatureNotFound)?;
 
-        // data.id can come from query params or from the body
+        // data.id can come from query params (Webhooks v2) or from the body
+        // Note: For IPN, the param is just "id", not "data.id"
         let data_id = extract_data_id_from_query(&request.query_params)
             .or_else(|| {
                 request
@@ -823,6 +861,10 @@ impl webhooks::IncomingWebhook for Mercadopago {
                     .parse_struct::<mercadopago::MercadopagoWebhookBody>("MercadopagoWebhookBody")
                     .ok()
                     .map(|body| body.data.id.to_lowercase())
+            })
+            .or_else(|| {
+                // Fallback for IPN: try to get "id" from query params
+                extract_ipn_id_from_query(&request.query_params).map(|id| id.to_lowercase())
             })
             .ok_or(errors::ConnectorError::WebhookSignatureNotFound)?;
 
@@ -836,33 +878,53 @@ impl webhooks::IncomingWebhook for Mercadopago {
         &self,
         request: &webhooks::IncomingWebhookRequestDetails<'_>,
     ) -> CustomResult<api_models::webhooks::ObjectReferenceId, errors::ConnectorError> {
-        let webhook_body: mercadopago::MercadopagoWebhookBody = request
+        // First, try to parse as Webhooks v2 format
+        if let Ok(webhook_body) = request
             .body
-            .parse_struct("MercadopagoWebhookBody")
-            .change_context(errors::ConnectorError::WebhookReferenceIdNotFound)?;
+            .parse_struct::<mercadopago::MercadopagoWebhookBody>("MercadopagoWebhookBody")
+        {
+            let action = mercadopago::MercadopagoWebhookAction::from(webhook_body.action.as_str());
 
-        let action = mercadopago::MercadopagoWebhookAction::from(webhook_body.action.as_str());
+            return match action {
+                mercadopago::MercadopagoWebhookAction::PaymentCreated
+                | mercadopago::MercadopagoWebhookAction::PaymentUpdated
+                | mercadopago::MercadopagoWebhookAction::ChargebackCreated
+                | mercadopago::MercadopagoWebhookAction::ChargebackUpdated => {
+                    Ok(api_models::webhooks::ObjectReferenceId::PaymentId(
+                        api_models::payments::PaymentIdType::ConnectorTransactionId(
+                            webhook_body.data.id,
+                        ),
+                    ))
+                }
+                mercadopago::MercadopagoWebhookAction::RefundCreated
+                | mercadopago::MercadopagoWebhookAction::RefundUpdated => {
+                    Ok(api_models::webhooks::ObjectReferenceId::RefundId(
+                        api_models::webhooks::RefundIdType::ConnectorRefundId(webhook_body.data.id),
+                    ))
+                }
+                mercadopago::MercadopagoWebhookAction::Unknown => {
+                    Err(errors::ConnectorError::WebhookReferenceIdNotFound.into())
+                }
+            };
+        }
 
-        match action {
-            mercadopago::MercadopagoWebhookAction::PaymentCreated
-            | mercadopago::MercadopagoWebhookAction::PaymentUpdated
-            | mercadopago::MercadopagoWebhookAction::ChargebackCreated
-            | mercadopago::MercadopagoWebhookAction::ChargebackUpdated => {
+        // Fallback: try IPN legacy format (topic and id in query params)
+        // IPN sends: ?topic=payment&id=123456789
+        let topic = extract_topic_from_query(&request.query_params);
+        let id = extract_ipn_id_from_query(&request.query_params);
+
+        match (topic.as_deref(), id) {
+            (Some("payment"), Some(payment_id)) => {
                 Ok(api_models::webhooks::ObjectReferenceId::PaymentId(
-                    api_models::payments::PaymentIdType::ConnectorTransactionId(
-                        webhook_body.data.id,
-                    ),
+                    api_models::payments::PaymentIdType::ConnectorTransactionId(payment_id),
                 ))
             }
-            mercadopago::MercadopagoWebhookAction::RefundCreated
-            | mercadopago::MercadopagoWebhookAction::RefundUpdated => {
-                Ok(api_models::webhooks::ObjectReferenceId::RefundId(
-                    api_models::webhooks::RefundIdType::ConnectorRefundId(webhook_body.data.id),
+            (Some("chargebacks"), Some(chargeback_id)) => {
+                Ok(api_models::webhooks::ObjectReferenceId::PaymentId(
+                    api_models::payments::PaymentIdType::ConnectorTransactionId(chargeback_id),
                 ))
             }
-            mercadopago::MercadopagoWebhookAction::Unknown => {
-                Err(errors::ConnectorError::WebhookReferenceIdNotFound.into())
-            }
+            _ => Err(errors::ConnectorError::WebhookReferenceIdNotFound.into()),
         }
     }
 
@@ -870,13 +932,23 @@ impl webhooks::IncomingWebhook for Mercadopago {
         &self,
         request: &webhooks::IncomingWebhookRequestDetails<'_>,
     ) -> CustomResult<api_models::webhooks::IncomingWebhookEvent, errors::ConnectorError> {
-        let webhook_body: mercadopago::MercadopagoWebhookBody = request
+        // First, try to parse as Webhooks v2 format (JSON body with "action" field)
+        if let Ok(webhook_body) = request
             .body
-            .parse_struct("MercadopagoWebhookBody")
-            .change_context(errors::ConnectorError::WebhookEventTypeNotFound)?;
+            .parse_struct::<mercadopago::MercadopagoWebhookBody>("MercadopagoWebhookBody")
+        {
+            let action = mercadopago::MercadopagoWebhookAction::from(webhook_body.action.as_str());
+            return Ok(api_models::webhooks::IncomingWebhookEvent::from(action));
+        }
 
-        let action = mercadopago::MercadopagoWebhookAction::from(webhook_body.action.as_str());
-        Ok(api_models::webhooks::IncomingWebhookEvent::from(action))
+        // Fallback: try IPN legacy format (topic in query params)
+        // IPN sends: ?topic=payment&id=123456789
+        if let Some(topic) = extract_topic_from_query(&request.query_params) {
+            let action = ipn_topic_to_action(&topic);
+            return Ok(api_models::webhooks::IncomingWebhookEvent::from(action));
+        }
+
+        Err(errors::ConnectorError::WebhookEventTypeNotFound.into())
     }
 
     fn get_webhook_resource_object(
