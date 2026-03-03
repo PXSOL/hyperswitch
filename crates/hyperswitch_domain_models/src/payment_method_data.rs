@@ -526,6 +526,8 @@ pub struct MercadoPagoSdkData {
     pub payer: Option<MercadoPagoPayerInfo>,
     /// Item information for anti-fraud (optional)
     pub item: Option<MercadoPagoItemInfo>,
+    /// Device ID from Mercado Pago SDK for anti-fraud (X-meli-session-id header)
+    pub device_id: Option<Secret<String>>,
 }
 
 #[derive(Eq, PartialEq, Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -1279,6 +1281,7 @@ impl From<api_models::payments::WalletData> for WalletData {
                         description: i.description,
                         category_id: i.category_id,
                     }),
+                    device_id: mp_sdk_data.device_id,
                 })
             }
             api_models::payments::WalletData::Paze(paze_data) => {

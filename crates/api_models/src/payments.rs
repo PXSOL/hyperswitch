@@ -4300,6 +4300,9 @@ pub struct MercadoPagoSdkData {
     pub payer: Option<MercadoPagoPayerInfo>,
     /// Item information for anti-fraud (optional)
     pub item: Option<MercadoPagoItemInfo>,
+    /// Device ID from Mercado Pago SDK for anti-fraud (X-meli-session-id header)
+    #[schema(value_type = Option<String>)]
+    pub device_id: Option<Secret<String>>,
 }
 
 #[derive(Eq, PartialEq, Clone, Debug, serde::Deserialize, serde::Serialize, ToSchema)]
