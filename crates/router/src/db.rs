@@ -11,6 +11,7 @@ pub mod capture;
 pub mod configs;
 pub mod customers;
 pub mod dashboard_metadata;
+pub mod diagnostic;
 pub mod dispute;
 pub mod dynamic_routing_stats;
 pub mod ephemeral_key;
@@ -136,6 +137,7 @@ pub trait StorageInterface:
     + authorization::AuthorizationInterface
     + user::sample_data::BatchSampleDataInterface
     + health_check::HealthCheckDbInterface
+    + diagnostic::PaymentAttemptDiagnosticInterface
     + user_authentication_method::UserAuthenticationMethodInterface
     + authentication::AuthenticationInterface
     + generic_link::GenericLinkInterface

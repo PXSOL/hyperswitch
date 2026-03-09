@@ -64,6 +64,7 @@ use crate::{
         capture::CaptureInterface,
         configs::ConfigInterface,
         customers::CustomerInterface,
+        diagnostic,
         dispute::DisputeInterface,
         ephemeral_key::EphemeralKeyInterface,
         events::EventInterface,
@@ -3881,6 +3882,20 @@ impl AuthenticationInterface for KafkaStore {
 impl HealthCheckDbInterface for KafkaStore {
     async fn health_check_db(&self) -> CustomResult<(), errors::HealthCheckDBError> {
         self.diesel_store.health_check_db().await
+    }
+}
+
+#[async_trait::async_trait]
+impl diagnostic::PaymentAttemptDiagnosticInterface for KafkaStore {
+    async fn get_failed_attempts_in_window(
+        &self,
+        window_minutes: i64,
+        merchant_id: Option<&str>,
+        profile_id: Option<&str>,
+    ) -> CustomResult<Vec<diagnostic::FailureAttemptData>, errors::StorageError> {
+        self.diesel_store
+            .get_failed_attempts_in_window(window_minutes, merchant_id, profile_id)
+            .await
     }
 }
 

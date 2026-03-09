@@ -332,6 +332,47 @@ impl PaymentAttempt {
         .await
     }
 
+    /// Obtiene payment attempts con status=Failure en la ventana temporal.
+    /// Usado por el endpoint de diagnóstico /diagnostic/hyperswitch/payment-attempt/health.
+    #[cfg(feature = "v1")]
+    pub async fn find_failures_in_window(
+        conn: &PgPooledConn,
+        window_minutes: i64,
+        merchant_id_filter: Option<&str>,
+        profile_id_filter: Option<&str>,
+    ) -> StorageResult<Vec<Self>> {
+        use diesel::query_dsl::methods::{FilterDsl, OrderDsl};
+        use crate::query::utils::GetPrimaryKey;
+
+        let now = common_utils::date_time::now();
+        let from_time = now.saturating_sub(time::Duration::minutes(window_minutes));
+
+        let query = FilterDsl::filter(
+            FilterDsl::filter(
+                FilterDsl::filter(
+                    <Self as HasTable>::table().into_boxed(),
+                    dsl::status.eq(enums::AttemptStatus::Failure),
+                ),
+                dsl::modified_at.ge(from_time),
+            ),
+            <Self as HasTable>::table().get_primary_key().is_not_null(),
+        );
+        let mut query = OrderDsl::order(query, dsl::modified_at.desc());
+
+        if let Some(mid) = merchant_id_filter {
+            query = FilterDsl::filter(query, dsl::merchant_id.eq(mid.to_string()));
+        }
+        if let Some(pid) = profile_id_filter {
+            query = FilterDsl::filter(query, dsl::profile_id.eq(pid.to_string()));
+        }
+
+        query
+            .get_results_async(conn)
+            .await
+            .change_context(DatabaseError::Others)
+            .attach_printable("Error querying failed payment attempts for diagnostic")
+    }
+
     #[cfg(feature = "v1")]
     pub async fn get_filters_for_payments(
         conn: &PgPooledConn,

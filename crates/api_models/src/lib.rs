@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod analytics;
+pub mod diagnostic;
 pub mod api_keys;
 pub mod apple_pay_certificates_migration;
 pub mod authentication;
