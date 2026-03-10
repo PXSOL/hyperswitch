@@ -255,6 +255,11 @@ pub fn mk_app(
     server_app = server_app.service(routes::Cache::server(state.clone()));
     server_app = server_app.service(routes::Health::server(state.clone()));
 
+    #[cfg(feature = "v1")]
+    {
+        server_app = server_app.service(routes::Diagnostic::server(state.clone()));
+    }
+
     server_app
 }
 

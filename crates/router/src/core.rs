@@ -17,6 +17,7 @@ pub mod connector_validation;
 #[cfg(any(feature = "olap", feature = "oltp"))]
 pub mod currency;
 pub mod customers;
+pub mod diagnostic;
 pub mod disputes;
 pub mod encryption;
 pub mod errors;

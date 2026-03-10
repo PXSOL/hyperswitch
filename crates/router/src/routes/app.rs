@@ -61,8 +61,8 @@ use super::verification::{apple_pay_merchant_registration, retrieve_apple_pay_ve
 #[cfg(feature = "oltp")]
 use super::webhooks::*;
 use super::{
-    admin, api_keys, cache::*, chat, connector_onboarding, disputes, files, gsm, health::*,
-    profiles, relay, user, user_role,
+    admin, api_keys, cache::*, chat, connector_onboarding, diagnostic, disputes, files, gsm,
+    health::*, profiles, relay, user, user_role,
 };
 #[cfg(feature = "v1")]
 use super::{apple_pay_certificates_migration, blocklist, payment_link, webhook_events};
@@ -586,6 +586,23 @@ impl Health {
             .app_data(web::Data::new(state))
             .service(web::resource("").route(web::get().to(health)))
             .service(web::resource("/ready").route(web::get().to(deep_health_check)))
+    }
+}
+
+/// Endpoint de diagnóstico para monitoreo de payment_attempt (Hyperswitch).
+/// GET /diagnostic/hyperswitch/payment-attempt/health
+#[cfg(feature = "v1")]
+pub struct Diagnostic;
+
+#[cfg(feature = "v1")]
+impl Diagnostic {
+    pub fn server(state: AppState) -> Scope {
+        web::scope("/diagnostic")
+            .app_data(web::Data::new(state))
+            .service(
+                web::resource("/hyperswitch/payment-attempt/health")
+                    .route(web::get().to(diagnostic::payment_attempt_health)),
+            )
     }
 }
 
