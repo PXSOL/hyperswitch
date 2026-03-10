@@ -3897,6 +3897,17 @@ impl diagnostic::PaymentAttemptDiagnosticInterface for KafkaStore {
             .get_failed_attempts_in_window(window_minutes, merchant_id, profile_id)
             .await
     }
+
+    async fn count_successes_in_window(
+        &self,
+        window_minutes: i64,
+        merchant_id: Option<&str>,
+        profile_id: Option<&str>,
+    ) -> CustomResult<i64, errors::StorageError> {
+        self.diesel_store
+            .count_successes_in_window(window_minutes, merchant_id, profile_id)
+            .await
+    }
 }
 
 #[async_trait::async_trait]

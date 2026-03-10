@@ -51,22 +51,27 @@ async fn payment_attempt_health_func(
     let now = date_time::now();
     let from_time = now.saturating_sub(time::Duration::minutes(window_minutes));
 
-    let attempts = state
-        .store
-        .get_failed_attempts_in_window(
+    let (attempts, total_successes) = tokio::try_join!(
+        state.store.get_failed_attempts_in_window(
             window_minutes,
             query.merchant_id.as_deref(),
             query.profile_id.as_deref(),
-        )
-        .await
-        .map_err(|error| {
-            let message = error.to_string();
-            logger::error!(error = %message, "Database error in payment attempt health diagnostic");
-            error.change_context(errors::ApiErrorResponse::InternalServerError)
-        })?;
+        ),
+        state.store.count_successes_in_window(
+            window_minutes,
+            query.merchant_id.as_deref(),
+            query.profile_id.as_deref(),
+        ),
+    )
+    .map_err(|error| {
+        let message = error.to_string();
+        logger::error!(error = %message, "Database error in payment attempt health diagnostic");
+        error.change_context(errors::ApiErrorResponse::InternalServerError)
+    })?;
 
     let response = diagnostic::evaluate_payment_attempt_health(
         attempts,
+        total_successes.max(0) as u64,
         query.window_minutes,
         from_time,
         now,
