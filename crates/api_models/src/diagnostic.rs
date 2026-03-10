@@ -37,9 +37,36 @@ pub struct TimeWindow {
     pub to: String,
 }
 
+/// Detalle de un pago fallido para diagnóstico
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailureDetail {
+    /// ID del pago
+    pub payment_id: String,
+    /// Connector/proveedor (ej: stripe, mercadopago)
+    pub provider: Option<String>,
+    /// Mensaje de error principal
+    pub error_message: Option<String>,
+    /// Mensaje de error del emisor
+    pub issuer_error_message: Option<String>,
+    /// Código de error
+    pub error_code: Option<String>,
+    /// Razón del error
+    pub error_reason: Option<String>,
+    /// Código unificado
+    pub unified_code: Option<String>,
+    /// Código de error del emisor
+    pub issuer_error_code: Option<String>,
+    /// Monto (en unidades menores)
+    pub amount: Option<i64>,
+    /// Moneda
+    pub currency: Option<String>,
+}
+
 /// Métricas de payment attempts en la ventana
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaymentAttemptMetrics {
+    /// Total de pagos exitosos en la ventana (Charged, PartialCharged)
+    pub total_successes: u64,
     /// Total de intentos fallidos en la ventana
     pub total_failures: u32,
     /// Distribución por categoría de error
@@ -75,6 +102,8 @@ pub struct PaymentAttemptHealthResponse {
     pub status: HealthStatus,
     pub window: TimeWindow,
     pub metrics: PaymentAttemptMetrics,
+    /// Detalle de cada pago fallido (payment_id, provider, campos de error)
+    pub failures: Vec<FailureDetail>,
     pub alerts: Vec<AlertRule>,
 }
 

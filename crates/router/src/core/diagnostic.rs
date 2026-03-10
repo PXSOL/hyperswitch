@@ -3,7 +3,7 @@
 //! Incluye patrones por proveedor: Stripe, PayPal, MercadoPago, Payway.
 
 use api_models::diagnostic::{
-    AlertRule, ErrorCategoryCounts, HealthStatus, PaymentAttemptHealthResponse,
+    AlertRule, ErrorCategoryCounts, FailureDetail, HealthStatus, PaymentAttemptHealthResponse,
     PaymentAttemptMetrics, TimeWindow,
 };
 use router_env::logger;
@@ -89,11 +89,28 @@ const EXPECTED_TRAFFIC_WINDOW_MINUTES: i64 = 60;
 
 pub fn evaluate_payment_attempt_health(
     attempts: Vec<FailureAttemptData>,
+    total_successes: u64,
     window_minutes: u32,
     from_time: time::PrimitiveDateTime,
     to_time: time::PrimitiveDateTime,
 ) -> PaymentAttemptHealthResponse {
     let total = attempts.len() as u32;
+
+    let failures: Vec<FailureDetail> = attempts
+        .iter()
+        .map(|a| FailureDetail {
+            payment_id: a.payment_id.clone(),
+            provider: a.connector.clone(),
+            error_message: a.error_message.clone(),
+            issuer_error_message: a.issuer_error_message.clone(),
+            error_code: a.error_code.clone(),
+            error_reason: a.error_reason.clone(),
+            unified_code: a.unified_code.clone(),
+            issuer_error_code: a.issuer_error_code.clone(),
+            amount: a.amount,
+            currency: a.currency.clone(),
+        })
+        .collect();
 
     let mut user_errors = 0u32;
     let mut system_errors = 0u32;
@@ -122,6 +139,7 @@ pub fn evaluate_payment_attempt_health(
     };
 
     let metrics = PaymentAttemptMetrics {
+        total_successes,
         total_failures: total,
         by_category: ErrorCategoryCounts {
             user_errors,
@@ -153,16 +171,31 @@ pub fn evaluate_payment_attempt_health(
         0.0
     };
     if total > 0 && actionable_ratio >= FAILURE_RATIO_WARNING_THRESHOLD {
+        let failure_ids: Vec<String> = failures
+            .iter()
+            .map(|f| f.payment_id.clone())
+            .collect();
+        let ids_preview = if failure_ids.len() <= 5 {
+            failure_ids.join(", ")
+        } else {
+            format!(
+                "{}... (+{} más)",
+                failure_ids[..5].join(", "),
+                failure_ids.len() - 5
+            )
+        };
         alerts.push(AlertRule {
             rule_id: "high_actionable_failure_ratio".to_string(),
             severity: HealthStatus::Warning,
             message: format!(
-                "Ratio de errores que requieren acción (sistema/desconocidos) es {:.1}% (umbral: {}%). Total: {}, Sistema: {}, Desconocidos: {}",
+                "Ratio de errores que requieren acción (sistema/desconocidos) es {:.1}% (umbral: {}%). Exitosos: {}, Fallidos: {} (Sistema: {}, Desconocidos: {}). IDs: [{}]",
                 actionable_ratio * 100.0,
                 FAILURE_RATIO_WARNING_THRESHOLD * 100.0,
+                total_successes,
                 total,
                 system_errors,
-                unknown_errors
+                unknown_errors,
+                ids_preview
             ),
         });
     }
@@ -193,6 +226,7 @@ pub fn evaluate_payment_attempt_health(
         status,
         window,
         metrics,
+        failures,
         alerts,
     }
 }

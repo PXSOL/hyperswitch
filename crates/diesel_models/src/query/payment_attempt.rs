@@ -373,6 +373,47 @@ impl PaymentAttempt {
             .attach_printable("Error querying failed payment attempts for diagnostic")
     }
 
+    /// Cuenta payment attempts exitosos (Charged, PartialCharged) en la ventana temporal.
+    #[cfg(feature = "v1")]
+    pub async fn count_successes_in_window(
+        conn: &PgPooledConn,
+        window_minutes: i64,
+        merchant_id_filter: Option<&str>,
+        profile_id_filter: Option<&str>,
+    ) -> StorageResult<i64> {
+        use diesel::query_dsl::methods::FilterDsl;
+
+        let now = common_utils::date_time::now();
+        let from_time = now.saturating_sub(time::Duration::minutes(window_minutes));
+
+        let success_statuses = [
+            enums::AttemptStatus::Charged,
+            enums::AttemptStatus::PartialCharged,
+        ];
+
+        let mut query = FilterDsl::filter(
+            FilterDsl::filter(
+                <Self as HasTable>::table().count(),
+                dsl::status.eq_any(success_statuses),
+            ),
+            dsl::modified_at.ge(from_time),
+        )
+        .into_boxed();
+
+        if let Some(mid) = merchant_id_filter {
+            query = FilterDsl::filter(query, dsl::merchant_id.eq(mid.to_string()));
+        }
+        if let Some(pid) = profile_id_filter {
+            query = FilterDsl::filter(query, dsl::profile_id.eq(pid.to_string()));
+        }
+
+        query
+            .get_result_async::<i64>(conn)
+            .await
+            .change_context(DatabaseError::Others)
+            .attach_printable("Error counting successful payment attempts for diagnostic")
+    }
+
     #[cfg(feature = "v1")]
     pub async fn get_filters_for_payments(
         conn: &PgPooledConn,

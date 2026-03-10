@@ -51,6 +51,13 @@ pub trait PaymentAttemptDiagnosticInterface {
         merchant_id: Option<&str>,
         profile_id: Option<&str>,
     ) -> CustomResult<Vec<FailureAttemptData>, errors::StorageError>;
+
+    async fn count_successes_in_window(
+        &self,
+        window_minutes: i64,
+        merchant_id: Option<&str>,
+        profile_id: Option<&str>,
+    ) -> CustomResult<i64, errors::StorageError>;
 }
 
 #[async_trait::async_trait]
@@ -79,6 +86,22 @@ impl PaymentAttemptDiagnosticInterface for Store {
         logger::debug!(count = data.len(), "Retrieved failed payment attempts for diagnostic");
         Ok(data)
     }
+
+    #[instrument(skip_all)]
+    async fn count_successes_in_window(
+        &self,
+        window_minutes: i64,
+        merchant_id: Option<&str>,
+        profile_id: Option<&str>,
+    ) -> CustomResult<i64, errors::StorageError> {
+        let conn = connection::pg_connection_read(self)
+            .await
+            .change_context(errors::StorageError::DatabaseConnectionError)?;
+
+        PaymentAttempt::count_successes_in_window(&conn, window_minutes, merchant_id, profile_id)
+            .await
+            .change_context(errors::StorageError::DatabaseConnectionError)
+    }
 }
 
 #[async_trait::async_trait]
@@ -90,5 +113,14 @@ impl PaymentAttemptDiagnosticInterface for MockDb {
         _profile_id: Option<&str>,
     ) -> CustomResult<Vec<FailureAttemptData>, errors::StorageError> {
         Ok(vec![])
+    }
+
+    async fn count_successes_in_window(
+        &self,
+        _window_minutes: i64,
+        _merchant_id: Option<&str>,
+        _profile_id: Option<&str>,
+    ) -> CustomResult<i64, errors::StorageError> {
+        Ok(0)
     }
 }
