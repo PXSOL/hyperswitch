@@ -109,16 +109,10 @@ impl TryFrom<&Option<SecretSerdeValue>> for MercadopagoMetadata {
         match meta_data {
             Some(metadata) => {
                 let json_value = metadata.peek().clone();
-                router_env::logger::info!(mercadopago_frm_metadata_raw = ?json_value);
-                serde_json::from_value::<Self>(json_value.clone()).map_err(|e| {
-                    router_env::logger::error!(mercadopago_metadata_parse_error = ?e, raw_json = ?json_value);
-                    errors::ConnectorError::InvalidConnectorConfig { config: "frm_metadata" }.into()
-                })
+                serde_json::from_value::<Self>(json_value)
+                    .map_err(|_| errors::ConnectorError::InvalidConnectorConfig { config: "frm_metadata" }.into())
             }
-            None => {
-                router_env::logger::info!(mercadopago_frm_metadata = "None");
-                Ok(Self::default())
-            }
+            None => Ok(Self::default()),
         }
     }
 }
