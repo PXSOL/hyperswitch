@@ -74,6 +74,82 @@ impl api::PaymentToken for Mercadopago {}
 impl ConnectorIntegration<PaymentMethodToken, PaymentMethodTokenizationData, PaymentsResponseData>
     for Mercadopago
 {
+    fn get_headers(
+        &self,
+        req: &hyperswitch_domain_models::types::TokenizationRouterData,
+        connectors: &Connectors,
+    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+        self.build_headers(req, connectors)
+    }
+
+    fn get_content_type(&self) -> &'static str {
+        self.common_get_content_type()
+    }
+
+    fn get_url(
+        &self,
+        _req: &hyperswitch_domain_models::types::TokenizationRouterData,
+        connectors: &Connectors,
+    ) -> CustomResult<String, errors::ConnectorError> {
+        Ok(format!("{}/v1/card_tokens", self.base_url(connectors)))
+    }
+
+    fn get_request_body(
+        &self,
+        req: &hyperswitch_domain_models::types::TokenizationRouterData,
+        _connectors: &Connectors,
+    ) -> CustomResult<RequestContent, errors::ConnectorError> {
+        let connector_req = mercadopago::MercadopagoTokenRequest::try_from(req)?;
+        Ok(RequestContent::Json(Box::new(connector_req)))
+    }
+
+    fn build_request(
+        &self,
+        req: &hyperswitch_domain_models::types::TokenizationRouterData,
+        connectors: &Connectors,
+    ) -> CustomResult<Option<Request>, errors::ConnectorError> {
+        Ok(Some(
+            RequestBuilder::new()
+                .method(Method::Post)
+                .url(&types::TokenizationType::get_url(self, req, connectors)?)
+                .attach_default_headers()
+                .headers(types::TokenizationType::get_headers(self, req, connectors)?)
+                .set_body(types::TokenizationType::get_request_body(
+                    self, req, connectors,
+                )?)
+                .build(),
+        ))
+    }
+
+    fn handle_response(
+        &self,
+        data: &hyperswitch_domain_models::types::TokenizationRouterData,
+        event_builder: Option<&mut ConnectorEvent>,
+        res: Response,
+    ) -> CustomResult<hyperswitch_domain_models::types::TokenizationRouterData, errors::ConnectorError>
+    where
+        PaymentsResponseData: Clone,
+    {
+        let response: mercadopago::MercadopagoTokenResponse = res
+            .response
+            .parse_struct("MercadopagoTokenResponse")
+            .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+        event_builder.map(|i| i.set_response_body(&response));
+        router_env::logger::info!(connector_response=?response);
+        RouterData::try_from(ResponseRouterData {
+            response,
+            data: data.clone(),
+            http_code: res.status_code,
+        })
+    }
+
+    fn get_error_response(
+        &self,
+        res: Response,
+        event_builder: Option<&mut ConnectorEvent>,
+    ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
+        self.build_error_response(res, event_builder)
+    }
 }
 
 impl<Flow, Request, Response> ConnectorCommonExt<Flow, Request, Response> for Mercadopago
@@ -164,7 +240,7 @@ impl ConnectorValidation for Mercadopago {
         pm_data: PaymentMethodData,
     ) -> CustomResult<(), errors::ConnectorError> {
         match pm_data {
-            PaymentMethodData::Wallet(_) => Ok(()),
+            PaymentMethodData::Card(_) => Ok(()),
             _ => Err(errors::ConnectorError::NotImplemented(
                 "mandate payment not supported for this payment method".to_string(),
             )
@@ -208,14 +284,22 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
             "X-Idempotency-Key".to_string(),
             req.connector_request_reference_id.clone().into(),
         ));
-        // Add X-meli-session-id header if device_id is provided (for anti-fraud)
-        if let PaymentMethodData::Wallet(hyperswitch_domain_models::payment_method_data::WalletData::MercadoPagoSdk(mp_data)) = &req.request.payment_method_data {
-            if let Some(device_id) = &mp_data.device_id {
-                headers.push((
-                    "X-meli-session-id".to_string(),
-                    device_id.peek().to_string().into_masked(),
-                ));
-            }
+        // Add X-meli-session-id header if device_id is provided in metadata or frm_metadata (for anti-fraud)
+        let device_id = req.request.metadata.as_ref()
+            .and_then(|m| serde_json::from_value::<mercadopago::MercadopagoMetadata>(m.clone()).ok())
+            .and_then(|mp| mp.device_id)
+            .or_else(|| {
+                // Fallback to frm_metadata
+                req.frm_metadata.as_ref()
+                    .and_then(|m| serde_json::from_value::<mercadopago::MercadopagoMetadata>(m.peek().clone()).ok())
+                    .and_then(|mp| mp.device_id)
+            });
+        
+        if let Some(device_id) = device_id {
+            headers.push((
+                "X-meli-session-id".to_string(),
+                device_id.peek().to_string().into_masked(),
+            ));
         }
         Ok(headers)
     }
@@ -977,17 +1061,31 @@ static MERCADOPAGO_SUPPORTED_PAYMENT_METHODS: LazyLock<SupportedPaymentMethods> 
     LazyLock::new(|| {
         let mut supported_payment_methods = SupportedPaymentMethods::new();
 
-        // Add wallet payment method with MercadoPago type
+        let supported_capture_methods = vec![
+            enums::CaptureMethod::Automatic,
+            enums::CaptureMethod::Manual,
+        ];
+
+        // Add Card Credit payment method
         supported_payment_methods.add(
-            enums::PaymentMethod::Wallet,
-            enums::PaymentMethodType::MercadoPago,
+            enums::PaymentMethod::Card,
+            enums::PaymentMethodType::Credit,
             PaymentMethodDetails {
                 mandates: enums::FeatureStatus::NotSupported,
                 refunds: enums::FeatureStatus::Supported,
-                supported_capture_methods: vec![
-                    enums::CaptureMethod::Automatic,
-                    enums::CaptureMethod::Manual,
-                ],
+                supported_capture_methods: supported_capture_methods.clone(),
+                specific_features: None,
+            },
+        );
+
+        // Add Card Debit payment method
+        supported_payment_methods.add(
+            enums::PaymentMethod::Card,
+            enums::PaymentMethodType::Debit,
+            PaymentMethodDetails {
+                mandates: enums::FeatureStatus::NotSupported,
+                refunds: enums::FeatureStatus::Supported,
+                supported_capture_methods,
                 specific_features: None,
             },
         );

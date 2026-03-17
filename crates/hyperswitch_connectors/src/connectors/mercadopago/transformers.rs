@@ -1,12 +1,15 @@
 use common_enums::enums;
-use common_utils::types::FloatMajorUnit;
+use common_utils::{pii::SecretSerdeValue, types::FloatMajorUnit};
 use hyperswitch_domain_models::{
-    payment_method_data::{PaymentMethodData, WalletData},
+    payment_method_data::PaymentMethodData,
     router_data::{ConnectorAuthType, ErrorResponse, RouterData},
-    router_flow_types::refunds::{Execute, RSync},
+    router_flow_types::{
+        payments::PaymentMethodToken,
+        refunds::{Execute, RSync},
+    },
     router_request_types::ResponseId,
     router_response_types::{PaymentsResponseData, RefundsResponseData},
-    types::{PaymentsAuthorizeRouterData, PaymentsCaptureRouterData, RefundsRouterData},
+    types::{PaymentsAuthorizeRouterData, PaymentsCaptureRouterData, RefundsRouterData, TokenizationRouterData},
 };
 use hyperswitch_interfaces::errors;
 use masking::{PeekInterface, Secret};
@@ -14,7 +17,7 @@ use serde::{de::Deserialize as DeDeserialize, Deserialize, Serialize};
 
 use crate::{
     types::{RefundsResponseRouterData, ResponseRouterData},
-    utils::RouterData as _,
+    utils::{self, RouterData as _},
 };
 
 pub struct MercadopagoRouterData<T> {
@@ -48,6 +51,189 @@ impl TryFrom<&ConnectorAuthType> for MercadopagoAuthType {
     }
 }
 
+// ============================================================================
+// Metadata Structure - Custom fields for MercadoPago payments
+// ============================================================================
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub struct MercadopagoPayerInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_name: Option<Secret<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_name: Option<Secret<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phone: Option<Secret<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<Secret<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zip_code: Option<Secret<String>>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub struct MercadopagoItemInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category_id: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub struct MercadopagoMetadata {
+    /// Payment method ID from Mercado Pago (visa, master, amex, naranja, cabal, etc.)
+    pub payment_method_id: Option<String>,
+    /// Issuer ID from Mercado Pago (bank that issued the card)
+    pub issuer_id: Option<String>,
+    /// Number of installments (1 = single payment, 3, 6, 12, etc.)
+    pub installments: Option<i32>,
+    /// Payer identification type (DNI, CPF, CUIT, CUIL, RUT, CC, CE, etc.)
+    pub identification_type: Option<String>,
+    /// Payer identification number
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identification_number: Option<Secret<String>>,
+    /// Additional payer information for anti-fraud
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payer: Option<MercadopagoPayerInfo>,
+    /// Item information for anti-fraud
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item: Option<MercadopagoItemInfo>,
+    /// Device ID from Mercado Pago SDK for anti-fraud (X-meli-session-id header)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<Secret<String>>,
+}
+
+impl TryFrom<&Option<SecretSerdeValue>> for MercadopagoMetadata {
+    type Error = error_stack::Report<errors::ConnectorError>;
+    fn try_from(meta_data: &Option<SecretSerdeValue>) -> Result<Self, Self::Error> {
+        match meta_data {
+            Some(metadata) => {
+                let json_value = metadata.peek().clone();
+                serde_json::from_value::<Self>(json_value)
+                    .map_err(|_| errors::ConnectorError::InvalidConnectorConfig { config: "frm_metadata" }.into())
+            }
+            None => Ok(Self::default()),
+        }
+    }
+}
+
+impl TryFrom<&Option<serde_json::Value>> for MercadopagoMetadata {
+    type Error = error_stack::Report<errors::ConnectorError>;
+    fn try_from(meta_data: &Option<serde_json::Value>) -> Result<Self, Self::Error> {
+        match meta_data {
+            Some(metadata) => serde_json::from_value::<Self>(metadata.clone())
+                .map_err(|_e| errors::ConnectorError::InvalidConnectorConfig { config: "metadata" }.into()),
+            None => Ok(Self::default()),
+        }
+    }
+}
+
+// ============================================================================
+// Tokenization Types - POST /v1/card_tokens
+// ============================================================================
+
+#[derive(Debug, Serialize)]
+pub struct MercadopagoCardholderIdentification {
+    #[serde(rename = "type")]
+    pub id_type: String,
+    pub number: Secret<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MercadopagoCardholder {
+    pub name: Secret<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identification: Option<MercadopagoCardholderIdentification>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MercadopagoTokenRequest {
+    pub card_number: cards::CardNumber,
+    pub expiration_month: Secret<String>,
+    pub expiration_year: Secret<String>,
+    pub security_code: Secret<String>,
+    pub cardholder: MercadopagoCardholder,
+}
+
+impl TryFrom<&TokenizationRouterData> for MercadopagoTokenRequest {
+    type Error = error_stack::Report<errors::ConnectorError>;
+    fn try_from(item: &TokenizationRouterData) -> Result<Self, Self::Error> {
+        match &item.request.payment_method_data {
+            PaymentMethodData::Card(card) => {
+                // Get metadata from frm_metadata field in RouterData
+                // This is a workaround since PaymentMethodTokenizationData doesn't have metadata field
+                // User should pass MercadoPago metadata in frm_metadata of the payment request
+                let metadata = MercadopagoMetadata::try_from(&item.frm_metadata)?;
+                
+                let cardholder_name = card
+                    .card_holder_name
+                    .clone()
+                    .unwrap_or_else(|| Secret::new("APRO".to_string()));
+
+                // Build identification for cardholder if provided in metadata
+                let identification = match (metadata.identification_type, metadata.identification_number) {
+                    (Some(id_type), Some(id_number)) => Some(MercadopagoCardholderIdentification {
+                        id_type,
+                        number: id_number,
+                    }),
+                    _ => None,
+                };
+
+                Ok(Self {
+                    card_number: card.card_number.clone(),
+                    expiration_month: card.card_exp_month.clone(),
+                    expiration_year: card.card_exp_year.clone(),
+                    security_code: card.card_cvc.clone(),
+                    cardholder: MercadopagoCardholder {
+                        name: cardholder_name,
+                        identification,
+                    },
+                })
+            }
+            _ => Err(errors::ConnectorError::NotImplemented(
+                "Payment method not supported for MercadoPago tokenization".to_string(),
+            )
+            .into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MercadopagoTokenResponse {
+    pub id: String,
+    pub status: Option<String>,
+    pub first_six_digits: Option<String>,
+    pub last_four_digits: Option<String>,
+    pub expiration_month: Option<i32>,
+    pub expiration_year: Option<i32>,
+}
+
+impl<T>
+    TryFrom<
+        ResponseRouterData<PaymentMethodToken, MercadopagoTokenResponse, T, PaymentsResponseData>,
+    > for RouterData<PaymentMethodToken, T, PaymentsResponseData>
+{
+    type Error = error_stack::Report<errors::ConnectorError>;
+    fn try_from(
+        item: ResponseRouterData<
+            PaymentMethodToken,
+            MercadopagoTokenResponse,
+            T,
+            PaymentsResponseData,
+        >,
+    ) -> Result<Self, Self::Error> {
+        Ok(Self {
+            response: Ok(PaymentsResponseData::TokenizationResponse {
+                token: item.response.id,
+            }),
+            ..item.data
+        })
+    }
+}
+
+// ============================================================================
+// Payment Request Types
+// ============================================================================
 
 #[derive(Debug, Serialize)]
 pub struct MercadopagoPayer {
@@ -145,31 +331,42 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
     ) -> Result<Self, Self::Error> {
         let router_data = item.router_data;
 
-        let (token, payment_method_id, issuer_id, installments, identification_type, identification_number, sdk_payer, sdk_item) =
-            match &router_data.request.payment_method_data {
-                PaymentMethodData::Wallet(WalletData::MercadoPagoSdk(mp_data)) => {
-                    let issuer_id_parsed = mp_data
-                        .issuer_id
-                        .as_ref()
-                        .and_then(|id| id.parse::<i64>().ok());
-                    (
-                        mp_data.token.clone(),
-                        mp_data.payment_method_id.clone(),
-                        issuer_id_parsed,
-                        i32::from(mp_data.installments.unwrap_or(1)),
-                        mp_data.identification_type.clone(),
-                        mp_data.identification_number.clone(),
-                        mp_data.payer.as_ref(),
-                        mp_data.item.as_ref(),
-                    )
+        // Get token from payment_method_token (generated in tokenization step)
+        let token = match router_data.get_payment_method_token()? {
+            hyperswitch_domain_models::router_data::PaymentMethodToken::Token(t) => {
+                Secret::new(t.peek().to_string())
+            }
+            _ => {
+                return Err(errors::ConnectorError::MissingRequiredField {
+                    field_name: "payment_method_token",
                 }
-                _ => {
-                    return Err(errors::ConnectorError::NotImplemented(
-                        "Payment method not supported for MercadoPago".to_string(),
-                    )
-                    .into())
-                }
-            };
+                .into())
+            }
+        };
+
+        // Get metadata with MercadoPago-specific fields
+        // Try request.metadata first, then fall back to frm_metadata (for consistency with tokenization)
+        let metadata_from_request = MercadopagoMetadata::try_from(&router_data.request.metadata)?;
+        let metadata = if metadata_from_request.payment_method_id.is_some() {
+            metadata_from_request
+        } else {
+            // Fallback to frm_metadata if request.metadata doesn't have payment_method_id
+            MercadopagoMetadata::try_from(&router_data.frm_metadata)?
+        };
+
+        // payment_method_id is required
+        let payment_method_id = metadata
+            .payment_method_id
+            .ok_or(errors::ConnectorError::MissingRequiredField {
+                field_name: "metadata.payment_method_id",
+            })?;
+
+        let issuer_id = metadata
+            .issuer_id
+            .as_ref()
+            .and_then(|id| id.parse::<i64>().ok());
+
+        let installments = metadata.installments.unwrap_or(1);
 
         let transaction_amount = item.amount;
 
@@ -206,23 +403,22 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
             .filter(|url| !url.contains("localhost") && !url.contains("127.0.0.1"))
             .cloned();
 
-        // Build payer identification if provided
-        let payer_identification = if identification_type.is_some() || identification_number.is_some() {
-            Some(MercadopagoIdentification {
-                id_type: identification_type,
-                number: identification_number,
-            })
-        } else {
-            None
+        // Build payer identification from metadata
+        let payer_identification = match (&metadata.identification_type, &metadata.identification_number) {
+            (Some(id_type), Some(id_number)) => Some(MercadopagoIdentification {
+                id_type: Some(id_type.clone()),
+                number: Some(id_number.clone()),
+            }),
+            _ => None,
         };
 
-        // Build additional_info for anti-fraud if SDK provided extra data
+        // Build additional_info for anti-fraud from metadata
         let additional_info = {
-            let has_payer_info = sdk_payer.is_some();
-            let has_item_info = sdk_item.is_some();
+            let has_payer_info = metadata.payer.is_some();
+            let has_item_info = metadata.item.is_some();
 
             if has_payer_info || has_item_info {
-                let additional_payer = sdk_payer.map(|p| {
+                let additional_payer = metadata.payer.as_ref().map(|p| {
                     MercadopagoAdditionalInfoPayer {
                         first_name: p.first_name.as_ref().map(|s| s.peek().to_string()),
                         last_name: p.last_name.as_ref().map(|s| s.peek().to_string()),
@@ -240,7 +436,7 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
                     }
                 });
 
-                let additional_items = sdk_item.map(|i| {
+                let additional_items = metadata.item.as_ref().map(|i| {
                     vec![MercadopagoAdditionalInfoItem {
                         id: "1".to_string(),
                         title: i.title.clone(),
