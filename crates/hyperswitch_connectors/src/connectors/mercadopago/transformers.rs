@@ -921,6 +921,8 @@ impl MercadopagoErrorResponse {
 // Webhook Types
 // ============================================================================
 
+/// Webhooks v1 format: full JSON with action and data.id
+/// Example: {"action":"payment.created","data":{"id":"150211668619"},...}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MercadopagoWebhookBody {
     #[serde(default)]
@@ -938,9 +940,76 @@ pub struct MercadopagoWebhookBody {
     pub data: MercadopagoWebhookData,
 }
 
+/// Feed v2 format: minimal JSON with resource and topic
+/// Example: {"resource":"150211668619","topic":"payment"}
+/// Used by "MercadoPago Feed v2.0 payment" user-agent
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MercadopagoWebhookFeedBody {
+    pub resource: String,
+    pub topic: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MercadopagoWebhookBodyEnum {
+    Full(MercadopagoWebhookBody),
+    Feed(MercadopagoWebhookFeedBody),
+}
+
+impl MercadopagoWebhookBodyEnum {
+    /// Get the connector transaction ID (payment/refund/chargeback ID) from either format
+    pub fn get_resource_id(&self) -> String {
+        match self {
+            Self::Full(body) => body.data.id.clone(),
+            Self::Feed(body) => body.resource.clone(),
+        }
+    }
+
+    /// Get the webhook action/event type
+    pub fn get_action(&self) -> MercadopagoWebhookAction {
+        match self {
+            Self::Full(body) => MercadopagoWebhookAction::from(body.action.as_str()),
+            Self::Feed(body) => topic_to_action(&body.topic),
+        }
+    }
+
+    /// Convert to a unified struct for get_webhook_resource_object (implements ErasedMaskSerialize)
+    pub fn to_resource_object(&self) -> MercadopagoWebhookResourceObject {
+        match self {
+            Self::Full(body) => MercadopagoWebhookResourceObject {
+                resource_id: body.data.id.clone(),
+                topic: body.webhook_type.clone().unwrap_or_else(|| "payment".to_string()),
+                action: Some(body.action.clone()),
+            },
+            Self::Feed(body) => MercadopagoWebhookResourceObject {
+                resource_id: body.resource.clone(),
+                topic: body.topic.clone(),
+                action: None,
+            },
+        }
+    }
+}
+
+/// Unified resource object for logging (implements ErasedMaskSerialize)
+#[derive(Debug, Clone, Serialize)]
+pub struct MercadopagoWebhookResourceObject {
+    #[serde(rename = "resource_id")]
+    pub resource_id: String,
+    pub topic: String,
+    pub action: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MercadopagoWebhookData {
     pub id: String,
+}
+
+fn topic_to_action(topic: &str) -> MercadopagoWebhookAction {
+    match topic {
+        "payment" => MercadopagoWebhookAction::PaymentUpdated,
+        "chargebacks" => MercadopagoWebhookAction::ChargebackUpdated,
+        _ => MercadopagoWebhookAction::Unknown,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
