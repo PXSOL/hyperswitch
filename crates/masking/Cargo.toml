@@ -27,7 +27,7 @@ erased-serde = "0.4.6"
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1.0.140", optional = true }
 subtle = "2.6.1"
-time = { version = "0.3.41", optional = true, features = ["serde-human-readable"] }
+time = { version = "0.3.47", optional = true, features = ["serde-human-readable"] }
 url = { version = "2.5.4", features = ["serde"] }
 zeroize = { version = "1.8", default-features = false }
 scylla = { git = "https://github.com/juspay/scylla-rust-driver.git",rev = "5700aa2847b25437cdd4fcf34d707aa90dca8b89", optional = true}
