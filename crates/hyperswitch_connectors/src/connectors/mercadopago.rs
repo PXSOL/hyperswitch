@@ -44,6 +44,8 @@ use transformers as mercadopago;
 
 use crate::{constants::headers, types::ResponseRouterData, utils};
 
+const PXSOL_PLATFORM_ID: &str = "dev_ab8e21775bb211ed88d80242ac130004";
+
 #[derive(Clone)]
 pub struct Mercadopago {
     amount_converter: &'static (dyn AmountConvertor<Output = FloatMajorUnit> + Sync),
@@ -283,6 +285,10 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         headers.push((
             "X-Idempotency-Key".to_string(),
             req.connector_request_reference_id.clone().into(),
+        ));
+        headers.push((
+            "x-platform-id".to_string(),
+            masking::Secret::new(PXSOL_PLATFORM_ID.to_string()).into_masked(),
         ));
         // Add X-meli-session-id header if device_id is provided in metadata or frm_metadata (for anti-fraud)
         let device_id = req.request.metadata.as_ref()
