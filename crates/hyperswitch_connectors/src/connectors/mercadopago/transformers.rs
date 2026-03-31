@@ -279,6 +279,20 @@ pub struct MercadopagoAdditionalInfoPayer {
     pub address: Option<MercadopagoAdditionalInfoPayerAddress>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct MercadopagoPassenger {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MercadopagoCategoryDescriptor {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passenger: Option<MercadopagoPassenger>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct MercadopagoAdditionalInfoItem {
     pub id: String,
@@ -290,6 +304,10 @@ pub struct MercadopagoAdditionalInfoItem {
     pub category_id: Option<String>,
     pub quantity: i32,
     pub unit_price: FloatMajorUnit,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category_descriptor: Option<MercadopagoCategoryDescriptor>,
 }
 
 #[derive(Debug, Serialize)]
@@ -436,6 +454,21 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
                     }
                 });
 
+                let category_descriptor = metadata.payer.as_ref().and_then(|p| {
+                    if p.first_name.is_some() || p.last_name.is_some() {
+                        Some(MercadopagoCategoryDescriptor {
+                            passenger: Some(MercadopagoPassenger {
+                                first_name: p.first_name.as_ref().map(|s| s.peek().to_string()),
+                                last_name: p.last_name.as_ref().map(|s| s.peek().to_string()),
+                            }),
+                        })
+                    } else {
+                        None
+                    }
+                });
+
+                let event_date = common_utils::date_time::date_as_yyyymmddthhmmssmmmz().ok();
+
                 let additional_items = metadata.item.as_ref().map(|i| {
                     vec![MercadopagoAdditionalInfoItem {
                         id: "1".to_string(),
@@ -444,6 +477,8 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
                         category_id: i.category_id.clone(),
                         quantity: 1,
                         unit_price: transaction_amount,
+                        event_date: event_date.clone(),
+                        category_descriptor: category_descriptor.clone(),
                     }]
                 });
 
