@@ -81,7 +81,12 @@ impl ConnectorIntegration<PaymentMethodToken, PaymentMethodTokenizationData, Pay
         req: &hyperswitch_domain_models::types::TokenizationRouterData,
         connectors: &Connectors,
     ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
-        self.build_headers(req, connectors)
+        let mut headers = self.build_headers(req, connectors)?;
+        headers.push((
+            "x-platform-id".to_string(),
+            masking::Secret::new(PXSOL_PLATFORM_ID.to_string()).into_masked(),
+        ));
+        Ok(headers)
     }
 
     fn get_content_type(&self) -> &'static str {
