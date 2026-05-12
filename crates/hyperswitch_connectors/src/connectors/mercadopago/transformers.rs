@@ -20,6 +20,8 @@ use crate::{
     utils::{self, RouterData as _},
 };
 
+const MAX_APPLICATION_FEE_RATIO: f64 = 0.005;
+
 pub struct MercadopagoRouterData<T> {
     pub amount: FloatMajorUnit,
     pub router_data: T,
@@ -101,6 +103,9 @@ pub struct MercadopagoMetadata {
     /// Device ID from Mercado Pago SDK for anti-fraud (X-meli-session-id header)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_id: Option<Secret<String>>,
+    /// Marketplace commission — absolute amount in the transaction currency
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub application_fee: Option<f64>,
 }
 
 impl TryFrom<&Option<SecretSerdeValue>> for MercadopagoMetadata {
@@ -339,6 +344,8 @@ pub struct MercadopagoPaymentsRequest {
     pub statement_descriptor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub additional_info: Option<MercadopagoAdditionalInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub application_fee: Option<f64>,
 }
 
 impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for MercadopagoPaymentsRequest {
@@ -491,6 +498,21 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
             }
         };
 
+        let application_fee = match metadata.application_fee {
+            Some(fee) if fee > 0.0 => {
+                let amount_f64 = transaction_amount.get_amount_as_f64();
+                let max_fee = amount_f64 * MAX_APPLICATION_FEE_RATIO;
+                if fee > max_fee {
+                    return Err(errors::ConnectorError::InvalidDataFormat {
+                        field_name: "application_fee exceeds maximum allowed (0.5% of transaction_amount)",
+                    }
+                    .into());
+                }
+                Some(fee)
+            }
+            _ => None,
+        };
+
         Ok(Self {
             transaction_amount,
             token,
@@ -510,6 +532,7 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
             notification_url,
             statement_descriptor: router_data.request.statement_descriptor.clone(),
             additional_info,
+            application_fee,
         })
     }
 }
