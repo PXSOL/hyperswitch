@@ -20,7 +20,7 @@ use crate::{
     utils::{self, RouterData as _},
 };
 
-const MAX_APPLICATION_FEE_RATIO: f64 = 0.005;
+const MAX_APPLICATION_FEE_RATIO: f64 = 0.007;
 
 pub struct MercadopagoRouterData<T> {
     pub amount: FloatMajorUnit,
@@ -504,7 +504,7 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
                 let max_fee = amount_f64 * MAX_APPLICATION_FEE_RATIO;
                 if fee > max_fee {
                     return Err(errors::ConnectorError::InvalidDataFormat {
-                        field_name: "application_fee exceeds maximum allowed (0.5% of transaction_amount)",
+                        field_name: "application_fee exceeds maximum allowed (0.7% of transaction_amount)",
                     }
                     .into());
                 }
