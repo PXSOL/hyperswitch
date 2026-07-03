@@ -238,13 +238,17 @@ where
                 ),
                 (
                     auth_headers::PAYPAL_PARTNER_ATTRIBUTION_ID.to_string(),
-                    "HyperSwitchPPCP_SP".to_string().into(),
+                    auth_headers::PAYPAL_PARTNER_ATTRIBUTION_ID_VALUE
+                        .to_string()
+                        .into(),
                 ),
             ])
         } else {
             headers.extend(vec![(
                 auth_headers::PAYPAL_PARTNER_ATTRIBUTION_ID.to_string(),
-                "HyperSwitchlegacy_Ecom".to_string().into(),
+                auth_headers::PAYPAL_PARTNER_ATTRIBUTION_ID_VALUE
+                    .to_string()
+                    .into(),
             )])
         }
         Ok(headers)
@@ -417,6 +421,12 @@ impl ConnectorIntegration<AccessTokenAuth, AccessTokenRequestData, AccessToken> 
                 RefreshTokenType::get_content_type(self).to_string().into(),
             ),
             (headers::AUTHORIZATION.to_string(), auth_val.into_masked()),
+            (
+                auth_headers::PAYPAL_PARTNER_ATTRIBUTION_ID.to_string(),
+                auth_headers::PAYPAL_PARTNER_ATTRIBUTION_ID_VALUE
+                    .to_string()
+                    .into(),
+            ),
         ])
     }
     fn get_request_body(
@@ -1933,6 +1943,12 @@ impl
                     .into(),
             ),
             (headers::AUTHORIZATION.to_string(), auth_val.into_masked()),
+            (
+                auth_headers::PAYPAL_PARTNER_ATTRIBUTION_ID.to_string(),
+                auth_headers::PAYPAL_PARTNER_ATTRIBUTION_ID_VALUE
+                    .to_string()
+                    .into(),
+            ),
         ])
     }
 

@@ -1,6 +1,7 @@
 use common_utils::request::{Method, Request, RequestBuilder, RequestContent};
 use error_stack::ResultExt;
 use http::header;
+use hyperswitch_connectors::connectors::paypal::transformers::auth_headers;
 
 use crate::{
     connector,
@@ -59,6 +60,10 @@ where
             header::CONTENT_TYPE.to_string().as_str(),
             "application/json",
         )
+        .header(
+            auth_headers::PAYPAL_PARTNER_ATTRIBUTION_ID,
+            auth_headers::PAYPAL_PARTNER_ATTRIBUTION_ID_VALUE,
+        )
         .set_body(RequestContent::Json(Box::new(body)))
         .build())
 }
@@ -71,6 +76,10 @@ pub fn build_paypal_get_request(url: String, access_token: String) -> RouterResu
         .header(
             header::AUTHORIZATION.to_string().as_str(),
             format!("Bearer {access_token}").as_str(),
+        )
+        .header(
+            auth_headers::PAYPAL_PARTNER_ATTRIBUTION_ID,
+            auth_headers::PAYPAL_PARTNER_ATTRIBUTION_ID_VALUE,
         )
         .build())
 }
