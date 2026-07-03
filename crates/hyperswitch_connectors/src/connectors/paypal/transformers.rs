@@ -126,6 +126,8 @@ mod webhook_headers {
 }
 pub mod auth_headers {
     pub const PAYPAL_PARTNER_ATTRIBUTION_ID: &str = "PayPal-Partner-Attribution-Id";
+    /// PXSOL partner attribution id (BN code) sent on every PayPal API call.
+    pub const PAYPAL_PARTNER_ATTRIBUTION_ID_VALUE: &str = "PXSOL_SP_CMReservas";
     pub const PREFER: &str = "Prefer";
     pub const PAYPAL_REQUEST_ID: &str = "PayPal-Request-Id";
     pub const PAYPAL_AUTH_ASSERTION: &str = "PayPal-Auth-Assertion";
