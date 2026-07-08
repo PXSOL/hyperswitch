@@ -465,6 +465,12 @@ impl ConnectorIntegration<CompleteAuthorize, CompleteAuthorizeData, PaymentsResp
         // Reuses the shared response conversion: a second `WAITING` + `params` (challenge
         // after the method step) yields another `redirection_data` + `AuthenticationPending`;
         // a terminal response maps to Charged/Authorized/Failure via `map_status`.
+        //
+        // No amount integrity object is set here (unlike Authorize/Capture/PSync/Refund):
+        // `CompleteAuthorizeData` has no `integrity_object` field
+        // (hyperswitch_domain_models::router_request_types::CompleteAuthorizeData), so there is
+        // nowhere to store it. If that field is added upstream, mirror the
+        // `settlement_amount()` -> `get_authorise_integrity_object(...)` block used above.
         RouterData::try_from(ResponseRouterData {
             response,
             data: data.clone(),

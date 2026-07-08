@@ -73,13 +73,15 @@ pub enum FiservemeaLegalFramework {
     UryReturnsIvaLaw19210,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+// NOTE: This struct is never deserialized directly — it is built field-by-field in
+// `from_sources` via the `extract_*` helpers, each of which reads raw `serde_json::Value` and
+// carries its own alias key list in its `lookup_field(&[...])` call. The previous
+// `#[derive(Deserialize)]` + `#[serde(default)]` + `#[serde(alias = ...)]` attributes were
+// therefore dead (duplicating those alias lists) and have been removed.
+#[derive(Debug, Clone, Default)]
 pub struct FiservemeaMetadataObject {
-    #[serde(alias = "number_of_installments")]
     pub installments: Option<i32>,
     pub installment_interest: Option<bool>,
-    #[serde(alias = "legal_framework")]
     pub tax_refund_legal_framework: Option<FiservemeaLegalFramework>,
 }
 
@@ -192,6 +194,11 @@ pub struct FiservemeaPaymentCard {
     number: cards::CardNumber,
     expiry_date: FiservemeaExpiryDate,
     security_code: Secret<String>,
+    // Documented `paymentCard` field (Appendix III / §7.2). Sending the cardholder name aids
+    // 3DS success and AVS. Serialized as `cardholderName`; omitted entirely when absent so a
+    // request without a holder name stays byte-identical to the previous behavior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cardholder_name: Option<Secret<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -204,6 +211,14 @@ pub enum FiservemeaPaymentMethods {
 /// Only emitted when the payment is `is_three_ds()`; absent otherwise so the
 /// NoThreeDs request stays byte-identical to the pre-3DS behavior. See vendor doc
 /// §10.1.1 (lines 526-578) and design spec §3.4.
+///
+/// NOTE: Two documented variants are intentionally deferred (out of scope here):
+/// - Mastercard Data-Only (`messageCategory: "80"`, vendor doc §10.1.6): niche and only
+///   applicable to recurring/MIT (merchant-initiated) transactions, which this connector does
+///   not yet support.
+/// - 3DS v1 (`Secure3D10AuthenticationRequest`/`payerAuthenticationResponse`, vendor doc
+///   §10.1.5 v1 variant): the card schemes have sunset 3DS v1, so only the 3DS v2.1/v2.2
+///   (`Secure3D21...`) flow is implemented.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FiservemeaAuthenticationRequest {
@@ -255,6 +270,7 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
                         year: req_card.get_card_expiry_year_2_digit()?,
                     },
                     security_code: req_card.card_cvc,
+                    cardholder_name: req_card.card_holder_name.clone(),
                 };
                 let request_type = if is_auto_capture(item.router_data.request.capture_method) {
                     FiservemeaRequestType::PaymentCardSaleTransaction
@@ -300,8 +316,12 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
                         authentication_type: "Secure3D21AuthenticationRequest".to_string(),
                         term_url: return_url.clone(),
                         method_notification_url: return_url,
+                        // `01` = no preference (vendor doc §10.1.1, line ~536).
                         challenge_indicator: Some("01".to_string()),
-                        challenge_window_size: Some("01".to_string()),
+                        // `05` = full screen (vendor doc §10.1.1, line ~552). The narrowest
+                        // option `01` (250x400) is a poor default on modern/mobile viewports, so
+                        // request full screen for a better challenge UX.
+                        challenge_window_size: Some("05".to_string()),
                     })
                 } else {
                     None
@@ -394,6 +414,69 @@ fn extract_acs_cres(redirect_response: &CompleteAuthorizeRedirectResponse) -> Op
     None
 }
 
+/// Reports whether the browser's return data carries a `threeDSMethodData` field, i.e. the
+/// issuer ACS actually POSTed the 3DSMethod device-fingerprint notification to the
+/// `methodNotificationURL` (vendor doc §10.1.3, lines 619-651). Mirrors `extract_acs_cres`:
+/// checks the JSON `payload` first, then the `params` query string. The field name is matched
+/// case-insensitively since browsers/intermediaries may alter its casing. Used to distinguish
+/// `RECEIVED` (notification arrived) from `EXPECTED_BUT_NOT_RECEIVED` (issuer didn't POST it)
+/// on the methodForm continuation. `NOT_EXPECTED` is never emitted because
+/// `methodNotificationURL` is always sent on the initial Authorize request.
+fn has_three_ds_method_data(redirect_response: &CompleteAuthorizeRedirectResponse) -> bool {
+    if let Some(payload) = redirect_response.payload.as_ref() {
+        if let Some(object) = payload.peek().as_object() {
+            if object
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case("threeDSMethodData"))
+            {
+                return true;
+            }
+        }
+    }
+    if let Some(params) = redirect_response.params.as_ref() {
+        if url::form_urlencoded::parse(params.peek().as_bytes())
+            .any(|(key, _)| key.eq_ignore_ascii_case("threeDSMethodData"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Builds the 3DS continuation PATCH body from the browser's `redirect_response`. Extracted as a
+/// standalone function (like `select_void_request_type`) so the branch selection can be
+/// unit-tested without constructing a full `PaymentsCompleteAuthorizeRouterData`.
+///
+/// - If the browser returned a challenge result (`cRes`), this is the final continuation after
+///   the cardholder challenge (§10.1.5.d): send `acsResponse.cRes`.
+/// - Otherwise the browser returned from the methodForm/device-fingerprint step (§10.1.4.a):
+///   send `methodNotificationStatus`. It is `RECEIVED` when the ACS POSTed `threeDSMethodData`
+///   to the `methodNotificationURL`, and `EXPECTED_BUT_NOT_RECEIVED` when it did not (some
+///   issuers don't support browser data collection — vendor doc §10.1.1 line ~580 / §10.1.3).
+fn build_continuation_request(
+    redirect_response: &CompleteAuthorizeRedirectResponse,
+) -> FiservemeaCompleteAuthorizeRequest {
+    match extract_acs_cres(redirect_response) {
+        Some(c_res) => FiservemeaCompleteAuthorizeRequest {
+            authentication_type: "Secure3D21AuthenticationUpdateRequest".to_string(),
+            method_notification_status: None,
+            acs_response: Some(FiservemeaAcsResponse { c_res }),
+        },
+        None => {
+            let method_notification_status = if has_three_ds_method_data(redirect_response) {
+                "RECEIVED"
+            } else {
+                "EXPECTED_BUT_NOT_RECEIVED"
+            };
+            FiservemeaCompleteAuthorizeRequest {
+                authentication_type: "Secure3D21AuthenticationUpdateRequest".to_string(),
+                method_notification_status: Some(method_notification_status.to_string()),
+                acs_response: None,
+            }
+        }
+    }
+}
+
 impl TryFrom<&PaymentsCompleteAuthorizeRouterData> for FiservemeaCompleteAuthorizeRequest {
     type Error = error_stack::Report<errors::ConnectorError>;
     fn try_from(item: &PaymentsCompleteAuthorizeRouterData) -> Result<Self, Self::Error> {
@@ -403,22 +486,7 @@ impl TryFrom<&PaymentsCompleteAuthorizeRouterData> for FiservemeaCompleteAuthori
             },
         )?;
 
-        // If the browser returned a challenge result (`cRes`), this is the final continuation
-        // (§10.1.5.d). Otherwise the browser returned from the methodForm/device-fingerprint
-        // step (§10.1.4.a); report `RECEIVED` since Hyperswitch only re-invokes
-        // CompleteAuthorize after the browser has come back from `methodNotificationURL`.
-        match extract_acs_cres(redirect_response) {
-            Some(c_res) => Ok(Self {
-                authentication_type: "Secure3D21AuthenticationUpdateRequest".to_string(),
-                method_notification_status: None,
-                acs_response: Some(FiservemeaAcsResponse { c_res }),
-            }),
-            None => Ok(Self {
-                authentication_type: "Secure3D21AuthenticationUpdateRequest".to_string(),
-                method_notification_status: Some("RECEIVED".to_string()),
-                acs_response: None,
-            }),
-        }
+        Ok(build_continuation_request(redirect_response))
     }
 }
 
@@ -693,6 +761,17 @@ impl FiservemeaAuthenticationResponse {
     }
 }
 
+/// 3DS authentication outcome echoed on the frictionless/challenge terminal responses (vendor
+/// doc §10.1.4.b line ~691 and §10.1.5.e line ~802). Parsed for observability only: the
+/// accept/decline decision stays driven by `transactionStatus`/`transactionResult` via
+/// `map_status`, never by this field. Its `responseCode3dSecure` is surfaced on the response
+/// `connector_metadata` so it is available in logs/analytics rather than being silently dropped.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FiservemeaSecure3dResponse {
+    response_code3d_secure: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FiservemeaPaymentsResponse {
@@ -723,6 +802,9 @@ pub struct FiservemeaPaymentsResponse {
     // Present only on 3DS Authorize/CompleteAuthorize responses; `None` for
     // capture/void/refund responses, which is what keeps those flows unaffected.
     authentication_response: Option<FiservemeaAuthenticationResponse>,
+    // Present only on the frictionless/challenge terminal 3DS responses (§10.1.4.b/§10.1.5.e).
+    // Parsed purely for observability (see `FiservemeaSecure3dResponse`); does not drive status.
+    secure3d_response: Option<FiservemeaSecure3dResponse>,
 }
 
 impl FiservemeaPaymentsResponse {
@@ -767,13 +849,23 @@ impl<F, T> TryFrom<ResponseRouterData<F, FiservemeaPaymentsResponse, T, Payments
                 item.response.transaction_type,
             )
         };
+        // Surface the 3DS authentication outcome (`responseCode3dSecure`) for observability when
+        // present. It never influences status (that's `map_status`'s job); it's only attached so
+        // it shows up in logs/analytics instead of being silently dropped. Absent on non-3DS and
+        // intermediate 3DS responses, so `connector_metadata` stays `None` there as before.
+        let connector_metadata = item
+            .response
+            .secure3d_response
+            .as_ref()
+            .and_then(|secure3d| secure3d.response_code3d_secure.as_ref())
+            .map(|code| serde_json::json!({ "responseCode3dSecure": code }));
         Ok(Self {
             status,
             response: Ok(PaymentsResponseData::TransactionResponse {
                 resource_id: ResponseId::ConnectorTransactionId(item.response.ipg_transaction_id),
                 redirection_data: Box::new(redirection_data),
                 mandate_reference: Box::new(None),
-                connector_metadata: None,
+                connector_metadata,
                 network_txn_id: None,
                 connector_response_reference_id: item.response.order_id,
                 incremental_authorization_allowed: None,
@@ -1148,6 +1240,7 @@ mod tests {
                     year: Secret::new("30".to_string()),
                 },
                 security_code: Secret::new("123".to_string()),
+                cardholder_name: None,
             }),
             authentication_request,
         }
@@ -1390,5 +1483,211 @@ mod tests {
             payload: None,
         };
         assert_eq!(extract_acs_cres(&redirect), Some("abc def".to_string()));
+    }
+
+    // ---- Item 1: methodNotificationStatus RECEIVED vs EXPECTED_BUT_NOT_RECEIVED ----
+
+    #[test]
+    fn continuation_reports_received_when_method_data_present() {
+        // The ACS POSTed `threeDSMethodData` to the methodNotificationURL (§10.1.3) -> RECEIVED.
+        let redirect = CompleteAuthorizeRedirectResponse {
+            params: None,
+            payload: Some(Secret::new(serde_json::json!({
+                "threeDSMethodData": "eyJ0aHJlZURTU2VydmVyVHJhbnNJRCI6IjNhYzcifQ==",
+            }))),
+        };
+        let request = build_continuation_request(&redirect);
+        assert_eq!(
+            request.method_notification_status.as_deref(),
+            Some("RECEIVED")
+        );
+        assert!(request.acs_response.is_none());
+    }
+
+    #[test]
+    fn continuation_reports_expected_but_not_received_when_method_data_absent() {
+        // The browser came back from the methodForm step but the ACS never POSTed
+        // `threeDSMethodData` (issuer doesn't support browser data collection, §10.1.1 line
+        // ~580) -> EXPECTED_BUT_NOT_RECEIVED (never `RECEIVED`, never `NOT_EXPECTED`).
+        let redirect = CompleteAuthorizeRedirectResponse {
+            params: Some(Secret::new("foo=bar".to_string())),
+            payload: None,
+        };
+        let request = build_continuation_request(&redirect);
+        assert_eq!(
+            request.method_notification_status.as_deref(),
+            Some("EXPECTED_BUT_NOT_RECEIVED")
+        );
+        assert!(request.acs_response.is_none());
+    }
+
+    #[test]
+    fn continuation_reports_received_from_query_string_method_data() {
+        // `threeDSMethodData` may arrive as a query-string param rather than a JSON payload.
+        let redirect = CompleteAuthorizeRedirectResponse {
+            params: Some(Secret::new("threeDSMethodData=eyJ0aHJlZSJ9".to_string())),
+            payload: None,
+        };
+        let request = build_continuation_request(&redirect);
+        assert_eq!(
+            request.method_notification_status.as_deref(),
+            Some("RECEIVED")
+        );
+    }
+
+    #[test]
+    fn continuation_sends_cres_when_challenge_result_present() {
+        // A challenge result (`cRes`) means the final continuation (§10.1.5.d): send
+        // `acsResponse.cRes` and no `methodNotificationStatus`, regardless of methodData.
+        let redirect = CompleteAuthorizeRedirectResponse {
+            params: None,
+            payload: Some(Secret::new(serde_json::json!({ "cRes": "cres_blob" }))),
+        };
+        let request = build_continuation_request(&redirect);
+        assert_eq!(
+            request.acs_response.as_ref().map(|acs| acs.c_res.clone()),
+            Some("cres_blob".to_string())
+        );
+        assert!(request.method_notification_status.is_none());
+    }
+
+    // ---- Item 3: secure3dResponse.responseCode3dSecure is parsed, not dropped ----
+
+    #[test]
+    fn secure3d_response_code_is_captured() {
+        // §10.1.4.b / §10.1.5.e terminal response: `secure3dResponse.responseCode3dSecure` must
+        // deserialize into the response so it is available for observability.
+        let json = serde_json::json!({
+            "ipgTransactionId": "838916029301",
+            "transactionType": "SALE",
+            "transactionStatus": "APPROVED",
+            "secure3dResponse": { "responseCode3dSecure": "1" },
+        });
+        let response: FiservemeaPaymentsResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            response
+                .secure3d_response
+                .and_then(|secure3d| secure3d.response_code3d_secure),
+            Some("1".to_string())
+        );
+    }
+
+    // ---- Item 4: paymentCard.cardholderName ----
+
+    fn sample_card(cardholder_name: Option<Secret<String>>) -> FiservemeaPaymentCard {
+        FiservemeaPaymentCard {
+            number: "4111111111111111".parse().unwrap(),
+            expiry_date: FiservemeaExpiryDate {
+                month: Secret::new("12".to_string()),
+                year: Secret::new("30".to_string()),
+            },
+            security_code: Secret::new("123".to_string()),
+            cardholder_name,
+        }
+    }
+
+    #[test]
+    fn payment_card_serializes_cardholder_name_when_present() {
+        let card = sample_card(Some(Secret::new("Jane Doe".to_string())));
+        let json = serde_json::to_value(&card).unwrap();
+        assert_eq!(json["cardholderName"], "Jane Doe");
+    }
+
+    #[test]
+    fn payment_card_omits_cardholder_name_when_absent() {
+        let card = sample_card(None);
+        let json = serde_json::to_value(&card).unwrap();
+        assert!(
+            json.get("cardholderName").is_none(),
+            "cardholderName must be omitted when no holder name is present"
+        );
+    }
+
+    // ---- Doc-fixture tests: lock the wire format to the vendor doc (§10) ----
+
+    #[test]
+    fn doc_method_form_response_produces_html_redirect() {
+        // EXACT shape from vendor doc §10.1.2 (lines 599-616): the methodForm auth response must
+        // deserialize and produce an `Html` RedirectForm carrying the methodForm HTML verbatim.
+        let json = serde_json::json!({
+            "clientRequestId": "30dd879c-ee2f-11db-8314-0800200c9a66",
+            "apiTraceId": "rrt-0c80a3403e2c2def0-d-ea-28805-6810951-2",
+            "ipgTransactionId": "838916029301",
+            "transactionType": "SALE",
+            "transactionTime": 1518811817_i64,
+            "approvedAmount": { "total": 122.04, "currency": "USD" },
+            "transactionStatus": "WAITING",
+            "authenticationResponse": {
+                "type": "3D_SECURE",
+                "version": "2.1",
+                "secure3dMethod": {
+                    "methodForm": "<form name=\"frm\" method=\"POST\"><iframe hidden></iframe></form>",
+                    "secure3dTransId": "3ac7caa7-aa42-2663-791b-2ac05a542c4a"
+                }
+            }
+        });
+        let response: FiservemeaPaymentsResponse = serde_json::from_value(json).unwrap();
+        let auth = response
+            .authentication_response
+            .expect("doc response carries an authenticationResponse");
+        match auth.to_redirection() {
+            Some(RedirectForm::Html { html_data }) => {
+                assert_eq!(
+                    html_data,
+                    "<form name=\"frm\" method=\"POST\"><iframe hidden></iframe></form>"
+                );
+            }
+            other => panic!("expected Html redirect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn doc_challenge_params_response_produces_acs_form() {
+        // EXACT shape from vendor doc §10.1.5.b (lines 720-739): the challenge params response
+        // must deserialize (note the doc's lowercase `sessiondata`) and produce a `Form`
+        // POST to `acsURL` carrying `creq`/`threeDSSessionData` (the field names the ACS
+        // expects, doc lines 749-753).
+        let json = serde_json::json!({
+            "clientRequestId": "30dd879c-ee2f-11db-8314-0800200c9a66",
+            "apiTraceId": "rrt-0c80a3403e2c2def0-d-ea-28805-6810951-2",
+            "ipgTransactionId": "838916029301",
+            "transactionType": "SALE",
+            "transactionTime": 1518811817_i64,
+            "approvedAmount": { "total": 122.04, "currency": "USD" },
+            "transactionStatus": "WAITING",
+            "authenticationResponse": {
+                "type": "3D_SECURE",
+                "version": "2.1",
+                "params": {
+                    "acsURL": "https://3ds-acs.test.modirum.com/mdpayacs/pareq",
+                    "termURL": "https://www.mywebshop.com/process3dSecure/",
+                    "cReq": "ewogICAiYWNzVHJhbCIgOiA...wMDAtMDAwMDAwMDA0MWE5Igp9",
+                    "sessiondata": "50F2156E03083CA665BCB4.."
+                }
+            }
+        });
+        let response: FiservemeaPaymentsResponse = serde_json::from_value(json).unwrap();
+        let auth = response
+            .authentication_response
+            .expect("doc response carries an authenticationResponse");
+        match auth.to_redirection() {
+            Some(RedirectForm::Form {
+                endpoint,
+                method,
+                form_fields,
+            }) => {
+                assert_eq!(endpoint, "https://3ds-acs.test.modirum.com/mdpayacs/pareq");
+                assert_eq!(method, Method::Post);
+                assert_eq!(
+                    form_fields.get("creq"),
+                    Some(&"ewogICAiYWNzVHJhbCIgOiA...wMDAtMDAwMDAwMDA0MWE5Igp9".to_string())
+                );
+                assert_eq!(
+                    form_fields.get("threeDSSessionData"),
+                    Some(&"50F2156E03083CA665BCB4..".to_string())
+                );
+            }
+            other => panic!("expected Form redirect, got {other:?}"),
+        }
     }
 }
