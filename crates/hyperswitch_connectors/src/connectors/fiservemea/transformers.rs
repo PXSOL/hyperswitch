@@ -12,7 +12,7 @@ use hyperswitch_domain_models::{
     },
 };
 use hyperswitch_interfaces::errors;
-use masking::Secret;
+use masking::{PeekInterface, Secret};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -46,6 +46,68 @@ pub struct FiservemeaTransactionAmount {
 #[serde(rename_all = "camelCase")]
 pub struct FiservemeaOrder {
     order_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    installment_options: Option<FiservemeaInstallmentOptions>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum FiservemeaLegalFramework {
+    #[serde(rename = "NO_TAX_REFUND")]
+    NoTaxRefund,
+    #[serde(rename = "URY_RETURNS_IVA_LAW_17934")]
+    UryReturnsIvaLaw17934,
+    #[serde(rename = "URY_RETURNS_IMESI_LAW_18083")]
+    UryReturnsImesiLaw18083,
+    #[serde(rename = "URY_RETURNS_AFAM_LAW_18910")]
+    UryReturnsAfamLaw18910,
+    #[serde(rename = "URY_TAX_REFUND_LAW_18999")]
+    UryTaxRefundLaw18999,
+    #[serde(rename = "URY_RETURNS_IVA_LAW_19210")]
+    UryReturnsIvaLaw19210,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct FiservemeaMetadataObject {
+    #[serde(alias = "number_of_installments")]
+    pub installments: Option<i32>,
+    pub installment_interest: Option<bool>,
+    #[serde(alias = "legal_framework")]
+    pub tax_refund_legal_framework: Option<FiservemeaLegalFramework>,
+}
+
+impl FiservemeaMetadataObject {
+    /// Reads from `request.metadata` and, for each missing field, falls back to
+    /// `request.frm_metadata`. Both sources are intentionally supported (see spec §3.1).
+    /// Tolerant of invalid/absent JSON.
+    fn from_sources(
+        metadata: Option<&serde_json::Value>,
+        frm_metadata: Option<&serde_json::Value>,
+    ) -> Self {
+        let primary = metadata
+            .and_then(|v| serde_json::from_value::<Self>(v.clone()).ok())
+            .unwrap_or_default();
+        let fallback = frm_metadata
+            .and_then(|v| serde_json::from_value::<Self>(v.clone()).ok())
+            .unwrap_or_default();
+        Self {
+            installments: primary.installments.or(fallback.installments),
+            installment_interest: primary
+                .installment_interest
+                .or(fallback.installment_interest),
+            tax_refund_legal_framework: primary
+                .tax_refund_legal_framework
+                .or(fallback.tax_refund_legal_framework),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FiservemeaInstallmentOptions {
+    number_of_installments: i32,
+    #[serde(rename = "Interest", skip_serializing_if = "Option::is_none", default)]
+    interest: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -113,6 +175,20 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
                     FiservemeaRequestType::PaymentCardPreAuthTransaction
                 };
 
+                let fiservemea_meta = FiservemeaMetadataObject::from_sources(
+                    item.router_data.request.metadata.as_ref(),
+                    item.router_data
+                        .frm_metadata
+                        .as_ref()
+                        .map(|secret| secret.peek()),
+                );
+                let installment_options = fiservemea_meta.installments.and_then(|n| {
+                    (n > 1).then_some(FiservemeaInstallmentOptions {
+                        number_of_installments: n,
+                        interest: fiservemea_meta.installment_interest,
+                    })
+                });
+
                 Ok(Self {
                     request_type,
                     merchant_transaction_id: item
@@ -127,6 +203,7 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
                     },
                     order: FiservemeaOrder {
                         order_id: item.router_data.connector_request_reference_id.clone(),
+                        installment_options,
                     },
                     payment_method: FiservemeaPaymentMethods::PaymentCard(card),
                 })
@@ -527,4 +604,30 @@ pub struct FiservemeaErrorResponse {
     api_trace_id: Option<String>,
     pub response_type: Option<String>,
     pub error: Option<FiservemeaError>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installments_serialize_into_order() {
+        let order = FiservemeaOrder {
+            order_id: "ord_1".to_string(),
+            installment_options: Some(FiservemeaInstallmentOptions {
+                number_of_installments: 6,
+                interest: Some(true),
+            }),
+        };
+        let json = serde_json::to_value(&order).unwrap();
+        assert_eq!(json["installmentOptions"]["numberOfInstallments"], 6);
+        assert_eq!(json["installmentOptions"]["Interest"], true);
+    }
+
+    #[test]
+    fn metadata_reads_from_frm_fallback() {
+        let frm = serde_json::json!({ "installments": 3 });
+        let meta = FiservemeaMetadataObject::from_sources(None, Some(&frm));
+        assert_eq!(meta.installments, Some(3));
+    }
 }
