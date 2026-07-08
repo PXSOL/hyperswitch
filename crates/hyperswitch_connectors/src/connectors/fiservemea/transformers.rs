@@ -130,6 +130,7 @@ pub enum FiservemeaRequestType {
     PaymentCardSaleTransaction,
     PaymentCardPreAuthTransaction,
     PostAuthTransaction,
+    VoidTransaction,
     VoidPreAuthTransactions,
     ReturnTransaction,
 }
@@ -506,11 +507,36 @@ pub struct FiservemeaVoidRequest {
     request_type: FiservemeaRequestType,
 }
 
+// `PaymentsCancelData` exposes `capture_method: Option<storage_enums::CaptureMethod>`
+// (see hyperswitch_domain_models::router_request_types::PaymentsCancelData), populated from the
+// original payment attempt's capture method
+// (crates/router/src/core/payments/transformers.rs, `PaymentsCancelData::try_from`).
+// Per the Fiserv EMEA API docs, `VoidTransaction` must be used to void a sale/postauth (i.e. a
+// transaction that was, or would be, auto-captured), while `VoidPreAuthTransactions` is reserved
+// for voiding an un-captured pre-auth. We reuse the same automatic-capture signal already used
+// in `FiservemeaPaymentsRequest` to pick between `PaymentCardSaleTransaction` and
+// `PaymentCardPreAuthTransaction`. Extracted as a standalone function so the selection logic can
+// be unit-tested without constructing a full `PaymentsCancelRouterData`.
+fn select_void_request_type(
+    capture_method: Option<enums::CaptureMethod>,
+) -> FiservemeaRequestType {
+    if matches!(
+        capture_method,
+        Some(enums::CaptureMethod::Automatic) | Some(enums::CaptureMethod::SequentialAutomatic)
+    ) {
+        FiservemeaRequestType::VoidTransaction
+    } else {
+        // Manual capture (or no capture-method signal at all) is treated as a pre-auth void,
+        // preserving the connector's previous default behavior.
+        FiservemeaRequestType::VoidPreAuthTransactions
+    }
+}
+
 impl TryFrom<&PaymentsCancelRouterData> for FiservemeaVoidRequest {
     type Error = error_stack::Report<errors::ConnectorError>;
-    fn try_from(_item: &PaymentsCancelRouterData) -> Result<Self, Self::Error> {
+    fn try_from(item: &PaymentsCancelRouterData) -> Result<Self, Self::Error> {
         Ok(Self {
-            request_type: FiservemeaRequestType::VoidPreAuthTransactions,
+            request_type: select_void_request_type(item.request.capture_method),
         })
     }
 }
@@ -668,5 +694,29 @@ mod tests {
             json["taxRefundRequestData"]["legalFramework"],
             "URY_RETURNS_IVA_LAW_19210"
         );
+    }
+
+    #[test]
+    fn void_request_type_auto_capture_selects_void_transaction() {
+        assert!(matches!(
+            select_void_request_type(Some(enums::CaptureMethod::Automatic)),
+            FiservemeaRequestType::VoidTransaction
+        ));
+        assert!(matches!(
+            select_void_request_type(Some(enums::CaptureMethod::SequentialAutomatic)),
+            FiservemeaRequestType::VoidTransaction
+        ));
+    }
+
+    #[test]
+    fn void_request_type_manual_or_missing_capture_selects_preauth_void() {
+        assert!(matches!(
+            select_void_request_type(Some(enums::CaptureMethod::Manual)),
+            FiservemeaRequestType::VoidPreAuthTransactions
+        ));
+        assert!(matches!(
+            select_void_request_type(None),
+            FiservemeaRequestType::VoidPreAuthTransactions
+        ));
     }
 }
