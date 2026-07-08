@@ -311,6 +311,7 @@ pub struct FiservemeaAcsResponse {
 /// share this payload (vendor doc §10.1.4/§10.1.5):
 /// - after the device-fingerprint (methodForm) step: `methodNotificationStatus` only.
 /// - after the cardholder challenge: `acsResponse.cRes` only.
+///
 /// Both carry `authenticationType: "Secure3D21AuthenticationUpdateRequest"`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -900,6 +901,8 @@ pub struct FiservemeaErrorResponse {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
+
     use super::*;
 
     /// Builds a minimal `FiservemeaPaymentsResponse` (only the required fields plus whichever
