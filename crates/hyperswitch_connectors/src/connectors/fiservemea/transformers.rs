@@ -6,11 +6,11 @@ use hyperswitch_domain_models::{
     payment_method_data::PaymentMethodData,
     router_data::{ConnectorAuthType, RouterData},
     router_flow_types::refunds::{Execute, RSync},
-    router_request_types::ResponseId,
+    router_request_types::{CompleteAuthorizeRedirectResponse, ResponseId},
     router_response_types::{PaymentsResponseData, RedirectForm, RefundsResponseData},
     types::{
         PaymentsAuthorizeRouterData, PaymentsCancelRouterData, PaymentsCaptureRouterData,
-        RefundsRouterData,
+        PaymentsCompleteAuthorizeRouterData, RefundsRouterData,
     },
 };
 use hyperswitch_interfaces::errors;
@@ -283,6 +283,91 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
                 "Selected payment method through fiservemea".to_string(),
             )
             .into()),
+        }
+    }
+}
+
+/// ACS challenge result wrapper for the final 3DS continuation PATCH (vendor doc §10.1.5.d,
+/// lines 758-783). `cRes` is the Base64 challenge-result message the issuer ACS posts back to
+/// the `termURL` when the cardholder completes the challenge.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FiservemeaAcsResponse {
+    #[serde(rename = "cRes")]
+    c_res: String,
+}
+
+/// 3DS native continuation request, sent as a PATCH on the original transaction. Two shapes
+/// share this payload (vendor doc §10.1.4/§10.1.5):
+/// - after the device-fingerprint (methodForm) step: `methodNotificationStatus` only.
+/// - after the cardholder challenge: `acsResponse.cRes` only.
+/// Both carry `authenticationType: "Secure3D21AuthenticationUpdateRequest"`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FiservemeaCompleteAuthorizeRequest {
+    authentication_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    method_notification_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acs_response: Option<FiservemeaAcsResponse>,
+}
+
+/// Extracts the ACS challenge result (`cRes`) that the issuer ACS posts back to the `termURL`
+/// when the challenge completes (vendor doc lines 758-783). Hyperswitch forwards the browser's
+/// return data in `redirect_response`, which may be a JSON body (`payload`) or a query string
+/// (`params`). The vendor labels the field `cRes`; browsers/intermediaries may lower-case it,
+/// so both `cRes` and `cres` are accepted. Returns `None` after the device-fingerprint
+/// (methodForm) step, which carries no challenge result.
+fn extract_acs_cres(redirect_response: &CompleteAuthorizeRedirectResponse) -> Option<String> {
+    // Prefer the JSON payload (the shape most ACS `termURL` posts use).
+    if let Some(payload) = redirect_response.payload.as_ref() {
+        let value = payload.peek();
+        if let Some(c_res) = value
+            .get("cRes")
+            .or_else(|| value.get("cres"))
+            .and_then(|v| v.as_str())
+        {
+            return Some(c_res.to_string());
+        }
+    }
+    // Fall back to the query-string form (`cRes=...&...`).
+    if let Some(params) = redirect_response.params.as_ref() {
+        for pair in params.peek().split('&') {
+            let mut kv = pair.splitn(2, '=');
+            if let (Some(key), Some(val)) = (kv.next(), kv.next()) {
+                if key.eq_ignore_ascii_case("cres") {
+                    return Some(val.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+impl TryFrom<&PaymentsCompleteAuthorizeRouterData> for FiservemeaCompleteAuthorizeRequest {
+    type Error = error_stack::Report<errors::ConnectorError>;
+    fn try_from(item: &PaymentsCompleteAuthorizeRouterData) -> Result<Self, Self::Error> {
+        let redirect_response = item.request.redirect_response.as_ref().ok_or(
+            errors::ConnectorError::MissingRequiredField {
+                field_name: "redirect_response",
+            },
+        )?;
+
+        // If the browser returned a challenge result (`cRes`), this is the final continuation
+        // (§10.1.5.d). Otherwise the browser returned from the methodForm/device-fingerprint
+        // step (§10.1.4.a); report `RECEIVED` since Hyperswitch only re-invokes
+        // CompleteAuthorize after the browser has come back from `methodNotificationURL`.
+        match extract_acs_cres(redirect_response) {
+            Some(c_res) => Ok(Self {
+                authentication_type: "Secure3D21AuthenticationUpdateRequest".to_string(),
+                method_notification_status: None,
+                acs_response: Some(FiservemeaAcsResponse { c_res }),
+            }),
+            None => Ok(Self {
+                authentication_type: "Secure3D21AuthenticationUpdateRequest".to_string(),
+                method_notification_status: Some("RECEIVED".to_string()),
+                acs_response: None,
+            }),
         }
     }
 }
@@ -971,5 +1056,77 @@ mod tests {
             params: None,
         };
         assert!(auth.to_redirection().is_none());
+    }
+
+    #[test]
+    fn complete_authorize_method_status_serializes() {
+        // Continuation after the device-fingerprint step: only `methodNotificationStatus`.
+        let request = FiservemeaCompleteAuthorizeRequest {
+            authentication_type: "Secure3D21AuthenticationUpdateRequest".to_string(),
+            method_notification_status: Some("RECEIVED".to_string()),
+            acs_response: None,
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            json["authenticationType"],
+            "Secure3D21AuthenticationUpdateRequest"
+        );
+        assert_eq!(json["methodNotificationStatus"], "RECEIVED");
+        assert!(
+            json.get("acsResponse").is_none(),
+            "method-status continuation must not serialize acsResponse"
+        );
+    }
+
+    #[test]
+    fn complete_authorize_cres_serializes() {
+        // Continuation after the challenge: only `acsResponse.cRes`.
+        let request = FiservemeaCompleteAuthorizeRequest {
+            authentication_type: "Secure3D21AuthenticationUpdateRequest".to_string(),
+            method_notification_status: None,
+            acs_response: Some(FiservemeaAcsResponse {
+                c_res: "cRes_value".to_string(),
+            }),
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            json["authenticationType"],
+            "Secure3D21AuthenticationUpdateRequest"
+        );
+        assert_eq!(json["acsResponse"]["cRes"], "cRes_value");
+        assert!(
+            json.get("methodNotificationStatus").is_none(),
+            "cRes continuation must not serialize methodNotificationStatus"
+        );
+    }
+
+    #[test]
+    fn extract_acs_cres_reads_json_payload() {
+        // ACS posts the challenge result as a JSON body -> forwarded in `payload`.
+        let redirect = CompleteAuthorizeRedirectResponse {
+            params: None,
+            payload: Some(Secret::new(serde_json::json!({ "cRes": "abc123" }))),
+        };
+        assert_eq!(extract_acs_cres(&redirect), Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn extract_acs_cres_reads_query_params() {
+        // ACS result forwarded as a query string -> case-insensitive key match.
+        let redirect = CompleteAuthorizeRedirectResponse {
+            params: Some(Secret::new("foo=bar&cres=xyz789".to_string())),
+            payload: None,
+        };
+        assert_eq!(extract_acs_cres(&redirect), Some("xyz789".to_string()));
+    }
+
+    #[test]
+    fn extract_acs_cres_none_after_method_step() {
+        // Return from the methodForm step carries no challenge result.
+        let redirect = CompleteAuthorizeRedirectResponse {
+            params: Some(Secret::new("threeDSMethodData=xyz".to_string())),
+            payload: None,
+        };
+        assert!(extract_acs_cres(&redirect).is_none());
     }
 }
