@@ -48,6 +48,8 @@ pub struct FiservemeaOrder {
     order_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     installment_options: Option<FiservemeaInstallmentOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    additional_details: Option<FiservemeaAdditionalDetails>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -108,6 +110,19 @@ pub struct FiservemeaInstallmentOptions {
     number_of_installments: i32,
     #[serde(rename = "Interest", skip_serializing_if = "Option::is_none", default)]
     interest: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FiservemeaTaxRefundRequestData {
+    legal_framework: FiservemeaLegalFramework,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FiservemeaAdditionalDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tax_refund_request_data: Option<FiservemeaTaxRefundRequestData>,
 }
 
 #[derive(Debug, Serialize)]
@@ -188,6 +203,14 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
                         interest: fiservemea_meta.installment_interest,
                     })
                 });
+                let additional_details =
+                    fiservemea_meta
+                        .tax_refund_legal_framework
+                        .map(|legal_framework| FiservemeaAdditionalDetails {
+                            tax_refund_request_data: Some(FiservemeaTaxRefundRequestData {
+                                legal_framework,
+                            }),
+                        });
 
                 Ok(Self {
                     request_type,
@@ -204,6 +227,7 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
                     order: FiservemeaOrder {
                         order_id: item.router_data.connector_request_reference_id.clone(),
                         installment_options,
+                        additional_details,
                     },
                     payment_method: FiservemeaPaymentMethods::PaymentCard(card),
                 })
@@ -618,6 +642,7 @@ mod tests {
                 number_of_installments: 6,
                 interest: Some(true),
             }),
+            additional_details: None,
         };
         let json = serde_json::to_value(&order).unwrap();
         assert_eq!(json["installmentOptions"]["numberOfInstallments"], 6);
@@ -629,5 +654,19 @@ mod tests {
         let frm = serde_json::json!({ "installments": 3 });
         let meta = FiservemeaMetadataObject::from_sources(None, Some(&frm));
         assert_eq!(meta.installments, Some(3));
+    }
+
+    #[test]
+    fn tax_refund_legal_framework_serializes() {
+        let details = FiservemeaAdditionalDetails {
+            tax_refund_request_data: Some(FiservemeaTaxRefundRequestData {
+                legal_framework: FiservemeaLegalFramework::UryReturnsIvaLaw19210,
+            }),
+        };
+        let json = serde_json::to_value(&details).unwrap();
+        assert_eq!(
+            json["taxRefundRequestData"]["legalFramework"],
+            "URY_RETURNS_IVA_LAW_19210"
+        );
     }
 }
