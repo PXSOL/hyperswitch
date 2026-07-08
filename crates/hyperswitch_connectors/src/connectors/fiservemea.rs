@@ -8,7 +8,10 @@ use common_utils::{
     errors::CustomResult,
     ext_traits::BytesExt,
     request::{Method, Request, RequestBuilder, RequestContent},
-    types::{AmountConvertor, StringMajorUnit, StringMajorUnitForConnector},
+    types::{
+        AmountConvertor, FloatMajorUnit, FloatMajorUnitForConnector, StringMajorUnit,
+        StringMajorUnitForConnector,
+    },
 };
 use error_stack::{report, ResultExt};
 use hyperswitch_domain_models::{
@@ -60,12 +63,21 @@ use crate::{
 #[derive(Clone)]
 pub struct Fiservemea {
     amount_converter: &'static (dyn AmountConvertor<Output = StringMajorUnit> + Sync),
+    // fiservemea's request bodies carry amounts as strings (`amount_converter` above), but the
+    // response's `approvedAmount`/`transactionAmount.total` come back as JSON numbers. A
+    // dedicated `FloatMajorUnit` converter lets us feed those response amounts straight into
+    // `get_*_integrity_object` (see `FiservemeaPaymentsResponse::settlement_amount`) without a
+    // lossy string round-trip. This mirrors the dual-converter pattern already used by
+    // `trustpay.rs`.
+    amount_converter_to_float_major_unit:
+        &'static (dyn AmountConvertor<Output = FloatMajorUnit> + Sync),
 }
 
 impl Fiservemea {
     pub fn new() -> &'static Self {
         &Self {
             amount_converter: &StringMajorUnitForConnector,
+            amount_converter_to_float_major_unit: &FloatMajorUnitForConnector,
         }
     }
 
@@ -342,11 +354,25 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
-        RouterData::try_from(ResponseRouterData {
+
+        let integrity_object = response
+            .settlement_amount()
+            .map(|(amount, currency)| {
+                utils::get_authorise_integrity_object(
+                    self.amount_converter_to_float_major_unit,
+                    amount,
+                    currency.to_string(),
+                )
+            })
+            .transpose()?;
+
+        let mut router_data = RouterData::try_from(ResponseRouterData {
             response,
             data: data.clone(),
             http_code: res.status_code,
-        })
+        })?;
+        router_data.request.integrity_object = integrity_object;
+        Ok(router_data)
     }
 
     fn get_error_response(
@@ -515,11 +541,25 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Fis
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
-        RouterData::try_from(ResponseRouterData {
+
+        let integrity_object = response
+            .settlement_amount()
+            .map(|(amount, currency)| {
+                utils::get_sync_integrity_object(
+                    self.amount_converter_to_float_major_unit,
+                    amount,
+                    currency.to_string(),
+                )
+            })
+            .transpose()?;
+
+        let mut router_data = RouterData::try_from(ResponseRouterData {
             response,
             data: data.clone(),
             http_code: res.status_code,
-        })
+        })?;
+        router_data.request.integrity_object = integrity_object;
+        Ok(router_data)
     }
 
     fn get_error_response(
@@ -604,11 +644,25 @@ impl ConnectorIntegration<Capture, PaymentsCaptureData, PaymentsResponseData> fo
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
-        RouterData::try_from(ResponseRouterData {
+
+        let integrity_object = response
+            .settlement_amount()
+            .map(|(amount, currency)| {
+                utils::get_capture_integrity_object(
+                    self.amount_converter_to_float_major_unit,
+                    Some(amount),
+                    currency.to_string(),
+                )
+            })
+            .transpose()?;
+
+        let mut router_data = RouterData::try_from(ResponseRouterData {
             response,
             data: data.clone(),
             http_code: res.status_code,
-        })
+        })?;
+        router_data.request.integrity_object = integrity_object;
+        Ok(router_data)
     }
 
     fn get_error_response(
@@ -772,11 +826,25 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Fiserve
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
-        RouterData::try_from(ResponseRouterData {
+
+        let integrity_object = response
+            .settlement_amount()
+            .map(|(amount, currency)| {
+                utils::get_refund_integrity_object(
+                    self.amount_converter_to_float_major_unit,
+                    amount,
+                    currency.to_string(),
+                )
+            })
+            .transpose()?;
+
+        let mut router_data = RouterData::try_from(ResponseRouterData {
             response,
             data: data.clone(),
             http_code: res.status_code,
-        })
+        })?;
+        router_data.request.integrity_object = integrity_object;
+        Ok(router_data)
     }
 
     fn get_error_response(
@@ -847,11 +915,25 @@ impl ConnectorIntegration<RSync, RefundsData, RefundsResponseData> for Fiserveme
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
-        RouterData::try_from(ResponseRouterData {
+
+        let integrity_object = response
+            .settlement_amount()
+            .map(|(amount, currency)| {
+                utils::get_refund_integrity_object(
+                    self.amount_converter_to_float_major_unit,
+                    amount,
+                    currency.to_string(),
+                )
+            })
+            .transpose()?;
+
+        let mut router_data = RouterData::try_from(ResponseRouterData {
             response,
             data: data.clone(),
             http_code: res.status_code,
-        })
+        })?;
+        router_data.request.integrity_object = integrity_object;
+        Ok(router_data)
     }
 
     fn get_error_response(

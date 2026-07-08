@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 
 use common_enums::enums;
-use common_utils::{request::Method, types::StringMajorUnit};
+use common_utils::{
+    request::Method,
+    types::{FloatMajorUnit, StringMajorUnit},
+};
 use hyperswitch_domain_models::{
     payment_method_data::PaymentMethodData,
     router_data::{ConnectorAuthType, RouterData},
@@ -188,6 +191,17 @@ pub struct FiservemeaPaymentsRequest {
     authentication_request: Option<FiservemeaAuthenticationRequest>,
 }
 
+/// Whether `capture_method` signals auto-capture (`Automatic`/`SequentialAutomatic`), i.e. the
+/// transaction should be treated as a sale/postauth rather than a pre-auth. Shared by the
+/// Authorize request-type selection and `select_void_request_type` below, which both need the
+/// same auto-capture-vs-manual distinction.
+fn is_auto_capture(capture_method: Option<enums::CaptureMethod>) -> bool {
+    matches!(
+        capture_method,
+        Some(enums::CaptureMethod::Automatic) | Some(enums::CaptureMethod::SequentialAutomatic)
+    )
+}
+
 impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for FiservemeaPaymentsRequest {
     type Error = error_stack::Report<errors::ConnectorError>;
     fn try_from(
@@ -203,11 +217,7 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
                     },
                     security_code: req_card.card_cvc,
                 };
-                let request_type = if matches!(
-                    item.router_data.request.capture_method,
-                    Some(enums::CaptureMethod::Automatic)
-                        | Some(enums::CaptureMethod::SequentialAutomatic)
-                ) {
+                let request_type = if is_auto_capture(item.router_data.request.capture_method) {
                     FiservemeaRequestType::PaymentCardSaleTransaction
                 } else {
                     FiservemeaRequestType::PaymentCardPreAuthTransaction
@@ -478,7 +488,10 @@ pub struct Components {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AmountDetails {
-    total: Option<f64>,
+    // Typed as `FloatMajorUnit` (rather than a bare `f64`) so it can be fed directly into
+    // `get_*_integrity_object` via a `FloatMajorUnitForConnector` amount converter without any
+    // lossy/hacky string round-tripping (see `FiservemeaPaymentsResponse::settlement_amount`).
+    total: Option<FloatMajorUnit>,
     currency: Option<common_enums::Currency>,
     components: Option<Components>,
 }
@@ -654,6 +667,23 @@ pub struct FiservemeaPaymentsResponse {
     authentication_response: Option<FiservemeaAuthenticationResponse>,
 }
 
+impl FiservemeaPaymentsResponse {
+    /// Picks the settlement amount/currency used to build the amount integrity object for
+    /// Authorize/Capture/PSync/Refund/RSync responses (see `fiservemea.rs::handle_response`).
+    /// Prefers `approvedAmount` (the amount actually settled) and falls back to
+    /// `transactionAmount` (the requested amount) when the former is absent, e.g. on
+    /// non-approved outcomes. Returns `None` when neither amount block carries both a total and
+    /// a currency, since a partial value can't be safely compared against the request amount;
+    /// callers then skip setting `integrity_object` entirely rather than guessing a default.
+    pub fn settlement_amount(&self) -> Option<(FloatMajorUnit, common_enums::Currency)> {
+        let amount_details = self
+            .approved_amount
+            .as_ref()
+            .or(self.transaction_amount.as_ref())?;
+        Some((amount_details.total?, amount_details.currency?))
+    }
+}
+
 impl<F, T> TryFrom<ResponseRouterData<F, FiservemeaPaymentsResponse, T, PaymentsResponseData>>
     for RouterData<F, T, PaymentsResponseData>
 {
@@ -734,13 +764,8 @@ pub struct FiservemeaVoidRequest {
 // in `FiservemeaPaymentsRequest` to pick between `PaymentCardSaleTransaction` and
 // `PaymentCardPreAuthTransaction`. Extracted as a standalone function so the selection logic can
 // be unit-tested without constructing a full `PaymentsCancelRouterData`.
-fn select_void_request_type(
-    capture_method: Option<enums::CaptureMethod>,
-) -> FiservemeaRequestType {
-    if matches!(
-        capture_method,
-        Some(enums::CaptureMethod::Automatic) | Some(enums::CaptureMethod::SequentialAutomatic)
-    ) {
+fn select_void_request_type(capture_method: Option<enums::CaptureMethod>) -> FiservemeaRequestType {
+    if is_auto_capture(capture_method) {
         FiservemeaRequestType::VoidTransaction
     } else {
         // Manual capture (or no capture-method signal at all) is treated as a pre-auth void,
@@ -876,6 +901,59 @@ pub struct FiservemeaErrorResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds a minimal `FiservemeaPaymentsResponse` (only the required fields plus whichever
+    /// amount blocks the caller supplies as raw JSON) for `settlement_amount` tests, without
+    /// needing every private field to be individually settable from this module.
+    fn response_with_amounts(amounts: serde_json::Value) -> FiservemeaPaymentsResponse {
+        let mut json = serde_json::json!({
+            "ipgTransactionId": "ipg_1",
+            "transactionType": "SALE",
+        });
+        json.as_object_mut()
+            .unwrap()
+            .extend(amounts.as_object().unwrap().clone());
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn settlement_amount_prefers_approved_amount_when_present() {
+        let response = response_with_amounts(serde_json::json!({
+            "approvedAmount": { "total": 12.5, "currency": "USD" },
+            "transactionAmount": { "total": 99.0, "currency": "EUR" },
+        }));
+        let (amount, currency) = response.settlement_amount().unwrap();
+        assert_eq!(amount.get_amount_as_f64(), 12.5);
+        assert_eq!(currency, common_enums::Currency::USD);
+    }
+
+    #[test]
+    fn settlement_amount_falls_back_to_transaction_amount_when_approved_amount_missing() {
+        let response = response_with_amounts(serde_json::json!({
+            "transactionAmount": { "total": 42.0, "currency": "ARS" },
+        }));
+        let (amount, currency) = response.settlement_amount().unwrap();
+        assert_eq!(amount.get_amount_as_f64(), 42.0);
+        assert_eq!(currency, common_enums::Currency::ARS);
+    }
+
+    #[test]
+    fn settlement_amount_is_none_when_approved_amount_total_missing() {
+        // `approvedAmount` is present but incomplete (no `total`): we do not fall back to
+        // `transactionAmount` in this case (see `settlement_amount` doc comment) since the two
+        // blocks aren't guaranteed to agree, so the caller skips setting `integrity_object`.
+        let response = response_with_amounts(serde_json::json!({
+            "approvedAmount": { "currency": "USD" },
+            "transactionAmount": { "total": 42.0, "currency": "ARS" },
+        }));
+        assert!(response.settlement_amount().is_none());
+    }
+
+    #[test]
+    fn settlement_amount_is_none_when_no_amount_block_present() {
+        let response = response_with_amounts(serde_json::json!({}));
+        assert!(response.settlement_amount().is_none());
+    }
 
     #[test]
     fn installments_serialize_into_order() {
