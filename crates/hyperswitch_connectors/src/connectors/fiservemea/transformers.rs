@@ -83,28 +83,67 @@ pub struct FiservemeaMetadataObject {
     pub tax_refund_legal_framework: Option<FiservemeaLegalFramework>,
 }
 
+/// Looks up `keys` (in order) inside `source` (a JSON object) and returns the first present
+/// value, regardless of whether it later parses cleanly. Used so that a single malformed
+/// sibling key can't hide a field that *is* present under one of its aliases.
+fn lookup_field<'a>(
+    source: Option<&'a serde_json::Value>,
+    keys: &[&str],
+) -> Option<&'a serde_json::Value> {
+    let object = source?.as_object()?;
+    keys.iter().find_map(|key| object.get(*key))
+}
+
+/// Extracts `installments` from a single JSON source, tolerant of the value being a JSON
+/// number (`6`) or a numeric string (`"6"`), and of the alias key `number_of_installments`.
+/// Returns `None` (rather than failing) when the field is absent or not parseable as an
+/// integer, so one malformed field never takes down the others.
+fn extract_installments(source: Option<&serde_json::Value>) -> Option<i32> {
+    let value = lookup_field(source, &["installments", "number_of_installments"])?;
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+        .and_then(|n| i32::try_from(n).ok())
+}
+
+/// Extracts `installment_interest` from a single JSON source, tolerant of a JSON bool or a
+/// bool-ish string (`"true"`/`"false"`, case-insensitive). `None` when absent/unparseable.
+fn extract_installment_interest(source: Option<&serde_json::Value>) -> Option<bool> {
+    let value = lookup_field(source, &["installment_interest"])?;
+    value.as_bool().or_else(|| match value.as_str() {
+        Some(s) if s.eq_ignore_ascii_case("true") => Some(true),
+        Some(s) if s.eq_ignore_ascii_case("false") => Some(false),
+        _ => None,
+    })
+}
+
+/// Extracts `tax_refund_legal_framework` from a single JSON source, accepting the alias key
+/// `legal_framework`. The enum is parsed from its serialized string representation so an
+/// unknown/typo'd value yields `None` instead of failing the whole metadata object.
+fn extract_legal_framework(source: Option<&serde_json::Value>) -> Option<FiservemeaLegalFramework> {
+    let value = lookup_field(source, &["tax_refund_legal_framework", "legal_framework"])?;
+    serde_json::from_value(value.clone()).ok()
+}
+
 impl FiservemeaMetadataObject {
     /// Reads from `request.metadata` and, for each missing field, falls back to
     /// `request.frm_metadata`. Both sources are intentionally supported (see spec §3.1).
-    /// Tolerant of invalid/absent JSON.
+    ///
+    /// Each field is parsed independently, per source, so that a malformed/typo'd sibling key
+    /// (e.g. `installments` sent as a non-numeric string, or an unknown `legal_framework`)
+    /// cannot cause the *whole* object to fail to parse and silently drop otherwise-valid
+    /// fields (see fix for the "customer charged in 1 installment instead of N" issue).
     fn from_sources(
         metadata: Option<&serde_json::Value>,
         frm_metadata: Option<&serde_json::Value>,
     ) -> Self {
-        let primary = metadata
-            .and_then(|v| serde_json::from_value::<Self>(v.clone()).ok())
-            .unwrap_or_default();
-        let fallback = frm_metadata
-            .and_then(|v| serde_json::from_value::<Self>(v.clone()).ok())
-            .unwrap_or_default();
         Self {
-            installments: primary.installments.or(fallback.installments),
-            installment_interest: primary
-                .installment_interest
-                .or(fallback.installment_interest),
-            tax_refund_legal_framework: primary
-                .tax_refund_legal_framework
-                .or(fallback.tax_refund_legal_framework),
+            installments: extract_installments(metadata)
+                .or_else(|| extract_installments(frm_metadata)),
+            installment_interest: extract_installment_interest(metadata)
+                .or_else(|| extract_installment_interest(frm_metadata)),
+            tax_refund_legal_framework: extract_legal_framework(metadata)
+                .or_else(|| extract_legal_framework(frm_metadata)),
         }
     }
 }
@@ -341,14 +380,14 @@ fn extract_acs_cres(redirect_response: &CompleteAuthorizeRedirectResponse) -> Op
             return Some(c_res.to_string());
         }
     }
-    // Fall back to the query-string form (`cRes=...&...`).
+    // Fall back to the query-string form (`cRes=...&...`). Query-string values are
+    // `application/x-www-form-urlencoded`, so a Base64 `cRes` blob may contain `+` (space) or
+    // `%xx` percent-escapes; decode via `url::form_urlencoded::parse` rather than taking the
+    // raw substring, which would otherwise pass through a still-encoded (corrupted) value.
     if let Some(params) = redirect_response.params.as_ref() {
-        for pair in params.peek().split('&') {
-            let mut kv = pair.splitn(2, '=');
-            if let (Some(key), Some(val)) = (kv.next(), kv.next()) {
-                if key.eq_ignore_ascii_case("cres") {
-                    return Some(val.to_string());
-                }
+        for (key, val) in url::form_urlencoded::parse(params.peek().as_bytes()) {
+            if key.eq_ignore_ascii_case("cres") {
+                return Some(val.into_owned());
             }
         }
     }
@@ -570,6 +609,11 @@ fn map_status(
 /// 3DSMethod block returned on the initial Authorize response (vendor doc §10.1.2,
 /// lines 599-617). `method_form` is a self-contained HTML snippet with a hidden
 /// iframe that auto-submits browser data to the issuer ACS.
+///
+/// `methodForm`/`secure3dTransId` are spelled consistently between the doc's field table
+/// (line ~594) and its JSON example (lines 611-613), so no `#[serde(alias = ...)]` is needed
+/// for either field here — see `FiservemeaAuthenticationResponse` for the field that *is*
+/// inconsistent in this section of the doc.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FiservemeaSecure3dMethod {
@@ -578,7 +622,13 @@ pub struct FiservemeaSecure3dMethod {
 }
 
 /// ACS challenge params returned on the challenge continuation (vendor doc §10.1.5,
-/// lines 709-740). `cReq`/`sessiondata` are posted to `acsURL`.
+/// lines 709-740). `cReq`/`sessionData` are posted to `acsURL`.
+///
+/// `acsURL`/`cReq`/`termURL` are spelled consistently between the field table (line ~715) and
+/// the JSON example (lines 732-737), so no alias is needed for those three. `sessionData` is
+/// the exception: the field table spells it `sessionData` while the JSON example spells it
+/// `sessiondata` — accept both so a real gateway response using either casing still parses
+/// instead of silently dropping session data needed for the ACS challenge POST.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FiservemeaAcsParams {
@@ -588,6 +638,7 @@ pub struct FiservemeaAcsParams {
     c_req: Option<String>,
     #[serde(rename = "termURL")]
     term_url: Option<String>,
+    #[serde(alias = "sessionData")]
     sessiondata: Option<String>,
 }
 
@@ -597,6 +648,12 @@ pub struct FiservemeaAuthenticationResponse {
     #[serde(rename = "type")]
     auth_type: Option<String>,
     version: Option<String>,
+    // The doc's field table for this section (line ~594) spells this `secure3DMethod`
+    // (capital D), while its JSON example (line ~611) spells it `secure3dMethod` (lowercase
+    // d, which is also what `rename_all = "camelCase"` derives from `secure3d_method` below).
+    // Accept both spellings so a gateway response using either casing still parses — the
+    // alternative is a silent "no redirect / payment stuck in Pending" for 3DS payments.
+    #[serde(alias = "secure3DMethod")]
     secure3d_method: Option<FiservemeaSecure3dMethod>,
     params: Option<FiservemeaAcsParams>,
 }
@@ -981,6 +1038,57 @@ mod tests {
     }
 
     #[test]
+    fn metadata_malformed_sibling_key_does_not_lose_installments() {
+        // A malformed/unknown `tax_refund_legal_framework` value must not cause the whole
+        // metadata object to fail to parse and take a perfectly valid `installments` down
+        // with it (previously: `serde_json::from_value::<Self>` on the whole object, so one
+        // bad field silently dropped every field -- including installments, which could
+        // silently charge the customer in 1 installment instead of N).
+        let metadata = serde_json::json!({
+            "installments": 6,
+            "tax_refund_legal_framework": "NOT_A_REAL_LEGAL_FRAMEWORK",
+        });
+        let meta = FiservemeaMetadataObject::from_sources(Some(&metadata), None);
+        assert_eq!(meta.installments, Some(6));
+        assert_eq!(meta.tax_refund_legal_framework, None);
+    }
+
+    #[test]
+    fn installments_as_numeric_string_parses() {
+        // Some senders may serialize `installments` as a JSON string instead of a number;
+        // tolerate that rather than failing to parse.
+        let metadata = serde_json::json!({ "installments": "6" });
+        let meta = FiservemeaMetadataObject::from_sources(Some(&metadata), None);
+        assert_eq!(meta.installments, Some(6));
+    }
+
+    #[test]
+    fn metadata_missing_field_falls_back_to_frm_metadata_per_field() {
+        // `metadata` supplies `installment_interest` but not `installments`; the latter must
+        // be filled in independently from `frm_metadata` without the presence of one field in
+        // `metadata` blocking the fallback for a different, absent field.
+        let metadata = serde_json::json!({ "installment_interest": true });
+        let frm_metadata = serde_json::json!({ "installments": 12 });
+        let meta = FiservemeaMetadataObject::from_sources(Some(&metadata), Some(&frm_metadata));
+        assert_eq!(meta.installments, Some(12));
+        assert_eq!(meta.installment_interest, Some(true));
+    }
+
+    #[test]
+    fn metadata_supports_alias_keys() {
+        let metadata = serde_json::json!({
+            "number_of_installments": 4,
+            "legal_framework": "URY_TAX_REFUND_LAW_18999",
+        });
+        let meta = FiservemeaMetadataObject::from_sources(Some(&metadata), None);
+        assert_eq!(meta.installments, Some(4));
+        assert_eq!(
+            meta.tax_refund_legal_framework,
+            Some(FiservemeaLegalFramework::UryTaxRefundLaw18999)
+        );
+    }
+
+    #[test]
     fn tax_refund_legal_framework_serializes() {
         let details = FiservemeaAdditionalDetails {
             tax_refund_request_data: Some(FiservemeaTaxRefundRequestData {
@@ -1140,6 +1248,56 @@ mod tests {
     }
 
     #[test]
+    fn alternate_secure3d_method_casing_still_redirects() {
+        // The vendor doc's field table (line ~594) spells this `secure3DMethod` (capital D)
+        // while its JSON example (line ~611) spells it `secure3dMethod`. A gateway that
+        // follows the field table must still deserialize and produce a redirect, instead of
+        // silently leaving the payment stuck in `Pending`.
+        let json = serde_json::json!({
+            "type": "3D_SECURE",
+            "version": "2.1",
+            "secure3DMethod": {
+                "methodForm": "<form id=\"tds-alt\"></form>",
+                "secure3dTransId": "trans_alt",
+            },
+        });
+        let auth: FiservemeaAuthenticationResponse = serde_json::from_value(json).unwrap();
+        match auth.to_redirection() {
+            Some(RedirectForm::Html { html_data }) => {
+                assert_eq!(html_data, "<form id=\"tds-alt\"></form>");
+            }
+            other => panic!("expected Html redirect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alternate_session_data_casing_still_redirects() {
+        // The vendor doc's field table (line ~718) spells this `sessionData` while its JSON
+        // example (line ~736) spells it `sessiondata`. Either casing must still parse and
+        // reach the ACS challenge form.
+        let json = serde_json::json!({
+            "type": "3D_SECURE",
+            "version": "2.1",
+            "params": {
+                "acsURL": "https://acs.example.com/challenge",
+                "cReq": "creq_value",
+                "termURL": "https://hyperswitch.io/complete/abc",
+                "sessionData": "session_value",
+            },
+        });
+        let auth: FiservemeaAuthenticationResponse = serde_json::from_value(json).unwrap();
+        match auth.to_redirection() {
+            Some(RedirectForm::Form { form_fields, .. }) => {
+                assert_eq!(
+                    form_fields.get("threeDSSessionData"),
+                    Some(&"session_value".to_string())
+                );
+            }
+            other => panic!("expected Form redirect, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn complete_authorize_method_status_serializes() {
         // Continuation after the device-fingerprint step: only `methodNotificationStatus`.
         let request = FiservemeaCompleteAuthorizeRequest {
@@ -1209,5 +1367,28 @@ mod tests {
             payload: None,
         };
         assert!(extract_acs_cres(&redirect).is_none());
+    }
+
+    #[test]
+    fn extract_acs_cres_url_decodes_query_param() {
+        // A Base64 `cRes` blob may contain `+`/`=` that gets percent-encoded on the wire
+        // (e.g. `+` -> `%2B`, `=` -> `%3D`). The query-param fallback must decode it back to
+        // the original bytes rather than passing through the still-encoded string.
+        let redirect = CompleteAuthorizeRedirectResponse {
+            params: Some(Secret::new("cres=abc%2Bdef%3D%3D".to_string())),
+            payload: None,
+        };
+        assert_eq!(extract_acs_cres(&redirect), Some("abc+def==".to_string()));
+    }
+
+    #[test]
+    fn extract_acs_cres_decodes_literal_plus_as_space() {
+        // `application/x-www-form-urlencoded` semantics: a literal `+` in the query string
+        // means an (unencoded) space, not a literal plus sign.
+        let redirect = CompleteAuthorizeRedirectResponse {
+            params: Some(Secret::new("cres=abc+def".to_string())),
+            payload: None,
+        };
+        assert_eq!(extract_acs_cres(&redirect), Some("abc def".to_string()));
     }
 }
