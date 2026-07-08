@@ -1,11 +1,13 @@
+use std::collections::HashMap;
+
 use common_enums::enums;
-use common_utils::types::StringMajorUnit;
+use common_utils::{request::Method, types::StringMajorUnit};
 use hyperswitch_domain_models::{
     payment_method_data::PaymentMethodData,
     router_data::{ConnectorAuthType, RouterData},
     router_flow_types::refunds::{Execute, RSync},
     router_request_types::ResponseId,
-    router_response_types::{PaymentsResponseData, RefundsResponseData},
+    router_response_types::{PaymentsResponseData, RedirectForm, RefundsResponseData},
     types::{
         PaymentsAuthorizeRouterData, PaymentsCancelRouterData, PaymentsCaptureRouterData,
         RefundsRouterData,
@@ -17,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     types::{RefundsResponseRouterData, ResponseRouterData},
-    utils::CardData as _,
+    utils::{CardData as _, RouterData as _},
 };
 
 //TODO: Fill the struct with respective fields
@@ -156,6 +158,24 @@ pub enum FiservemeaPaymentMethods {
     PaymentCard(FiservemeaPaymentCard),
 }
 
+/// 3DS native (Fiserv IPG "provider-owned" flow) authentication request object.
+/// Only emitted when the payment is `is_three_ds()`; absent otherwise so the
+/// NoThreeDs request stays byte-identical to the pre-3DS behavior. See vendor doc
+/// §10.1.1 (lines 526-578) and design spec §3.4.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FiservemeaAuthenticationRequest {
+    authentication_type: String,
+    #[serde(rename = "termURL")]
+    term_url: String,
+    #[serde(rename = "methodNotificationURL")]
+    method_notification_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    challenge_indicator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    challenge_window_size: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FiservemeaPaymentsRequest {
@@ -164,6 +184,8 @@ pub struct FiservemeaPaymentsRequest {
     transaction_amount: FiservemeaTransactionAmount,
     order: FiservemeaOrder,
     payment_method: FiservemeaPaymentMethods,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authentication_request: Option<FiservemeaAuthenticationRequest>,
 }
 
 impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for FiservemeaPaymentsRequest {
@@ -213,6 +235,29 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
                             }),
                         });
 
+                // 3DS is optional: only attach `authenticationRequest` when the payment
+                // requests ThreeDs. The NoThreeDs branch leaves this `None`, keeping the
+                // serialized request byte-identical to the pre-3DS behavior (spec §3.4).
+                let authentication_request = if item.router_data.is_three_ds() {
+                    let return_url = item
+                        .router_data
+                        .request
+                        .complete_authorize_url
+                        .clone()
+                        .ok_or(errors::ConnectorError::MissingRequiredField {
+                            field_name: "complete_authorize_url",
+                        })?;
+                    Some(FiservemeaAuthenticationRequest {
+                        authentication_type: "Secure3D21AuthenticationRequest".to_string(),
+                        term_url: return_url.clone(),
+                        method_notification_url: return_url,
+                        challenge_indicator: Some("01".to_string()),
+                        challenge_window_size: Some("01".to_string()),
+                    })
+                } else {
+                    None
+                };
+
                 Ok(Self {
                     request_type,
                     merchant_transaction_id: item
@@ -231,6 +276,7 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
                         additional_details,
                     },
                     payment_method: FiservemeaPaymentMethods::PaymentCard(card),
+                    authentication_request,
                 })
             }
             _ => Err(errors::ConnectorError::NotImplemented(
@@ -422,6 +468,75 @@ fn map_status(
     }
 }
 
+/// 3DSMethod block returned on the initial Authorize response (vendor doc §10.1.2,
+/// lines 599-617). `method_form` is a self-contained HTML snippet with a hidden
+/// iframe that auto-submits browser data to the issuer ACS.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FiservemeaSecure3dMethod {
+    method_form: Option<String>,
+    secure3d_trans_id: Option<String>,
+}
+
+/// ACS challenge params returned on the challenge continuation (vendor doc §10.1.5,
+/// lines 709-740). `cReq`/`sessiondata` are posted to `acsURL`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FiservemeaAcsParams {
+    #[serde(rename = "acsURL")]
+    acs_url: Option<String>,
+    #[serde(rename = "cReq")]
+    c_req: Option<String>,
+    #[serde(rename = "termURL")]
+    term_url: Option<String>,
+    sessiondata: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FiservemeaAuthenticationResponse {
+    #[serde(rename = "type")]
+    auth_type: Option<String>,
+    version: Option<String>,
+    secure3d_method: Option<FiservemeaSecure3dMethod>,
+    params: Option<FiservemeaAcsParams>,
+}
+
+impl FiservemeaAuthenticationResponse {
+    /// Builds the redirect the browser must follow to progress 3DS, or `None` when the
+    /// response carries no actionable 3DS data (e.g. an unenrolled cardholder that got an
+    /// immediate APPROVED/DECLINED). Two shapes per the vendor doc:
+    /// - `secure3dMethod.methodForm` (§10.1.2) => hidden-iframe HTML for device fingerprinting.
+    /// - `params.acsURL` (§10.1.5) => self-posting form to the ACS challenge page. Field names
+    ///   `creq`/`threeDSSessionData` are exactly what the ACS expects (vendor doc lines 742-753).
+    fn to_redirection(&self) -> Option<RedirectForm> {
+        if let Some(method_form) = self
+            .secure3d_method
+            .as_ref()
+            .and_then(|method| method.method_form.clone())
+        {
+            return Some(RedirectForm::Html {
+                html_data: method_form,
+            });
+        }
+
+        let params = self.params.as_ref()?;
+        let acs_url = params.acs_url.clone()?;
+        let mut form_fields = HashMap::new();
+        if let Some(c_req) = params.c_req.clone() {
+            form_fields.insert("creq".to_string(), c_req);
+        }
+        if let Some(sessiondata) = params.sessiondata.clone() {
+            form_fields.insert("threeDSSessionData".to_string(), sessiondata);
+        }
+        Some(RedirectForm::Form {
+            endpoint: acs_url,
+            method: Method::Post,
+            form_fields,
+        })
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FiservemeaPaymentsResponse {
@@ -449,6 +564,9 @@ pub struct FiservemeaPaymentsResponse {
     transaction_state: Option<String>,
     scheme_transaction_id: Option<String>,
     processor: Option<Processor>,
+    // Present only on 3DS Authorize/CompleteAuthorize responses; `None` for
+    // capture/void/refund responses, which is what keeps those flows unaffected.
+    authentication_response: Option<FiservemeaAuthenticationResponse>,
 }
 
 impl<F, T> TryFrom<ResponseRouterData<F, FiservemeaPaymentsResponse, T, PaymentsResponseData>>
@@ -458,15 +576,29 @@ impl<F, T> TryFrom<ResponseRouterData<F, FiservemeaPaymentsResponse, T, Payments
     fn try_from(
         item: ResponseRouterData<F, FiservemeaPaymentsResponse, T, PaymentsResponseData>,
     ) -> Result<Self, Self::Error> {
-        Ok(Self {
-            status: map_status(
+        // 3DS handling is inert for non-3DS flows: capture/void/refund responses never
+        // carry `authenticationResponse`, so `redirection_data` stays `None` and the status
+        // is derived by `map_status` exactly as before. Only when actionable 3DS data is
+        // present do we emit a redirect and flip the status to `AuthenticationPending`.
+        let redirection_data = item
+            .response
+            .authentication_response
+            .as_ref()
+            .and_then(|auth| auth.to_redirection());
+        let status = if redirection_data.is_some() {
+            common_enums::AttemptStatus::AuthenticationPending
+        } else {
+            map_status(
                 item.response.transaction_status,
                 item.response.transaction_result,
                 item.response.transaction_type,
-            ),
+            )
+        };
+        Ok(Self {
+            status,
             response: Ok(PaymentsResponseData::TransactionResponse {
                 resource_id: ResponseId::ConnectorTransactionId(item.response.ipg_transaction_id),
-                redirection_data: Box::new(None),
+                redirection_data: Box::new(redirection_data),
                 mandate_reference: Box::new(None),
                 connector_metadata: None,
                 network_txn_id: None,
@@ -718,5 +850,126 @@ mod tests {
             select_void_request_type(None),
             FiservemeaRequestType::VoidPreAuthTransactions
         ));
+    }
+
+    fn sample_request(
+        authentication_request: Option<FiservemeaAuthenticationRequest>,
+    ) -> FiservemeaPaymentsRequest {
+        FiservemeaPaymentsRequest {
+            request_type: FiservemeaRequestType::PaymentCardSaleTransaction,
+            merchant_transaction_id: "mtx_1".to_string(),
+            transaction_amount: FiservemeaTransactionAmount {
+                total: StringMajorUnit::zero(),
+                currency: common_enums::Currency::USD,
+            },
+            order: FiservemeaOrder {
+                order_id: "ord_1".to_string(),
+                installment_options: None,
+                additional_details: None,
+            },
+            payment_method: FiservemeaPaymentMethods::PaymentCard(FiservemeaPaymentCard {
+                number: "4111111111111111".parse().unwrap(),
+                expiry_date: FiservemeaExpiryDate {
+                    month: Secret::new("12".to_string()),
+                    year: Secret::new("30".to_string()),
+                },
+                security_code: Secret::new("123".to_string()),
+            }),
+            authentication_request,
+        }
+    }
+
+    #[test]
+    fn three_ds_authentication_request_serializes() {
+        let url = "https://hyperswitch.io/complete/abc".to_string();
+        let request = sample_request(Some(FiservemeaAuthenticationRequest {
+            authentication_type: "Secure3D21AuthenticationRequest".to_string(),
+            term_url: url.clone(),
+            method_notification_url: url.clone(),
+            challenge_indicator: Some("01".to_string()),
+            challenge_window_size: Some("01".to_string()),
+        }));
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            json["authenticationRequest"]["authenticationType"],
+            "Secure3D21AuthenticationRequest"
+        );
+        assert_eq!(json["authenticationRequest"]["termURL"], url);
+        assert_eq!(json["authenticationRequest"]["methodNotificationURL"], url);
+        assert_eq!(json["authenticationRequest"]["challengeIndicator"], "01");
+        assert_eq!(json["authenticationRequest"]["challengeWindowSize"], "01");
+    }
+
+    #[test]
+    fn no_three_ds_request_omits_authentication_request() {
+        let request = sample_request(None);
+        let json = serde_json::to_value(&request).unwrap();
+        assert!(
+            json.get("authenticationRequest").is_none(),
+            "NoThreeDs request must not serialize an authenticationRequest field"
+        );
+    }
+
+    #[test]
+    fn method_form_maps_to_html_redirect() {
+        let auth = FiservemeaAuthenticationResponse {
+            auth_type: Some("3D_SECURE".to_string()),
+            version: Some("2.1".to_string()),
+            secure3d_method: Some(FiservemeaSecure3dMethod {
+                method_form: Some("<form id=\"tds\"></form>".to_string()),
+                secure3d_trans_id: Some("trans_1".to_string()),
+            }),
+            params: None,
+        };
+        match auth.to_redirection() {
+            Some(RedirectForm::Html { html_data }) => {
+                assert_eq!(html_data, "<form id=\"tds\"></form>");
+            }
+            other => panic!("expected Html redirect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn challenge_params_map_to_acs_form() {
+        let auth = FiservemeaAuthenticationResponse {
+            auth_type: Some("3D_SECURE".to_string()),
+            version: Some("2.1".to_string()),
+            secure3d_method: None,
+            params: Some(FiservemeaAcsParams {
+                acs_url: Some("https://acs.example.com/challenge".to_string()),
+                c_req: Some("creq_value".to_string()),
+                term_url: Some("https://hyperswitch.io/complete/abc".to_string()),
+                sessiondata: Some("session_value".to_string()),
+            }),
+        };
+        match auth.to_redirection() {
+            Some(RedirectForm::Form {
+                endpoint,
+                method,
+                form_fields,
+            }) => {
+                assert_eq!(endpoint, "https://acs.example.com/challenge");
+                assert_eq!(method, Method::Post);
+                assert_eq!(form_fields.get("creq"), Some(&"creq_value".to_string()));
+                assert_eq!(
+                    form_fields.get("threeDSSessionData"),
+                    Some(&"session_value".to_string())
+                );
+            }
+            other => panic!("expected Form redirect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_authentication_response_yields_no_redirect() {
+        // A response without ACS data (e.g. unenrolled cardholder or a capture/void
+        // response) must not produce a redirect.
+        let auth = FiservemeaAuthenticationResponse {
+            auth_type: Some("3D_SECURE".to_string()),
+            version: Some("2.1".to_string()),
+            secure3d_method: None,
+            params: None,
+        };
+        assert!(auth.to_redirection().is_none());
     }
 }
