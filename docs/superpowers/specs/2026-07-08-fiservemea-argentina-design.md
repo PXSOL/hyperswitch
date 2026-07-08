@@ -173,3 +173,17 @@ Estos cambios viven en `/home/enzods/api2` (Hyperswitch = "Mithras", base `MITHR
    - leer `next_action.type == "redirect_to_url"` + `next_action.redirect_to_url` de la respuesta y redirigir al cliente (el patrón ya existe **comentado** en `PayPalGateway.php:289-297`), en lugar de asumir `url_to_pay = null`;
    - tras el retorno, consultar el estado con `GET /payments/{id}` para el resultado final.
 5. **Void (opcional)**: si se quiere anular vía Hyperswitch en lugar de solo local, agregar la llamada `POST /payments/{id}/cancel`.
+
+### 7.1 Estado de implementación (actualizado)
+
+**Conector (este repo):** 3DS nativo completo a fidelidad de spec — frictionless + challenge, `methodNotificationStatus` correcto (`RECEIVED`/`EXPECTED_BUT_NOT_RECEIVED`), `responseCode3dSecure` parseado y surfacedo en `connector_metadata`, `cardholderName`, `challengeWindowSize=05`, tests de fixture con el JSON del doc. Diferidos (niche): Data-Only Mastercard (`messageCategory:80`, §10.1.6) y 3DS v1 (`Secure3D10`). Nota: `CompleteAuthorizeData` no expone `integrity_object`, así que el cargo terminal 3DS no lleva integrity check (limitación de plataforma).
+
+**api2 (companion):** IMPLEMENTADO en la rama `enzodossantos/fiservemea-3ds` (off `master`, NO mergeada): `FiservEmeaGateway` + registro en factory + validator (`three_ds` boolean, `FiservEmea` en `Rule::in`) + `PROVIDERS_BASE_CURRENCIES['fiservemea']=['ARS','UYU']`. `php -l` OK. **NO testeado en runtime** — validar en staging.
+
+### 7.2 Checklist de validación en staging (antes de producción)
+
+1. **Prerequisito ops:** crear el merchant-connector `fiservemea` en Mithras/Hyperswitch (profile_id + merchant_connector_id + api_key/key1 de Fiserv IPG, 3DS habilitado).
+2. **Timing de finalización 3DS (RIESGO #1):** confirmar que Hyperswitch corre CompleteAuthorize y deja el pago en estado terminal **antes** de redirigir al `return_url`. Si `pay()` puede ejecutarse con estado `requires_customer_action`, el `GET /payments/{id}` devolvería no-terminal y el pago se marcaría fallido/cancelado prematuramente. (Es el supuesto central del flujo.)
+3. **Cuotas:** confirmar que Fiserv/el conector aplica el interés de cuotas nativamente (api2 NO multiplica el monto localmente para evitar doble cobro).
+4. **Casing 3DS:** capturar una respuesta real del sandbox y confirmar el casing de `secure3dMethod`/`sessiondata`/`acsURL` (mitigado con serde aliases, pero conviene verificar).
+5. **Currency base ARS/UYU:** confirmar que es lo correcto para este connector (dispara FX si el budget viene en otra moneda).
