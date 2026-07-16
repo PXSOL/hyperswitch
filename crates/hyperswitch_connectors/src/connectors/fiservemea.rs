@@ -60,6 +60,21 @@ use crate::{
     utils::{self, RefundsRequestData as _},
 };
 
+fn determine_endpoint(
+    connectors: &Connectors,
+    test_mode: Option<bool>,
+) -> CustomResult<String, errors::ConnectorError> {
+    if test_mode.unwrap_or(true) {
+        Ok(connectors
+            .fiservemea
+            .secondary_base_url
+            .clone()
+            .unwrap_or(connectors.fiservemea.base_url.to_string()))
+    } else {
+        Ok(connectors.fiservemea.base_url.to_string())
+    }
+}
+
 #[derive(Clone)]
 pub struct Fiservemea {
     amount_converter: &'static (dyn AmountConvertor<Output = StringMajorUnit> + Sync),
@@ -294,12 +309,12 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
 
     fn get_url(
         &self,
-        _req: &PaymentsAuthorizeRouterData,
+        req: &PaymentsAuthorizeRouterData,
         connectors: &Connectors,
     ) -> CustomResult<String, errors::ConnectorError> {
         Ok(format!(
             "{}/ipp/payments-gateway/v2/payments",
-            self.base_url(connectors)
+            determine_endpoint(connectors, req.test_mode)?
         ))
     }
 
@@ -413,7 +428,7 @@ impl ConnectorIntegration<CompleteAuthorize, CompleteAuthorizeData, PaymentsResp
             .ok_or(errors::ConnectorError::MissingConnectorTransactionID)?;
         Ok(format!(
             "{}/ipp/payments-gateway/v2/payments/{connector_payment_id}",
-            self.base_url(connectors)
+            determine_endpoint(connectors, req.test_mode)?
         ))
     }
 
@@ -516,7 +531,7 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Fis
             .change_context(errors::ConnectorError::MissingConnectorTransactionID)?;
         Ok(format!(
             "{}/ipp/payments-gateway/v2/payments/{connector_payment_id}",
-            self.base_url(connectors)
+            determine_endpoint(connectors, req.test_mode)?
         ))
     }
 
@@ -598,7 +613,7 @@ impl ConnectorIntegration<Capture, PaymentsCaptureData, PaymentsResponseData> fo
         let connector_payment_id = req.request.connector_transaction_id.clone();
         Ok(format!(
             "{}/ipp/payments-gateway/v2/payments/{connector_payment_id}",
-            self.base_url(connectors)
+            determine_endpoint(connectors, req.test_mode)?
         ))
     }
 
@@ -701,7 +716,7 @@ impl ConnectorIntegration<Void, PaymentsCancelData, PaymentsResponseData> for Fi
         let connector_payment_id = req.request.connector_transaction_id.clone();
         Ok(format!(
             "{}/ipp/payments-gateway/v2/payments/{connector_payment_id}",
-            self.base_url(connectors)
+            determine_endpoint(connectors, req.test_mode)?
         ))
     }
 
@@ -781,7 +796,7 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Fiserve
         let connector_payment_id = req.request.connector_transaction_id.clone();
         Ok(format!(
             "{}/ipp/payments-gateway/v2/payments/{connector_payment_id}",
-            self.base_url(connectors)
+            determine_endpoint(connectors, req.test_mode)?
         ))
     }
 
@@ -887,7 +902,7 @@ impl ConnectorIntegration<RSync, RefundsData, RefundsResponseData> for Fiserveme
         let connector_payment_id = req.request.get_connector_refund_id()?;
         Ok(format!(
             "{}/ipp/payments-gateway/v2/payments/{connector_payment_id}",
-            self.base_url(connectors)
+            determine_endpoint(connectors, req.test_mode)?
         ))
     }
 
