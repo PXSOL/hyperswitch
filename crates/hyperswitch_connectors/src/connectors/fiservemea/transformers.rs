@@ -385,6 +385,17 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
         // Hyperswitch runs the PaymentMethodToken flow first and hands the token back here.
         if let Ok(PaymentMethodToken::Token(pm_token)) = item.router_data.get_payment_method_token()
         {
+            // Fail closed: never authorize a token (Card-on-File) payment without authentication
+            // when the merchant requested 3DS. IPG token + native 3DS is not implemented, so
+            // silently dropping `authenticationRequest` here would skip Strong Customer
+            // Authentication and authorize anyway. Error out instead (mirrors the card branch,
+            // which fails closed when `complete_authorize_url` is missing).
+            if item.router_data.is_three_ds() {
+                return Err(errors::ConnectorError::NotImplemented(
+                    "3DS with a stored IPG token (Card-on-File) for fiservemea".to_string(),
+                )
+                .into());
+            }
             return Ok(Self {
                 request_type: if auto_capture {
                     FiservemeaRequestType::PaymentTokenSaleTransaction
@@ -641,19 +652,21 @@ pub struct FiservemeaCompleteAuthorizeRequest {
 /// Extracts the ACS challenge result (`cRes`) that the issuer ACS posts back to the `termURL`
 /// when the challenge completes (vendor doc lines 758-783). Hyperswitch forwards the browser's
 /// return data in `redirect_response`, which may be a JSON body (`payload`) or a query string
-/// (`params`). The vendor labels the field `cRes`; browsers/intermediaries may lower-case it,
-/// so both `cRes` and `cres` are accepted. Returns `None` after the device-fingerprint
-/// (methodForm) step, which carries no challenge result.
+/// (`params`). The vendor labels the field `cRes`; browsers/intermediaries may alter its casing,
+/// so the key is matched case-insensitively (mirroring the query-string branch and
+/// `has_three_ds_method_data`). Returns `None` after the device-fingerprint (methodForm) step,
+/// which carries no challenge result.
 fn extract_acs_cres(redirect_response: &CompleteAuthorizeRedirectResponse) -> Option<String> {
     // Prefer the JSON payload (the shape most ACS `termURL` posts use).
     if let Some(payload) = redirect_response.payload.as_ref() {
-        let value = payload.peek();
-        if let Some(c_res) = value
-            .get("cRes")
-            .or_else(|| value.get("cres"))
-            .and_then(|v| v.as_str())
-        {
-            return Some(c_res.to_string());
+        if let Some(object) = payload.peek().as_object() {
+            if let Some(c_res) = object
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("cres"))
+                .and_then(|(_, value)| value.as_str())
+            {
+                return Some(c_res.to_string());
+            }
         }
     }
     // Fall back to the query-string form (`cRes=...&...`). Query-string values are
