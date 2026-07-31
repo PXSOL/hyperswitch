@@ -1747,6 +1747,18 @@ mod tests {
     }
 
     #[test]
+    fn extract_acs_cres_json_payload_case_insensitive() {
+        // Browsers/intermediaries may alter the key casing; the JSON branch must match
+        // case-insensitively, like the query-string branch. Regression test for a payload
+        // keyed `CRES` (would be missed by an exact `cRes`/`cres` lookup).
+        let redirect = CompleteAuthorizeRedirectResponse {
+            params: None,
+            payload: Some(Secret::new(serde_json::json!({ "CRES": "xyz789" }))),
+        };
+        assert_eq!(extract_acs_cres(&redirect), Some("xyz789".to_string()));
+    }
+
+    #[test]
     fn extract_acs_cres_reads_query_params() {
         // ACS result forwarded as a query string -> case-insensitive key match.
         let redirect = CompleteAuthorizeRedirectResponse {
