@@ -7,17 +7,22 @@ use common_utils::{
 };
 use hyperswitch_domain_models::{
     payment_method_data::PaymentMethodData,
-    router_data::{ConnectorAuthType, RouterData},
-    router_flow_types::refunds::{Execute, RSync},
-    router_request_types::{CompleteAuthorizeRedirectResponse, ResponseId},
+    router_data::{ConnectorAuthType, PaymentMethodToken, RouterData},
+    router_flow_types::{
+        payments::{self, SetupMandate},
+        refunds::{Execute, RSync},
+    },
+    router_request_types::{
+        CompleteAuthorizeRedirectResponse, ResponseId, SetupMandateRequestData,
+    },
     router_response_types::{PaymentsResponseData, RedirectForm, RefundsResponseData},
     types::{
         PaymentsAuthorizeRouterData, PaymentsCancelRouterData, PaymentsCaptureRouterData,
-        PaymentsCompleteAuthorizeRouterData, RefundsRouterData,
+        PaymentsCompleteAuthorizeRouterData, RefundsRouterData, TokenizationRouterData,
     },
 };
 use hyperswitch_interfaces::errors;
-use masking::{PeekInterface, Secret};
+use masking::{ExposeInterface, PeekInterface, Secret};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -47,6 +52,16 @@ pub struct FiservemeaTransactionAmount {
     currency: common_enums::Currency,
 }
 
+/// Soft descriptor — the merchant name shown on the cardholder's statement. Nested under
+/// `order` (`order.softDescriptor.dynamicMerchantName`); the IPG API rejects it at the top
+/// level of the transaction (verified against the cert gateway: a top-level `softDescriptor`
+/// returns `INVALID_INPUT "No field named 'softDescriptor'"`).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FiservemeaSoftDescriptor {
+    dynamic_merchant_name: Secret<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FiservemeaOrder {
@@ -55,6 +70,8 @@ pub struct FiservemeaOrder {
     installment_options: Option<FiservemeaInstallmentOptions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     additional_details: Option<FiservemeaAdditionalDetails>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    soft_descriptor: Option<FiservemeaSoftDescriptor>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -83,6 +100,11 @@ pub struct FiservemeaMetadataObject {
     pub installments: Option<i32>,
     pub installment_interest: Option<bool>,
     pub tax_refund_legal_framework: Option<FiservemeaLegalFramework>,
+    /// Soft descriptor / dynamic merchant name shown on the cardholder statement
+    /// (`softDescriptor.dynamicMerchantName`, vendor doc §7.2 / Apéndice III).
+    pub dynamic_merchant_name: Option<String>,
+    /// Opt-in to Mastercard 3DS Data-Only (`messageCategory: "80"`, vendor doc §10.1.6).
+    pub three_ds_data_only: Option<bool>,
 }
 
 /// Looks up `keys` (in order) inside `source` (a JSON object) and returns the first present
@@ -127,6 +149,35 @@ fn extract_legal_framework(source: Option<&serde_json::Value>) -> Option<Fiserve
     serde_json::from_value(value.clone()).ok()
 }
 
+/// Extracts the dynamic merchant name (soft descriptor) from a single JSON source, accepting the
+/// alias keys `dynamic_merchant_name` / `dynamicMerchantName` / `soft_descriptor`. A blank value
+/// is treated as absent so we never serialize an empty `dynamicMerchantName`.
+fn extract_dynamic_merchant_name(source: Option<&serde_json::Value>) -> Option<String> {
+    lookup_field(
+        source,
+        &[
+            "dynamic_merchant_name",
+            "dynamicMerchantName",
+            "soft_descriptor",
+        ],
+    )?
+    .as_str()
+    .map(str::trim)
+    .filter(|s| !s.is_empty())
+    .map(str::to_string)
+}
+
+/// Extracts the `three_ds_data_only` opt-in flag (JSON bool or bool-ish string), mirroring
+/// `extract_installment_interest`. `None` when absent/unparseable.
+fn extract_three_ds_data_only(source: Option<&serde_json::Value>) -> Option<bool> {
+    let value = lookup_field(source, &["three_ds_data_only", "threeDsDataOnly"])?;
+    value.as_bool().or_else(|| match value.as_str() {
+        Some(s) if s.eq_ignore_ascii_case("true") => Some(true),
+        Some(s) if s.eq_ignore_ascii_case("false") => Some(false),
+        _ => None,
+    })
+}
+
 impl FiservemeaMetadataObject {
     /// Reads from `request.metadata` and, for each missing field, falls back to
     /// `request.frm_metadata`. Both sources are intentionally supported (see spec §3.1).
@@ -146,6 +197,10 @@ impl FiservemeaMetadataObject {
                 .or_else(|| extract_installment_interest(frm_metadata)),
             tax_refund_legal_framework: extract_legal_framework(metadata)
                 .or_else(|| extract_legal_framework(frm_metadata)),
+            dynamic_merchant_name: extract_dynamic_merchant_name(metadata)
+                .or_else(|| extract_dynamic_merchant_name(frm_metadata)),
+            three_ds_data_only: extract_three_ds_data_only(metadata)
+                .or_else(|| extract_three_ds_data_only(frm_metadata)),
         }
     }
 }
@@ -179,6 +234,10 @@ pub enum FiservemeaRequestType {
     VoidTransaction,
     VoidPreAuthTransactions,
     ReturnTransaction,
+    // IPG gateway tokenization (Card-on-File): create a token, then pay with it (vendor doc §9.1).
+    PaymentCardPaymentTokenizationRequest,
+    PaymentTokenSaleTransaction,
+    PaymentTokenPreAuthTransaction,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -205,6 +264,17 @@ pub struct FiservemeaPaymentCard {
 #[serde(rename_all = "camelCase")]
 pub enum FiservemeaPaymentMethods {
     PaymentCard(FiservemeaPaymentCard),
+    /// Pay with a previously created IPG gateway token (Card-on-File, vendor doc §9.1.4.2).
+    /// Serialized as `paymentToken`.
+    PaymentToken(FiservemeaPaymentTokenRef),
+}
+
+/// Reference to an IPG gateway token used to pay (`paymentMethod.paymentToken`, vendor doc §9.1.4.2).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FiservemeaPaymentTokenRef {
+    value: Secret<String>,
+    token_origin_store_id: Secret<String>,
 }
 
 /// 3DS native (Fiserv IPG "provider-owned" flow) authentication request object.
@@ -212,13 +282,12 @@ pub enum FiservemeaPaymentMethods {
 /// NoThreeDs request stays byte-identical to the pre-3DS behavior. See vendor doc
 /// §10.1.1 (lines 526-578) and design spec §3.4.
 ///
-/// NOTE: Two documented variants are intentionally deferred (out of scope here):
-/// - Mastercard Data-Only (`messageCategory: "80"`, vendor doc §10.1.6): niche and only
-///   applicable to recurring/MIT (merchant-initiated) transactions, which this connector does
-///   not yet support.
-/// - 3DS v1 (`Secure3D10AuthenticationRequest`/`payerAuthenticationResponse`, vendor doc
-///   §10.1.5 v1 variant): the card schemes have sunset 3DS v1, so only the 3DS v2.1/v2.2
-///   (`Secure3D21...`) flow is implemented.
+/// Mastercard Data-Only (`messageCategory: "80"`, vendor doc §10.1.6) is opt-in via
+/// `metadata.three_ds_data_only`; see `message_category` below.
+///
+/// NOTE: 3DS v1 (`Secure3D10AuthenticationRequest`/`payerAuthenticationResponse`, vendor doc
+/// §10.1.5 v1 variant) is intentionally not implemented — the card schemes have sunset 3DS v1,
+/// so only the 3DS v2.1/v2.2 (`Secure3D21...`) flow is supported.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FiservemeaAuthenticationRequest {
@@ -231,12 +300,18 @@ pub struct FiservemeaAuthenticationRequest {
     challenge_indicator: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     challenge_window_size: Option<String>,
+    // Mastercard 3DS Data-Only: `"80"` requests authentication data without a challenge
+    // (vendor doc §10.1.6). Set from `metadata.three_ds_data_only`; omitted otherwise so the
+    // normal 3DS request stays byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_category: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FiservemeaPaymentsRequest {
     request_type: FiservemeaRequestType,
+    store_id: Secret<String>,
     merchant_transaction_id: String,
     transaction_amount: FiservemeaTransactionAmount,
     order: FiservemeaOrder,
@@ -261,6 +336,73 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
     fn try_from(
         item: &FiservemeaRouterData<&PaymentsAuthorizeRouterData>,
     ) -> Result<Self, Self::Error> {
+        let auth = FiservemeaAuthType::try_from(&item.router_data.connector_auth_type)?;
+
+        // Order-level fields derived from metadata are shared by the card and token flows.
+        let fiservemea_meta = FiservemeaMetadataObject::from_sources(
+            item.router_data.request.metadata.as_ref(),
+            item.router_data
+                .frm_metadata
+                .as_ref()
+                .map(|secret| secret.peek()),
+        );
+        let installment_options = fiservemea_meta.installments.and_then(|n| {
+            (n > 1).then_some(FiservemeaInstallmentOptions {
+                number_of_installments: n,
+                interest: fiservemea_meta.installment_interest,
+            })
+        });
+        let additional_details =
+            fiservemea_meta
+                .tax_refund_legal_framework
+                .map(|legal_framework| FiservemeaAdditionalDetails {
+                    tax_refund_request_data: Some(FiservemeaTaxRefundRequestData { legal_framework }),
+                });
+        let soft_descriptor = fiservemea_meta.dynamic_merchant_name.clone().map(|name| {
+            FiservemeaSoftDescriptor {
+                dynamic_merchant_name: Secret::new(name),
+            }
+        });
+        let order = FiservemeaOrder {
+            order_id: item.router_data.connector_request_reference_id.clone(),
+            installment_options,
+            additional_details,
+            soft_descriptor,
+        };
+        let merchant_transaction_id = item
+            .router_data
+            .request
+            .merchant_order_reference_id
+            .clone()
+            .unwrap_or(item.router_data.connector_request_reference_id.clone());
+        let transaction_amount = FiservemeaTransactionAmount {
+            total: item.amount.clone(),
+            currency: item.router_data.request.currency,
+        };
+        let auto_capture = is_auto_capture(item.router_data.request.capture_method);
+
+        // Card-on-File: pay with a previously created IPG gateway token (vendor doc §9.1.4.2).
+        // Hyperswitch runs the PaymentMethodToken flow first and hands the token back here.
+        if let Ok(PaymentMethodToken::Token(pm_token)) = item.router_data.get_payment_method_token()
+        {
+            return Ok(Self {
+                request_type: if auto_capture {
+                    FiservemeaRequestType::PaymentTokenSaleTransaction
+                } else {
+                    FiservemeaRequestType::PaymentTokenPreAuthTransaction
+                },
+                store_id: auth.store_id.clone(),
+                merchant_transaction_id,
+                transaction_amount,
+                order,
+                payment_method: FiservemeaPaymentMethods::PaymentToken(FiservemeaPaymentTokenRef {
+                    value: pm_token,
+                    token_origin_store_id: auth.store_id,
+                }),
+                authentication_request: None,
+            });
+        }
+
         match item.router_data.request.payment_method_data.clone() {
             PaymentMethodData::Card(req_card) => {
                 let card = FiservemeaPaymentCard {
@@ -272,33 +414,11 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
                     security_code: req_card.card_cvc,
                     cardholder_name: req_card.card_holder_name.clone(),
                 };
-                let request_type = if is_auto_capture(item.router_data.request.capture_method) {
+                let request_type = if auto_capture {
                     FiservemeaRequestType::PaymentCardSaleTransaction
                 } else {
                     FiservemeaRequestType::PaymentCardPreAuthTransaction
                 };
-
-                let fiservemea_meta = FiservemeaMetadataObject::from_sources(
-                    item.router_data.request.metadata.as_ref(),
-                    item.router_data
-                        .frm_metadata
-                        .as_ref()
-                        .map(|secret| secret.peek()),
-                );
-                let installment_options = fiservemea_meta.installments.and_then(|n| {
-                    (n > 1).then_some(FiservemeaInstallmentOptions {
-                        number_of_installments: n,
-                        interest: fiservemea_meta.installment_interest,
-                    })
-                });
-                let additional_details =
-                    fiservemea_meta
-                        .tax_refund_legal_framework
-                        .map(|legal_framework| FiservemeaAdditionalDetails {
-                            tax_refund_request_data: Some(FiservemeaTaxRefundRequestData {
-                                legal_framework,
-                            }),
-                        });
 
                 // 3DS is optional: only attach `authenticationRequest` when the payment
                 // requests ThreeDs. The NoThreeDs branch leaves this `None`, keeping the
@@ -322,6 +442,11 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
                         // option `01` (250x400) is a poor default on modern/mobile viewports, so
                         // request full screen for a better challenge UX.
                         challenge_window_size: Some("05".to_string()),
+                        // Mastercard Data-Only (`"80"`) when opted-in via metadata; else omitted.
+                        message_category: fiservemea_meta
+                            .three_ds_data_only
+                            .unwrap_or(false)
+                            .then(|| "80".to_string()),
                     })
                 } else {
                     None
@@ -329,21 +454,10 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
 
                 Ok(Self {
                     request_type,
-                    merchant_transaction_id: item
-                        .router_data
-                        .request
-                        .merchant_order_reference_id
-                        .clone()
-                        .unwrap_or(item.router_data.connector_request_reference_id.clone()),
-                    transaction_amount: FiservemeaTransactionAmount {
-                        total: item.amount.clone(),
-                        currency: item.router_data.request.currency,
-                    },
-                    order: FiservemeaOrder {
-                        order_id: item.router_data.connector_request_reference_id.clone(),
-                        installment_options,
-                        additional_details,
-                    },
+                    store_id: auth.store_id,
+                    merchant_transaction_id,
+                    transaction_amount,
+                    order,
                     payment_method: FiservemeaPaymentMethods::PaymentCard(card),
                     authentication_request,
                 })
@@ -353,6 +467,147 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
             )
             .into()),
         }
+    }
+}
+
+/// Zero Auth (account verification) — a zero-amount `PaymentCardSaleTransaction` that validates
+/// the card without a real charge (vendor doc Parte 3 §Zero Auth). Wired to Hyperswitch's
+/// `SetupMandate` flow. Verified against the cert gateway: `total: 0` → APPROVED.
+impl TryFrom<&RouterData<SetupMandate, SetupMandateRequestData, PaymentsResponseData>>
+    for FiservemeaPaymentsRequest
+{
+    type Error = error_stack::Report<errors::ConnectorError>;
+    fn try_from(
+        item: &RouterData<SetupMandate, SetupMandateRequestData, PaymentsResponseData>,
+    ) -> Result<Self, Self::Error> {
+        let auth = FiservemeaAuthType::try_from(&item.connector_auth_type)?;
+        match item.request.payment_method_data.clone() {
+            PaymentMethodData::Card(req_card) => {
+                let card = FiservemeaPaymentCard {
+                    number: req_card.card_number.clone(),
+                    expiry_date: FiservemeaExpiryDate {
+                        month: req_card.card_exp_month.clone(),
+                        year: req_card.get_card_expiry_year_2_digit()?,
+                    },
+                    security_code: req_card.card_cvc,
+                    cardholder_name: req_card.card_holder_name.clone(),
+                };
+                Ok(Self {
+                    request_type: FiservemeaRequestType::PaymentCardSaleTransaction,
+                    store_id: auth.store_id,
+                    merchant_transaction_id: item.connector_request_reference_id.clone(),
+                    // Zero amount: the issuer validates the card without a real charge.
+                    transaction_amount: FiservemeaTransactionAmount {
+                        total: StringMajorUnit::zero(),
+                        currency: item.request.currency,
+                    },
+                    order: FiservemeaOrder {
+                        order_id: item.connector_request_reference_id.clone(),
+                        installment_options: None,
+                        additional_details: None,
+                        soft_descriptor: None,
+                    },
+                    payment_method: FiservemeaPaymentMethods::PaymentCard(card),
+                    authentication_request: None,
+                })
+            }
+            _ => Err(errors::ConnectorError::NotImplemented(
+                "Selected payment method through fiservemea zero auth".to_string(),
+            )
+            .into()),
+        }
+    }
+}
+
+// ---- IPG gateway tokenization (Card-on-File, vendor doc §9.1) ----
+
+/// `createToken` block of a `PaymentCardPaymentTokenizationRequest`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FiservemeaCreateToken {
+    reusable: bool,
+    decline_duplicates: bool,
+}
+
+/// Create-token request — sent to `POST /payment-tokens`. Note `paymentCard` is a top-level field
+/// here (not under `paymentMethod`), verified against the cert gateway.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FiservemeaCreateTokenRequest {
+    request_type: FiservemeaRequestType,
+    store_id: Secret<String>,
+    payment_card: FiservemeaPaymentCard,
+    create_token: FiservemeaCreateToken,
+}
+
+impl TryFrom<&TokenizationRouterData> for FiservemeaCreateTokenRequest {
+    type Error = error_stack::Report<errors::ConnectorError>;
+    fn try_from(item: &TokenizationRouterData) -> Result<Self, Self::Error> {
+        let auth = FiservemeaAuthType::try_from(&item.connector_auth_type)?;
+        match item.request.payment_method_data.clone() {
+            PaymentMethodData::Card(req_card) => Ok(Self {
+                request_type: FiservemeaRequestType::PaymentCardPaymentTokenizationRequest,
+                store_id: auth.store_id,
+                payment_card: FiservemeaPaymentCard {
+                    number: req_card.card_number.clone(),
+                    expiry_date: FiservemeaExpiryDate {
+                        month: req_card.card_exp_month.clone(),
+                        year: req_card.get_card_expiry_year_2_digit()?,
+                    },
+                    security_code: req_card.card_cvc,
+                    cardholder_name: req_card.card_holder_name.clone(),
+                },
+                create_token: FiservemeaCreateToken {
+                    reusable: true,
+                    decline_duplicates: false,
+                },
+            }),
+            _ => Err(errors::ConnectorError::NotImplemented(
+                "Selected payment method through fiservemea tokenization".to_string(),
+            )
+            .into()),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FiservemeaTokenValue {
+    value: Secret<String>,
+}
+
+/// Create-token response (`paymentToken.value` = the IPG token / Hosted Data ID, vendor doc §9.1).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FiservemeaTokenResponse {
+    payment_token: FiservemeaTokenValue,
+}
+
+impl<T>
+    TryFrom<
+        ResponseRouterData<
+            payments::PaymentMethodToken,
+            FiservemeaTokenResponse,
+            T,
+            PaymentsResponseData,
+        >,
+    > for RouterData<payments::PaymentMethodToken, T, PaymentsResponseData>
+{
+    type Error = error_stack::Report<errors::ConnectorError>;
+    fn try_from(
+        item: ResponseRouterData<
+            payments::PaymentMethodToken,
+            FiservemeaTokenResponse,
+            T,
+            PaymentsResponseData,
+        >,
+    ) -> Result<Self, Self::Error> {
+        Ok(Self {
+            response: Ok(PaymentsResponseData::TokenizationResponse {
+                token: item.response.payment_token.value.expose(),
+            }),
+            ..item.data
+        })
     }
 }
 
@@ -376,6 +631,7 @@ pub struct FiservemeaAcsResponse {
 #[serde(rename_all = "camelCase")]
 pub struct FiservemeaCompleteAuthorizeRequest {
     authentication_type: String,
+    store_id: Secret<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     method_notification_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -455,10 +711,12 @@ fn has_three_ds_method_data(redirect_response: &CompleteAuthorizeRedirectRespons
 ///   issuers don't support browser data collection — vendor doc §10.1.1 line ~580 / §10.1.3).
 fn build_continuation_request(
     redirect_response: &CompleteAuthorizeRedirectResponse,
+    store_id: Secret<String>,
 ) -> FiservemeaCompleteAuthorizeRequest {
     match extract_acs_cres(redirect_response) {
         Some(c_res) => FiservemeaCompleteAuthorizeRequest {
             authentication_type: "Secure3D21AuthenticationUpdateRequest".to_string(),
+            store_id,
             method_notification_status: None,
             acs_response: Some(FiservemeaAcsResponse { c_res }),
         },
@@ -470,6 +728,7 @@ fn build_continuation_request(
             };
             FiservemeaCompleteAuthorizeRequest {
                 authentication_type: "Secure3D21AuthenticationUpdateRequest".to_string(),
+                store_id,
                 method_notification_status: Some(method_notification_status.to_string()),
                 acs_response: None,
             }
@@ -480,30 +739,42 @@ fn build_continuation_request(
 impl TryFrom<&PaymentsCompleteAuthorizeRouterData> for FiservemeaCompleteAuthorizeRequest {
     type Error = error_stack::Report<errors::ConnectorError>;
     fn try_from(item: &PaymentsCompleteAuthorizeRouterData) -> Result<Self, Self::Error> {
+        let auth = FiservemeaAuthType::try_from(&item.connector_auth_type)?;
         let redirect_response = item.request.redirect_response.as_ref().ok_or(
             errors::ConnectorError::MissingRequiredField {
                 field_name: "redirect_response",
             },
         )?;
 
-        Ok(build_continuation_request(redirect_response))
+        Ok(build_continuation_request(redirect_response, auth.store_id))
     }
 }
 
 // Auth Struct
+//
+// Field mapping (`ConnectorAuthType::SignatureKey`):
+//   api_key    -> Fiserv API Key    (public key, sent in the `API-KEY` header)
+//   api_secret -> Fiserv API Secret (HMAC key used to sign every request)
+//   key1       -> Fiserv Store Id   (required by the IPG API in the request body / sync query)
 #[derive(Clone)]
 pub struct FiservemeaAuthType {
     pub(super) api_key: Secret<String>,
     pub(super) secret_key: Secret<String>,
+    pub(super) store_id: Secret<String>,
 }
 
 impl TryFrom<&ConnectorAuthType> for FiservemeaAuthType {
     type Error = error_stack::Report<errors::ConnectorError>;
     fn try_from(auth_type: &ConnectorAuthType) -> Result<Self, Self::Error> {
         match auth_type {
-            ConnectorAuthType::BodyKey { api_key, key1 } => Ok(Self {
+            ConnectorAuthType::SignatureKey {
+                api_key,
+                key1,
+                api_secret,
+            } => Ok(Self {
                 api_key: api_key.to_owned(),
-                secret_key: key1.to_owned(),
+                secret_key: api_secret.to_owned(),
+                store_id: key1.to_owned(),
             }),
             _ => Err(errors::ConnectorError::FailedToObtainAuthType.into()),
         }
@@ -880,6 +1151,7 @@ impl<F, T> TryFrom<ResponseRouterData<F, FiservemeaPaymentsResponse, T, Payments
 #[serde(rename_all = "camelCase")]
 pub struct FiservemeaCaptureRequest {
     request_type: FiservemeaRequestType,
+    store_id: Secret<String>,
     transaction_amount: FiservemeaTransactionAmount,
 }
 
@@ -888,8 +1160,10 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsCaptureRouterData>> for FiservemeaCa
     fn try_from(
         item: &FiservemeaRouterData<&PaymentsCaptureRouterData>,
     ) -> Result<Self, Self::Error> {
+        let auth = FiservemeaAuthType::try_from(&item.router_data.connector_auth_type)?;
         Ok(Self {
             request_type: FiservemeaRequestType::PostAuthTransaction,
+            store_id: auth.store_id,
             transaction_amount: FiservemeaTransactionAmount {
                 total: item.amount.clone(),
                 currency: item.router_data.request.currency,
@@ -902,6 +1176,7 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsCaptureRouterData>> for FiservemeaCa
 #[serde(rename_all = "camelCase")]
 pub struct FiservemeaVoidRequest {
     request_type: FiservemeaRequestType,
+    store_id: Secret<String>,
 }
 
 // `PaymentsCancelData` exposes `capture_method: Option<storage_enums::CaptureMethod>`
@@ -927,8 +1202,10 @@ fn select_void_request_type(capture_method: Option<enums::CaptureMethod>) -> Fis
 impl TryFrom<&PaymentsCancelRouterData> for FiservemeaVoidRequest {
     type Error = error_stack::Report<errors::ConnectorError>;
     fn try_from(item: &PaymentsCancelRouterData) -> Result<Self, Self::Error> {
+        let auth = FiservemeaAuthType::try_from(&item.connector_auth_type)?;
         Ok(Self {
             request_type: select_void_request_type(item.request.capture_method),
+            store_id: auth.store_id,
         })
     }
 }
@@ -938,14 +1215,17 @@ impl TryFrom<&PaymentsCancelRouterData> for FiservemeaVoidRequest {
 #[serde(rename_all = "camelCase")]
 pub struct FiservemeaRefundRequest {
     request_type: FiservemeaRequestType,
+    store_id: Secret<String>,
     transaction_amount: FiservemeaTransactionAmount,
 }
 
 impl<F> TryFrom<&FiservemeaRouterData<&RefundsRouterData<F>>> for FiservemeaRefundRequest {
     type Error = error_stack::Report<errors::ConnectorError>;
     fn try_from(item: &FiservemeaRouterData<&RefundsRouterData<F>>) -> Result<Self, Self::Error> {
+        let auth = FiservemeaAuthType::try_from(&item.router_data.connector_auth_type)?;
         Ok(Self {
             request_type: FiservemeaRequestType::ReturnTransaction,
+            store_id: auth.store_id,
             transaction_amount: FiservemeaTransactionAmount {
                 total: item.amount.clone(),
                 currency: item.router_data.request.currency,
@@ -1116,6 +1396,7 @@ mod tests {
                 interest: Some(true),
             }),
             additional_details: None,
+            soft_descriptor: None,
         };
         let json = serde_json::to_value(&order).unwrap();
         assert_eq!(json["installmentOptions"]["numberOfInstallments"], 6);
@@ -1223,6 +1504,7 @@ mod tests {
     ) -> FiservemeaPaymentsRequest {
         FiservemeaPaymentsRequest {
             request_type: FiservemeaRequestType::PaymentCardSaleTransaction,
+            store_id: Secret::new("teststore".to_string()),
             merchant_transaction_id: "mtx_1".to_string(),
             transaction_amount: FiservemeaTransactionAmount {
                 total: StringMajorUnit::zero(),
@@ -1232,6 +1514,7 @@ mod tests {
                 order_id: "ord_1".to_string(),
                 installment_options: None,
                 additional_details: None,
+                soft_descriptor: None,
             },
             payment_method: FiservemeaPaymentMethods::PaymentCard(FiservemeaPaymentCard {
                 number: "4111111111111111".parse().unwrap(),
@@ -1255,6 +1538,7 @@ mod tests {
             method_notification_url: url.clone(),
             challenge_indicator: Some("01".to_string()),
             challenge_window_size: Some("01".to_string()),
+            message_category: None,
         }));
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(
@@ -1395,6 +1679,7 @@ mod tests {
         // Continuation after the device-fingerprint step: only `methodNotificationStatus`.
         let request = FiservemeaCompleteAuthorizeRequest {
             authentication_type: "Secure3D21AuthenticationUpdateRequest".to_string(),
+            store_id: Secret::new("teststore".to_string()),
             method_notification_status: Some("RECEIVED".to_string()),
             acs_response: None,
         };
@@ -1415,6 +1700,7 @@ mod tests {
         // Continuation after the challenge: only `acsResponse.cRes`.
         let request = FiservemeaCompleteAuthorizeRequest {
             authentication_type: "Secure3D21AuthenticationUpdateRequest".to_string(),
+            store_id: Secret::new("teststore".to_string()),
             method_notification_status: None,
             acs_response: Some(FiservemeaAcsResponse {
                 c_res: "cRes_value".to_string(),
@@ -1496,7 +1782,7 @@ mod tests {
                 "threeDSMethodData": "eyJ0aHJlZURTU2VydmVyVHJhbnNJRCI6IjNhYzcifQ==",
             }))),
         };
-        let request = build_continuation_request(&redirect);
+        let request = build_continuation_request(&redirect, Secret::new("teststore".to_string()));
         assert_eq!(
             request.method_notification_status.as_deref(),
             Some("RECEIVED")
@@ -1513,7 +1799,7 @@ mod tests {
             params: Some(Secret::new("foo=bar".to_string())),
             payload: None,
         };
-        let request = build_continuation_request(&redirect);
+        let request = build_continuation_request(&redirect, Secret::new("teststore".to_string()));
         assert_eq!(
             request.method_notification_status.as_deref(),
             Some("EXPECTED_BUT_NOT_RECEIVED")
@@ -1528,7 +1814,7 @@ mod tests {
             params: Some(Secret::new("threeDSMethodData=eyJ0aHJlZSJ9".to_string())),
             payload: None,
         };
-        let request = build_continuation_request(&redirect);
+        let request = build_continuation_request(&redirect, Secret::new("teststore".to_string()));
         assert_eq!(
             request.method_notification_status.as_deref(),
             Some("RECEIVED")
@@ -1543,7 +1829,7 @@ mod tests {
             params: None,
             payload: Some(Secret::new(serde_json::json!({ "cRes": "cres_blob" }))),
         };
-        let request = build_continuation_request(&redirect);
+        let request = build_continuation_request(&redirect, Secret::new("teststore".to_string()));
         assert_eq!(
             request.acs_response.as_ref().map(|acs| acs.c_res.clone()),
             Some("cres_blob".to_string())

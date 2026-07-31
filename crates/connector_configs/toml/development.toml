@@ -2388,9 +2388,10 @@ options=["Connector", "Hyperswitch"]
   payment_method_type = "CartesBancaires"
 [[fiservemea.debit]]
   payment_method_type = "UnionPay"
-[fiservemea.connector_auth.BodyKey]
+[fiservemea.connector_auth.SignatureKey]
 api_key="API Key"
-key1="Secret Key"
+key1="Store ID"
+api_secret="API Secret"
 
 [forte]
 [[forte.credit]]
