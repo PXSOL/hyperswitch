@@ -164,7 +164,10 @@ fn extract_dynamic_merchant_name(source: Option<&serde_json::Value>) -> Option<S
     .as_str()
     .map(str::trim)
     .filter(|s| !s.is_empty())
-    .map(str::to_string)
+    // Fiserv caps `dynamicMerchantName` around 25 characters (the exact limit varies by
+    // acquirer/brand and is truncated downstream); truncate defensively so an over-long value
+    // isn't rejected. `chars()` keeps the truncation on a UTF-8 boundary.
+    .map(|s| s.chars().take(25).collect::<String>())
 }
 
 /// Extracts the `three_ds_data_only` opt-in flag (JSON bool or bool-ish string), mirroring
@@ -1451,6 +1454,59 @@ mod tests {
         let metadata = serde_json::json!({ "installments": "6" });
         let meta = FiservemeaMetadataObject::from_sources(Some(&metadata), None);
         assert_eq!(meta.installments, Some(6));
+    }
+
+    #[test]
+    fn dynamic_merchant_name_truncated_to_25_chars() {
+        let metadata =
+            serde_json::json!({ "dynamic_merchant_name": "PXSOL_SUPER_LONG_STORE_NAME_1234567890" });
+        let meta = FiservemeaMetadataObject::from_sources(Some(&metadata), None);
+        let name = meta.dynamic_merchant_name.expect("should extract");
+        assert_eq!(name.chars().count(), 25);
+        assert!(name.starts_with("PXSOL_SUPER_LONG_STORE_NA"));
+    }
+
+    #[test]
+    fn order_serializes_soft_descriptor_dynamic_merchant_name() {
+        let order = FiservemeaOrder {
+            order_id: "ord_1".to_string(),
+            installment_options: None,
+            additional_details: None,
+            soft_descriptor: Some(FiservemeaSoftDescriptor {
+                dynamic_merchant_name: Secret::new("PXSOL*Reservas".to_string()),
+            }),
+        };
+        let json = serde_json::to_value(&order).unwrap();
+        assert_eq!(json["softDescriptor"]["dynamicMerchantName"], "PXSOL*Reservas");
+    }
+
+    #[test]
+    fn authentication_request_locks_wire_values() {
+        // Lock the exact strings the connector sends on the wire (the Authorize `try_from`
+        // emits challengeWindowSize "05" / challengeIndicator "01", and "80" for Data-Only).
+        let req = FiservemeaAuthenticationRequest {
+            authentication_type: "Secure3D21AuthenticationRequest".to_string(),
+            term_url: "https://hyperswitch.io/complete".to_string(),
+            method_notification_url: "https://hyperswitch.io/complete".to_string(),
+            challenge_indicator: Some("01".to_string()),
+            challenge_window_size: Some("05".to_string()),
+            message_category: Some("80".to_string()),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["challengeIndicator"], "01");
+        assert_eq!(json["challengeWindowSize"], "05");
+        assert_eq!(json["messageCategory"], "80");
+    }
+
+    #[test]
+    fn payment_method_payment_token_serializes() {
+        let pm = FiservemeaPaymentMethods::PaymentToken(FiservemeaPaymentTokenRef {
+            value: Secret::new("TOKEN-123".to_string()),
+            token_origin_store_id: Secret::new("5926072901".to_string()),
+        });
+        let json = serde_json::to_value(&pm).unwrap();
+        assert_eq!(json["paymentToken"]["value"], "TOKEN-123");
+        assert_eq!(json["paymentToken"]["tokenOriginStoreId"], "5926072901");
     }
 
     #[test]

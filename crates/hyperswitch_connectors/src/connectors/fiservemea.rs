@@ -528,16 +528,20 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
 
-        let integrity_object = response
-            .settlement_amount()
-            .map(|(amount, currency)| {
-                utils::get_authorise_integrity_object(
-                    self.amount_converter_to_float_major_unit,
-                    amount,
-                    currency.to_string(),
-                )
-            })
-            .transpose()?;
+        // Build the authorize integrity object from the REQUESTED amount, not the response's
+        // approved amount. The gateway can approve less than requested (partial authorization);
+        // comparing the approved amount against the request would flag a legitimate partial auth
+        // as an integrity failure (CodeRabbit).
+        let integrity_amount = utils::convert_amount(
+            self.amount_converter_to_float_major_unit,
+            data.request.minor_amount,
+            data.request.currency,
+        )?;
+        let integrity_object = Some(utils::get_authorise_integrity_object(
+            self.amount_converter_to_float_major_unit,
+            integrity_amount,
+            data.request.currency.to_string(),
+        )?);
 
         let mut router_data = RouterData::try_from(ResponseRouterData {
             response,
@@ -689,12 +693,15 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Fis
             .change_context(errors::ConnectorError::MissingConnectorTransactionID)?;
         // The IPG sync (GET) requires the storeId as a query param (vendor doc, e.g.
         // `/payments/{id}?storeId=...`); the HMAC signature for GET is over an empty body, so
-        // the query param is not part of the signed payload.
+        // the query param is not part of the signed payload. `store_id` is a non-sensitive
+        // merchant identifier (also sent in request bodies); percent-encode it so the query
+        // string is always well-formed regardless of its contents.
         let auth = fiservemea::FiservemeaAuthType::try_from(&req.connector_auth_type)?;
+        let store_id: String =
+            url::form_urlencoded::byte_serialize(auth.store_id.peek().as_bytes()).collect();
         Ok(format!(
-            "{}/payments/{connector_payment_id}?storeId={}",
+            "{}/payments/{connector_payment_id}?storeId={store_id}",
             determine_endpoint(connectors, req.test_mode)?,
-            auth.store_id.peek()
         ))
     }
 
@@ -1063,12 +1070,14 @@ impl ConnectorIntegration<RSync, RefundsData, RefundsResponseData> for Fiserveme
         connectors: &Connectors,
     ) -> CustomResult<String, errors::ConnectorError> {
         let connector_payment_id = req.request.get_connector_refund_id()?;
-        // IPG refund-sync (GET) also needs the storeId query param (see PSync note above).
+        // IPG refund-sync (GET) also needs the storeId query param (see PSync note above);
+        // percent-encode it for a well-formed query string.
         let auth = fiservemea::FiservemeaAuthType::try_from(&req.connector_auth_type)?;
+        let store_id: String =
+            url::form_urlencoded::byte_serialize(auth.store_id.peek().as_bytes()).collect();
         Ok(format!(
-            "{}/payments/{connector_payment_id}?storeId={}",
+            "{}/payments/{connector_payment_id}?storeId={store_id}",
             determine_endpoint(connectors, req.test_mode)?,
-            auth.store_id.peek()
         ))
     }
 
