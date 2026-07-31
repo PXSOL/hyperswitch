@@ -55,6 +55,7 @@ pub struct ConnectorAuthentication {
     pub fiserv: Option<SignatureKey>,
     pub fiservemea: Option<SignatureKey>,
     pub fiuu: Option<HeaderKey>,
+    pub mercadopago: Option<HeaderKey>,
     pub flexiti: Option<HeaderKey>,
     pub forte: Option<MultiAuthKey>,
     pub getnet: Option<HeaderKey>,

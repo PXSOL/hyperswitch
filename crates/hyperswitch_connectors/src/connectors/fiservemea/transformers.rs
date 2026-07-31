@@ -1454,6 +1454,79 @@ mod tests {
     }
 
     #[test]
+    fn real_cert_sale_response_deserializes_and_maps_to_charged() {
+        // Full APPROVED sale response captured live from the Fiserv cert gateway. It carries
+        // `transactionResult` (not the deprecated `transactionStatus`), so it exercises the
+        // result-based status path against a complete, real payload (all fields must parse).
+        let raw = serde_json::json!({
+            "type": "transactionResponse",
+            "clientRequestId": "c4abc979-df0d-4626-aa08-97d6dae93b3f",
+            "apiTraceId": "amvFrHVLgzSvT6IP5kfSbQAAAq4",
+            "ipgTransactionId": "84666242633",
+            "orderId": "1c2e11bb-3075-4195-bc95-591789e2b995",
+            "transactionType": "SALE",
+            "paymentToken": { "last4": "0019", "brand": "VISA" },
+            "transactionOrigin": "ECOM",
+            "paymentMethodDetails": {
+                "paymentCard": {
+                    "expiryDate": { "month": "12", "year": "2026" },
+                    "bin": "400555", "last4": "0019", "brand": "VISA"
+                },
+                "paymentMethodType": "PAYMENT_CARD",
+                "paymentMethodBrand": "VISA"
+            },
+            "terminalId": "98000003",
+            "merchantId": "00000014",
+            "merchantTransactionId": "1c2e11bb-3075-4195-bc95-591789e2b995",
+            "transactionTime": 1_785_447_849_i64,
+            "approvedAmount": { "total": 10.00, "currency": "UYU", "components": { "subtotal": 10.00 } },
+            "transactionAmount": { "total": 10.00, "currency": "UYU", "components": { "subtotal": 10.00 } },
+            "transactionResult": "APPROVED",
+            "approvalCode": "Y:375878:4666242633:PPXX:1107096288",
+            "transactionState": "CAPTURED",
+            "processor": { "referenceNumber": "000000018547", "responseCode": "00" }
+        });
+        let response: FiservemeaPaymentsResponse =
+            serde_json::from_value(raw).expect("real cert sale response must deserialize");
+        // Borrow first (settlement_amount takes &self), then move the status fields into map_status.
+        assert!(response.settlement_amount().is_some());
+        let status = map_status(
+            response.transaction_status,
+            response.transaction_result,
+            response.transaction_type,
+        );
+        assert_eq!(status, common_enums::AttemptStatus::Charged);
+    }
+
+    #[test]
+    fn real_cert_network_token_response_extracts_value() {
+        // Real NETWORK_TOKEN tokenization response (POST /payment-tokens). Verifies the
+        // create-token response struct extracts `paymentToken.value` (the IPG token).
+        let raw = serde_json::json!({
+            "type": "paymentTokenizationResponse",
+            "clientRequestId": "c39278c0-826c-4d59-b450-1285f81b3148",
+            "requestStatus": "SUCCESS",
+            "paymentToken": {
+                "value": "96DCAB40-0110-4821-9230-F852720DCC98",
+                "reusable": true,
+                "declineDuplicates": false,
+                "last4": "3013",
+                "brand": "MASTERCARD",
+                "type": "NETWORK_TOKEN",
+                "networkTokenProvisionStatus": "PROVISIONED"
+            },
+            "orderId": "R-9d34b7b8-09c1-49d4-8009-240ae08a3cf9",
+            "ipgTransactionId": "84681094144"
+        });
+        let response: FiservemeaTokenResponse =
+            serde_json::from_value(raw).expect("real cert token response must deserialize");
+        assert_eq!(
+            response.payment_token.value.peek(),
+            "96DCAB40-0110-4821-9230-F852720DCC98"
+        );
+    }
+
+    #[test]
     fn metadata_missing_field_falls_back_to_frm_metadata_per_field() {
         // `metadata` supplies `installment_interest` but not `installments`; the latter must
         // be filled in independently from `frm_metadata` without the presence of one field in
