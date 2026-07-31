@@ -1124,14 +1124,19 @@ impl<F, T> TryFrom<ResponseRouterData<F, FiservemeaPaymentsResponse, T, Payments
             .authentication_response
             .as_ref()
             .and_then(|auth| auth.to_redirection());
-        let status = if redirection_data.is_some() {
+        let mapped_status = map_status(
+            item.response.transaction_status,
+            item.response.transaction_result,
+            item.response.transaction_type,
+        );
+        // Only treat the payment as awaiting authentication when it carries actionable 3DS
+        // redirect data AND has not already reached a terminal outcome. A terminal response
+        // (e.g. Charged/Failure/Voided) that still echoes `authenticationResponse` must map to
+        // its real status instead of stalling in `AuthenticationPending`.
+        let status = if redirection_data.is_some() && !mapped_status.is_terminal_status() {
             common_enums::AttemptStatus::AuthenticationPending
         } else {
-            map_status(
-                item.response.transaction_status,
-                item.response.transaction_result,
-                item.response.transaction_type,
-            )
+            mapped_status
         };
         // Surface the 3DS authentication outcome (`responseCode3dSecure`) for observability when
         // present. It never influences status (that's `map_status`'s job); it's only attached so

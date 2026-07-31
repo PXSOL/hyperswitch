@@ -64,12 +64,20 @@ fn determine_endpoint(
     connectors: &Connectors,
     test_mode: Option<bool>,
 ) -> CustomResult<String, errors::ConnectorError> {
-    if test_mode.unwrap_or(true) {
-        Ok(connectors
-            .fiservemea
-            .secondary_base_url
-            .clone()
-            .unwrap_or(connectors.fiservemea.base_url.to_string()))
+    // Fail closed in both directions — the wrong endpoint silently mis-routes real money
+    // (a production auth sent to the certification gateway returns APPROVED but never settles):
+    // - An unset `test_mode` defaults to LIVE, so a production account that never set the flag
+    //   is never routed to the certification gateway.
+    // - Test mode requires an explicitly configured `secondary_base_url`; error out rather than
+    //   silently falling back to the production host.
+    if test_mode.unwrap_or(false) {
+        match connectors.fiservemea.secondary_base_url.clone() {
+            Some(url) => Ok(url),
+            None => Err(errors::ConnectorError::InvalidConnectorConfig {
+                config: "fiservemea.secondary_base_url (required when test_mode is enabled)",
+            }
+            .into()),
+        }
     } else {
         Ok(connectors.fiservemea.base_url.to_string())
     }
