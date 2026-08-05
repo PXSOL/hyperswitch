@@ -272,6 +272,8 @@ api_key="API Key"
 
 [fiservemea]
 api_key="API Key"
+key1="Store Id"
+api_secret="API Secret"
 
 [nexixpay]
 api_key="API Key"

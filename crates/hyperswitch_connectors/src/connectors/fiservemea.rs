@@ -8,7 +8,10 @@ use common_utils::{
     errors::CustomResult,
     ext_traits::BytesExt,
     request::{Method, Request, RequestBuilder, RequestContent},
-    types::{AmountConvertor, StringMajorUnit, StringMajorUnitForConnector},
+    types::{
+        AmountConvertor, FloatMajorUnit, FloatMajorUnitForConnector, StringMajorUnit,
+        StringMajorUnitForConnector,
+    },
 };
 use error_stack::{report, ResultExt};
 use hyperswitch_domain_models::{
@@ -17,11 +20,12 @@ use hyperswitch_domain_models::{
         access_token_auth::AccessTokenAuth,
         payments::{Authorize, Capture, PSync, PaymentMethodToken, Session, SetupMandate, Void},
         refunds::{Execute, RSync},
+        CompleteAuthorize,
     },
     router_request_types::{
-        AccessTokenRequestData, PaymentMethodTokenizationData, PaymentsAuthorizeData,
-        PaymentsCancelData, PaymentsCaptureData, PaymentsSessionData, PaymentsSyncData,
-        RefundsData, SetupMandateRequestData,
+        AccessTokenRequestData, CompleteAuthorizeData, PaymentMethodTokenizationData,
+        PaymentsAuthorizeData, PaymentsCancelData, PaymentsCaptureData, PaymentsSessionData,
+        PaymentsSyncData, RefundsData, SetupMandateRequestData,
     },
     router_response_types::{
         ConnectorInfo, PaymentMethodDetails, PaymentsResponseData, RefundsResponseData,
@@ -29,7 +33,8 @@ use hyperswitch_domain_models::{
     },
     types::{
         PaymentsAuthorizeRouterData, PaymentsCancelRouterData, PaymentsCaptureRouterData,
-        PaymentsSyncRouterData, RefundSyncRouterData, RefundsRouterData,
+        PaymentsCompleteAuthorizeRouterData, PaymentsSyncRouterData, RefundSyncRouterData,
+        RefundsRouterData, TokenizationRouterData,
     },
 };
 use hyperswitch_interfaces::{
@@ -55,15 +60,47 @@ use crate::{
     utils::{self, RefundsRequestData as _},
 };
 
+fn determine_endpoint(
+    connectors: &Connectors,
+    test_mode: Option<bool>,
+) -> CustomResult<String, errors::ConnectorError> {
+    // Fail closed in both directions — the wrong endpoint silently mis-routes real money
+    // (a production auth sent to the certification gateway returns APPROVED but never settles):
+    // - An unset `test_mode` defaults to LIVE, so a production account that never set the flag
+    //   is never routed to the certification gateway.
+    // - Test mode requires an explicitly configured `secondary_base_url`; error out rather than
+    //   silently falling back to the production host.
+    if test_mode.unwrap_or(false) {
+        match connectors.fiservemea.secondary_base_url.clone() {
+            Some(url) => Ok(url),
+            None => Err(errors::ConnectorError::InvalidConnectorConfig {
+                config: "fiservemea.secondary_base_url (required when test_mode is enabled)",
+            }
+            .into()),
+        }
+    } else {
+        Ok(connectors.fiservemea.base_url.to_string())
+    }
+}
+
 #[derive(Clone)]
 pub struct Fiservemea {
     amount_converter: &'static (dyn AmountConvertor<Output = StringMajorUnit> + Sync),
+    // fiservemea's request bodies carry amounts as strings (`amount_converter` above), but the
+    // response's `approvedAmount`/`transactionAmount.total` come back as JSON numbers. A
+    // dedicated `FloatMajorUnit` converter lets us feed those response amounts straight into
+    // `get_*_integrity_object` (see `FiservemeaPaymentsResponse::settlement_amount`) without a
+    // lossy string round-trip. This mirrors the dual-converter pattern already used by
+    // `trustpay.rs`.
+    amount_converter_to_float_major_unit:
+        &'static (dyn AmountConvertor<Output = FloatMajorUnit> + Sync),
 }
 
 impl Fiservemea {
     pub fn new() -> &'static Self {
         &Self {
             amount_converter: &StringMajorUnitForConnector,
+            amount_converter_to_float_major_unit: &FloatMajorUnitForConnector,
         }
     }
 
@@ -77,6 +114,7 @@ impl Fiservemea {
         let fiservemea::FiservemeaAuthType {
             api_key,
             secret_key,
+            .. // store_id is sent in the request body / sync query, not in the HMAC signature
         } = auth;
         let raw_signature = format!("{}{request_id}{timestamp}{payload}", api_key.peek());
 
@@ -92,6 +130,7 @@ impl api::PaymentSession for Fiservemea {}
 impl api::ConnectorAccessToken for Fiservemea {}
 impl api::MandateSetup for Fiservemea {}
 impl api::PaymentAuthorize for Fiservemea {}
+impl api::PaymentsCompleteAuthorize for Fiservemea {}
 impl api::PaymentSync for Fiservemea {}
 impl api::PaymentCapture for Fiservemea {}
 impl api::PaymentVoid for Fiservemea {}
@@ -104,24 +143,173 @@ impl ConnectorIntegration<Session, PaymentsSessionData, PaymentsResponseData> fo
 
 impl ConnectorIntegration<AccessTokenAuth, AccessTokenRequestData, AccessToken> for Fiservemea {}
 
+// Zero Auth (account verification): mapped to Hyperswitch's SetupMandate flow. Sends a
+// zero-amount `PaymentCardSaleTransaction` to `/payments` (vendor doc Parte 3 §Zero Auth).
 impl ConnectorIntegration<SetupMandate, SetupMandateRequestData, PaymentsResponseData>
     for Fiservemea
 {
+    fn get_headers(
+        &self,
+        req: &RouterData<SetupMandate, SetupMandateRequestData, PaymentsResponseData>,
+        connectors: &Connectors,
+    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+        self.build_headers(req, connectors)
+    }
+
+    fn get_content_type(&self) -> &'static str {
+        self.common_get_content_type()
+    }
+
+    fn get_url(
+        &self,
+        req: &RouterData<SetupMandate, SetupMandateRequestData, PaymentsResponseData>,
+        connectors: &Connectors,
+    ) -> CustomResult<String, errors::ConnectorError> {
+        Ok(format!(
+            "{}/payments",
+            determine_endpoint(connectors, req.test_mode)?
+        ))
+    }
+
+    fn get_request_body(
+        &self,
+        req: &RouterData<SetupMandate, SetupMandateRequestData, PaymentsResponseData>,
+        _connectors: &Connectors,
+    ) -> CustomResult<RequestContent, errors::ConnectorError> {
+        let connector_req = fiservemea::FiservemeaPaymentsRequest::try_from(req)?;
+        Ok(RequestContent::Json(Box::new(connector_req)))
+    }
+
     fn build_request(
         &self,
-        _req: &RouterData<SetupMandate, SetupMandateRequestData, PaymentsResponseData>,
-        _connectors: &Connectors,
+        req: &RouterData<SetupMandate, SetupMandateRequestData, PaymentsResponseData>,
+        connectors: &Connectors,
     ) -> CustomResult<Option<Request>, errors::ConnectorError> {
-        Err(
-            errors::ConnectorError::NotImplemented("Setup Mandate flow for Fiservemea".to_string())
-                .into(),
-        )
+        Ok(Some(
+            RequestBuilder::new()
+                .method(Method::Post)
+                .url(&types::SetupMandateType::get_url(self, req, connectors)?)
+                .attach_default_headers()
+                .headers(types::SetupMandateType::get_headers(self, req, connectors)?)
+                .set_body(types::SetupMandateType::get_request_body(
+                    self, req, connectors,
+                )?)
+                .build(),
+        ))
+    }
+
+    fn handle_response(
+        &self,
+        data: &RouterData<SetupMandate, SetupMandateRequestData, PaymentsResponseData>,
+        event_builder: Option<&mut ConnectorEvent>,
+        res: Response,
+    ) -> CustomResult<
+        RouterData<SetupMandate, SetupMandateRequestData, PaymentsResponseData>,
+        errors::ConnectorError,
+    > {
+        let response: fiservemea::FiservemeaPaymentsResponse = res
+            .response
+            .parse_struct("Fiservemea SetupMandateResponse")
+            .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+        event_builder.map(|i| i.set_response_body(&response));
+        router_env::logger::info!(connector_response=?response);
+        RouterData::try_from(ResponseRouterData {
+            response,
+            data: data.clone(),
+            http_code: res.status_code,
+        })
+    }
+
+    fn get_error_response(
+        &self,
+        res: Response,
+        event_builder: Option<&mut ConnectorEvent>,
+    ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
+        self.build_error_response(res, event_builder)
     }
 }
 
+// IPG gateway tokenization (Card-on-File): creates a reusable token via `POST /payment-tokens`
+// (a different endpoint than `/payments`); the token is then used by the Authorize flow.
 impl ConnectorIntegration<PaymentMethodToken, PaymentMethodTokenizationData, PaymentsResponseData>
     for Fiservemea
 {
+    fn get_headers(
+        &self,
+        req: &TokenizationRouterData,
+        connectors: &Connectors,
+    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+        self.build_headers(req, connectors)
+    }
+
+    fn get_content_type(&self) -> &'static str {
+        self.common_get_content_type()
+    }
+
+    fn get_url(
+        &self,
+        req: &TokenizationRouterData,
+        connectors: &Connectors,
+    ) -> CustomResult<String, errors::ConnectorError> {
+        Ok(format!(
+            "{}/payment-tokens",
+            determine_endpoint(connectors, req.test_mode)?
+        ))
+    }
+
+    fn get_request_body(
+        &self,
+        req: &TokenizationRouterData,
+        _connectors: &Connectors,
+    ) -> CustomResult<RequestContent, errors::ConnectorError> {
+        let connector_req = fiservemea::FiservemeaCreateTokenRequest::try_from(req)?;
+        Ok(RequestContent::Json(Box::new(connector_req)))
+    }
+
+    fn build_request(
+        &self,
+        req: &TokenizationRouterData,
+        connectors: &Connectors,
+    ) -> CustomResult<Option<Request>, errors::ConnectorError> {
+        Ok(Some(
+            RequestBuilder::new()
+                .method(Method::Post)
+                .url(&types::TokenizationType::get_url(self, req, connectors)?)
+                .attach_default_headers()
+                .headers(types::TokenizationType::get_headers(self, req, connectors)?)
+                .set_body(types::TokenizationType::get_request_body(
+                    self, req, connectors,
+                )?)
+                .build(),
+        ))
+    }
+
+    fn handle_response(
+        &self,
+        data: &TokenizationRouterData,
+        event_builder: Option<&mut ConnectorEvent>,
+        res: Response,
+    ) -> CustomResult<TokenizationRouterData, errors::ConnectorError> {
+        let response: fiservemea::FiservemeaTokenResponse = res
+            .response
+            .parse_struct("Fiservemea FiservemeaTokenResponse")
+            .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+        event_builder.map(|i| i.set_response_body(&response));
+        router_env::logger::info!(connector_response=?response);
+        RouterData::try_from(ResponseRouterData {
+            response,
+            data: data.clone(),
+            http_code: res.status_code,
+        })
+    }
+
+    fn get_error_response(
+        &self,
+        res: Response,
+        event_builder: Option<&mut ConnectorEvent>,
+    ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
+        self.build_error_response(res, event_builder)
+    }
 }
 
 impl<Flow, Request, Response> ConnectorCommonExt<Flow, Request, Response> for Fiservemea
@@ -279,12 +467,12 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
 
     fn get_url(
         &self,
-        _req: &PaymentsAuthorizeRouterData,
+        req: &PaymentsAuthorizeRouterData,
         connectors: &Connectors,
     ) -> CustomResult<String, errors::ConnectorError> {
         Ok(format!(
-            "{}/ipp/payments-gateway/v2/payments",
-            self.base_url(connectors)
+            "{}/payments",
+            determine_endpoint(connectors, req.test_mode)?
         ))
     }
 
@@ -339,6 +527,127 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
+
+        // Build the authorize integrity object from the REQUESTED amount, not the response's
+        // approved amount. The gateway can approve less than requested (partial authorization);
+        // comparing the approved amount against the request would flag a legitimate partial auth
+        // as an integrity failure (CodeRabbit).
+        let integrity_amount = utils::convert_amount(
+            self.amount_converter_to_float_major_unit,
+            data.request.minor_amount,
+            data.request.currency,
+        )?;
+        let integrity_object = Some(utils::get_authorise_integrity_object(
+            self.amount_converter_to_float_major_unit,
+            integrity_amount,
+            data.request.currency.to_string(),
+        )?);
+
+        let mut router_data = RouterData::try_from(ResponseRouterData {
+            response,
+            data: data.clone(),
+            http_code: res.status_code,
+        })?;
+        router_data.request.integrity_object = integrity_object;
+        Ok(router_data)
+    }
+
+    fn get_error_response(
+        &self,
+        res: Response,
+        event_builder: Option<&mut ConnectorEvent>,
+    ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
+        self.build_error_response(res, event_builder)
+    }
+}
+
+impl ConnectorIntegration<CompleteAuthorize, CompleteAuthorizeData, PaymentsResponseData>
+    for Fiservemea
+{
+    fn get_headers(
+        &self,
+        req: &PaymentsCompleteAuthorizeRouterData,
+        connectors: &Connectors,
+    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+        self.build_headers(req, connectors)
+    }
+
+    fn get_content_type(&self) -> &'static str {
+        self.common_get_content_type()
+    }
+
+    fn get_url(
+        &self,
+        req: &PaymentsCompleteAuthorizeRouterData,
+        connectors: &Connectors,
+    ) -> CustomResult<String, errors::ConnectorError> {
+        // 3DS native continuation is a PATCH on the original transaction created by the
+        // Authorize POST (vendor doc §10.1.4/§10.1.5).
+        let connector_payment_id = req
+            .request
+            .connector_transaction_id
+            .clone()
+            .ok_or(errors::ConnectorError::MissingConnectorTransactionID)?;
+        Ok(format!(
+            "{}/payments/{connector_payment_id}",
+            determine_endpoint(connectors, req.test_mode)?
+        ))
+    }
+
+    fn get_request_body(
+        &self,
+        req: &PaymentsCompleteAuthorizeRouterData,
+        _connectors: &Connectors,
+    ) -> CustomResult<RequestContent, errors::ConnectorError> {
+        let connector_req = fiservemea::FiservemeaCompleteAuthorizeRequest::try_from(req)?;
+        Ok(RequestContent::Json(Box::new(connector_req)))
+    }
+
+    fn build_request(
+        &self,
+        req: &PaymentsCompleteAuthorizeRouterData,
+        connectors: &Connectors,
+    ) -> CustomResult<Option<Request>, errors::ConnectorError> {
+        Ok(Some(
+            RequestBuilder::new()
+                // The IPG continuation uses PATCH; `build_headers` signs the body for PATCH
+                // just like POST (see the `get_http_method` match).
+                .method(Method::Patch)
+                .url(&types::PaymentsCompleteAuthorizeType::get_url(
+                    self, req, connectors,
+                )?)
+                .attach_default_headers()
+                .headers(types::PaymentsCompleteAuthorizeType::get_headers(
+                    self, req, connectors,
+                )?)
+                .set_body(types::PaymentsCompleteAuthorizeType::get_request_body(
+                    self, req, connectors,
+                )?)
+                .build(),
+        ))
+    }
+
+    fn handle_response(
+        &self,
+        data: &PaymentsCompleteAuthorizeRouterData,
+        event_builder: Option<&mut ConnectorEvent>,
+        res: Response,
+    ) -> CustomResult<PaymentsCompleteAuthorizeRouterData, errors::ConnectorError> {
+        let response: fiservemea::FiservemeaPaymentsResponse = res
+            .response
+            .parse_struct("Fiservemea CompleteAuthorizeResponse")
+            .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+        event_builder.map(|i| i.set_response_body(&response));
+        router_env::logger::info!(connector_response=?response);
+        // Reuses the shared response conversion: a second `WAITING` + `params` (challenge
+        // after the method step) yields another `redirection_data` + `AuthenticationPending`;
+        // a terminal response maps to Charged/Authorized/Failure via `map_status`.
+        //
+        // No amount integrity object is set here (unlike Authorize/Capture/PSync/Refund):
+        // `CompleteAuthorizeData` has no `integrity_object` field
+        // (hyperswitch_domain_models::router_request_types::CompleteAuthorizeData), so there is
+        // nowhere to store it. If that field is added upstream, mirror the
+        // `settlement_amount()` -> `get_authorise_integrity_object(...)` block used above.
         RouterData::try_from(ResponseRouterData {
             response,
             data: data.clone(),
@@ -382,9 +691,17 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Fis
             .connector_transaction_id
             .get_connector_transaction_id()
             .change_context(errors::ConnectorError::MissingConnectorTransactionID)?;
+        // The IPG sync (GET) requires the storeId as a query param (vendor doc, e.g.
+        // `/payments/{id}?storeId=...`); the HMAC signature for GET is over an empty body, so
+        // the query param is not part of the signed payload. `store_id` is a non-sensitive
+        // merchant identifier (also sent in request bodies); percent-encode it so the query
+        // string is always well-formed regardless of its contents.
+        let auth = fiservemea::FiservemeaAuthType::try_from(&req.connector_auth_type)?;
+        let store_id: String =
+            url::form_urlencoded::byte_serialize(auth.store_id.peek().as_bytes()).collect();
         Ok(format!(
-            "{}/ipp/payments-gateway/v2/payments/{connector_payment_id}",
-            self.base_url(connectors)
+            "{}/payments/{connector_payment_id}?storeId={store_id}",
+            determine_endpoint(connectors, req.test_mode)?,
         ))
     }
 
@@ -415,11 +732,25 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Fis
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
-        RouterData::try_from(ResponseRouterData {
+
+        let integrity_object = response
+            .settlement_amount()
+            .map(|(amount, currency)| {
+                utils::get_sync_integrity_object(
+                    self.amount_converter_to_float_major_unit,
+                    amount,
+                    currency.to_string(),
+                )
+            })
+            .transpose()?;
+
+        let mut router_data = RouterData::try_from(ResponseRouterData {
             response,
             data: data.clone(),
             http_code: res.status_code,
-        })
+        })?;
+        router_data.request.integrity_object = integrity_object;
+        Ok(router_data)
     }
 
     fn get_error_response(
@@ -451,8 +782,8 @@ impl ConnectorIntegration<Capture, PaymentsCaptureData, PaymentsResponseData> fo
     ) -> CustomResult<String, errors::ConnectorError> {
         let connector_payment_id = req.request.connector_transaction_id.clone();
         Ok(format!(
-            "{}/ipp/payments-gateway/v2/payments/{connector_payment_id}",
-            self.base_url(connectors)
+            "{}/payments/{connector_payment_id}",
+            determine_endpoint(connectors, req.test_mode)?
         ))
     }
 
@@ -504,11 +835,25 @@ impl ConnectorIntegration<Capture, PaymentsCaptureData, PaymentsResponseData> fo
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
-        RouterData::try_from(ResponseRouterData {
+
+        let integrity_object = response
+            .settlement_amount()
+            .map(|(amount, currency)| {
+                utils::get_capture_integrity_object(
+                    self.amount_converter_to_float_major_unit,
+                    Some(amount),
+                    currency.to_string(),
+                )
+            })
+            .transpose()?;
+
+        let mut router_data = RouterData::try_from(ResponseRouterData {
             response,
             data: data.clone(),
             http_code: res.status_code,
-        })
+        })?;
+        router_data.request.integrity_object = integrity_object;
+        Ok(router_data)
     }
 
     fn get_error_response(
@@ -540,8 +885,8 @@ impl ConnectorIntegration<Void, PaymentsCancelData, PaymentsResponseData> for Fi
     ) -> CustomResult<String, errors::ConnectorError> {
         let connector_payment_id = req.request.connector_transaction_id.clone();
         Ok(format!(
-            "{}/ipp/payments-gateway/v2/payments/{connector_payment_id}",
-            self.base_url(connectors)
+            "{}/payments/{connector_payment_id}",
+            determine_endpoint(connectors, req.test_mode)?
         ))
     }
 
@@ -620,8 +965,8 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Fiserve
     ) -> CustomResult<String, errors::ConnectorError> {
         let connector_payment_id = req.request.connector_transaction_id.clone();
         Ok(format!(
-            "{}/ipp/payments-gateway/v2/payments/{connector_payment_id}",
-            self.base_url(connectors)
+            "{}/payments/{connector_payment_id}",
+            determine_endpoint(connectors, req.test_mode)?
         ))
     }
 
@@ -672,11 +1017,25 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Fiserve
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
-        RouterData::try_from(ResponseRouterData {
+
+        let integrity_object = response
+            .settlement_amount()
+            .map(|(amount, currency)| {
+                utils::get_refund_integrity_object(
+                    self.amount_converter_to_float_major_unit,
+                    amount,
+                    currency.to_string(),
+                )
+            })
+            .transpose()?;
+
+        let mut router_data = RouterData::try_from(ResponseRouterData {
             response,
             data: data.clone(),
             http_code: res.status_code,
-        })
+        })?;
+        router_data.request.integrity_object = integrity_object;
+        Ok(router_data)
     }
 
     fn get_error_response(
@@ -711,9 +1070,14 @@ impl ConnectorIntegration<RSync, RefundsData, RefundsResponseData> for Fiserveme
         connectors: &Connectors,
     ) -> CustomResult<String, errors::ConnectorError> {
         let connector_payment_id = req.request.get_connector_refund_id()?;
+        // IPG refund-sync (GET) also needs the storeId query param (see PSync note above);
+        // percent-encode it for a well-formed query string.
+        let auth = fiservemea::FiservemeaAuthType::try_from(&req.connector_auth_type)?;
+        let store_id: String =
+            url::form_urlencoded::byte_serialize(auth.store_id.peek().as_bytes()).collect();
         Ok(format!(
-            "{}/ipp/payments-gateway/v2/payments/{connector_payment_id}",
-            self.base_url(connectors)
+            "{}/payments/{connector_payment_id}?storeId={store_id}",
+            determine_endpoint(connectors, req.test_mode)?,
         ))
     }
 
@@ -747,11 +1111,25 @@ impl ConnectorIntegration<RSync, RefundsData, RefundsResponseData> for Fiserveme
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
-        RouterData::try_from(ResponseRouterData {
+
+        let integrity_object = response
+            .settlement_amount()
+            .map(|(amount, currency)| {
+                utils::get_refund_integrity_object(
+                    self.amount_converter_to_float_major_unit,
+                    amount,
+                    currency.to_string(),
+                )
+            })
+            .transpose()?;
+
+        let mut router_data = RouterData::try_from(ResponseRouterData {
             response,
             data: data.clone(),
             http_code: res.status_code,
-        })
+        })?;
+        router_data.request.integrity_object = integrity_object;
+        Ok(router_data)
     }
 
     fn get_error_response(
@@ -819,7 +1197,7 @@ static FISERVEMEA_SUPPORTED_PAYMENT_METHODS: LazyLock<SupportedPaymentMethods> =
                 specific_features: Some(
                     api_models::feature_matrix::PaymentMethodSpecificFeatures::Card({
                         api_models::feature_matrix::CardSpecificFeatures {
-                            three_ds: common_enums::FeatureStatus::NotSupported,
+                            three_ds: common_enums::FeatureStatus::Supported,
                             no_three_ds: common_enums::FeatureStatus::Supported,
                             supported_card_networks: supported_card_network.clone(),
                         }
@@ -838,7 +1216,7 @@ static FISERVEMEA_SUPPORTED_PAYMENT_METHODS: LazyLock<SupportedPaymentMethods> =
                 specific_features: Some(
                     api_models::feature_matrix::PaymentMethodSpecificFeatures::Card({
                         api_models::feature_matrix::CardSpecificFeatures {
-                            three_ds: common_enums::FeatureStatus::NotSupported,
+                            three_ds: common_enums::FeatureStatus::Supported,
                             no_three_ds: common_enums::FeatureStatus::Supported,
                             supported_card_networks: supported_card_network.clone(),
                         }

@@ -1200,7 +1200,6 @@ default_imp_for_complete_authorize!(
     connectors::Elavon,
     connectors::Facilitapay,
     connectors::Fiserv,
-    connectors::Fiservemea,
     connectors::Fiuu,
     connectors::Flexiti,
     connectors::Forte,
