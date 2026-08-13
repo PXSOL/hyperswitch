@@ -46,11 +46,11 @@ use hyperswitch_interfaces::{
     errors::ConnectorError,
     events::connector_api_logs::ConnectorEvent,
     types::Response,
-    webhooks::{IncomingWebhook, IncomingWebhookRequestDetails},
+    webhooks::{IncomingWebhook, IncomingWebhookRequestDetails, WebhookContext},
 };
 #[cfg(feature = "payouts")]
-use masking::PeekInterface;
-use masking::{Mask as _, Maskable};
+use hyperswitch_masking::PeekInterface;
+use hyperswitch_masking::{Mask as _, Maskable};
 #[cfg(feature = "payouts")]
 use router_env::{instrument, tracing};
 
@@ -84,8 +84,6 @@ where
         req: &RouterData<Flow, Request, Response>,
         _connectors: &Connectors,
     ) -> CustomResult<Vec<(String, Maskable<String>)>, ConnectorError> {
-        use masking::Mask as _;
-
         let mut header = vec![(
             headers::CONTENT_TYPE.to_string(),
             PayoutQuoteType::get_content_type(self).to_string().into(),
@@ -146,6 +144,7 @@ impl ConnectorCommon for Wise {
                         reason: None,
                         attempt_status: None,
                         connector_transaction_id: None,
+                        connector_response_reference_id: None,
                         network_advice_code: None,
                         network_decline_code: None,
                         network_error_message: None,
@@ -159,6 +158,7 @@ impl ConnectorCommon for Wise {
                         reason: None,
                         attempt_status: None,
                         connector_transaction_id: None,
+                        connector_response_reference_id: None,
                         network_advice_code: None,
                         network_decline_code: None,
                         network_error_message: None,
@@ -173,6 +173,7 @@ impl ConnectorCommon for Wise {
                 reason: None,
                 attempt_status: None,
                 connector_transaction_id: None,
+                connector_response_reference_id: None,
                 network_advice_code: None,
                 network_decline_code: None,
                 network_error_message: None,
@@ -327,6 +328,7 @@ impl ConnectorIntegration<PoCancel, PayoutsData, PayoutsResponseData> for Wise {
             reason: None,
             attempt_status: None,
             connector_transaction_id: None,
+            connector_response_reference_id: None,
             network_advice_code: None,
             network_decline_code: None,
             network_error_message: None,
@@ -756,6 +758,16 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Wise {}
 
 impl ConnectorIntegration<RSync, RefundsData, RefundsResponseData> for Wise {}
 
+#[cfg(feature = "payouts")]
+fn is_setup_webhook_event(request: &IncomingWebhookRequestDetails<'_>) -> bool {
+    let test_webhook_header = request
+        .headers
+        .get("X-Test-Notification")
+        .and_then(|header_value| String::from_utf8(header_value.as_bytes().to_vec()).ok());
+
+    test_webhook_header == Some("true".to_string())
+}
+
 #[async_trait::async_trait]
 impl IncomingWebhook for Wise {
     fn get_webhook_source_verification_algorithm(
@@ -830,9 +842,14 @@ impl IncomingWebhook for Wise {
         &self,
         #[cfg(feature = "payouts")] request: &IncomingWebhookRequestDetails<'_>,
         #[cfg(not(feature = "payouts"))] _request: &IncomingWebhookRequestDetails<'_>,
+        _context: Option<&WebhookContext>,
     ) -> CustomResult<IncomingWebhookEvent, ConnectorError> {
         #[cfg(feature = "payouts")]
         {
+            if is_setup_webhook_event(request) {
+                return Ok(IncomingWebhookEvent::SetupWebhook);
+            }
+
             let payload: wise::WisePayoutsWebhookBody = request
                 .body
                 .parse_struct("WisePayoutsWebhookBody")
@@ -852,7 +869,7 @@ impl IncomingWebhook for Wise {
         &self,
         #[cfg(feature = "payouts")] request: &IncomingWebhookRequestDetails<'_>,
         #[cfg(not(feature = "payouts"))] _request: &IncomingWebhookRequestDetails<'_>,
-    ) -> CustomResult<Box<dyn masking::ErasedMaskSerialize>, ConnectorError> {
+    ) -> CustomResult<Box<dyn hyperswitch_masking::ErasedMaskSerialize>, ConnectorError> {
         #[cfg(feature = "payouts")]
         {
             let payload: wise::WisePayoutsWebhookBody = request

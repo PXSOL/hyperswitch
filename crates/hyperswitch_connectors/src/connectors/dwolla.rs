@@ -27,8 +27,8 @@ use hyperswitch_domain_models::{
         PaymentsSyncData, RefundsData, ResponseId, SetupMandateRequestData,
     },
     router_response_types::{
-        ConnectorInfo, PaymentMethodDetails, PaymentsResponseData, RefundsResponseData,
-        SupportedPaymentMethods, SupportedPaymentMethodsExt,
+        ConnectorCustomerResponseData, ConnectorInfo, PaymentMethodDetails, PaymentsResponseData,
+        RefundsResponseData, SupportedPaymentMethods, SupportedPaymentMethodsExt,
     },
     types::{
         ConnectorCustomerRouterData, PaymentsAuthorizeRouterData, PaymentsSyncRouterData,
@@ -46,7 +46,7 @@ use hyperswitch_interfaces::{
     types::{self, RefreshTokenType, Response, TokenizationType},
     webhooks,
 };
-use masking::{ExposeInterface, Mask, Secret};
+use hyperswitch_masking::{ExposeInterface, Mask, Secret};
 use ring::hmac;
 use transformers as dwolla;
 use transformers::extract_token_from_body;
@@ -92,7 +92,8 @@ where
         &self,
         req: &RouterData<Flow, Request, Response>,
         _connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         let access_token = req
             .access_token
             .clone()
@@ -154,13 +155,13 @@ impl ConnectorCommon for Dwolla {
             code: response.code,
             message: response.message,
             reason: response
-                ._embedded
+                .embedded
                 .as_ref()
-                .and_then(|errors_vec| errors_vec.first())
-                .and_then(|details| details.errors.first())
-                .and_then(|err_detail| err_detail.message.clone()),
+                .and_then(|errors_vec| errors_vec.errors.first())
+                .and_then(|details| details.message.clone()),
             attempt_status: None,
             connector_transaction_id: None,
+            connector_response_reference_id: None,
             network_advice_code: None,
             network_decline_code: None,
             network_error_message: None,
@@ -190,7 +191,8 @@ impl ConnectorIntegration<AccessTokenAuth, AccessTokenRequestData, AccessToken> 
         &self,
         req: &RefreshTokenRouterData,
         _connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         let auth = dwolla::DwollaAuthType::try_from(&req.connector_auth_type)?;
         let mut headers = vec![(
             headers::CONTENT_TYPE.to_string(),
@@ -285,7 +287,8 @@ impl ConnectorIntegration<CreateConnectorCustomer, ConnectorCustomerData, Paymen
         &self,
         req: &ConnectorCustomerRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.build_headers(req, connectors)
     }
 
@@ -346,9 +349,9 @@ impl ConnectorIntegration<CreateConnectorCustomer, ConnectorCustomerData, Paymen
 
         Ok(RouterData {
             connector_customer: Some(connector_customer_id.clone()),
-            response: Ok(PaymentsResponseData::ConnectorCustomerResponse {
-                connector_customer_id,
-            }),
+            response: Ok(PaymentsResponseData::ConnectorCustomerResponse(
+                ConnectorCustomerResponseData::new_with_customer_id(connector_customer_id),
+            )),
             ..data.clone()
         })
     }
@@ -369,7 +372,8 @@ impl ConnectorIntegration<PaymentMethodToken, PaymentMethodTokenizationData, Pay
         &self,
         req: &TokenizationRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.build_headers(req, connectors)
     }
 
@@ -466,13 +470,13 @@ impl ConnectorIntegration<PaymentMethodToken, PaymentMethodTokenizationData, Pay
                     code: response.code,
                     message: response.message,
                     reason: response
-                        ._embedded
+                        .embedded
                         .as_ref()
-                        .and_then(|errors_vec| errors_vec.first())
-                        .and_then(|details| details.errors.first())
-                        .and_then(|err_detail| err_detail.message.clone()),
+                        .and_then(|errors_vec| errors_vec.errors.first())
+                        .and_then(|details| details.message.clone()),
                     attempt_status: None,
                     connector_transaction_id: None,
+                    connector_response_reference_id: None,
                     network_advice_code: None,
                     network_decline_code: None,
                     network_error_message: None,
@@ -491,7 +495,8 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         &self,
         req: &PaymentsAuthorizeRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.build_headers(req, connectors)
     }
 
@@ -584,8 +589,10 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
                 mandate_reference: Box::new(None),
                 connector_metadata,
                 network_txn_id: None,
+                network_txn_link_id: None,
                 connector_response_reference_id: Some(payment_id.clone()),
                 incremental_authorization_allowed: None,
+                authentication_data: None,
                 charges: None,
             }),
             amount_captured: Some(data.request.amount),
@@ -607,7 +614,8 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Dwo
         &self,
         req: &PaymentsSyncRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.build_headers(req, connectors)
     }
 
@@ -688,7 +696,8 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Dwolla 
         &self,
         req: &RefundsRouterData<Execute>,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.build_headers(req, connectors)
     }
 
@@ -788,7 +797,8 @@ impl ConnectorIntegration<RSync, RefundsData, RefundsResponseData> for Dwolla {
         &self,
         req: &RefundSyncRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.build_headers(req, connectors)
     }
 
@@ -936,6 +946,7 @@ impl webhooks::IncomingWebhook for Dwolla {
     fn get_webhook_event_type(
         &self,
         request: &webhooks::IncomingWebhookRequestDetails<'_>,
+        _context: Option<&webhooks::WebhookContext>,
     ) -> CustomResult<api_models::webhooks::IncomingWebhookEvent, errors::ConnectorError> {
         let details: dwolla::DwollaWebhookDetails = request
             .body
@@ -949,7 +960,8 @@ impl webhooks::IncomingWebhook for Dwolla {
     fn get_webhook_resource_object(
         &self,
         request: &webhooks::IncomingWebhookRequestDetails<'_>,
-    ) -> CustomResult<Box<dyn masking::ErasedMaskSerialize>, errors::ConnectorError> {
+    ) -> CustomResult<Box<dyn hyperswitch_masking::ErasedMaskSerialize>, errors::ConnectorError>
+    {
         let details: dwolla::DwollaWebhookDetails = request
             .body
             .parse_struct("DwollaWebhookDetails")
@@ -984,7 +996,7 @@ static DWOLLA_CONNECTOR_INFO: ConnectorInfo = ConnectorInfo {
     display_name: "Dwolla",
     description: "Dwolla is a multinational financial technology company offering financial services and software as a service (SaaS)",
     connector_type: enums::HyperswitchConnectorCategory::PaymentGateway,
-    integration_status: enums::ConnectorIntegrationStatus::Beta,
+    integration_status: enums::ConnectorIntegrationStatus::Sandbox,
 };
 
 static DWOLLA_SUPPORTED_WEBHOOK_FLOWS: [enums::EventClass; 2] =
@@ -1001,5 +1013,13 @@ impl ConnectorSpecifications for Dwolla {
 
     fn get_supported_webhook_flows(&self) -> Option<&'static [enums::EventClass]> {
         Some(&DWOLLA_SUPPORTED_WEBHOOK_FLOWS)
+    }
+
+    fn should_call_connector_customer(
+        &self,
+        #[cfg(feature = "v1")]
+        _payment_attempt: &hyperswitch_domain_models::payments::payment_attempt::PaymentAttempt,
+    ) -> api::ConnectorCustomerAction {
+        api::ConnectorCustomerAction::CallConnectorCustomer
     }
 }

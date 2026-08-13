@@ -24,7 +24,7 @@ use hyperswitch_domain_models::{
     types as recovery_router_data_types,
 };
 use hyperswitch_interfaces::errors;
-use masking::Secret;
+use hyperswitch_masking::Secret;
 use serde::{Deserialize, Serialize};
 use time::PrimitiveDateTime;
 
@@ -155,8 +155,10 @@ impl<F, T> TryFrom<ResponseRouterData<F, StripebillingPaymentsResponse, T, Payme
                 mandate_reference: Box::new(None),
                 connector_metadata: None,
                 network_txn_id: None,
+                network_txn_link_id: None,
                 connector_response_reference_id: None,
                 incremental_authorization_allowed: None,
+                authentication_data: None,
                 charges: None,
             }),
             ..item.data
@@ -423,6 +425,8 @@ impl TryFrom<StripebillingInvoiceBody> for revenue_recovery::RevenueRecoveryInvo
             next_billing_at,
             billing_started_at,
             metadata: None,
+            // TODO! This field should be handled for billing connnector integrations
+            enable_partial_authorization: None,
         })
     }
 }
@@ -506,7 +510,7 @@ pub enum StripebillingChargeStatus {
 #[cfg(all(feature = "v2", feature = "revenue_recovery"))]
 // This is the default hard coded mca Id to find the stripe account associated with the stripe biliing
 // Context : Since we dont have the concept of connector_reference_id in stripebilling because payments always go through stripe.
-// While creating stripebilling we will hard code the stripe account id to string "stripebilling" in mca featrue metadata. So we have to pass the same as account_reference_id here in response.
+// While creating stripebilling we will hard code the stripe account id to string "stripebilling" in mca feature metadata. So we have to pass the same as account_reference_id here in response.
 const MCA_ID_IDENTIFIER_FOR_STRIPE_IN_STRIPEBILLING_MCA_FEAATURE_METADATA: &str = "stripebilling";
 
 #[cfg(all(feature = "v2", feature = "revenue_recovery"))]
@@ -572,6 +576,7 @@ impl
                         card_issuer: None,
                         card_type: None,
                         card_issuing_country: None,
+                        card_issuing_country_code: None,
                         bank_code: None,
                         last4: None,
                         card_extended_bin: None,
@@ -582,6 +587,7 @@ impl
                         authentication_data: None,
                         is_regulated: None,
                         signature_network: None,
+                        auth_code: None,
                     },
                 },
             ),

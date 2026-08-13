@@ -14,7 +14,7 @@ use crate::{
 #[cfg(feature = "v1")]
 pub async fn upsert_surcharge_decision_config(
     state: SessionState,
-    merchant_context: domain::MerchantContext,
+    processor: domain::Processor,
     request: SurchargeDecisionConfigReq,
 ) -> RouterResponse<SurchargeDecisionManagerRecord> {
     use common_utils::ext_traits::{Encode, OptionExt, ValueExt};
@@ -36,8 +36,8 @@ pub async fn upsert_surcharge_decision_config(
     let merchant_surcharge_configs = request.merchant_surcharge_configs;
 
     let timestamp = common_utils::date_time::now_unix_timestamp();
-    let mut algo_id: api_models::routing::RoutingAlgorithmRef = merchant_context
-        .get_merchant_account()
+    let mut algo_id: api_models::routing::RoutingAlgorithmRef = processor
+        .get_account()
         .routing_algorithm
         .clone()
         .map(|val| val.parse_value("routing algorithm"))
@@ -46,8 +46,8 @@ pub async fn upsert_surcharge_decision_config(
         .attach_printable("Could not decode the routing algorithm")?
         .unwrap_or_default();
 
-    let key = merchant_context
-        .get_merchant_account()
+    let key = processor
+        .get_account()
         .get_id()
         .get_payment_method_surcharge_routing_id();
     let read_config_key = db.find_config_by_key(&key).await;
@@ -57,10 +57,7 @@ pub async fn upsert_surcharge_decision_config(
             message: "Invalid Request Data".to_string(),
         })
         .attach_printable("The Request has an Invalid Comparison")?;
-    let surcharge_cache_key = merchant_context
-        .get_merchant_account()
-        .get_id()
-        .get_surcharge_dsk_key();
+    let surcharge_cache_key = processor.get_account().get_id().get_surcharge_dsk_key();
     match read_config_key {
         Ok(config) => {
             let previous_record: SurchargeDecisionManagerRecord = config
@@ -95,7 +92,7 @@ pub async fn upsert_surcharge_decision_config(
             let config_key = cache::CacheKind::Surcharge(surcharge_cache_key.into());
             update_merchant_active_algorithm_ref(
                 &state,
-                merchant_context.get_merchant_key_store(),
+                processor.get_key_store(),
                 config_key,
                 algo_id,
             )
@@ -137,7 +134,7 @@ pub async fn upsert_surcharge_decision_config(
             let config_key = cache::CacheKind::Surcharge(surcharge_cache_key.into());
             update_merchant_active_algorithm_ref(
                 &state,
-                merchant_context.get_merchant_key_store(),
+                processor.get_key_store(),
                 config_key,
                 algo_id,
             )
@@ -156,7 +153,7 @@ pub async fn upsert_surcharge_decision_config(
 #[cfg(feature = "v2")]
 pub async fn upsert_surcharge_decision_config(
     _state: SessionState,
-    _merchant_context: domain::MerchantContext,
+    _processor: domain::Processor,
     _request: SurchargeDecisionConfigReq,
 ) -> RouterResponse<SurchargeDecisionManagerRecord> {
     todo!();
@@ -165,7 +162,7 @@ pub async fn upsert_surcharge_decision_config(
 #[cfg(feature = "v1")]
 pub async fn delete_surcharge_decision_config(
     state: SessionState,
-    merchant_context: domain::MerchantContext,
+    processor: domain::Processor,
 ) -> RouterResponse<()> {
     use common_utils::ext_traits::ValueExt;
     use storage_impl::redis::cache;
@@ -173,12 +170,12 @@ pub async fn delete_surcharge_decision_config(
     use super::routing::helpers::update_merchant_active_algorithm_ref;
 
     let db = state.store.as_ref();
-    let key = merchant_context
-        .get_merchant_account()
+    let key = processor
+        .get_account()
         .get_id()
         .get_payment_method_surcharge_routing_id();
-    let mut algo_id: api_models::routing::RoutingAlgorithmRef = merchant_context
-        .get_merchant_account()
+    let mut algo_id: api_models::routing::RoutingAlgorithmRef = processor
+        .get_account()
         .routing_algorithm
         .clone()
         .map(|value| value.parse_value("routing algorithm"))
@@ -187,20 +184,12 @@ pub async fn delete_surcharge_decision_config(
         .attach_printable("Could not decode the surcharge conditional_config algorithm")?
         .unwrap_or_default();
     algo_id.surcharge_config_algo_id = None;
-    let surcharge_cache_key = merchant_context
-        .get_merchant_account()
-        .get_id()
-        .get_surcharge_dsk_key();
+    let surcharge_cache_key = processor.get_account().get_id().get_surcharge_dsk_key();
     let config_key = cache::CacheKind::Surcharge(surcharge_cache_key.into());
-    update_merchant_active_algorithm_ref(
-        &state,
-        merchant_context.get_merchant_key_store(),
-        config_key,
-        algo_id,
-    )
-    .await
-    .change_context(errors::ApiErrorResponse::InternalServerError)
-    .attach_printable("Failed to update deleted algorithm ref")?;
+    update_merchant_active_algorithm_ref(&state, processor.get_key_store(), config_key, algo_id)
+        .await
+        .change_context(errors::ApiErrorResponse::InternalServerError)
+        .attach_printable("Failed to update deleted algorithm ref")?;
 
     db.delete_config_by_key(&key)
         .await
@@ -212,18 +201,18 @@ pub async fn delete_surcharge_decision_config(
 #[cfg(feature = "v2")]
 pub async fn delete_surcharge_decision_config(
     _state: SessionState,
-    _merchant_context: domain::MerchantContext,
+    _processor: domain::Processor,
 ) -> RouterResponse<()> {
     todo!()
 }
 
 pub async fn retrieve_surcharge_decision_config(
     state: SessionState,
-    merchant_context: domain::MerchantContext,
+    processor: domain::Processor,
 ) -> RouterResponse<SurchargeDecisionManagerResponse> {
     let db = state.store.as_ref();
-    let algorithm_id = merchant_context
-        .get_merchant_account()
+    let algorithm_id = processor
+        .get_account()
         .get_id()
         .get_payment_method_surcharge_routing_id();
     let algo_config = db

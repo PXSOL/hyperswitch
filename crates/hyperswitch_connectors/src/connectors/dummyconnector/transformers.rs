@@ -11,7 +11,7 @@ use hyperswitch_domain_models::{
     types::{PaymentsAuthorizeRouterData, RefundsRouterData},
 };
 use hyperswitch_interfaces::errors::ConnectorError;
-use masking::Secret;
+use hyperswitch_masking::Secret;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -210,8 +210,8 @@ impl<const T: u8> TryFrom<&DummyConnectorRouterData<&PaymentsAuthorizeRouterData
                     UpiData::UpiCollect(data) => Ok(DummyPaymentMethodData::Upi(
                         DummyConnectorUpi::try_from(data.clone())?,
                     )),
-                    UpiData::UpiIntent(_) => {
-                        Err(ConnectorError::NotImplemented("UPI Intent".to_string()).into())
+                    UpiData::UpiIntent(_) | UpiData::UpiQr(_) => {
+                        Err(ConnectorError::NotImplemented("UPI flow".to_string()).into())
                     }
                 },
                 PaymentMethodData::Wallet(ref wallet_data) => Ok(DummyPaymentMethodData::Wallet(
@@ -314,8 +314,10 @@ impl<F, T> TryFrom<ResponseRouterData<F, PaymentsResponse, T, PaymentsResponseDa
                 mandate_reference: Box::new(None),
                 connector_metadata: None,
                 network_txn_id: None,
+                network_txn_link_id: None,
                 connector_response_reference_id: None,
                 incremental_authorization_allowed: None,
+                authentication_data: None,
                 charges: None,
             }),
             ..item.data

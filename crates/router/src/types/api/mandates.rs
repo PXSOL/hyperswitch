@@ -45,7 +45,6 @@ impl MandateResponseExt for MandateResponse {
         let db = &*state.store;
         let payment_method = db
             .find_payment_method(
-                &(state.into()),
                 &key_store,
                 &mandate.payment_method_id,
                 merchant_account.storage_scheme,
@@ -59,30 +58,42 @@ impl MandateResponseExt for MandateResponse {
             .change_context(errors::ApiErrorResponse::PaymentMethodNotFound)
             .attach_printable("payment_method not found")?;
 
+        let customer_id = payment_method
+            .customer_id
+            .clone()
+            .get_required_value("customer_id")
+            .change_context(errors::ApiErrorResponse::CustomerNotFound)
+            .attach_printable("Missing customer_id in domain payment method")?;
+
         let card = if pm == storage_enums::PaymentMethod::Card {
             // if locker is disabled , decrypt the payment method data
             let card_details = if state.conf.locker.locker_enabled {
                 let card = payment_methods::cards::get_card_from_locker(
                     state,
-                    &payment_method.customer_id,
+                    &customer_id,
                     &payment_method.merchant_id,
                     payment_method
                         .locker_id
                         .as_ref()
                         .unwrap_or(payment_method.get_id()),
                 )
-                .await?;
+                .await?
+                .get_card();
 
                 payment_methods::transformers::get_card_detail(&payment_method, card)
                     .change_context(errors::ApiErrorResponse::InternalServerError)
                     .attach_printable("Failed while getting card details")?
             } else {
-                let merchant_context = domain::MerchantContext::NormalMerchant(Box::new(
-                    domain::Context(merchant_account.clone(), key_store),
-                ));
+                let platform = domain::Platform::new(
+                    merchant_account.clone(),
+                    key_store.clone(),
+                    merchant_account.clone(),
+                    key_store,
+                    None,
+                );
                 payment_methods::cards::PmCards {
                     state,
-                    merchant_context: &merchant_context,
+                    provider: platform.get_provider(),
                 }
                 .get_card_details_without_locker_fallback(&payment_method)
                 .await?

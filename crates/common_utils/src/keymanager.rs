@@ -6,13 +6,17 @@ use std::str::FromStr;
 use base64::Engine;
 use error_stack::ResultExt;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
-use masking::{PeekInterface, StrongSecret};
+use hyperswitch_masking::{PeekInterface, StrongSecret};
 use once_cell::sync::OnceCell;
 use router_env::{instrument, logger, tracing};
+use time::OffsetDateTime;
 
+#[cfg(feature = "ext_services_latency")]
+use crate::consts::EXTERNAL_CALL_TAG;
 use crate::{
     consts::{BASE64_ENGINE, TENANT_HEADER},
     errors,
+    external_service::ExternalServiceCall,
     types::keymanager::{
         BatchDecryptDataRequest, DataKeyCreateResponse, DecryptDataRequest,
         EncryptionCreateRequest, EncryptionTransferRequest, GetKeymanagerTenant, KeyManagerState,
@@ -23,7 +27,7 @@ use crate::{
 const CONTENT_TYPE: &str = "Content-Type";
 static ENCRYPTION_API_CLIENT: OnceCell<reqwest::Client> = OnceCell::new();
 static DEFAULT_ENCRYPTION_VERSION: &str = "v1";
-#[cfg(feature = "km_forward_x_request_id")]
+#[cfg(any(feature = "km_forward_x_request_id", feature = "ext_services_latency"))]
 const X_REQUEST_ID: &str = "X-Request-Id";
 
 /// Get keymanager client constructed from the url and state
@@ -72,6 +76,7 @@ pub async fn send_encryption_request<T>(
     url: String,
     method: Method,
     request_body: T,
+    endpoint: &str,
 ) -> errors::CustomResult<reqwest::Response, errors::KeyManagerClientError>
 where
     T: ConvertRaw,
@@ -80,7 +85,10 @@ where
     let url = reqwest::Url::parse(&url)
         .change_context(errors::KeyManagerClientError::UrlEncodingFailed)?;
 
-    client
+    let method_str = method.to_string();
+    let start_time = std::time::Instant::now();
+
+    let response = client
         .request(method, url)
         .json(&ConvertRaw::convert_raw(request_body)?)
         .headers(headers)
@@ -88,7 +96,46 @@ where
         .await
         .change_context(errors::KeyManagerClientError::RequestNotSent(
             "Unable to send request to encryption service".to_string(),
-        ))
+        ))?;
+
+    let elapsed = start_time.elapsed();
+    let latency_ms = elapsed.as_millis();
+    let created_at_timestamp = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    #[cfg(feature = "ext_services_latency")]
+    {
+        let downstream_request_id = response
+            .headers()
+            .get(X_REQUEST_ID)
+            .and_then(|value| value.to_str().ok());
+
+        logger::info!(
+            tag = EXTERNAL_CALL_TAG,
+            operation = endpoint,
+            method = method_str,
+            status_code = response.status().as_u16(),
+            latency_ms = elapsed.as_secs_f64() * 1000.0,
+            downstream_request_id,
+        );
+    }
+
+    if let Some(request_id) = &state.request_id {
+        state
+            .event_emitter
+            .emit_external_service_call(ExternalServiceCall {
+                service_name: "keymanager".to_string(),
+                endpoint: endpoint.to_string(),
+                method: method_str.clone(),
+                request_id: request_id.clone(),
+                status_code: response.status().as_u16(),
+                success: response.status().is_success(),
+                latency_ms,
+                created_at_timestamp,
+            });
+    } else {
+        logger::warn!("KeyManager call made without emitting event: request_id missing");
+    }
+
+    Ok(response)
 }
 
 /// Generic function to call the Keymanager and parse the response back
@@ -103,7 +150,7 @@ where
     T: GetKeymanagerTenant + ConvertRaw + Send + Sync + 'static + Debug,
     R: serde::de::DeserializeOwned,
 {
-    let url = format!("{}/{endpoint}", &state.url);
+    let url = format!("{}/{endpoint}", state.url);
 
     logger::info!(key_manager_request=?request_body);
     let mut header = vec![];
@@ -114,11 +161,11 @@ where
             .change_context(errors::KeyManagerClientError::FailedtoConstructHeader)?,
     ));
     #[cfg(feature = "km_forward_x_request_id")]
-    if let Some(request_id) = state.request_id {
+    if let Some(ref request_id) = state.request_id {
         header.push((
             HeaderName::from_str(X_REQUEST_ID)
                 .change_context(errors::KeyManagerClientError::FailedtoConstructHeader)?,
-            HeaderValue::from_str(request_id.as_hyphenated().to_string().as_str())
+            HeaderValue::from_str(request_id.as_str())
                 .change_context(errors::KeyManagerClientError::FailedtoConstructHeader)?,
         ))
     }
@@ -137,6 +184,7 @@ where
         url,
         method,
         request_body,
+        endpoint,
     )
     .await
     .map_err(|err| err.change_context(errors::KeyManagerClientError::RequestSendFailed))?;
@@ -235,10 +283,19 @@ impl ConvertRaw for TransientBatchDecryptDataRequest {
 pub async fn create_key_in_key_manager(
     state: &KeyManagerState,
     request_body: EncryptionCreateRequest,
-) -> errors::CustomResult<DataKeyCreateResponse, errors::KeyManagerError> {
-    call_encryption_service(state, Method::POST, "key/create", request_body)
-        .await
-        .change_context(errors::KeyManagerError::KeyAddFailed)
+) -> errors::CustomResult<Option<DataKeyCreateResponse>, errors::KeyManagerError> {
+    if !state.is_encryption_service_enabled() {
+        logger::info!(
+            "Encryption service is disabled, skipping key creation for identifier: {:?}",
+            request_body.identifier
+        );
+        Ok(None)
+    } else {
+        call_encryption_service(state, Method::POST, "key/create", request_body)
+            .await
+            .map(Some)
+            .change_context(errors::KeyManagerError::KeyAddFailed)
+    }
 }
 
 /// A function to transfer the key in keymanager
@@ -246,8 +303,17 @@ pub async fn create_key_in_key_manager(
 pub async fn transfer_key_to_key_manager(
     state: &KeyManagerState,
     request_body: EncryptionTransferRequest,
-) -> errors::CustomResult<DataKeyCreateResponse, errors::KeyManagerError> {
-    call_encryption_service(state, Method::POST, "key/transfer", request_body)
-        .await
-        .change_context(errors::KeyManagerError::KeyTransferFailed)
+) -> errors::CustomResult<Option<DataKeyCreateResponse>, errors::KeyManagerError> {
+    if !state.is_encryption_service_enabled() {
+        logger::info!(
+            "Encryption service is disabled, skipping key transfer for identifier: {:?}",
+            request_body.identifier
+        );
+        Ok(None)
+    } else {
+        call_encryption_service(state, Method::POST, "key/transfer", request_body)
+            .await
+            .map(Some)
+            .change_context(errors::KeyManagerError::KeyTransferFailed)
+    }
 }

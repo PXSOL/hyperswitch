@@ -52,7 +52,7 @@ use hyperswitch_interfaces::{
     types::{self, Response},
     webhooks,
 };
-use masking::{ExposeInterface, Mask, PeekInterface};
+use hyperswitch_masking::{ExposeInterface, Mask, PeekInterface};
 use ring::hmac;
 use time::OffsetDateTime;
 use transformers as fiservemea;
@@ -196,7 +196,7 @@ impl Fiservemea {
         &self,
         req: &RouterData<Flow, Req, Res>,
         payload: &str,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
         let timestamp = OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
         let auth = fiservemea::FiservemeaAuthType::try_from(&req.connector_auth_type)?;
         let client_request_id = Uuid::new_v4().to_string();
@@ -243,7 +243,7 @@ impl ConnectorIntegration<SetupMandate, SetupMandateRequestData, PaymentsRespons
         &self,
         req: &RouterData<SetupMandate, SetupMandateRequestData, PaymentsResponseData>,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
         self.build_headers(req, connectors)
     }
 
@@ -329,7 +329,7 @@ impl ConnectorIntegration<PaymentMethodToken, PaymentMethodTokenizationData, Pay
         &self,
         req: &TokenizationRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
         self.build_headers(req, connectors)
     }
 
@@ -411,7 +411,7 @@ where
         &self,
         req: &RouterData<Flow, Request, Response>,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
         let timestamp = OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
         let auth: fiservemea::FiservemeaAuthType =
             fiservemea::FiservemeaAuthType::try_from(&req.connector_auth_type)?;
@@ -495,7 +495,7 @@ impl ConnectorCommon for Fiservemea {
             .secure3d_response
             .as_ref()
             .and_then(fiservemea::FiservemeaSecure3dResponse::to_metadata)
-            .map(masking::Secret::new);
+            .map(hyperswitch_masking::Secret::new);
 
         match response.error {
             Some(error) => {
@@ -534,6 +534,7 @@ impl ConnectorCommon for Fiservemea {
                     },
                     attempt_status: None,
                     connector_transaction_id: connector_transaction_id.clone(),
+                    connector_response_reference_id: None,
                     network_advice_code: network.advice_code,
                     network_decline_code: network.decline_code,
                     network_error_message: network.error_message,
@@ -550,6 +551,7 @@ impl ConnectorCommon for Fiservemea {
                 reason: response.response_type,
                 attempt_status: None,
                 connector_transaction_id,
+                connector_response_reference_id: None,
                 network_advice_code: network.advice_code,
                 network_decline_code: network.decline_code,
                 network_error_message: network.error_message,
@@ -566,7 +568,7 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         &self,
         req: &PaymentsAuthorizeRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
         self.build_headers(req, connectors)
     }
 
@@ -686,7 +688,7 @@ impl ConnectorIntegration<CompleteAuthorize, CompleteAuthorizeData, PaymentsResp
         &self,
         req: &PaymentsCompleteAuthorizeRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
         self.build_headers(req, connectors)
     }
 
@@ -835,7 +837,7 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Fis
         &self,
         req: &PaymentsSyncRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
         self.build_headers(req, connectors)
     }
 
@@ -934,7 +936,7 @@ impl ConnectorIntegration<Capture, PaymentsCaptureData, PaymentsResponseData> fo
         &self,
         req: &PaymentsCaptureRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
         self.build_headers(req, connectors)
     }
 
@@ -1037,7 +1039,7 @@ impl ConnectorIntegration<Void, PaymentsCancelData, PaymentsResponseData> for Fi
         &self,
         req: &PaymentsCancelRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
         self.build_headers(req, connectors)
     }
 
@@ -1117,7 +1119,7 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Fiserve
         &self,
         req: &RefundsRouterData<Execute>,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
         self.build_headers(req, connectors)
     }
 
@@ -1219,7 +1221,7 @@ impl ConnectorIntegration<RSync, RefundsData, RefundsResponseData> for Fiserveme
         &self,
         req: &RefundSyncRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
         self.build_headers(req, connectors)
     }
 
@@ -1322,6 +1324,7 @@ impl webhooks::IncomingWebhook for Fiservemea {
     fn get_webhook_event_type(
         &self,
         _request: &webhooks::IncomingWebhookRequestDetails<'_>,
+        _context: Option<&webhooks::WebhookContext>,
     ) -> CustomResult<api_models::webhooks::IncomingWebhookEvent, errors::ConnectorError> {
         Err(report!(errors::ConnectorError::WebhooksNotImplemented))
     }
@@ -1329,7 +1332,7 @@ impl webhooks::IncomingWebhook for Fiservemea {
     fn get_webhook_resource_object(
         &self,
         _request: &webhooks::IncomingWebhookRequestDetails<'_>,
-    ) -> CustomResult<Box<dyn masking::ErasedMaskSerialize>, errors::ConnectorError> {
+    ) -> CustomResult<Box<dyn hyperswitch_masking::ErasedMaskSerialize>, errors::ConnectorError> {
         Err(report!(errors::ConnectorError::WebhooksNotImplemented))
     }
 }
@@ -1552,9 +1555,9 @@ mod tests {
             payment_method: enums::PaymentMethod::Card,
             connector_auth_type:
                 hyperswitch_domain_models::router_data::ConnectorAuthType::SignatureKey {
-                api_key: masking::Secret::new("apikey".to_string()),
-                key1: masking::Secret::new("5926072901".to_string()),
-                api_secret: masking::Secret::new("apisecret".to_string()),
+                api_key: hyperswitch_masking::Secret::new("apikey".to_string()),
+                key1: hyperswitch_masking::Secret::new("5926072901".to_string()),
+                api_secret: hyperswitch_masking::Secret::new("apisecret".to_string()),
             },
             description: None,
             address: hyperswitch_domain_models::payment_address::PaymentAddress::default(),
@@ -1599,6 +1602,12 @@ mod tests {
             psd2_sca_exemption_type: None,
             raw_connector_response: None,
             is_payment_id_from_merchant: None,
+            payment_method_type: None,
+            payout_id: None,
+            authorized_amount: None,
+            customer_document_details: None,
+            feature_data: None,
+            sender_payment_instrument_id: None,
         }
     }
 

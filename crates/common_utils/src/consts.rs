@@ -1,5 +1,8 @@
 //! Commonly used constants
 
+/// Structured log tag for external service latency events.
+pub const EXTERNAL_CALL_TAG: &str = "ExternalCall";
+
 /// Number of characters in a generated ID
 pub const ID_LENGTH: usize = 20;
 
@@ -46,6 +49,12 @@ pub fn default_payouts_list_limit() -> u32 {
 /// surcharge percentage maximum precision length
 pub const SURCHARGE_PERCENTAGE_PRECISION_LENGTH: u8 = 2;
 
+/// discount percentage maximum precision length
+pub const DISCOUNT_PERCENTAGE_PRECISION_LENGTH: u8 = 2;
+
+/// installment interest rate maximum precision length
+pub const INSTALLMENT_INTEREST_RATE_PRECISION_LENGTH: u8 = 2;
+
 /// Header Key for application overhead of a request
 pub const X_HS_LATENCY: &str = "x-hs-latency";
 
@@ -89,14 +98,22 @@ pub const MAX_GLOBAL_ID_LENGTH: u8 = 64;
 pub const MIN_REQUIRED_MERCHANT_REFERENCE_ID_LENGTH: u8 = 1;
 
 /// Length of a cell identifier in a distributed system
-pub const CELL_IDENTIFIER_LENGTH: u8 = 5;
+pub const CELL_IDENTIFIER_LENGTH: u8 = 2;
 
 /// General purpose base64 engine
 pub const BASE64_ENGINE: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+/// General purpose base64 engine standard nopad
+pub const BASE64_ENGINE_STD_NO_PAD: base64::engine::GeneralPurpose =
+    base64::engine::general_purpose::STANDARD_NO_PAD;
 
 /// URL Safe base64 engine
 pub const BASE64_ENGINE_URL_SAFE: base64::engine::GeneralPurpose =
     base64::engine::general_purpose::URL_SAFE;
+
+/// URL Safe base64 engine without padding
+pub const BASE64_ENGINE_URL_SAFE_NO_PAD: base64::engine::GeneralPurpose =
+    base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
 /// Regex for matching a domain
 /// Eg -
 /// http://www.example.com
@@ -116,6 +133,9 @@ pub const WILDCARD_DOMAIN_REGEX: &str = r"^((\*|https?)?://)?((\*\.|[A-Za-z0-9][
 /// Maximum allowed length for MerchantName
 pub const MAX_ALLOWED_MERCHANT_NAME_LENGTH: usize = 64;
 
+/// Maximum allowed length for CardIssuerName
+pub const MAX_ALLOWED_CARD_ISSUER_NAME_LENGTH: usize = 255;
+
 /// Default locale
 pub const DEFAULT_LOCALE: &str = "en";
 
@@ -127,8 +147,6 @@ pub const ROLE_ID_ORGANIZATION_ADMIN: &str = "org_admin";
 pub const ROLE_ID_INTERNAL_VIEW_ONLY_USER: &str = "internal_view_only";
 /// Role ID for Internal Admin
 pub const ROLE_ID_INTERNAL_ADMIN: &str = "internal_admin";
-/// Role ID for Internal Demo
-pub const ROLE_ID_INTERNAL_DEMO: &str = "internal_demo";
 
 /// Max length allowed for Description
 pub const MAX_DESCRIPTION_LENGTH: u16 = 255;
@@ -151,6 +169,30 @@ pub const APPLEPAY_VALIDATION_URL: &str =
 
 /// Request ID
 pub const X_REQUEST_ID: &str = "x-request-id";
+
+/// Flow name
+pub const X_FLOW_NAME: &str = "x-flow";
+
+/// Connector name
+pub const X_CONNECTOR_NAME: &str = "x-connector";
+
+/// Payment method
+pub const X_PAYMENT_METHOD: &str = "x-payment-method";
+
+/// Payment method type
+pub const X_PAYMENT_METHOD_TYPE: &str = "x-payment-method-type";
+
+/// Sub-flow name
+pub const X_SUB_FLOW_NAME: &str = "x-sub-flow";
+
+/// Unified Connector Service Mode
+pub const X_UNIFIED_CONNECTOR_SERVICE_MODE: &str = "x-shadow-mode";
+
+/// Proxy name for UCS to select the proxy to route the request through
+pub const X_PROXY_NAME: &str = "x-proxy-name";
+
+/// Config Override Header for UCS
+pub const X_CONFIG_OVERRIDE: &str = "x-config-override";
 
 /// Chat Session ID
 pub const X_CHAT_SESSION_ID: &str = "x-chat-session-id";
@@ -182,6 +224,12 @@ pub const DEFAULT_CUSTOMER_ID_BLOCKING_THRESHOLD: i32 = 5;
 /// Default Card Testing Guard Redis Expiry in seconds
 pub const DEFAULT_CARD_TESTING_GUARD_EXPIRY_IN_SECS: i32 = 3600;
 
+/// Default status of Guest IP Blocking
+pub const DEFAULT_GUEST_IP_BLOCKING_STATUS: bool = false;
+
+/// Default Threshold for Guest IP Blocking
+pub const DEFAULT_GUEST_IP_BLOCKING_THRESHOLD: i32 = 10;
+
 /// SOAP 1.1 Envelope Namespace
 pub const SOAP_ENV_NAMESPACE: &str = "http://schemas.xmlsoap.org/soap/envelope/";
 
@@ -197,3 +245,15 @@ pub const REQUEST_TIME_OUT: u64 = 30;
 
 /// API client request timeout for ai service (in seconds)
 pub const REQUEST_TIME_OUT_FOR_AI_SERVICE: u64 = 120;
+
+/// Default limit for list operations (can be used across different entities)
+pub const DEFAULT_LIST_LIMIT: i64 = 100;
+
+/// Default offset for list operations (can be used across different entities)
+pub const DEFAULT_LIST_OFFSET: i64 = 0;
+
+/// Default number of card issuers returned in a list request
+pub const DEFAULT_CARD_ISSUER_LIST_LIMIT: u8 = 30;
+
+/// Length of a generated card issuer ID
+pub const CARD_ISSUER_ID_LENGTH: u8 = 5;

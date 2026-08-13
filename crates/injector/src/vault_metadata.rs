@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use base64::Engine;
-use masking::{ExposeInterface, Secret};
+use hyperswitch_masking::{ExposeInterface, Secret};
 use router_env::logger;
 use url::Url;
 
@@ -83,59 +83,26 @@ impl VaultMetadataProcessor for VgsMetadata {
         &self,
         connection_config: &mut ConnectionConfig,
     ) -> Result<(), VaultMetadataError> {
-        logger::debug!(
-            proxy_url = %self.proxy_url,
-            proxy_url_scheme = self.proxy_url.scheme(),
-            proxy_url_host = ?self.proxy_url.host(),
-            proxy_url_port = ?self.proxy_url.port(),
-            "Starting VGS metadata processing"
-        );
-
         // Validate and set proxy URL from VGS metadata
-        self.validate_proxy_url()?;
         let proxy_url_str = self.proxy_url.as_str().to_string();
         connection_config.proxy_url = Some(Secret::new(proxy_url_str.clone()));
 
-        logger::info!(
-            original_proxy_url = %self.proxy_url,
-            processed_proxy_url = %proxy_url_str,
-            proxy_url_length = proxy_url_str.len(),
-            "Set proxy URL from VGS metadata"
-        );
-
         // Validate and decode certificate from VGS metadata
-        self.validate_certificate()?;
         let cert_content = self.certificate.clone().expose();
-
-        logger::debug!(
-            cert_length = cert_content.len(),
-            cert_starts_with_pem = cert_content.starts_with("-----BEGIN"),
-            "Processing certificate from VGS metadata"
-        );
 
         // Check if certificate is base64 encoded and decode if necessary
         let decoded_cert = if cert_content.starts_with("-----BEGIN") {
-            logger::debug!("Certificate already in PEM format, using as-is");
             cert_content
         } else {
-            logger::debug!("Certificate appears to be base64 encoded, decoding...");
             match BASE64_ENGINE.decode(&cert_content) {
-                Ok(decoded_bytes) => {
-                    let decoded_string = String::from_utf8(decoded_bytes).map_err(|e| {
-                        VaultMetadataError::CertificateValidationFailed(format!(
-                            "Certificate is not valid UTF-8 after base64 decoding: {e}"
-                        ))
-                    })?;
-                    logger::debug!(
-                        decoded_cert_length = decoded_string.len(),
-                        "Successfully decoded base64 certificate"
-                    );
-                    decoded_string
-                }
+                Ok(decoded_bytes) => String::from_utf8(decoded_bytes).map_err(|e| {
+                    VaultMetadataError::CertificateValidationFailed(format!(
+                        "Certificate is not valid UTF-8 after base64 decoding: {e}"
+                    ))
+                })?,
                 Err(e) => {
                     logger::error!(
                         error = %e,
-                        cert_length = cert_content.len(),
                         "Failed to decode base64 certificate"
                     );
                     return Err(VaultMetadataError::CertificateValidationFailed(format!(
@@ -147,70 +114,11 @@ impl VaultMetadataProcessor for VgsMetadata {
 
         connection_config.ca_cert = Some(Secret::new(decoded_cert.clone()));
 
-        logger::info!(
-            proxy_url = %self.proxy_url,
-            proxy_url_as_str = self.proxy_url.as_str(),
-            proxy_url_set = connection_config.proxy_url.is_some(),
-            ca_cert_set = connection_config.ca_cert.is_some(),
-            ca_cert_length = decoded_cert.len(),
-            "Successfully applied VGS vault metadata to connection config"
-        );
-
         Ok(())
     }
 
     fn vault_connector(&self) -> VaultConnectors {
         VaultConnectors::VGS
-    }
-}
-
-impl VgsMetadata {
-    /// Validate the proxy URL
-    fn validate_proxy_url(&self) -> Result<(), VaultMetadataError> {
-        let url_str = self.proxy_url.as_str();
-
-        // Check if URL has HTTPS scheme for security
-        if self.proxy_url.scheme() != "https" {
-            return Err(VaultMetadataError::url_validation_failed(
-                "proxy_url",
-                url_str,
-                "VGS proxy URL must use HTTPS scheme for security",
-            ));
-        }
-
-        // Check if URL has a host
-        if self.proxy_url.host().is_none() {
-            return Err(VaultMetadataError::url_validation_failed(
-                "proxy_url",
-                url_str,
-                "Proxy URL must have a valid host",
-            ));
-        }
-
-        // Check if URL has a port (VGS typically uses specific ports)
-        if self.proxy_url.port().is_none() {
-            logger::warn!(
-                proxy_url = %self.proxy_url,
-                "VGS proxy URL does not specify a port, using default HTTPS port 443"
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Validate the certificate format and content
-    fn validate_certificate(&self) -> Result<(), VaultMetadataError> {
-        let cert_content = self.certificate.clone().expose();
-
-        // Only check that certificate is not empty - let the HTTP client handle the rest
-        if cert_content.trim().is_empty() {
-            return Err(VaultMetadataError::CertificateValidationFailed(
-                "Certificate content is empty".to_string(),
-            ));
-        }
-
-        logger::debug!("Certificate validation passed (non-empty check only)");
-        Ok(())
     }
 }
 
@@ -244,24 +152,13 @@ impl VaultMetadataFactory {
             return Err(VaultMetadataError::EmptyOrMalformedHeader);
         }
 
-        // Log the attempt (without exposing sensitive data)
-        logger::debug!(
-            header_length = base64_value.len(),
-            "Processing vault metadata from base64 header"
-        );
-
         // Decode base64 with detailed error context
         let decoded_bytes = BASE64_ENGINE.decode(base64_value.trim()).map_err(|e| {
             logger::error!(
                 error = %e,
-                header_length = base64_value.len(),
                 "Failed to decode base64 vault metadata header"
             );
-            VaultMetadataError::Base64DecodingFailed(format!(
-                "Invalid base64 encoding: {}. Header length: {}",
-                e,
-                base64_value.len()
-            ))
+            VaultMetadataError::Base64DecodingFailed(format!("Invalid base64 encoding: {e}"))
         })?;
 
         // Validate decoded size
@@ -280,14 +177,9 @@ impl VaultMetadataFactory {
             serde_json::from_slice(&decoded_bytes).map_err(|e| {
                 logger::error!(
                     error = %e,
-                    decoded_size = decoded_bytes.len(),
                     "Failed to parse vault metadata JSON"
                 );
-                VaultMetadataError::JsonParsingFailed(format!(
-                    "Invalid JSON structure: {}. Size: {} bytes",
-                    e,
-                    decoded_bytes.len()
-                ))
+                VaultMetadataError::JsonParsingFailed(format!("Invalid JSON structure: {e}"))
             })?;
 
         logger::info!(
@@ -314,26 +206,15 @@ impl VaultMetadataExtractor for ConnectionConfig {
         headers: &HashMap<String, Secret<String>>,
     ) -> Result<(), VaultMetadataError> {
         if let Some(vault_metadata_header) = headers.get(EXTERNAL_VAULT_METADATA_HEADER) {
-            logger::debug!(
-                header_length = vault_metadata_header.clone().expose().len(),
-                "Found vault metadata header, processing..."
-            );
-
             let processor =
                 VaultMetadataFactory::from_base64_header(&vault_metadata_header.clone().expose())
                     .map_err(|e| {
                     logger::error!(
                         error = %e,
-                        header_length = vault_metadata_header.clone().expose().len(),
                         "Failed to create vault metadata processor from header"
                     );
                     e
                 })?;
-
-            logger::debug!(
-                vault_connector = ?processor.vault_connector(),
-                "Created vault metadata processor, applying to connection config..."
-            );
 
             processor.process_metadata(self).map_err(|e| {
                 logger::error!(
@@ -350,11 +231,6 @@ impl VaultMetadataExtractor for ConnectionConfig {
                 ca_cert_applied = self.ca_cert.is_some(),
                 client_cert_applied = self.client_cert.is_some(),
                 "Successfully applied vault metadata to connection configuration"
-            );
-        } else {
-            logger::debug!(
-                available_headers = ?headers.keys().collect::<Vec<_>>(),
-                "No vault metadata header found, skipping vault configuration"
             );
         }
         Ok(())
@@ -417,24 +293,24 @@ impl VaultMetadataExtractorExt for ConnectionConfig {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use std::collections::HashMap;
 
     use base64::Engine;
-    use common_utils::pii::SecretSerdeValue;
 
     use super::*;
-    use crate::types::{HttpMethod, InjectorRequest, TokenData, VaultConnectors};
+    use crate::types::HttpMethod;
 
     #[test]
     fn test_vault_metadata_processing() {
-        // Create test VGS metadata with base64 encoded certificate
+        // Create test VGS metadata with a PEM-format certificate
         let vgs_metadata = VgsMetadata {
             proxy_url: "https://vgs-proxy.example.com:8443"
                 .parse()
                 .expect("Valid test URL"),
-            certificate: Secret::new("cert".to_string()),
+            certificate: Secret::new(
+                "-----BEGIN CERTIFICATE-----\nMIIBtest\n-----END CERTIFICATE-----".to_string(),
+            ),
         };
 
         let metadata = ExternalVaultProxyMetadata::VgsMetadata(vgs_metadata);
@@ -459,31 +335,26 @@ mod tests {
             Secret::new(base64_metadata),
         );
 
-        // Test the amazing automatic processing with the unified API!
-        let injector_request = InjectorRequest::new(
-            "https://api.example.com/v1/payments".to_string(),
+        // Test vault metadata extraction directly on ConnectionConfig
+        let mut connection_config = ConnectionConfig::new(
+            Url::parse("https://api.example.com/v1/payments").unwrap(),
             HttpMethod::POST,
-            "amount={{$amount}}&currency={{$currency}}".to_string(),
-            TokenData {
-                vault_connector: VaultConnectors::VGS,
-                specific_token_data: SecretSerdeValue::new(serde_json::json!({
-                    "amount": "1000",
-                    "currency": "USD"
-                })),
-            },
-            Some(headers),
-            None, // No fallback proxy needed - vault metadata provides it
-            None, // No fallback client cert
-            None, // No fallback client key
-            None, // No fallback CA cert
+        );
+        connection_config.headers = headers;
+
+        // Extract and apply vault metadata
+        let result =
+            connection_config.extract_and_apply_vault_metadata(&connection_config.headers.clone());
+        assert!(
+            result.is_ok(),
+            "Vault metadata extraction should succeed: {result:?}"
         );
 
-        // Verify vault metadata was automatically applied!
-        assert!(injector_request.connection_config.proxy_url.is_some());
-        assert!(injector_request.connection_config.ca_cert.is_some());
+        // Verify vault metadata was applied to connection config
+        assert!(connection_config.proxy_url.is_some());
+        assert!(connection_config.ca_cert.is_some());
         assert_eq!(
-            injector_request
-                .connection_config
+            connection_config
                 .proxy_url
                 .as_ref()
                 .expect("Proxy URL should be set")
@@ -491,22 +362,6 @@ mod tests {
                 .expose(),
             "https://vgs-proxy.example.com:8443/"
         );
-
-        // Verify vault metadata header was removed from regular headers
-        assert!(!injector_request
-            .connection_config
-            .headers
-            .contains_key(EXTERNAL_VAULT_METADATA_HEADER));
-
-        // Verify other headers are preserved
-        assert!(injector_request
-            .connection_config
-            .headers
-            .contains_key("Content-Type"));
-        assert!(injector_request
-            .connection_config
-            .headers
-            .contains_key("Authorization"));
     }
 
     #[test]

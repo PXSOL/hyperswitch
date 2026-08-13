@@ -1,5 +1,5 @@
 #[cfg(feature = "payouts")]
-use api_models::payouts::Bank;
+use api_models::payouts::BankTransfer;
 #[cfg(feature = "payouts")]
 use api_models::payouts::PayoutMethodData;
 #[cfg(feature = "payouts")]
@@ -13,7 +13,7 @@ use hyperswitch_domain_models::router_data::ConnectorAuthType;
 #[cfg(feature = "payouts")]
 use hyperswitch_domain_models::types::{PayoutsResponseData, PayoutsRouterData};
 use hyperswitch_interfaces::errors::ConnectorError;
-use masking::Secret;
+use hyperswitch_masking::Secret;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "payouts")]
@@ -363,7 +363,7 @@ fn get_payout_bank_details(
         }),
     }?;
     match payout_method_data {
-        PayoutMethodData::Bank(Bank::Ach(b)) => Ok(WiseBankDetails {
+        PayoutMethodData::BankTransfer(BankTransfer::Ach(b)) => Ok(WiseBankDetails {
             legal_type: LegalType::from(entity_type),
             address: Some(wise_address_details),
             account_number: Some(b.bank_account_number.to_owned()),
@@ -371,14 +371,14 @@ fn get_payout_bank_details(
             account_type: Some(AccountType::Checking),
             ..WiseBankDetails::default()
         }),
-        PayoutMethodData::Bank(Bank::Bacs(b)) => Ok(WiseBankDetails {
+        PayoutMethodData::BankTransfer(BankTransfer::Bacs(b)) => Ok(WiseBankDetails {
             legal_type: LegalType::from(entity_type),
             address: Some(wise_address_details),
             account_number: Some(b.bank_account_number.to_owned()),
             sort_code: Some(b.bank_sort_code),
             ..WiseBankDetails::default()
         }),
-        PayoutMethodData::Bank(Bank::Sepa(b)) => Ok(WiseBankDetails {
+        PayoutMethodData::BankTransfer(BankTransfer::Sepa(b)) => Ok(WiseBankDetails {
             legal_type: LegalType::from(entity_type),
             address: Some(wise_address_details),
             iban: Some(b.iban.to_owned()),
@@ -413,9 +413,11 @@ impl<F> TryFrom<&WiseRouterData<&PayoutsRouterData<F>>> for WiseRecipientCreateR
         }?;
         let payout_type = request.get_payout_type()?;
         match payout_type {
-            PayoutType::Card | PayoutType::Wallet => Err(ConnectorError::NotImplemented(
-                get_unimplemented_payment_method_error_message("Wise"),
-            ))?,
+            PayoutType::Card | PayoutType::Wallet | PayoutType::BankRedirect => {
+                Err(ConnectorError::NotImplemented(
+                    get_unimplemented_payment_method_error_message("Wise"),
+                ))?
+            }
             PayoutType::Bank => {
                 let account_holder_name = customer_details
                     .ok_or(ConnectorError::MissingRequiredField {
@@ -456,6 +458,7 @@ impl<F> TryFrom<PayoutsResponseRouterData<F, WiseRecipientCreateResponse>>
                 should_add_next_step_to_process_tracker: false,
                 error_code: None,
                 error_message: None,
+                payout_connector_metadata: None,
             }),
             ..item.data
         })
@@ -478,9 +481,11 @@ impl<F> TryFrom<&WiseRouterData<&PayoutsRouterData<F>>> for WisePayoutQuoteReque
                 target_currency: request.destination_currency.to_string(),
                 pay_out: WisePayOutOption::default(),
             }),
-            PayoutType::Card | PayoutType::Wallet => Err(ConnectorError::NotImplemented(
-                get_unimplemented_payment_method_error_message("Wise"),
-            ))?,
+            PayoutType::Card | PayoutType::Wallet | PayoutType::BankRedirect => {
+                Err(ConnectorError::NotImplemented(
+                    get_unimplemented_payment_method_error_message("Wise"),
+                ))?
+            }
         }
     }
 }
@@ -502,6 +507,7 @@ impl<F> TryFrom<PayoutsResponseRouterData<F, WisePayoutQuoteResponse>> for Payou
                 should_add_next_step_to_process_tracker: false,
                 error_code: None,
                 error_message: None,
+                payout_connector_metadata: None,
             }),
             ..item.data
         })
@@ -536,9 +542,11 @@ impl<F> TryFrom<&PayoutsRouterData<F>> for WisePayoutCreateRequest {
                     details: wise_transfer_details,
                 })
             }
-            PayoutType::Card | PayoutType::Wallet => Err(ConnectorError::NotImplemented(
-                get_unimplemented_payment_method_error_message("Wise"),
-            ))?,
+            PayoutType::Card | PayoutType::Wallet | PayoutType::BankRedirect => {
+                Err(ConnectorError::NotImplemented(
+                    get_unimplemented_payment_method_error_message("Wise"),
+                ))?
+            }
         }
     }
 }
@@ -564,6 +572,7 @@ impl<F> TryFrom<PayoutsResponseRouterData<F, WisePayoutResponse>> for PayoutsRou
                 should_add_next_step_to_process_tracker: false,
                 error_code: None,
                 error_message: None,
+                payout_connector_metadata: None,
             }),
             ..item.data
         })
@@ -580,9 +589,11 @@ impl<F> TryFrom<&PayoutsRouterData<F>> for WisePayoutFulfillRequest {
             PayoutType::Bank => Ok(Self {
                 fund_type: FundType::default(),
             }),
-            PayoutType::Card | PayoutType::Wallet => Err(ConnectorError::NotImplemented(
-                get_unimplemented_payment_method_error_message("Wise"),
-            ))?,
+            PayoutType::Card | PayoutType::Wallet | PayoutType::BankRedirect => {
+                Err(ConnectorError::NotImplemented(
+                    get_unimplemented_payment_method_error_message("Wise"),
+                ))?
+            }
         }
     }
 }
@@ -610,6 +621,7 @@ impl<F> TryFrom<PayoutsResponseRouterData<F, WiseFulfillResponse>> for PayoutsRo
                 should_add_next_step_to_process_tracker: false,
                 error_code: None,
                 error_message: None,
+                payout_connector_metadata: None,
             }),
             ..item.data
         })
@@ -650,9 +662,9 @@ impl TryFrom<PayoutMethodData> for RecipientType {
     type Error = error_stack::Report<ConnectorError>;
     fn try_from(payout_method_type: PayoutMethodData) -> Result<Self, Self::Error> {
         match payout_method_type {
-            PayoutMethodData::Bank(Bank::Ach(_)) => Ok(Self::Aba),
-            PayoutMethodData::Bank(Bank::Bacs(_)) => Ok(Self::SortCode),
-            PayoutMethodData::Bank(Bank::Sepa(_)) => Ok(Self::Iban),
+            PayoutMethodData::BankTransfer(BankTransfer::Ach(_)) => Ok(Self::Aba),
+            PayoutMethodData::BankTransfer(BankTransfer::Bacs(_)) => Ok(Self::SortCode),
+            PayoutMethodData::BankTransfer(BankTransfer::Sepa(_)) => Ok(Self::Iban),
             _ => Err(ConnectorError::NotImplemented(
                 get_unimplemented_payment_method_error_message("Wise"),
             )
@@ -698,6 +710,7 @@ impl<F> TryFrom<PayoutsResponseRouterData<F, WisePayoutSyncResponse>> for Payout
                 should_add_next_step_to_process_tracker: false,
                 error_code: None,
                 error_message: None,
+                payout_connector_metadata: None,
             }),
             ..item.data
         })

@@ -31,6 +31,10 @@ pub struct CustomerNew {
     pub updated_by: Option<String>,
     pub version: ApiVersion,
     pub tax_registration_id: Option<Encryption>,
+    pub created_by: Option<String>,
+    pub last_modified_by: Option<String>,
+    pub document_details: Option<Encryption>,
+    pub id: Option<common_utils::id_type::GlobalCustomerId>,
 }
 
 #[cfg(feature = "v1")]
@@ -60,6 +64,10 @@ impl From<CustomerNew> for Customer {
             updated_by: customer_new.updated_by,
             version: customer_new.version,
             tax_registration_id: customer_new.tax_registration_id,
+            document_details: customer_new.document_details,
+            created_by: customer_new.created_by,
+            last_modified_by: customer_new.last_modified_by,
+            id: customer_new.id,
         }
     }
 }
@@ -84,11 +92,15 @@ pub struct CustomerNew {
     pub updated_by: Option<String>,
     pub version: ApiVersion,
     pub tax_registration_id: Option<Encryption>,
+    pub created_by: Option<String>,
+    pub last_modified_by: Option<String>,
+    pub document_details: Option<Encryption>,
+    pub id: common_utils::id_type::GlobalCustomerId,
     pub merchant_reference_id: Option<common_utils::id_type::CustomerId>,
     pub default_billing_address: Option<Encryption>,
     pub default_shipping_address: Option<Encryption>,
     pub status: DeleteStatus,
-    pub id: common_utils::id_type::GlobalCustomerId,
+    pub customer_id: Option<common_utils::id_type::GlobalCustomerId>,
 }
 
 #[cfg(feature = "v2")]
@@ -115,12 +127,16 @@ impl From<CustomerNew> for Customer {
             default_payment_method_id: None,
             updated_by: customer_new.updated_by,
             tax_registration_id: customer_new.tax_registration_id,
+            document_details: customer_new.document_details,
             merchant_reference_id: customer_new.merchant_reference_id,
             default_billing_address: customer_new.default_billing_address,
             default_shipping_address: customer_new.default_shipping_address,
             id: customer_new.id,
             version: customer_new.version,
             status: customer_new.status,
+            created_by: customer_new.created_by,
+            last_modified_by: customer_new.last_modified_by,
+            customer_id: customer_new.customer_id,
         }
     }
 }
@@ -147,6 +163,10 @@ pub struct Customer {
     pub updated_by: Option<String>,
     pub version: ApiVersion,
     pub tax_registration_id: Option<Encryption>,
+    pub created_by: Option<String>,
+    pub last_modified_by: Option<String>,
+    pub document_details: Option<Encryption>,
+    pub id: Option<common_utils::id_type::GlobalCustomerId>,
 }
 
 #[cfg(feature = "v2")]
@@ -169,12 +189,25 @@ pub struct Customer {
     pub updated_by: Option<String>,
     pub version: ApiVersion,
     pub tax_registration_id: Option<Encryption>,
+    pub created_by: Option<String>,
+    pub last_modified_by: Option<String>,
+    pub document_details: Option<Encryption>,
+    pub id: common_utils::id_type::GlobalCustomerId,
     pub merchant_reference_id: Option<common_utils::id_type::CustomerId>,
     pub default_billing_address: Option<Encryption>,
     pub default_shipping_address: Option<Encryption>,
     #[diesel(deserialize_as = RequiredFromNullableWithDefault<DeleteStatus>)]
     pub status: DeleteStatus,
-    pub id: common_utils::id_type::GlobalCustomerId,
+    pub customer_id: Option<common_utils::id_type::GlobalCustomerId>,
+}
+
+#[cfg(feature = "v2")]
+#[derive(Clone, Debug, diesel::Queryable, serde::Serialize, serde::Deserialize)]
+pub struct CustomerGlobalIdMigrationRow {
+    pub merchant_id: common_utils::id_type::MerchantId,
+    pub customer_id: Option<String>,
+    pub id: Option<String>,
+    pub version: ApiVersion,
 }
 
 #[cfg(feature = "v1")]
@@ -182,6 +215,7 @@ pub struct Customer {
     Clone, Debug, AsChangeset, router_derive::DebugAsDisplay, serde::Deserialize, serde::Serialize,
 )]
 #[diesel(table_name = customers)]
+#[router_derive::apply_changeset(target = Customer)]
 pub struct CustomerUpdateInternal {
     pub name: Option<Encryption>,
     pub email: Option<Encryption>,
@@ -195,42 +229,8 @@ pub struct CustomerUpdateInternal {
     pub default_payment_method_id: Option<Option<String>>,
     pub updated_by: Option<String>,
     pub tax_registration_id: Option<Encryption>,
-}
-
-#[cfg(feature = "v1")]
-impl CustomerUpdateInternal {
-    pub fn apply_changeset(self, source: Customer) -> Customer {
-        let Self {
-            name,
-            email,
-            phone,
-            description,
-            phone_country_code,
-            metadata,
-            connector_customer,
-            address_id,
-            default_payment_method_id,
-            tax_registration_id,
-            ..
-        } = self;
-
-        Customer {
-            name: name.map_or(source.name, Some),
-            email: email.map_or(source.email, Some),
-            phone: phone.map_or(source.phone, Some),
-            description: description.map_or(source.description, Some),
-            phone_country_code: phone_country_code.map_or(source.phone_country_code, Some),
-            metadata: metadata.map_or(source.metadata, Some),
-            modified_at: common_utils::date_time::now(),
-            connector_customer: connector_customer.map_or(source.connector_customer, Some),
-            address_id: address_id.map_or(source.address_id, Some),
-            default_payment_method_id: default_payment_method_id
-                .flatten()
-                .map_or(source.default_payment_method_id, Some),
-            tax_registration_id: tax_registration_id.map_or(source.tax_registration_id, Some),
-            ..source
-        }
-    }
+    pub last_modified_by: Option<String>,
+    pub document_details: Option<Encryption>,
 }
 
 #[cfg(feature = "v2")]
@@ -238,6 +238,7 @@ impl CustomerUpdateInternal {
     Clone, Debug, AsChangeset, router_derive::DebugAsDisplay, serde::Deserialize, serde::Serialize,
 )]
 #[diesel(table_name = customers)]
+#[router_derive::apply_changeset(target = Customer)]
 pub struct CustomerUpdateInternal {
     pub name: Option<Encryption>,
     pub email: Option<Encryption>,
@@ -253,46 +254,6 @@ pub struct CustomerUpdateInternal {
     pub default_shipping_address: Option<Encryption>,
     pub status: Option<DeleteStatus>,
     pub tax_registration_id: Option<Encryption>,
-}
-
-#[cfg(feature = "v2")]
-impl CustomerUpdateInternal {
-    pub fn apply_changeset(self, source: Customer) -> Customer {
-        let Self {
-            name,
-            email,
-            phone,
-            description,
-            phone_country_code,
-            metadata,
-            connector_customer,
-            default_payment_method_id,
-            default_billing_address,
-            default_shipping_address,
-            status,
-            tax_registration_id,
-            ..
-        } = self;
-
-        Customer {
-            name: name.map_or(source.name, Some),
-            email: email.map_or(source.email, Some),
-            phone: phone.map_or(source.phone, Some),
-            description: description.map_or(source.description, Some),
-            phone_country_code: phone_country_code.map_or(source.phone_country_code, Some),
-            metadata: metadata.map_or(source.metadata, Some),
-            modified_at: common_utils::date_time::now(),
-            connector_customer: connector_customer.map_or(source.connector_customer, Some),
-            default_payment_method_id: default_payment_method_id
-                .flatten()
-                .map_or(source.default_payment_method_id, Some),
-            default_billing_address: default_billing_address
-                .map_or(source.default_billing_address, Some),
-            default_shipping_address: default_shipping_address
-                .map_or(source.default_shipping_address, Some),
-            status: status.unwrap_or(source.status),
-            tax_registration_id: tax_registration_id.map_or(source.tax_registration_id, Some),
-            ..source
-        }
-    }
+    pub last_modified_by: Option<String>,
+    pub document_details: Option<Encryption>,
 }

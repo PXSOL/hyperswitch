@@ -34,7 +34,7 @@ use hyperswitch_domain_models::{
     },
     router_response_types::PaymentsResponseData,
 };
-use masking::{ExposeInterface, Secret};
+use hyperswitch_masking::{ExposeInterface, Secret};
 use serde_json::json;
 
 use super::transformers as fiservemea;
@@ -104,6 +104,7 @@ fn card(number: &str) -> Card {
         nick_name: None,
         card_holder_name: Some(Secret::new("PXSOL TEST".to_string())),
         co_badged_card_data: None,
+        card_issuing_country_code: None,
     }
 }
 
@@ -123,8 +124,6 @@ fn authorize_data(
         customer_name: None,
         currency,
         confirm: true,
-        statement_descriptor_suffix: None,
-        statement_descriptor: None,
         capture_method: Some(enums::CaptureMethod::Automatic),
         router_return_url: None,
         webhook_url: None,
@@ -160,8 +159,18 @@ fn authorize_data(
         order_id: None,
         locale: None,
         payment_channel: None,
-        enable_partial_authorization: None,
         enable_overcapture: None,
+        ucs_authentication_data: None,
+        guest_customer: None,
+        is_stored_credential: None,
+        mit_category: None,
+        enable_partial_authorization: None,
+        partner_merchant_identifier_details: None,
+        billing_descriptor: None,
+        tokenization: None,
+        feature_metadata: None,
+        installment_details: None,
+        connector_intent_metadata: None,
     }
 }
 
@@ -233,6 +242,12 @@ fn router_data<Flow, Req, Res>(
         psd2_sca_exemption_type: None,
         raw_connector_response: None,
         is_payment_id_from_merchant: None,
+        payment_method_type: None,
+        payout_id: None,
+        authorized_amount: None,
+        customer_document_details: None,
+        feature_data: None,
+        sender_payment_instrument_id: None,
     }
 }
 
@@ -329,9 +344,8 @@ fn dump_phase1_payloads() {
         let request = SetupMandateRequestData {
             currency: enums::Currency::ARS,
             payment_method_data: PaymentMethodData::Card(card("5165850000000008")),
-            amount: Some(0),
+            amount: 0,
             confirm: true,
-            statement_descriptor_suffix: None,
             customer_acceptance: None,
             mandate_id: None,
             setup_future_usage: None,
@@ -350,12 +364,22 @@ fn dump_phase1_payloads() {
             capture_method: None,
             enrolled_for_3ds: false,
             related_transaction_id: None,
-            minor_amount: Some(MinorUnit::zero()),
+            minor_amount: MinorUnit::zero(),
             shipping_cost: None,
             connector_testing_data: None,
             customer_id: None,
-            enable_partial_authorization: None,
             payment_channel: None,
+            feature_metadata: None,
+            is_stored_credential: None,
+            billing_descriptor: None,
+            split_payments: None,
+            tokenization: None,
+            authentication_data: None,
+            connector_intent_metadata: None,
+            merchant_order_reference_id: None,
+            mit_category: None,
+            enable_partial_authorization: None,
+            partner_merchant_identifier_details: None,
         };
         let rd: RouterData<SetupMandate, _, _> = router_data(request, STORE_AR, &oid, false, None);
         let req = fiservemea::FiservemeaPaymentsRequest::try_from(&rd).unwrap();
@@ -380,6 +404,9 @@ fn dump_phase1_payloads() {
             setup_future_usage: None,
             setup_mandate_details: None,
             mandate_id: None,
+            payment_method_type: None,
+            router_return_url: None,
+            capture_method: None,
         };
         let rd: RouterData<PmTokenFlow, _, _> =
             router_data(request, STORE_TOKEN_GW, &oid, false, None);
@@ -544,6 +571,13 @@ fn dump_phase5_continuation_templates() {
             merchant_account_id: None,
             merchant_config_currency: None,
             threeds_method_comp_ind: None,
+            request_incremental_authorization: false,
+            authentication_data: None,
+            payment_method_type: None,
+            is_stored_credential: None,
+            tokenization: None,
+            router_return_url: None,
+            merchant_order_reference_id: None,
         };
         let rd: RouterData<CompleteAuthorize, _, _> =
             router_data(request, STORE_AR, case, true, None);
@@ -633,6 +667,13 @@ fn dump_phase3_continuations() {
             merchant_account_id: None,
             merchant_config_currency: None,
             threeds_method_comp_ind: None,
+            request_incremental_authorization: false,
+            authentication_data: None,
+            payment_method_type: None,
+            is_stored_credential: None,
+            tokenization: None,
+            router_return_url: None,
+            merchant_order_reference_id: None,
         };
         let rd: RouterData<CompleteAuthorize, _, _> = router_data(
             request,
@@ -762,6 +803,8 @@ fn dump_phase7_preauth_capture() {
         integrity_object: None,
         webhook_url: None,
         split_payments: None,
+        order_tax_amount: None,
+        merchant_order_reference_id: None,
     };
     let crd3: RouterData<Capture, _, PaymentsResponseData> =
         router_data(capture_request, STORE_AR, "capture", false, None);
@@ -786,6 +829,10 @@ fn dump_phase7_preauth_capture() {
         minor_amount: Some(MinorUnit::new(100_000)),
         webhook_url: None,
         capture_method: Some(enums::CaptureMethod::Manual),
+        split_payments: None,
+        merchant_order_reference_id: None,
+        payment_method_type: None,
+        feature_metadata: None,
     };
     let rd4: RouterData<Void, _, _> =
         router_data(cancel_request, STORE_AR, "void-preauth", false, None);
@@ -853,6 +900,10 @@ fn dump_phase4_void_refund() {
             minor_amount: Some(MinorUnit::new(100_000)),
             webhook_url: None,
             capture_method: Some(enums::CaptureMethod::Automatic),
+            split_payments: None,
+            merchant_order_reference_id: None,
+            payment_method_type: None,
+            feature_metadata: None,
         };
         let rd: RouterData<Void, _, _> = router_data(request, STORE_AR, "void-op", false, None);
         let req = fiservemea::FiservemeaVoidRequest::try_from(&rd).unwrap();

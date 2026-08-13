@@ -12,12 +12,12 @@ use hyperswitch_domain_models::{
     types::{PaymentsAuthorizeRouterData, PaymentsCaptureRouterData, RefundsRouterData, TokenizationRouterData},
 };
 use hyperswitch_interfaces::errors;
-use masking::{PeekInterface, Secret};
+use hyperswitch_masking::{PeekInterface, Secret};
 use serde::{de::Deserialize as DeDeserialize, Deserialize, Serialize};
 
 use crate::{
     types::{RefundsResponseRouterData, ResponseRouterData},
-    utils::{self, RouterData as _},
+    utils::RouterData as _,
 };
 
 const MAX_APPLICATION_FEE_RATIO: f64 = 0.007;
@@ -530,7 +530,12 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
             external_reference: router_data.connector_request_reference_id.clone(),
             binary_mode: Some(true),
             notification_url,
-            statement_descriptor: router_data.request.statement_descriptor.clone(),
+            // upstream movió `statement_descriptor` dentro de `billing_descriptor`
+            statement_descriptor: router_data
+                .request
+                .billing_descriptor
+                .as_ref()
+                .and_then(|descriptor| descriptor.statement_descriptor.clone()),
             additional_info,
             application_fee,
         })
@@ -655,6 +660,7 @@ impl<F, T> TryFrom<ResponseRouterData<F, MercadopagoPaymentsResponse, T, Payment
                 status_code: item.http_code,
                 attempt_status: Some(status),
                 connector_transaction_id: Some(connector_transaction_id.clone()),
+                connector_response_reference_id: None,
                 connector_metadata: None,
                 network_advice_code: None,
                 network_decline_code: Some(error_code),
@@ -667,11 +673,13 @@ impl<F, T> TryFrom<ResponseRouterData<F, MercadopagoPaymentsResponse, T, Payment
                 mandate_reference: Box::new(None),
                 connector_metadata: None,
                 network_txn_id: None,
+                network_txn_link_id: None,
                 connector_response_reference_id: item
                     .response
                     .external_reference
                     .or(Some(connector_transaction_id)),
                 incremental_authorization_allowed: None,
+                authentication_data: None,
                 charges: None,
             })
         };

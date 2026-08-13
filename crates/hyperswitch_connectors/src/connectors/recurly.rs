@@ -9,13 +9,47 @@ use error_stack::report;
 use error_stack::ResultExt;
 use hyperswitch_domain_models::{
     router_data::{ConnectorAuthType, ErrorResponse},
-    router_data_v2::UasFlowData,
-    router_flow_types::unified_authentication_service::{
-        Authenticate, AuthenticationConfirmation, PostAuthenticate, PreAuthenticate,
+    router_data_v2::{
+        flow_common_types::{
+            GetSubscriptionEstimateData, GetSubscriptionItemPricesData, GetSubscriptionItemsData,
+            InvoiceRecordBackData, SubscriptionCancelData, SubscriptionCreateData,
+            SubscriptionCustomerData, SubscriptionPauseData, SubscriptionResumeData,
+        },
+        UasFlowData,
     },
-    router_request_types::unified_authentication_service::{
-        UasAuthenticationRequestData, UasAuthenticationResponseData, UasConfirmationRequestData,
-        UasPostAuthenticationRequestData, UasPreAuthenticationRequestData,
+    router_flow_types::{
+        subscriptions::{
+            GetSubscriptionEstimate, GetSubscriptionItemPrices, GetSubscriptionItems,
+            SubscriptionCancel, SubscriptionCreate, SubscriptionPause, SubscriptionResume,
+        },
+        unified_authentication_service::{
+            Authenticate, AuthenticationConfirmation, PostAuthenticate, PreAuthenticate,
+            ProcessIncomingWebhook,
+        },
+        CreateConnectorCustomer, InvoiceRecordBack,
+    },
+    router_request_types::{
+        revenue_recovery::InvoiceRecordBackRequest,
+        subscriptions::{
+            GetSubscriptionEstimateRequest, GetSubscriptionItemPricesRequest,
+            GetSubscriptionItemsRequest, SubscriptionCancelRequest, SubscriptionCreateRequest,
+            SubscriptionPauseRequest, SubscriptionResumeRequest,
+        },
+        unified_authentication_service::{
+            UasAuthenticationRequestData, UasAuthenticationResponseData,
+            UasConfirmationRequestData, UasPostAuthenticationRequestData,
+            UasPreAuthenticationRequestData, UasWebhookRequestData,
+        },
+        ConnectorCustomerData,
+    },
+    router_response_types::{
+        revenue_recovery::InvoiceRecordBackResponse,
+        subscriptions::{
+            GetSubscriptionEstimateResponse, GetSubscriptionItemPricesResponse,
+            GetSubscriptionItemsResponse, SubscriptionCancelResponse, SubscriptionCreateResponse,
+            SubscriptionPauseResponse, SubscriptionResumeResponse,
+        },
+        PaymentsResponseData,
     },
 };
 #[cfg(all(feature = "v2", feature = "revenue_recovery"))]
@@ -37,7 +71,7 @@ use hyperswitch_interfaces::{
     types::Response,
     webhooks,
 };
-use masking::{Mask, PeekInterface};
+use hyperswitch_masking::{Mask, PeekInterface};
 use transformers as recurly;
 
 use crate::{connectors::recurly::transformers::RecurlyWebhookBody, constants::headers};
@@ -88,6 +122,7 @@ impl api::UasPreAuthenticationV2 for Recurly {}
 impl api::UasPostAuthenticationV2 for Recurly {}
 impl api::UasAuthenticationV2 for Recurly {}
 impl api::UasAuthenticationConfirmationV2 for Recurly {}
+impl api::UasProcessWebhookV2 for Recurly {}
 impl
     ConnectorIntegrationV2<
         PreAuthenticate,
@@ -130,7 +165,119 @@ impl
     //TODO: implement sessions flow
 }
 
+impl
+    ConnectorIntegrationV2<
+        ProcessIncomingWebhook,
+        UasFlowData,
+        UasWebhookRequestData,
+        UasAuthenticationResponseData,
+    > for Recurly
+{
+    //TODO: implement sessions flow
+}
+
 impl api::revenue_recovery_v2::RevenueRecoveryV2 for Recurly {}
+impl api::subscriptions_v2::SubscriptionsV2 for Recurly {}
+impl api::subscriptions_v2::GetSubscriptionPlansV2 for Recurly {}
+impl api::subscriptions_v2::SubscriptionRecordBackV2 for Recurly {}
+impl api::subscriptions_v2::SubscriptionConnectorCustomerV2 for Recurly {}
+
+impl
+    ConnectorIntegrationV2<
+        GetSubscriptionItems,
+        GetSubscriptionItemsData,
+        GetSubscriptionItemsRequest,
+        GetSubscriptionItemsResponse,
+    > for Recurly
+{
+}
+
+#[cfg(feature = "v1")]
+impl
+    ConnectorIntegrationV2<
+        InvoiceRecordBack,
+        InvoiceRecordBackData,
+        InvoiceRecordBackRequest,
+        InvoiceRecordBackResponse,
+    > for Recurly
+{
+}
+impl
+    ConnectorIntegrationV2<
+        CreateConnectorCustomer,
+        SubscriptionCustomerData,
+        ConnectorCustomerData,
+        PaymentsResponseData,
+    > for Recurly
+{
+}
+
+impl api::subscriptions_v2::GetSubscriptionPlanPricesV2 for Recurly {}
+
+impl
+    ConnectorIntegrationV2<
+        GetSubscriptionItemPrices,
+        GetSubscriptionItemPricesData,
+        GetSubscriptionItemPricesRequest,
+        GetSubscriptionItemPricesResponse,
+    > for Recurly
+{
+}
+impl api::subscriptions_v2::SubscriptionsCreateV2 for Recurly {}
+impl
+    ConnectorIntegrationV2<
+        SubscriptionCreate,
+        SubscriptionCreateData,
+        SubscriptionCreateRequest,
+        SubscriptionCreateResponse,
+    > for Recurly
+{
+}
+
+impl api::subscriptions_v2::GetSubscriptionEstimateV2 for Recurly {}
+impl
+    ConnectorIntegrationV2<
+        GetSubscriptionEstimate,
+        GetSubscriptionEstimateData,
+        GetSubscriptionEstimateRequest,
+        GetSubscriptionEstimateResponse,
+    > for Recurly
+{
+}
+
+impl api::subscriptions_v2::SubscriptionCancelV2 for Recurly {}
+impl
+    ConnectorIntegrationV2<
+        SubscriptionCancel,
+        SubscriptionCancelData,
+        SubscriptionCancelRequest,
+        SubscriptionCancelResponse,
+    > for Recurly
+{
+}
+
+impl api::subscriptions_v2::SubscriptionPauseV2 for Recurly {}
+impl
+    ConnectorIntegrationV2<
+        SubscriptionPause,
+        SubscriptionPauseData,
+        SubscriptionPauseRequest,
+        SubscriptionPauseResponse,
+    > for Recurly
+{
+}
+
+impl api::subscriptions_v2::SubscriptionResumeV2 for Recurly {}
+impl
+    ConnectorIntegrationV2<
+        SubscriptionResume,
+        SubscriptionResumeData,
+        SubscriptionResumeRequest,
+        SubscriptionResumeResponse,
+    > for Recurly
+{
+}
+
 #[cfg(all(feature = "v2", feature = "revenue_recovery"))]
 impl api::revenue_recovery_v2::RevenueRecoveryRecordBackV2 for Recurly {}
 #[cfg(all(feature = "v2", feature = "revenue_recovery"))]
@@ -161,7 +308,8 @@ impl ConnectorCommon for Recurly {
     fn get_auth_header(
         &self,
         auth_type: &ConnectorAuthType,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         let auth = recurly::RecurlyAuthType::try_from(auth_type)
             .change_context(errors::ConnectorError::FailedToObtainAuthType)?;
         Ok(vec![
@@ -200,6 +348,7 @@ impl ConnectorCommon for Recurly {
             reason: response.reason,
             attempt_status: None,
             connector_transaction_id: None,
+            connector_response_reference_id: None,
             network_advice_code: None,
             network_decline_code: None,
             network_error_message: None,
@@ -224,7 +373,8 @@ impl
     fn get_headers(
         &self,
         req: &recovery_router_data_types::BillingConnectorPaymentsSyncRouterDataV2,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         let mut header = vec![(
             headers::CONTENT_TYPE.to_string(),
             self.common_get_content_type().to_string().into(),
@@ -300,16 +450,17 @@ impl
 #[cfg(all(feature = "v2", feature = "revenue_recovery"))]
 impl
     ConnectorIntegrationV2<
-        recovery_router_flows::InvoiceRecordBack,
-        recovery_flow_common_types::InvoiceRecordBackData,
-        recovery_request_types::InvoiceRecordBackRequest,
-        recovery_response_types::InvoiceRecordBackResponse,
+        InvoiceRecordBack,
+        InvoiceRecordBackData,
+        InvoiceRecordBackRequest,
+        InvoiceRecordBackResponse,
     > for Recurly
 {
     fn get_headers(
         &self,
         req: &recovery_router_data_types::InvoiceRecordBackRouterDataV2,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         let mut header = vec![(
             headers::CONTENT_TYPE.to_string(),
             self.common_get_content_type().to_string().into(),
@@ -400,7 +551,8 @@ impl
     fn get_headers(
         &self,
         req: &recovery_router_data_types::BillingConnectorInvoiceSyncRouterDataV2,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         let mut header = vec![(
             headers::CONTENT_TYPE.to_string(),
             self.common_get_content_type().to_string().into(),
@@ -538,6 +690,7 @@ impl webhooks::IncomingWebhook for Recurly {
     fn get_webhook_event_type(
         &self,
         request: &webhooks::IncomingWebhookRequestDetails<'_>,
+        _context: Option<&webhooks::WebhookContext>,
     ) -> CustomResult<api_models::webhooks::IncomingWebhookEvent, errors::ConnectorError> {
         let webhook = RecurlyWebhookBody::get_webhook_object_from_body(request.body)
             .change_context(errors::ConnectorError::WebhookBodyDecodingFailed)?;
@@ -556,6 +709,7 @@ impl webhooks::IncomingWebhook for Recurly {
     fn get_webhook_event_type(
         &self,
         _request: &webhooks::IncomingWebhookRequestDetails<'_>,
+        _context: Option<&webhooks::WebhookContext>,
     ) -> CustomResult<api_models::webhooks::IncomingWebhookEvent, errors::ConnectorError> {
         Err(report!(errors::ConnectorError::WebhooksNotImplemented))
     }
@@ -563,7 +717,8 @@ impl webhooks::IncomingWebhook for Recurly {
     fn get_webhook_resource_object(
         &self,
         request: &webhooks::IncomingWebhookRequestDetails<'_>,
-    ) -> CustomResult<Box<dyn masking::ErasedMaskSerialize>, errors::ConnectorError> {
+    ) -> CustomResult<Box<dyn hyperswitch_masking::ErasedMaskSerialize>, errors::ConnectorError>
+    {
         let webhook = RecurlyWebhookBody::get_webhook_object_from_body(request.body)
             .change_context(errors::ConnectorError::WebhookResourceObjectNotFound)?;
         Ok(Box::new(webhook))

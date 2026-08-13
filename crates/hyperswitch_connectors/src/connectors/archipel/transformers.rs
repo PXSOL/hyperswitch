@@ -11,22 +11,26 @@ use hyperswitch_domain_models::{
     router_data::{ConnectorAuthType, ErrorResponse, PaymentMethodToken, RouterData},
     router_flow_types::refunds::{Execute, RSync},
     router_request_types::{
-        AuthenticationData, PaymentsAuthorizeData, PaymentsCancelData, PaymentsCaptureData,
-        PaymentsIncrementalAuthorizationData, PaymentsSyncData, ResponseId,
+        AuthenticationData, PaymentsIncrementalAuthorizationData, ResponseId,
         SetupMandateRequestData,
     },
     router_response_types::{PaymentsResponseData, RefundsResponseData},
     types::{
         PaymentsAuthorizeRouterData, PaymentsCancelRouterData, PaymentsCaptureRouterData,
-        PaymentsIncrementalAuthorizationRouterData, RefundsRouterData, SetupMandateRouterData,
+        PaymentsIncrementalAuthorizationRouterData, PaymentsSyncRouterData, RefundsRouterData,
+        SetupMandateRouterData,
     },
 };
 use hyperswitch_interfaces::{consts, errors};
-use masking::Secret;
+use hyperswitch_masking::Secret;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    types::{RefundsResponseRouterData, ResponseRouterData},
+    types::{
+        PaymentsCancelResponseRouterData, PaymentsCaptureResponseRouterData,
+        PaymentsResponseRouterData, PaymentsSyncResponseRouterData, RefundsResponseRouterData,
+        ResponseRouterData,
+    },
     unimplemented_payment_method,
     utils::{
         self, AddressData, AddressDetailsData, CardData, CardIssuer, PaymentsAuthorizeRequestData,
@@ -790,9 +794,16 @@ impl TryFrom<ArchipelRouterData<&PaymentsAuthorizeRouterData>>
             | PaymentMethodData::CardToken(..)
             | PaymentMethodData::OpenBanking(..)
             | PaymentMethodData::NetworkToken(..)
-            | PaymentMethodData::MobilePayment(..) => Err(errors::ConnectorError::NotImplemented(
-                utils::get_unimplemented_payment_method_error_message("Archipel"),
-            ))?,
+            | PaymentMethodData::MobilePayment(..)
+            | PaymentMethodData::CardWithOptionalCVC(..)
+            | PaymentMethodData::CardWithNetworkTokenDetails(_)
+            | PaymentMethodData::CardWithLimitedDetails(..)
+            | PaymentMethodData::DecryptedWalletTokenDetailsForNetworkTransactionId(..)
+            | PaymentMethodData::NetworkTokenDetailsForNetworkTransactionId(..) => {
+                Err(errors::ConnectorError::NotImplemented(
+                    utils::get_unimplemented_payment_method_error_message("Archipel"),
+                ))?
+            }
         };
 
         let three_ds: Option<Archipel3DS> = if item.router_data.is_three_ds() {
@@ -841,7 +852,12 @@ impl TryFrom<ArchipelRouterData<&PaymentsAuthorizeRouterData>>
                 TokenizedCardData::try_from((wallet_data, &item.router_data.payment_method_token))?
             }
             PaymentMethodData::Card(..)
+            | PaymentMethodData::CardWithOptionalCVC(..)
+            | PaymentMethodData::CardWithNetworkTokenDetails(_)
             | PaymentMethodData::CardDetailsForNetworkTransactionId(..)
+            | PaymentMethodData::NetworkTokenDetailsForNetworkTransactionId(_)
+            | PaymentMethodData::DecryptedWalletTokenDetailsForNetworkTransactionId(_)
+            | PaymentMethodData::CardWithLimitedDetails(..)
             | PaymentMethodData::CardRedirect(..)
             | PaymentMethodData::PayLater(..)
             | PaymentMethodData::BankRedirect(..)
@@ -876,24 +892,10 @@ impl TryFrom<ArchipelRouterData<&PaymentsAuthorizeRouterData>>
 }
 
 // Responses for AUTHORIZATION FLOW
-impl<F>
-    TryFrom<
-        ResponseRouterData<
-            F,
-            ArchipelPaymentsResponse,
-            PaymentsAuthorizeData,
-            PaymentsResponseData,
-        >,
-    > for RouterData<F, PaymentsAuthorizeData, PaymentsResponseData>
-{
+impl TryFrom<PaymentsResponseRouterData<ArchipelPaymentsResponse>> for PaymentsAuthorizeRouterData {
     type Error = error_stack::Report<errors::ConnectorError>;
     fn try_from(
-        item: ResponseRouterData<
-            F,
-            ArchipelPaymentsResponse,
-            PaymentsAuthorizeData,
-            PaymentsResponseData,
-        >,
+        item: PaymentsResponseRouterData<ArchipelPaymentsResponse>,
     ) -> Result<Self, Self::Error> {
         if let Some(error) = item.response.error {
             return Ok(Self {
@@ -928,6 +930,7 @@ impl<F>
             status,
             response: Ok(PaymentsResponseData::TransactionResponse {
                 resource_id: ResponseId::ConnectorTransactionId(item.response.order.id),
+                authentication_data: None,
                 charges: None,
                 redirection_data: Box::new(None),
                 mandate_reference: Box::new(None),
@@ -938,6 +941,7 @@ impl<F>
                     .request
                     .is_customer_initiated_mandate_payment()
                     .then_some(item.response.transaction_id),
+                network_txn_link_id: None,
                 connector_response_reference_id: None,
                 incremental_authorization_allowed: Some(is_incremental_allowed),
             }),
@@ -947,18 +951,10 @@ impl<F>
 }
 
 // PSYNC FLOW
-impl<F>
-    TryFrom<ResponseRouterData<F, ArchipelPaymentsResponse, PaymentsSyncData, PaymentsResponseData>>
-    for RouterData<F, PaymentsSyncData, PaymentsResponseData>
-{
+impl TryFrom<PaymentsSyncResponseRouterData<ArchipelPaymentsResponse>> for PaymentsSyncRouterData {
     type Error = error_stack::Report<errors::ConnectorError>;
     fn try_from(
-        item: ResponseRouterData<
-            F,
-            ArchipelPaymentsResponse,
-            PaymentsSyncData,
-            PaymentsResponseData,
-        >,
+        item: PaymentsSyncResponseRouterData<ArchipelPaymentsResponse>,
     ) -> Result<Self, Self::Error> {
         if let Some(error) = item.response.error {
             return Ok(Self {
@@ -987,11 +983,13 @@ impl<F>
             status,
             response: Ok(PaymentsResponseData::TransactionResponse {
                 resource_id: ResponseId::ConnectorTransactionId(item.response.order.id),
+                authentication_data: None,
                 charges: None,
                 redirection_data: Box::new(None),
                 mandate_reference: Box::new(None),
                 connector_metadata,
                 network_txn_id: None,
+                network_txn_link_id: None,
                 connector_response_reference_id: None,
                 incremental_authorization_allowed: None,
             }),
@@ -1022,19 +1020,12 @@ impl From<ArchipelRouterData<&PaymentsCaptureRouterData>> for ArchipelCaptureReq
     }
 }
 
-impl<F>
-    TryFrom<
-        ResponseRouterData<F, ArchipelPaymentsResponse, PaymentsCaptureData, PaymentsResponseData>,
-    > for RouterData<F, PaymentsCaptureData, PaymentsResponseData>
+impl TryFrom<PaymentsCaptureResponseRouterData<ArchipelPaymentsResponse>>
+    for PaymentsCaptureRouterData
 {
     type Error = error_stack::Report<errors::ConnectorError>;
     fn try_from(
-        item: ResponseRouterData<
-            F,
-            ArchipelPaymentsResponse,
-            PaymentsCaptureData,
-            PaymentsResponseData,
-        >,
+        item: PaymentsCaptureResponseRouterData<ArchipelPaymentsResponse>,
     ) -> Result<Self, Self::Error> {
         if let Some(error) = item.response.error {
             return Ok(Self {
@@ -1058,11 +1049,13 @@ impl<F>
             status,
             response: Ok(PaymentsResponseData::TransactionResponse {
                 resource_id: ResponseId::ConnectorTransactionId(item.response.order.id),
+                authentication_data: None,
                 charges: None,
                 redirection_data: Box::new(None),
                 mandate_reference: Box::new(None),
                 connector_metadata,
                 network_txn_id: None,
+                network_txn_link_id: None,
                 connector_response_reference_id: None,
                 incremental_authorization_allowed: None,
             }),
@@ -1180,11 +1173,13 @@ impl<F>
             status,
             response: Ok(PaymentsResponseData::TransactionResponse {
                 resource_id: ResponseId::ConnectorTransactionId(item.response.order.id),
+                authentication_data: None,
                 charges: None,
                 redirection_data: Box::new(None),
                 mandate_reference: Box::new(None),
                 connector_metadata,
                 network_txn_id: Some(item.response.transaction_id.clone()),
+                network_txn_link_id: None,
                 connector_response_reference_id: Some(item.response.transaction_id),
                 incremental_authorization_allowed: Some(false),
             }),
@@ -1208,19 +1203,12 @@ impl From<ArchipelRouterData<&PaymentsCancelRouterData>> for ArchipelPaymentsCan
     }
 }
 
-impl<F>
-    TryFrom<
-        ResponseRouterData<F, ArchipelPaymentsResponse, PaymentsCancelData, PaymentsResponseData>,
-    > for RouterData<F, PaymentsCancelData, PaymentsResponseData>
+impl TryFrom<PaymentsCancelResponseRouterData<ArchipelPaymentsResponse>>
+    for PaymentsCancelRouterData
 {
     type Error = error_stack::Report<errors::ConnectorError>;
     fn try_from(
-        item: ResponseRouterData<
-            F,
-            ArchipelPaymentsResponse,
-            PaymentsCancelData,
-            PaymentsResponseData,
-        >,
+        item: PaymentsCancelResponseRouterData<ArchipelPaymentsResponse>,
     ) -> Result<Self, Self::Error> {
         if let Some(error) = item.response.error {
             return Ok(Self {
@@ -1244,11 +1232,13 @@ impl<F>
             status,
             response: Ok(PaymentsResponseData::TransactionResponse {
                 resource_id: ResponseId::ConnectorTransactionId(item.response.order.id),
+                authentication_data: None,
                 charges: None,
                 redirection_data: Box::new(None),
                 mandate_reference: Box::new(None),
                 connector_metadata,
                 network_txn_id: None,
+                network_txn_link_id: None,
                 connector_response_reference_id: None,
                 incremental_authorization_allowed: None,
             }),
@@ -1451,6 +1441,7 @@ impl From<ArchipelErrorMessageWithHttpCode> for ErrorResponse {
             code: error_message.code,
             attempt_status: None,
             connector_transaction_id: None,
+            connector_response_reference_id: None,
             message: error_message
                 .description
                 .clone()

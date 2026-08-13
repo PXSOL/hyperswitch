@@ -1,8 +1,9 @@
 import {
   customerAcceptance,
-  singleUseMandateData,
   multiUseMandateData,
+  singleUseMandateData,
 } from "./Commons";
+// import { getCustomExchange } from "./Modifiers";
 const mockBillingDetails = {
   address: {
     line1: "Servidao B-1",
@@ -38,10 +39,10 @@ const failedCardDetails = {
 const payment_method_data_no3ds = {
   card: {
     last4: "1111",
-    card_type: "CREDIT",
+    card_type: "DEBIT",
     card_network: "Visa",
-    card_issuer: "JP Morgan",
-    card_issuing_country: "INDIA",
+    card_issuer: "Conotoxia Sp Z Oo",
+    card_issuing_country: "POLAND",
     card_isin: "411111",
     card_extended_bin: null,
     card_exp_month: "10",
@@ -49,16 +50,17 @@ const payment_method_data_no3ds = {
     card_holder_name: "Thiago Gabriel",
     payment_checks: null,
     authentication_data: null,
+    auth_code: null,
   },
   billing: null,
 };
 const payment_method_data_no3ds_address = {
   card: {
     last4: "1111",
-    card_type: "CREDIT",
+    card_type: "DEBIT",
     card_network: "Visa",
-    card_issuer: "JP Morgan",
-    card_issuing_country: "INDIA",
+    card_issuer: "Conotoxia Sp Z Oo",
+    card_issuing_country: "POLAND",
     card_isin: "411111",
     card_extended_bin: null,
     card_exp_month: "10",
@@ -66,16 +68,17 @@ const payment_method_data_no3ds_address = {
     card_holder_name: "Thiago Gabriel",
     payment_checks: null,
     authentication_data: null,
+    auth_code: null,
   },
   billing: mockBillingDetails,
 };
 const payment_method_data_3ds_address = {
   card: {
     last4: "1111",
-    card_type: "CREDIT",
+    card_type: "DEBIT",
     card_network: "Visa",
-    card_issuer: "JP Morgan",
-    card_issuing_country: "INDIA",
+    card_issuer: "Conotoxia Sp Z Oo",
+    card_issuing_country: "POLAND",
     card_isin: "411111",
     card_extended_bin: null,
     card_exp_month: "10",
@@ -83,10 +86,100 @@ const payment_method_data_3ds_address = {
     card_holder_name: "Thiago Gabriel",
     payment_checks: null,
     authentication_data: null,
+    auth_code: null,
   },
   billing: mockBillingDetails,
 };
 export const connectorDetails = {
+  voucher_pm: {
+    PaymentIntent: () => {
+      return {
+        Request: {
+          currency: "MXN",
+        },
+        Response: {
+          status: 200,
+          body: {
+            status: "requires_payment_method",
+          },
+        },
+      };
+    },
+    Oxxo: {
+      Request: {
+        payment_method: "voucher",
+        payment_method_type: "oxxo",
+        payment_method_data: {
+          voucher: "oxxo",
+        },
+        billing: {
+          address: {
+            line1: "123 Test Street",
+            city: "Mexico City",
+            state: "CDMX",
+            zip: "01000",
+            country: "MX",
+            first_name: "Test",
+            last_name: "Customer",
+          },
+          email: "guest@example.com",
+        },
+        customer: {
+          document_details: {
+            document_type: "cnpj",
+            document_number: "12345678000195",
+          },
+        },
+        currency: "MXN",
+      },
+      Response: {
+        status: 200,
+        body: {
+          status: "requires_customer_action",
+          payment_method: "voucher",
+          payment_method_type: "oxxo",
+        },
+      },
+    },
+    OxxoInvalidFormat: {
+      Request: {
+        payment_method: "voucher",
+        payment_method_type: "oxxo",
+        payment_method_data: {
+          voucher: "invalid_oxxo_value",
+        },
+        billing: {
+          address: {
+            line1: "123 Test Street",
+            city: "Mexico City",
+            state: "CDMX",
+            zip: "01000",
+            country: "MX",
+            first_name: "Test",
+            last_name: "Customer",
+          },
+          email: "guest@example.com",
+        },
+        customer: {
+          document_details: {
+            document_type: "cnpj",
+            document_number: "12345678000195",
+          },
+        },
+        currency: "MXN",
+      },
+      Response: {
+        status: 400,
+        body: {
+          error: {
+            message:
+              "Json deserialize error: unknown variant `invalid_oxxo_value`, expected one of `boleto`, `efecty`, `pago_efectivo`, `red_compra`, `red_pagos`, `alfamart`, `indomaret`, `oxxo`, `seven_eleven`, `lawson`, `mini_stop`, `family_mart`, `seicomart`, `pay_easy`",
+            code: "IR_06",
+          },
+        },
+      },
+    },
+  },
   card_pm: {
     No3DSFailPayment: {
       Request: {
@@ -529,6 +622,8 @@ export const connectorDetails = {
           card: successfulCardDetails,
           billing: mockBillingDetails,
         },
+        mandate_data: null,
+        customer_acceptance: customerAcceptance,
       },
       Response: {
         status: 501,

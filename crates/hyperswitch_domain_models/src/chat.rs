@@ -1,5 +1,5 @@
 use common_utils::id_type;
-use masking::Secret;
+use hyperswitch_masking::Secret;
 
 #[derive(Debug, serde::Deserialize, serde::Serialize, Clone)]
 pub struct GetDataMessage {
@@ -12,4 +12,5 @@ pub struct HyperswitchAiDataRequest {
     pub profile_id: id_type::ProfileId,
     pub org_id: id_type::OrganizationId,
     pub query: GetDataMessage,
+    pub entity_type: common_enums::EntityType,
 }

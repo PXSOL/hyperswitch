@@ -2,7 +2,7 @@ use std::{collections::HashMap, fmt, ops::Deref, str::FromStr, sync::LazyLock};
 
 use common_utils::errors::ValidationError;
 use error_stack::report;
-use masking::{PeekInterface, Strategy, StrongSecret, WithType};
+use hyperswitch_masking::{PeekInterface, Strategy, StrongSecret, WithType};
 use regex::Regex;
 #[cfg(not(target_arch = "wasm32"))]
 use router_env::{logger, which as router_env_which, Env};
@@ -85,7 +85,7 @@ impl CardNumber {
         let mut no_of_supported_card_networks = 0;
 
         let card_number_str = self.get_card_no();
-        for (_, regex) in CARD_NETWORK_REGEX.iter() {
+        for regex in CARD_NETWORK_REGEX.values() {
             let card_regex = match regex.as_ref() {
                 Ok(regex) => Ok(regex),
                 Err(_) => Err(report!(ValidationError::InvalidValue {
@@ -101,6 +101,10 @@ impl CardNumber {
             }
         }
         Ok(no_of_supported_card_networks > 1)
+    }
+
+    pub fn to_network_token(&self) -> NetworkToken {
+        NetworkToken(self.0.clone())
     }
 }
 
@@ -141,7 +145,7 @@ impl FromStr for CardNumber {
         ];
         #[cfg(not(target_arch = "wasm32"))]
         let valid_test_cards = match router_env_which() {
-            Env::Development | Env::Sandbox => valid_test_cards,
+            Env::Development | Env::Sandbox | Env::Integ => valid_test_cards,
             Env::Production => vec![],
         };
 
@@ -170,7 +174,7 @@ impl FromStr for NetworkToken {
         ];
         #[cfg(not(target_arch = "wasm32"))]
         let valid_test_network_tokens = match router_env_which() {
-            Env::Development | Env::Sandbox => valid_test_network_tokens,
+            Env::Development | Env::Sandbox | Env::Integ => valid_test_network_tokens,
             Env::Production => vec![],
         };
 
@@ -197,7 +201,7 @@ pub fn sanitize_card_number(card_number: &str) -> Result<bool, CardNumberValidat
 
 /// # Panics
 ///
-/// Never, as a single character will never be greater than 10, or `u8`
+/// Never, as a single decimal digit will never be greater than 10, or `u8`
 pub fn validate_card_number_chars(number: &str) -> Result<Vec<u8>, CardNumberValidationErr> {
     let data = number.chars().try_fold(
         Vec::with_capacity(MAX_CARD_NUMBER_LENGTH),
@@ -210,7 +214,7 @@ pub fn validate_card_number_chars(number: &str) -> Result<Vec<u8>, CardNumberVal
                         "invalid character found in card number",
                     ))?
                     .try_into()
-                    .expect("error while converting a single character to u8"), // safety, a single character will never be greater `u8`
+                    .expect("error while converting a single decimal digit to u8"), // safety, a single decimal digit will never be greater `u8`
             );
             Ok::<Vec<u8>, CardNumberValidationErr>(data)
         },
@@ -274,6 +278,18 @@ impl Deref for NetworkToken {
     }
 }
 
+impl From<NetworkToken> for CardNumber {
+    fn from(network_token: NetworkToken) -> Self {
+        Self(network_token.0)
+    }
+}
+
+impl From<CardNumber> for NetworkToken {
+    fn from(card_number: CardNumber) -> Self {
+        Self(card_number.0)
+    }
+}
+
 impl<'de> Deserialize<'de> for CardNumber {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
@@ -313,9 +329,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
-
-    use masking::Secret;
+    use hyperswitch_masking::Secret;
 
     use super::*;
 
@@ -359,7 +373,7 @@ mod tests {
     fn card_number_no_whitespace() {
         let s = "3714    4963  5398 431";
         assert_eq!(
-            CardNumber::from_str(s).unwrap().to_string(),
+            format!("{:?}", CardNumber::from_str(s).unwrap().0),
             "371449*********"
         );
     }
@@ -387,8 +401,10 @@ mod tests {
     #[test]
     fn test_valid_card_number_deserialization() {
         let card_number = serde_json::from_str::<CardNumber>(r#""3714 4963 5398 431""#).unwrap();
-        let secret = card_number.to_string();
-        assert_eq!(r#""371449*********""#, format!("{secret:?}"));
+        assert_eq!(
+            r#""371449*********""#,
+            format!("{:?}", card_number.get_card_no())
+        );
     }
 
     #[test]

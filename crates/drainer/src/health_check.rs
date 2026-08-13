@@ -162,7 +162,7 @@ impl HealthCheckInterface for Store {
         &self,
         _conf: &Settings,
     ) -> CustomResult<(), HealthCheckRedisError> {
-        let redis_conn = self.redis_conn.clone();
+        let redis_conn = self.get_redis_conn();
 
         redis_conn
             .serialize_and_set_key_with_expiry(&"test_key".into(), "test_value", 30)
@@ -197,18 +197,19 @@ impl HealthCheckInterface for Store {
         logger::debug!("Stream append succeeded");
 
         let output = redis_conn
-            .stream_read_entries(TEST_STREAM_NAME, "0-0", Some(10))
+            .stream_read_entries(
+                &[TEST_STREAM_NAME.into()],
+                vec!["0-0".to_string()],
+                Some(10),
+            )
             .await
             .change_context(HealthCheckRedisError::StreamReadFailed)?;
         logger::debug!("Stream read succeeded");
 
-        let (_, id_to_trim) = output
+        let id_to_trim = output
             .get(&redis_conn.add_prefix(TEST_STREAM_NAME))
-            .and_then(|entries| {
-                entries
-                    .last()
-                    .map(|last_entry| (entries, last_entry.0.clone()))
-            })
+            .and_then(|entries| entries.last())
+            .map(|(entry_id, _fields)| entry_id.clone())
             .ok_or(error_stack::report!(
                 HealthCheckRedisError::StreamReadFailed
             ))?;
@@ -217,10 +218,10 @@ impl HealthCheckInterface for Store {
         redis_conn
             .stream_trim_entries(
                 &TEST_STREAM_NAME.into(),
-                (
+                redis_interface::StreamTrimConfig::new(
                     redis_interface::StreamCapKind::MinID,
                     redis_interface::StreamCapTrim::Exact,
-                    id_to_trim,
+                    &id_to_trim,
                 ),
             )
             .await

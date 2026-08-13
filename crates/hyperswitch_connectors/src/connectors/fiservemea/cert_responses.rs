@@ -32,7 +32,7 @@ use hyperswitch_domain_models::{
     router_response_types::{PaymentsResponseData, RedirectForm},
 };
 use hyperswitch_interfaces::{api::ConnectorCommon, types::Response};
-use masking::{PeekInterface, Secret};
+use hyperswitch_masking::{PeekInterface, Secret};
 use serde_json::json;
 
 use super::transformers as fiservemea;
@@ -102,6 +102,12 @@ fn empty_router_data<F>() -> RouterData<F, (), PaymentsResponseData> {
         psd2_sca_exemption_type: None,
         raw_connector_response: None,
         is_payment_id_from_merchant: None,
+        payment_method_type: None,
+        payout_id: None,
+        authorized_amount: None,
+        customer_document_details: None,
+        feature_data: None,
+        sender_payment_instrument_id: None,
     }
 }
 
