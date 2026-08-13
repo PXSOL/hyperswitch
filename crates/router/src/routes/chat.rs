@@ -40,6 +40,32 @@ pub async fn get_data_from_hyperswitch_ai_workflow(
         // At present, the AI service retrieves data scoped to the merchant level
         &auth::JWTAuth {
             permission: Permission::MerchantPaymentRead,
+            allow_connected: false,
+            allow_platform: false,
+        },
+        api_locking::LockAction::NotApplicable,
+    ))
+    .await
+}
+
+#[instrument(skip_all)]
+pub async fn get_all_conversations(
+    state: web::Data<AppState>,
+    http_req: HttpRequest,
+    payload: web::Query<chat_api::ChatListRequest>,
+) -> HttpResponse {
+    let flow = Flow::ListAllChatInteractions;
+    Box::pin(api::server_wrap(
+        flow.clone(),
+        state,
+        &http_req,
+        payload.into_inner(),
+        |state, user: auth::UserFromToken, payload, _| {
+            chat_core::list_chat_conversations(state, user, payload)
+        },
+        &auth::DashboardNoPermissionAuth {
+            allow_connected: false,
+            allow_platform: false,
         },
         api_locking::LockAction::NotApplicable,
     ))

@@ -1,10 +1,18 @@
 use common_utils::errors::CustomResult;
 use error_stack::ResultExt;
+use hyperswitch_masking::PeekInterface;
 use jsonwebtoken::{encode, EncodingKey, Header};
-use masking::PeekInterface;
 
 use crate::{configs::Settings, core::errors::UserErrors};
 
+// deja: JWT expiry uses a raw SystemTime::now() that bypasses the instrumented
+// date_time::now boundary, so the `exp` claim (and thus the whole signed token)
+// diverges on replay. Record/replay the absolute expiry (Ok-only) to reproduce
+// byte-identical JWTs.
+#[cfg_attr(
+    feature = "deja",
+    deja::id(component = "router::jwt", operation = "generate_exp", codec = ResultOkCodec,)
+)]
 pub fn generate_exp(
     exp_duration: std::time::Duration,
 ) -> CustomResult<std::time::Duration, UserErrors> {

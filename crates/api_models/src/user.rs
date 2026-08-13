@@ -2,7 +2,7 @@ use std::fmt::Debug;
 
 use common_enums::{EntityType, TokenPurpose};
 use common_utils::{crypto::OptionalEncryptableName, id_type, pii};
-use masking::Secret;
+use hyperswitch_masking::Secret;
 use utoipa::ToSchema;
 
 use crate::user_role::UserStatus;
@@ -18,6 +18,7 @@ pub struct SignUpWithMerchantIdRequest {
     pub email: pii::Email,
     pub password: Secret<String>,
     pub company_name: String,
+    pub organization_type: Option<common_enums::OrganizationType>,
 }
 
 pub type SignUpWithMerchantIdResponse = AuthorizeResponse;
@@ -95,6 +96,24 @@ pub struct AcceptInviteFromEmailRequest {
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct ValidateOnlyQueryParam {
+    pub status_check: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub enum InvitationAcceptanceStatus {
+    AlreadyAccepted,
+    SuccessfullyAccepted,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(untagged)]
+pub enum AcceptInviteResponse {
+    Token(TokenResponse),
+    Status(InvitationAcceptanceStatus),
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct SwitchOrganizationRequest {
     pub org_id: id_type::OrganizationId,
 }
@@ -110,22 +129,10 @@ pub struct SwitchProfileRequest {
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
-pub struct CloneConnectorSource {
-    pub mca_id: id_type::MerchantConnectorAccountId,
-    pub merchant_id: id_type::MerchantId,
-}
-
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
-pub struct CloneConnectorDestination {
-    pub connector_label: Option<String>,
-    pub profile_id: id_type::ProfileId,
-    pub merchant_id: id_type::MerchantId,
-}
-
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct CloneConnectorRequest {
-    pub source: CloneConnectorSource,
-    pub destination: CloneConnectorDestination,
+    pub source_mca_id: id_type::MerchantConnectorAccountId,
+    pub destination_profile_id: id_type::ProfileId,
+    pub connector_label: Option<String>,
 }
 
 #[derive(serde::Deserialize, Debug, serde::Serialize)]
@@ -240,7 +247,7 @@ pub struct SkipTwoFactorAuthQueryParam {
     pub skip_two_factor_auth: Option<bool>,
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize, Clone)]
 pub struct TokenResponse {
     pub token: Secret<String>,
     pub token_type: TokenPurpose,
@@ -354,6 +361,17 @@ pub struct CreateUserAuthenticationMethodRequest {
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct CreateUserAuthenticationMethodResponse {
+    pub id: String,
+    pub auth_id: String,
+    pub owner_id: String,
+    pub owner_type: common_enums::Owner,
+    pub auth_type: common_enums::UserAuthType,
+    pub email_domain: Option<String>,
+    pub allow_signup: bool,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdateUserAuthenticationMethodRequest {
     AuthMethod {
@@ -416,6 +434,17 @@ pub struct UserKeyTransferRequest {
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct ListUsersInternalRequest {
+    pub user_ids: Vec<String>,
+}
+
+#[cfg(feature = "v1")]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct ListMembersQueryParam {
+    pub access_level: EntityType,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct UserTransferKeyResponse {
     pub total_transferred: usize,
 }
@@ -425,6 +454,12 @@ pub struct ListOrgsForUserResponse {
     pub org_id: id_type::OrganizationId,
     pub org_name: Option<String>,
     pub org_type: common_enums::OrganizationType,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct UserMerchantDetailsResponse {
+    pub product_type: Option<common_enums::MerchantProductType>,
+    pub merchant_account_type: common_enums::MerchantAccountType,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -440,4 +475,36 @@ pub struct UserMerchantAccountResponse {
 pub struct ListProfilesForUserInOrgAndMerchantAccountResponse {
     pub profile_id: id_type::ProfileId,
     pub profile_name: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct IssueEmbeddedTokenResponse {
+    pub token: Secret<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct EmbeddedTokenInfoResponse {
+    pub org_id: id_type::OrganizationId,
+    pub merchant_id: id_type::MerchantId,
+    pub merchant_account_version: common_enums::ApiVersion,
+    pub profile_id: id_type::ProfileId,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct GetUserInternalDetailsResponse {
+    pub user_id: String,
+    pub name: Secret<String>,
+    pub email: pii::Email,
+    pub is_active: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ListUsersInternalResponse {
+    pub users: Vec<GetUserInternalDetailsResponse>,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct AuthorizeTokenRequest {
+    pub token: Secret<String>,
+    pub permission: String,
 }

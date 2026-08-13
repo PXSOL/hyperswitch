@@ -5,12 +5,9 @@ pub mod customer;
 pub mod dispute;
 pub mod external_service_auth;
 pub mod gsm;
-mod locker_migration;
 pub mod payment;
 #[cfg(feature = "payouts")]
 pub mod payouts;
-#[cfg(feature = "recon")]
-pub mod recon;
 pub mod refund;
 #[cfg(feature = "v2")]
 pub mod revenue_recovery;
@@ -38,7 +35,9 @@ use crate::{
     disputes::*,
     files::*,
     mandates::*,
+    merchant_connector_webhook_management::*,
     organization::{
+        ConvertOrganizationToPlatformRequest, ConvertOrganizationToPlatformResponse,
         OrganizationCreateRequest, OrganizationId, OrganizationResponse, OrganizationUpdateRequest,
     },
     payment_methods::*,
@@ -74,6 +73,10 @@ impl_api_event_type!(
         RetrievePaymentLinkResponse,
         MandateListConstraints,
         CreateFileResponse,
+        ConvertOrganizationToPlatformRequest,
+        ConvertOrganizationToPlatformResponse,
+        ConnectorWebhookRegisterRequest,
+        ConnectorWebhookListResponse,
         MerchantConnectorResponse,
         MerchantConnectorId,
         MandateResponse,
@@ -83,6 +86,7 @@ impl_api_event_type!(
         MandateId,
         DisputeListGetConstraints,
         RetrieveApiKeyResponse,
+        RegisterConnectorWebhookResponse,
         ProfileResponse,
         ProfileUpdate,
         ProfileCreate,

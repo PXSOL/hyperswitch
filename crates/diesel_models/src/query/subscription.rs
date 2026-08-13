@@ -19,13 +19,13 @@ impl Subscription {
     pub async fn find_by_merchant_id_subscription_id(
         conn: &PgPooledConn,
         merchant_id: &common_utils::id_type::MerchantId,
-        subscription_id: String,
+        id: String,
     ) -> StorageResult<Self> {
         generics::generic_find_one::<<Self as HasTable>::Table, _, _>(
             conn,
             dsl::merchant_id
                 .eq(merchant_id.to_owned())
-                .and(dsl::subscription_id.eq(subscription_id.to_owned())),
+                .and(dsl::id.eq(id.to_owned())),
         )
         .await
     }
@@ -33,7 +33,7 @@ impl Subscription {
     pub async fn update_subscription_entry(
         conn: &PgPooledConn,
         merchant_id: &common_utils::id_type::MerchantId,
-        subscription_id: String,
+        id: String,
         subscription_update: SubscriptionUpdate,
     ) -> StorageResult<Self> {
         generics::generic_update_with_results::<
@@ -43,8 +43,8 @@ impl Subscription {
             _,
         >(
             conn,
-            dsl::subscription_id
-                .eq(subscription_id.to_owned())
+            dsl::id
+                .eq(id.to_owned())
                 .and(dsl::merchant_id.eq(merchant_id.to_owned())),
             subscription_update,
         )
@@ -55,5 +55,24 @@ impl Subscription {
             report!(errors::DatabaseError::NotFound)
                 .attach_printable("Error while updating subscription entry")
         })
+    }
+
+    pub async fn list_by_merchant_id_profile_id(
+        conn: &PgPooledConn,
+        merchant_id: &common_utils::id_type::MerchantId,
+        profile_id: &common_utils::id_type::ProfileId,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> StorageResult<Vec<Self>> {
+        generics::generic_filter::<<Self as HasTable>::Table, _, _, _>(
+            conn,
+            dsl::merchant_id
+                .eq(merchant_id.to_owned())
+                .and(dsl::profile_id.eq(profile_id.to_owned())),
+            limit,
+            offset,
+            Some(dsl::created_at.desc()),
+        )
+        .await
     }
 }

@@ -3,6 +3,7 @@
 pub mod api_keys;
 pub mod authentication;
 pub mod blocklist;
+pub mod card_issuer;
 pub mod customers;
 pub mod disputes;
 pub mod gsm;
@@ -23,6 +24,7 @@ pub mod refunds;
 pub mod relay;
 pub mod revenue_recovery;
 pub mod routing;
+pub mod subscriptions;
 pub mod three_ds_decision_rule;
 pub mod tokenization;
 pub mod webhook_events;

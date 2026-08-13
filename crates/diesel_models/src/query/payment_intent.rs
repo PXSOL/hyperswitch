@@ -6,14 +6,21 @@ use crate::schema::payment_intent::dsl;
 #[cfg(feature = "v2")]
 use crate::schema_v2::payment_intent::dsl;
 use crate::{
-    errors,
+    errors, kv,
     payment_intent::{self, PaymentIntent, PaymentIntentNew},
     PgPooledConn, StorageResult,
 };
 
 impl PaymentIntentNew {
     pub async fn insert(self, conn: &PgPooledConn) -> StorageResult<PaymentIntent> {
-        generics::generic_insert(conn, self).await
+        Box::pin(generics::generic_insert(conn, self)).await
+    }
+
+    pub async fn generate_drainer_insert_query(
+        self,
+        conn: &mut PgPooledConn,
+    ) -> StorageResult<kv::SerializableQuery> {
+        kv::generate_insert_query(conn, self).await
     }
 }
 
@@ -24,11 +31,12 @@ impl PaymentIntent {
         conn: &PgPooledConn,
         payment_intent_update: payment_intent::PaymentIntentUpdateInternal,
     ) -> StorageResult<Self> {
-        match generics::generic_update_by_id::<<Self as HasTable>::Table, _, _, _>(
-            conn,
-            self.id.to_owned(),
-            payment_intent_update,
-        )
+        match Box::pin(generics::generic_update_by_id::<
+            <Self as HasTable>::Table,
+            _,
+            _,
+            _,
+        >(conn, self.id.to_owned(), payment_intent_update))
         .await
         {
             Err(error) => match error.current_context() {
@@ -57,7 +65,7 @@ impl PaymentIntent {
             conn,
             dsl::payment_id
                 .eq(self.payment_id.to_owned())
-                .and(dsl::merchant_id.eq(self.merchant_id.to_owned())),
+                .and(dsl::processor_merchant_id.eq(self.processor_merchant_id.to_owned())),
             payment_intent::PaymentIntentUpdateInternal::from(payment_intent),
         )
         .await
@@ -105,15 +113,15 @@ impl PaymentIntent {
     }
 
     #[cfg(feature = "v1")]
-    pub async fn find_by_payment_id_merchant_id(
+    pub async fn find_by_payment_id_processor_merchant_id(
         conn: &PgPooledConn,
         payment_id: &common_utils::id_type::PaymentId,
-        merchant_id: &common_utils::id_type::MerchantId,
+        processor_merchant_id: &common_utils::id_type::MerchantId,
     ) -> StorageResult<Self> {
         generics::generic_find_one::<<Self as HasTable>::Table, _, _>(
             conn,
-            dsl::merchant_id
-                .eq(merchant_id.to_owned())
+            dsl::processor_merchant_id
+                .eq(processor_merchant_id.to_owned())
                 .and(dsl::payment_id.eq(payment_id.to_owned())),
         )
         .await
@@ -135,17 +143,48 @@ impl PaymentIntent {
     }
 
     #[cfg(feature = "v1")]
-    pub async fn find_optional_by_payment_id_merchant_id(
+    pub async fn find_optional_by_payment_id_processor_merchant_id(
         conn: &PgPooledConn,
         payment_id: &common_utils::id_type::PaymentId,
-        merchant_id: &common_utils::id_type::MerchantId,
+        processor_merchant_id: &common_utils::id_type::MerchantId,
     ) -> StorageResult<Option<Self>> {
         generics::generic_find_one_optional::<<Self as HasTable>::Table, _, _>(
             conn,
-            dsl::merchant_id
-                .eq(merchant_id.to_owned())
+            dsl::processor_merchant_id
+                .eq(processor_merchant_id.to_owned())
                 .and(dsl::payment_id.eq(payment_id.to_owned())),
         )
         .await
+    }
+}
+
+#[cfg(feature = "v1")]
+impl payment_intent::PaymentIntentUpdate {
+    pub async fn generate_drainer_update_query(
+        self,
+        conn: &mut PgPooledConn,
+        payment_id: common_utils::id_type::PaymentId,
+        processor_merchant_id: Option<common_utils::id_type::MerchantId>,
+    ) -> StorageResult<kv::SerializableQuery> {
+        kv::generate_update_query_with_predicate::<<PaymentIntent as HasTable>::Table, _, _>(
+            conn,
+            dsl::payment_id
+                .eq(payment_id)
+                .and(dsl::processor_merchant_id.eq(processor_merchant_id)),
+            payment_intent::PaymentIntentUpdateInternal::from(self),
+        )
+        .await
+    }
+}
+
+#[cfg(feature = "v2")]
+impl payment_intent::PaymentIntentUpdateInternal {
+    pub async fn generate_drainer_update_query(
+        self,
+        conn: &mut PgPooledConn,
+        id: common_utils::id_type::GlobalPaymentId,
+    ) -> StorageResult<kv::SerializableQuery> {
+        kv::generate_update_query_by_id::<<PaymentIntent as HasTable>::Table, _, _>(conn, id, self)
+            .await
     }
 }

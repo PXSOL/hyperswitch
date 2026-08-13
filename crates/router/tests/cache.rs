@@ -1,4 +1,3 @@
-#![allow(clippy::unwrap_used, clippy::print_stdout)]
 use std::sync::Arc;
 
 use router::{configs::settings::Settings, routes, services};
@@ -15,6 +14,7 @@ async fn invalidate_existing_cache_success() {
         Settings::default(),
         tx,
         Box::new(services::MockApiClient),
+        env!("CARGO_PKG_NAME"),
     ))
     .await;
     let state = Arc::new(app_state)

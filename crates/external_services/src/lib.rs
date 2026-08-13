@@ -2,32 +2,25 @@
 
 #![warn(missing_docs, missing_debug_implementations)]
 
-#[cfg(feature = "email")]
-pub mod email;
-
 #[cfg(feature = "aws_kms")]
 pub mod aws_kms;
-
-pub mod file_storage;
-#[cfg(feature = "hashicorp-vault")]
-pub mod hashicorp_vault;
-
-pub mod no_encryption;
-
-/// Building grpc clients to communicate with the server
-pub mod grpc_client;
-
-/// http_client module
-pub mod http_client;
-
-/// hubspot_proxy module
-pub mod hubspot_proxy;
-
-pub mod managers;
-
 /// crm module
 pub mod crm;
-
+#[cfg(feature = "email")]
+pub mod email;
+pub mod file_storage;
+/// Building grpc clients to communicate with the server
+pub mod grpc_client;
+#[cfg(feature = "hashicorp-vault")]
+pub mod hashicorp_vault;
+/// http_client module
+pub mod http_client;
+/// hubspot_proxy module
+pub mod hubspot_proxy;
+pub mod managers;
+pub mod no_encryption;
+#[cfg(feature = "superposition")]
+pub mod superposition;
 /// deserializers module_path
 pub mod utils;
 
@@ -69,6 +62,9 @@ pub mod date_time {
 
 /// Crate specific constants
 pub mod consts {
+    /// Default per-RPC timeout (seconds) for unified connector service calls.
+    pub(crate) const DEFAULT_UCS_REQUEST_TIMEOUT_SECS: u64 = 35;
+
     /// General purpose base64 engine
     #[cfg(feature = "aws_kms")]
     pub(crate) const BASE64_ENGINE: base64::engine::GeneralPurpose =
@@ -76,6 +72,12 @@ pub mod consts {
 
     /// Header key used to specify the connector name in UCS requests.
     pub(crate) const UCS_HEADER_CONNECTOR: &str = "x-connector";
+
+    /// Header key used to specify the payout connector name in UCS requests.
+    pub(crate) const UCS_HEADER_PAYOUT_CONNECTOR: &str = "x-payout-connector";
+
+    /// Header key used to specify the surcharge connector name in UCS requests.
+    pub(crate) const UCS_HEADER_SURCHARGE_CONNECTOR: &str = "x-surcharge-connector";
 
     /// Header key used to indicate the authentication type being used.
     pub(crate) const UCS_HEADER_AUTH_TYPE: &str = "x-auth";
@@ -89,13 +91,26 @@ pub mod consts {
     /// Header key for sending the API secret in signature-based authentication.
     pub(crate) const UCS_HEADER_API_SECRET: &str = "x-api-secret";
 
+    /// Header key for sending a second additional key used in multi-auth authentication.
+    pub(crate) const UCS_HEADER_KEY2: &str = "x-key2";
+
     /// Header key for sending the AUTH KEY MAP in currency-based authentication.
     pub(crate) const UCS_HEADER_AUTH_KEY_MAP: &str = "x-auth-key-map";
 
     /// Header key for sending the EXTERNAL VAULT METADATA in proxy payments
     pub(crate) const UCS_HEADER_EXTERNAL_VAULT_METADATA: &str = "x-external-vault-metadata";
 
+    /// Header key for sending the list of lineage ids
     pub(crate) const UCS_LINEAGE_IDS: &str = "x-lineage-ids";
+
+    /// Header key for sending the merchant reference id to UCS
+    pub(crate) const UCS_HEADER_REFERENCE_ID: &str = "x-reference-id";
+
+    /// Header key for sending the resource id to UCS
+    pub(crate) const UCS_HEADER_RESOURCE_ID: &str = "x-resource-id";
+
+    /// Header key for sending connector-specific configuration to UCS
+    pub(crate) const UCS_HEADER_CONNECTOR_CONFIG: &str = "x-connector-config";
 }
 
 /// Metrics for interactions with external systems.
@@ -114,4 +129,14 @@ pub mod metrics {
     histogram_metric_f64!(AWS_KMS_DECRYPT_TIME, GLOBAL_METER); // Histogram for AWS KMS decryption time (in sec)
     #[cfg(feature = "aws_kms")]
     histogram_metric_f64!(AWS_KMS_ENCRYPT_TIME, GLOBAL_METER); // Histogram for AWS KMS encryption time (in sec)
+}
+
+/// Metrics for config-related operations
+#[cfg(feature = "superposition")]
+pub mod config_metrics {
+    use router_env::{counter_metric, global_meter};
+
+    global_meter!(GLOBAL_METER, "EXTERNAL_SERVICES");
+
+    counter_metric!(CONFIG_SUPERPOSITION_FETCH, GLOBAL_METER); // No. of configs fetched from Superposition
 }

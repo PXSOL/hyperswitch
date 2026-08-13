@@ -10,6 +10,8 @@ pub(crate) mod headers {
     pub(crate) const IDEMPOTENCY_KEY: &str = "Idempotency-Key";
     pub(crate) const MESSAGE_SIGNATURE: &str = "Message-Signature";
     pub(crate) const MERCHANT_ID: &str = "Merchant-ID";
+    pub(crate) const MERCHANTID: &str = "MerchantID";
+    pub(crate) const MERCHANT_TOKEN: &str = "MerchantToken";
     pub(crate) const REQUEST_ID: &str = "request-id";
     pub(crate) const NONCE: &str = "nonce";
     pub(crate) const TIMESTAMP: &str = "Timestamp";
@@ -34,6 +36,8 @@ pub(crate) mod headers {
     pub(crate) const X_SIGNATURE: &str = "X-Signature";
     pub(crate) const SOAP_ACTION: &str = "SOAPAction";
     pub(crate) const X_PROFILE_ID: &str = "X-Profile-Id";
+    pub(crate) const X_APPLICATION_KEY: &str = "X-Application-Key";
+    pub(crate) const X_MERCHANT_ID: &str = "X-Merchant-Id";
 }
 
 /// Unsupported response type error message
@@ -46,6 +50,8 @@ pub const CONNECTOR_UNAUTHORIZED_ERROR: &str = "Authentication Error from the co
 pub const REFUND_VOIDED: &str = "Refund request has been voided.";
 
 pub const LOW_BALANCE_ERROR_MESSAGE: &str = "Insufficient balance in the payment method";
+
+pub const MISMATCHED_CURRENCY: &str = "Payment Method currency does not match the payment currency";
 
 pub const DUIT_NOW_BRAND_COLOR: &str = "#ED2E67";
 

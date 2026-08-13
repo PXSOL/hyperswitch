@@ -3,9 +3,7 @@ use std::ops::Deref;
 
 use base64::Engine;
 use error_stack::ResultExt;
-use masking::{ExposeInterface, Secret};
-use md5;
-use pem;
+use hyperswitch_masking::{ExposeInterface, PeekInterface, Secret};
 use ring::{
     aead::{self, BoundKey, OpeningKey, SealingKey, UnboundKey},
     hmac, rand as ring_rand,
@@ -13,16 +11,47 @@ use ring::{
 };
 #[cfg(feature = "logs")]
 use router_env::logger;
-use rsa::{pkcs8::DecodePublicKey, signature::Verifier};
+use rsa::{
+    pkcs1::DecodeRsaPrivateKey,
+    pkcs8::{DecodePrivateKey, DecodePublicKey},
+    signature::Verifier,
+    traits::PublicKeyParts,
+    Oaep,
+};
 
 use crate::{
-    consts::BASE64_ENGINE,
+    consts::{BASE64_ENGINE, BASE64_ENGINE_URL_SAFE_NO_PAD},
     errors::{self, CustomResult},
     pii::{self, EncryptionStrategy},
 };
 
 #[derive(Clone, Debug)]
-struct NonceSequence(u128);
+#[cfg_attr(feature = "deja", derive(serde::Serialize, serde::Deserialize))]
+struct NonceSequence(
+    // deja: serialize the 96-bit nonce as its 16 big-endian BYTES, not a bare
+    // u128. A nonce routinely exceeds u64::MAX, and `serde_json::Value::Number`
+    // cannot hold a u128 beyond u64 range — so capturing it as a number FAILED
+    // and the boundary recorded `null`, leaving nothing to substitute (the real
+    // random nonce then ran on replay → divergent at-rest ciphertext). A byte
+    // array is small-int-only, so it round-trips through serde_json and any
+    // JSON event transport losslessly, exactly like `generate_aes256_key`.
+    #[cfg_attr(feature = "deja", serde(with = "deja_nonce_bytes"))] u128,
+);
+
+/// deja: lossless u128 nonce (de)serialization via its 16 big-endian bytes.
+#[cfg(feature = "deja")]
+mod deja_nonce_bytes {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &u128, s: S) -> Result<S::Ok, S::Error> {
+        v.to_be_bytes().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u128, D::Error> {
+        let bytes = <[u8; 16]>::deserialize(d)?;
+        Ok(u128::from_be_bytes(bytes))
+    }
+}
 
 impl NonceSequence {
     /// Byte index at which sequence number starts in a 16-byte (128-bit) sequence.
@@ -31,6 +60,21 @@ impl NonceSequence {
     const SEQUENCE_NUMBER_START_INDEX: usize = 4;
 
     /// Generate a random nonce sequence.
+    //
+    // deja: the AEAD nonce is the single source of ciphertext non-determinism.
+    // Recording it (Ok-only; the ring error type is non-serializable) and
+    // replaying it in call order makes `encode_message` reproduce byte-identical
+    // ciphertext for the same key+plaintext, so encrypted DB columns and HTTP
+    // bodies match the recording exactly. Real AES still runs; only the random
+    // nonce is substituted.
+    #[cfg_attr(
+        feature = "deja",
+        deja::id(
+            component = "common_utils::crypto",
+            operation = "GcmAes256::nonce",
+            codec = ResultOkCodec,
+        )
+    )]
     fn new() -> Result<Self, ring::error::Unspecified> {
         use ring::rand::{SecureRandom, SystemRandom};
 
@@ -531,7 +575,7 @@ impl VerifySignature for RsaSha256 {
 
         let verifying_key = rsa::pkcs1v15::VerifyingKey::<rsa::sha2::Sha256>::new(rsa_public_key);
 
-        // transfrom the signature
+        // transform the signature
         let decoded_signature = BASE64_ENGINE
             .decode(signature)
             .change_context(errors::CryptoError::SignatureVerificationFailed)
@@ -604,6 +648,14 @@ impl EncodeMessage for TripleDesEde3CBC {
 /// Generate a random string using a cryptographically secure pseudo-random number generator
 /// (CSPRNG). Typically used for generating (readable) keys and passwords.
 #[inline]
+#[cfg_attr(
+    feature = "deja",
+    deja::id(
+        component = "common_utils::crypto",
+        operation = "generate_cryptographically_secure_random_string",
+        codec = SerdeCodec,
+    )
+)]
 pub fn generate_cryptographically_secure_random_string(length: usize) -> String {
     use rand::distributions::DistString;
 
@@ -628,7 +680,7 @@ pub struct Encryptable<T: Clone> {
     encrypted: Secret<Vec<u8>, EncryptionStrategy>,
 }
 
-impl<T: Clone, S: masking::Strategy<T>> Encryptable<Secret<T, S>> {
+impl<T: Clone, S: hyperswitch_masking::Strategy<T>> Encryptable<Secret<T, S>> {
     /// constructor function to be used by the encryptor and decryptor to generate the data type
     pub fn new(
         masked_data: Secret<T, S>,
@@ -693,15 +745,31 @@ impl<T: Clone> Deref for Encryptable<Secret<T>> {
     }
 }
 
-impl<T: Clone> masking::Serialize for Encryptable<T>
+impl<T: Clone> hyperswitch_masking::Serialize for Encryptable<T>
 where
-    T: masking::Serialize,
+    T: hyperswitch_masking::Serialize,
 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
         self.inner.serialize(serializer)
+    }
+}
+
+impl<'de, T: Clone> serde::Deserialize<'de> for Encryptable<T>
+where
+    T: serde::Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let inner = T::deserialize(deserializer)?;
+        Ok(Self {
+            inner,
+            encrypted: Secret::new(Vec::new()),
+        })
     }
 }
 
@@ -730,6 +798,57 @@ pub type OptionalSecretValue = Option<Secret<serde_json::Value>>;
 pub type EncryptableName = Encryptable<Secret<String>>;
 /// Type alias for `Encryptable<Secret<String>>` used for `email` field
 pub type EncryptableEmail = Encryptable<Secret<String, pii::EmailStrategy>>;
+
+/// Extract RSA public key components (n, e) from a private key PEM for JWKS
+/// Returns base64url-encoded modulus and exponent
+pub fn extract_rsa_public_key_components(
+    private_key_pem: &Secret<String>,
+) -> CustomResult<(String, String), errors::CryptoError> {
+    let pem_str = private_key_pem.peek();
+    let parsed_pem = pem::parse(pem_str).change_context(errors::CryptoError::EncodingFailed)?;
+
+    let private_key = match parsed_pem.tag() {
+        "PRIVATE KEY" => rsa::RsaPrivateKey::from_pkcs8_der(parsed_pem.contents())
+            .change_context(errors::CryptoError::InvalidKeyLength),
+        "RSA PRIVATE KEY" => rsa::RsaPrivateKey::from_pkcs1_der(parsed_pem.contents())
+            .change_context(errors::CryptoError::InvalidKeyLength),
+        tag => Err(errors::CryptoError::InvalidKeyLength).attach_printable(format!(
+            "Unexpected PEM tag: {tag}. Expected 'PRIVATE KEY' or 'RSA PRIVATE KEY'"
+        )),
+    }
+    .attach_printable("Failed to extract RSA public key components from private key")?;
+
+    let public_key = private_key.to_public_key();
+    let n_bytes = public_key.n().to_bytes_be();
+    let e_bytes = public_key.e().to_bytes_be();
+
+    let n_b64 = BASE64_ENGINE_URL_SAFE_NO_PAD.encode(n_bytes);
+    let e_b64 = BASE64_ENGINE_URL_SAFE_NO_PAD.encode(e_bytes);
+
+    Ok((n_b64, e_b64))
+}
+
+/// Encrypt plaintext using RSA-OAEP with SHA-256.
+/// `public_key_der` must be a DER-encoded SubjectPublicKeyInfo (PKCS#8) public key.
+/// Returns the raw ciphertext bytes.
+pub fn encrypt_rsa_oaep_sha256(
+    public_key_der: &[u8],
+    plaintext: &[u8],
+) -> CustomResult<Vec<u8>, errors::CryptoError> {
+    use rand::rngs::OsRng;
+
+    let public_key = rsa::RsaPublicKey::from_public_key_der(public_key_der)
+        .change_context(errors::CryptoError::EncodingFailed)
+        .attach_printable("Failed to parse DER public key for RSA-OAEP")?;
+
+    let padding = Oaep::new::<rsa::sha2::Sha256>();
+    let mut rng = OsRng;
+
+    public_key
+        .encrypt(&mut rng, padding, plaintext)
+        .change_context(errors::CryptoError::EncodingFailed)
+        .attach_printable("RSA OAEP encryption failed")
+}
 
 /// Represents the RSA-PSS-SHA256 signing algorithm
 #[derive(Debug)]
@@ -769,7 +888,6 @@ impl SignMessage for RsaPssSha256 {
 
 #[cfg(test)]
 mod crypto_tests {
-    #![allow(clippy::expect_used)]
     use super::{DecodeMessage, EncodeMessage, SignMessage, VerifySignature};
     use crate::crypto::GenerateDigest;
 

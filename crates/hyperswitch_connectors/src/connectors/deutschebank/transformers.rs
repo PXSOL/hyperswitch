@@ -5,6 +5,7 @@ use common_enums::{enums, PaymentMethod};
 use common_utils::{ext_traits::ValueExt, pii::Email, types::MinorUnit};
 use error_stack::ResultExt;
 use hyperswitch_domain_models::{
+    mandates,
     payment_method_data::{BankDebitData, PaymentMethodData},
     router_data::{AccessToken, ConnectorAuthType, ErrorResponse, RouterData},
     router_flow_types::{
@@ -24,7 +25,7 @@ use hyperswitch_domain_models::{
     },
 };
 use hyperswitch_interfaces::{consts, errors};
-use masking::{ExposeInterface, PeekInterface, Secret};
+use hyperswitch_masking::{ExposeInterface, PeekInterface, Secret};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -63,6 +64,26 @@ impl TryFrom<&ConnectorAuthType> for DeutschebankAuthType {
                 api_key,
                 key1,
                 api_secret,
+            } => Ok(Self {
+                client_id: api_key.to_owned(),
+                merchant_id: key1.to_owned(),
+                client_key: api_secret.to_owned(),
+            }),
+            // MultiAuthKey is the payouts shape: CSEAL credentials are routed
+            // to prism (UCS) rather than used by this struct directly. We
+            // accept it here so MCA creation/validation succeeds for
+            // payout_processor connectors; the actual CSEAL flow runs in prism
+            // and reads the four secrets from `ConnectorAuthMetadata`.
+            //
+            //   api_key   -> customer_identifier
+            //   key1      -> key_id
+            //   api_secret-> signing_private_key (PEM)
+            //   key2      -> client_certificate_bundle (PEM cert + key)
+            ConnectorAuthType::MultiAuthKey {
+                api_key,
+                key1,
+                api_secret,
+                key2: _,
             } => Ok(Self {
                 client_id: api_key.to_owned(),
                 merchant_id: key1.to_owned(),
@@ -285,7 +306,7 @@ impl TryFrom<&DeutschebankRouterData<&PaymentsAuthorizeRouterData>>
                     .into()),
                 }
             }
-            Some(api_models::payments::MandateReferenceId::ConnectorMandateId(mandate_data)) => {
+            Some(mandates::MandateReferenceId::ConnectorMandateId(mandate_data)) => {
                 let mandate_metadata: DeutschebankMandateMetadata = mandate_data
                     .get_mandate_metadata()
                     .ok_or(errors::ConnectorError::MissingConnectorMandateMetadata)?
@@ -309,8 +330,9 @@ impl TryFrom<&DeutschebankRouterData<&PaymentsAuthorizeRouterData>>
                     },
                 }))
             }
-            Some(api_models::payments::MandateReferenceId::NetworkTokenWithNTI(_))
-            | Some(api_models::payments::MandateReferenceId::NetworkMandateId(_)) => {
+            Some(mandates::MandateReferenceId::NetworkTokenWithNTI(_))
+            | Some(mandates::MandateReferenceId::NetworkMandateId(_))
+            | Some(mandates::MandateReferenceId::CardWithLimitedData(_)) => {
                 Err(errors::ConnectorError::NotImplemented(
                     utils::get_unimplemented_payment_method_error_message("deutschebank"),
                 )
@@ -387,8 +409,10 @@ impl
                             mandate_reference: Box::new(None),
                             connector_metadata: None,
                             network_txn_id: None,
+                            network_txn_link_id: None,
                             connector_response_reference_id: Some(processed.tx_id.clone()),
                             incremental_authorization_allowed: None,
+                            authentication_data: None,
                             charges: None,
                         }),
                         ..item.data
@@ -419,8 +443,10 @@ impl
                             mandate_reference: Box::new(None),
                             connector_metadata: None,
                             network_txn_id: None,
+                            network_txn_link_id: None,
                             connector_response_reference_id: None,
                             incremental_authorization_allowed: None,
+                            authentication_data: None,
                             charges: None,
                         }),
                         ..item.data
@@ -444,7 +470,9 @@ impl
                     reason: Some("METHOD_REQUIRED Flow is not currently supported for deutschebank 3ds payments".to_owned()),
                     status_code: item.http_code,
                     attempt_status: None,
-                    connector_transaction_id: None,network_advice_code: None,
+                    connector_transaction_id: None,
+                    connector_response_reference_id: None,
+                    network_advice_code: None,
                     network_decline_code: None,
                     network_error_message: None,
                     connector_metadata: None,
@@ -517,6 +545,7 @@ fn get_error_response(error_code: String, error_reason: String, status_code: u16
         status_code,
         attempt_status: None,
         connector_transaction_id: None,
+        connector_response_reference_id: None,
         network_advice_code: None,
         network_decline_code: None,
         network_error_message: None,
@@ -599,8 +628,10 @@ impl
                     },
                     connector_metadata: None,
                     network_txn_id: None,
+                    network_txn_link_id: None,
                     connector_response_reference_id: None,
                     incremental_authorization_allowed: None,
+                    authentication_data: None,
                     charges: None,
                 }),
                 ..item.data
@@ -650,8 +681,10 @@ impl
                     mandate_reference: Box::new(None),
                     connector_metadata: None,
                     network_txn_id: None,
+                    network_txn_link_id: None,
                     connector_response_reference_id: None,
                     incremental_authorization_allowed: None,
+                    authentication_data: None,
                     charges: None,
                 }),
                 ..item.data
@@ -900,8 +933,10 @@ impl
                     mandate_reference: Box::new(None),
                     connector_metadata: None,
                     network_txn_id: None,
+                    network_txn_link_id: None,
                     connector_response_reference_id: None,
                     incremental_authorization_allowed: None,
+                    authentication_data: None,
                     charges: None,
                 }),
                 ..item.data
@@ -989,8 +1024,10 @@ impl
                     mandate_reference: Box::new(None),
                     connector_metadata: None,
                     network_txn_id: None,
+                    network_txn_link_id: None,
                     connector_response_reference_id: None,
                     incremental_authorization_allowed: None,
+                    authentication_data: None,
                     charges: None,
                 }),
                 ..item.data

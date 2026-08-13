@@ -33,7 +33,7 @@ const successfulNo3DSCardDetails = {
 
 const successfulThreeDSTestCardDetails = {
   ...successfulNo3DSCardDetails,
-  card_number: "4000000000003063", // Using standard test card with authentication_type: "three_ds"
+  card_number: "4012001800000016", // Using standard test card with authentication_type: "three_ds"
 };
 
 const failedNo3DSCardDetails = {
@@ -43,11 +43,11 @@ const failedNo3DSCardDetails = {
 
 const payment_method_data_3ds = {
   card: {
-    last4: "3063",
+    last4: "0016",
     card_type: "DEBIT",
     card_network: "Visa",
-    card_issuer: "STRIPE PAYMENTS UK LIMITED",
-    card_issuing_country: "UNITEDKINGDOM",
+    card_issuer: "VISA PRODUCTION SUPPORT CLIENT BID 1",
+    card_issuing_country: "UNITEDSTATES",
     card_isin: "401200",
     card_extended_bin: null,
     card_exp_month: "10",
@@ -55,6 +55,7 @@ const payment_method_data_3ds = {
     card_holder_name: "Joseph Doe",
     payment_checks: null,
     authentication_data: null,
+    auth_code: null,
   },
   billing: null,
 };
@@ -73,6 +74,7 @@ const payment_method_data_no3ds = {
     card_holder_name: "Joseph Doe",
     payment_checks: null,
     authentication_data: null,
+    auth_code: null,
   },
   billing: null,
 };
@@ -267,6 +269,9 @@ export const connectorDetails = {
       },
     },
     PartialCapture: {
+      Configs: {
+        TRIGGER_SKIP: true, // Partial Capture is not supported in Shift4
+      },
       Request: {
         amount_to_capture: 2000,
       },
@@ -363,6 +368,8 @@ export const connectorDetails = {
           card: successfulNo3DSCardDetails,
         },
         payment_type: "setup_mandate",
+        mandate_data: null,
+        customer_acceptance: customerAcceptance,
       },
       Response: {
         status: 501,
@@ -756,6 +763,27 @@ export const connectorDetails = {
         },
       },
     },
+    MITAutoCaptureWithCustomerAcceptance: {
+      Configs: {
+        TRIGGER_SKIP: true,
+      },
+      Request: {
+        customer_acceptance: {
+          acceptance_type: "offline",
+          accepted_at: "1963-05-03T04:07:52.723Z",
+          online: {
+            ip_address: "127.0.0.1",
+            user_agent: "amet irure esse",
+          },
+        },
+      },
+      Response: {
+        status: 200,
+        body: {
+          status: "succeeded",
+        },
+      },
+    },
     MITManualCapture: {
       Configs: {
         TRIGGER_SKIP: true,
@@ -852,6 +880,79 @@ export const connectorDetails = {
         status: 200,
         body: {
           status: "requires_customer_action",
+        },
+      },
+    },
+    Giropay: {
+      Request: {
+        payment_method: "bank_redirect",
+        payment_method_type: "giropay",
+        payment_method_data: {
+          bank_redirect: {
+            giropay: {
+              bank_name: "",
+              bank_account_bic: "",
+              bank_account_iban: "",
+              preferred_language: "en",
+              country: "DE",
+            },
+          },
+        },
+        billing: {
+          address: {
+            line1: "1467",
+            line2: "Harrison Street",
+            line3: "Harrison Street",
+            city: "San Fransico",
+            state: "California",
+            zip: "94122",
+            country: "DE",
+            first_name: "john",
+            last_name: "doe",
+          },
+        },
+      },
+      Response: {
+        status: 200,
+        body: {
+          status: "failed",
+          error_code: null,
+          error_message: "Payment method type giropay not supported",
+        },
+      },
+    },
+    Sofort: {
+      Request: {
+        payment_method: "bank_redirect",
+        payment_method_type: "sofort",
+        payment_method_data: {
+          bank_redirect: {
+            sofort: {
+              country: "DE",
+              preferred_language: "en",
+            },
+          },
+        },
+        billing: {
+          address: {
+            line1: "1467",
+            line2: "Harrison Street",
+            line3: "Harrison Street",
+            city: "San Fransico",
+            state: "California",
+            zip: "94122",
+            country: "DE",
+            first_name: "john",
+            last_name: "doe",
+          },
+        },
+      },
+      Response: {
+        status: 200,
+        body: {
+          status: "failed",
+          error_code: null,
+          error_message: "Payment method type sofort not supported",
         },
       },
     },

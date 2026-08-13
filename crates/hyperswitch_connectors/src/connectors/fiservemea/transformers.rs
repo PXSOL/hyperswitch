@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, str::FromStr};
 
 use common_enums::enums;
 use common_utils::{
@@ -25,7 +25,7 @@ use hyperswitch_domain_models::{
 };
 use error_stack::ResultExt;
 use hyperswitch_interfaces::{consts, errors};
-use masking::{ExposeInterface, PeekInterface, Secret};
+use hyperswitch_masking::{ExposeInterface, PeekInterface, Secret};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -1084,7 +1084,16 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
                 }
 
                 let card = FiservemeaPaymentCard {
-                    number: token_data.get_network_token(),
+                    // El gateway recibe el network token en el mismo campo `paymentCard.number`
+                    // que un PAN. Upstream le cambió el tipo de retorno a `get_network_token()`
+                    // de `CardNumber` a `NetworkToken`; los dos envuelven el mismo
+                    // `StrongSecret<String, CardNumberStrategy>`, así que serializan igual y
+                    // alcanza con volver a envolverlo. La revalidación es la misma que ya pasó
+                    // el token al construirse, así que no puede rechazar un token válido.
+                    number: cards::CardNumber::from_str(&token_data.get_network_token().get_card_no())
+                        .change_context(errors::ConnectorError::InvalidDataFormat {
+                            field_name: "payment_method_data.network_token.token_number",
+                        })?,
                     expiry_date: FiservemeaExpiryDate {
                         month: token_data.get_network_token_expiry_month(),
                         year: token_data.get_token_expiry_year_2_digit()?,
@@ -2164,6 +2173,7 @@ impl<F, T> TryFrom<ResponseRouterData<F, FiservemeaPaymentsResponse, T, Payments
                     // `ipgTransactionId` es opcional: el gateway lo omite en los rechazos que
                     // fallan antes de crear la transacción (por ejemplo el 409 de Data Only).
                     connector_transaction_id: item.response.ipg_transaction_id,
+                    connector_response_reference_id: None,
                     network_decline_code: network.decline_code,
                     network_advice_code: network.advice_code,
                     network_error_message: network.error_message,
@@ -2205,8 +2215,10 @@ impl<F, T> TryFrom<ResponseRouterData<F, FiservemeaPaymentsResponse, T, Payments
                 // recurrente. Hyperswitch lo persiste como `network_txn_id`; antes se parseaba
                 // de la respuesta y se descartaba, así que la recurrencia Visa no se podía armar.
                 network_txn_id: item.response.scheme_transaction_id.clone(),
+                network_txn_link_id: None,
                 connector_response_reference_id: item.response.order_id,
                 incremental_authorization_allowed: None,
+                authentication_data: None,
                 charges: None,
             }),
             ..item.data
@@ -4819,6 +4831,12 @@ mod tests {
             psd2_sca_exemption_type: None,
             raw_connector_response: None,
             is_payment_id_from_merchant: None,
+            payment_method_type: None,
+            payout_id: None,
+            authorized_amount: None,
+            customer_document_details: None,
+            feature_data: None,
+            sender_payment_instrument_id: None,
         }
     }
 
@@ -4836,8 +4854,6 @@ mod tests {
             customer_name: None,
             currency,
             confirm: true,
-            statement_descriptor_suffix: None,
-            statement_descriptor: None,
             // La homologación mandó ventas (`PaymentCardSaleTransaction`), o sea captura
             // automática.
             capture_method: Some(common_enums::CaptureMethod::Automatic),
@@ -4875,8 +4891,18 @@ mod tests {
             order_id: None,
             locale: None,
             payment_channel: None,
-            enable_partial_authorization: None,
             enable_overcapture: None,
+            ucs_authentication_data: None,
+            guest_customer: None,
+            is_stored_credential: None,
+            mit_category: None,
+            enable_partial_authorization: None,
+            partner_merchant_identifier_details: None,
+            billing_descriptor: None,
+            tokenization: None,
+            feature_metadata: None,
+            installment_details: None,
+            connector_intent_metadata: None,
         }
     }
 
@@ -5128,6 +5154,9 @@ mod tests {
                 setup_future_usage: None,
                 setup_mandate_details: None,
                 mandate_id: None,
+                payment_method_type: None,
+                router_return_url: None,
+                capture_method: None,
             },
         );
         let request = FiservemeaCreateTokenRequest::try_from(&router_data).unwrap();
@@ -5159,9 +5188,8 @@ mod tests {
                 SetupMandateRequestData {
                     currency: common_enums::Currency::ARS,
                     payment_method_data: cert_card_data(CERT_CARD),
-                    amount: Some(0),
+                    amount: 0,
                     confirm: true,
-                    statement_descriptor_suffix: None,
                     customer_acceptance: None,
                     mandate_id: None,
                     setup_future_usage: None,
@@ -5180,12 +5208,22 @@ mod tests {
                     capture_method: None,
                     enrolled_for_3ds: false,
                     related_transaction_id: None,
-                    minor_amount: Some(MinorUnit::new(0)),
+                    minor_amount: MinorUnit::new(0),
                     shipping_cost: None,
                     connector_testing_data: None,
                     customer_id: None,
-                    enable_partial_authorization: None,
                     payment_channel: None,
+                    feature_metadata: None,
+                    is_stored_credential: None,
+                    billing_descriptor: None,
+                    split_payments: None,
+                    tokenization: None,
+                    authentication_data: None,
+                    connector_intent_metadata: None,
+                    merchant_order_reference_id: None,
+                    mit_category: None,
+                    enable_partial_authorization: None,
+                    partner_merchant_identifier_details: None,
                 },
             );
         let request = FiservemeaPaymentsRequest::try_from(&router_data).unwrap();
@@ -5381,9 +5419,8 @@ mod tests {
                 SetupMandateRequestData {
                     currency: common_enums::Currency::ARS,
                     payment_method_data: cert_card_data(CERT_CARD),
-                    amount: Some(0),
+                    amount: 0,
                     confirm: true,
-                    statement_descriptor_suffix: None,
                     customer_acceptance: None,
                     mandate_id: None,
                     setup_future_usage: None,
@@ -5402,12 +5439,22 @@ mod tests {
                     capture_method: None,
                     enrolled_for_3ds: false,
                     related_transaction_id: None,
-                    minor_amount: Some(MinorUnit::new(0)),
+                    minor_amount: MinorUnit::new(0),
                     shipping_cost: None,
                     connector_testing_data: None,
                     customer_id: None,
-                    enable_partial_authorization: None,
                     payment_channel: None,
+                    feature_metadata: None,
+                    is_stored_credential: None,
+                    billing_descriptor: None,
+                    split_payments: None,
+                    tokenization: None,
+                    authentication_data: None,
+                    connector_intent_metadata: None,
+                    merchant_order_reference_id: None,
+                    mit_category: None,
+                    enable_partial_authorization: None,
+                    partner_merchant_identifier_details: None,
                 },
             );
         let request = FiservemeaPaymentsRequest::try_from(&zero_auth).unwrap();

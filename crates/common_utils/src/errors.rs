@@ -1,5 +1,7 @@
 //! Errors and error specific types for universal use
 
+use serde::Serialize;
+
 use crate::types::MinorUnit;
 
 /// Custom Result
@@ -11,7 +13,7 @@ pub type CustomResult<T, E> = error_stack::Result<T, E>;
 
 /// Parsing Errors
 #[allow(missing_docs)] // Only to prevent warnings about struct fields not being documented
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ParsingError {
     ///Failed to parse enum
     #[error("Failed to parse enum: {0}")]
@@ -78,7 +80,7 @@ pub enum ValidationError {
 }
 
 /// Integrity check errors.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
 pub struct IntegrityCheckError {
     /// Field names for which integrity check failed!
     pub field_names: String,
@@ -134,10 +136,18 @@ pub enum PercentageError {
     #[error("Failed apply percentage of {percentage} on {amount}")]
     UnableToApplyPercentage {
         /// percentage value
-        percentage: f32,
+        percentage: f64,
         /// amount value
         amount: MinorUnit,
     },
+}
+
+/// Error type for installment interest rate operations
+#[derive(Debug, Clone, thiserror::Error, PartialEq)]
+pub enum InstallmentInterestRateError {
+    /// Error occurred while applying interest rate to amount
+    #[error("Failed to apply interest rate to amount")]
+    UnableToApplyInterestRate,
 }
 
 /// Allows [error_stack::Report] to change between error contexts

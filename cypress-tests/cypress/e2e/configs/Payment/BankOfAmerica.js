@@ -17,6 +17,43 @@ const successfulThreeDSTestCardDetails = {
   card_cvc: "123",
 };
 
+const billing_with_newline = {
+  address: {
+    line1: "1467",
+    line2: "Harrison Street\nApt 101",
+    line3: "Harrison Street\nApt 101",
+    city: "San Fransico\n city",
+    state: "California",
+    zip: "94122",
+    country: "NL",
+    first_name: "joseph",
+    last_name: "Doe",
+  },
+  phone: {
+    number: "9123456789",
+    country_code: "+91",
+  },
+};
+
+const cardTestingGuardBilling = {
+  address: {
+    city: "sakilmostak",
+    country: "US",
+    line1: "here",
+    line2: "there",
+    line3: "anywhere",
+    zip: "560090",
+    state: "Washingtonr",
+    first_name: "One",
+    last_name: "Two",
+  },
+  phone: {
+    number: "1234567890",
+    country_code: "+1",
+  },
+  email: "guest@example.com",
+};
+
 const singleUseMandateData = {
   customer_acceptance: customerAcceptance,
   mandate_type: {
@@ -143,6 +180,7 @@ export const connectorDetails = {
     No3DSAutoCapture: {
       Request: {
         payment_method: "card",
+        payment_method_type: "credit",
         payment_method_data: {
           card: successfulNo3DSCardDetails,
         },
@@ -155,6 +193,27 @@ export const connectorDetails = {
         body: {
           status: "succeeded",
         },
+      },
+    },
+    ExtendedCardBin: {
+      Request: {
+        payment_method: "card",
+        payment_method_type: "credit",
+        payment_method_data: {
+          card: successfulNo3DSCardDetails,
+        },
+        currency: "USD",
+        customer_acceptance: null,
+        setup_future_usage: "on_session",
+      },
+      Response: {
+        status: 200,
+        body: {
+          status: "succeeded",
+        },
+      },
+      Configs: {
+        skipBillingAssertion: true,
       },
     },
     Capture: {
@@ -237,6 +296,15 @@ export const connectorDetails = {
         body: {
           status: "pending",
         },
+      },
+    },
+    ManualRefundUpdate: {
+      Request: {
+        status: "failed",
+      },
+      Response: {
+        status: 200,
+        body: {},
       },
     },
     SyncRefund: {
@@ -360,6 +428,24 @@ export const connectorDetails = {
         },
       },
     },
+    MITAutoCaptureWithCustomerAcceptance: {
+      Request: {
+        customer_acceptance: {
+          acceptance_type: "offline",
+          accepted_at: "1963-05-03T04:07:52.723Z",
+          online: {
+            ip_address: "127.0.0.1",
+            user_agent: "amet irure esse",
+          },
+        },
+      },
+      Response: {
+        status: 200,
+        body: {
+          status: "succeeded",
+        },
+      },
+    },
     MITManualCapture: {
       Request: {},
       Response: {
@@ -407,6 +493,8 @@ export const connectorDetails = {
         payment_method_data: {
           card: successfulNo3DSCardDetails,
         },
+        mandate_data: null,
+        customer_acceptance: customerAcceptance,
       },
       Response: {
         status: 200,
@@ -573,6 +661,485 @@ export const connectorDetails = {
         customer_acceptance: customerAcceptance,
       },
     }),
+    No3DSFailPayment: {
+      Request: {
+        payment_method: "card",
+        payment_method_data: {
+          billing: {
+            address: {
+              city: "sakilmostak",
+              country: "US",
+              line1: "here",
+              line2: "there",
+              line3: "anywhere",
+              zip: "560090",
+              state: "Washingtonr",
+              first_name: "One",
+              last_name: "Two",
+            },
+            phone: {
+              number: "1234567890",
+              country_code: "+1",
+            },
+            email: "guest@example.com",
+          },
+          card: successfulNo3DSCardDetails,
+        },
+        currency: "USD",
+        customer_acceptance: null,
+        setup_future_usage: "on_session",
+        billing: billing_with_newline,
+      },
+      Response: {
+        status: 200,
+        body: {
+          status: "failed",
+          error_message:
+            "Declined - One or more fields in the request contains invalid data, detailed_error_information: orderInformation.billTo.administrativeArea : INVALID_DATA",
+          attempt_count: 1,
+        },
+      },
+    },
+    ManualRetryPaymentDisabled: {
+      Request: {
+        payment_method: "card",
+        payment_method_data: {
+          billing: {
+            address: {
+              city: "sakilmostak",
+              country: "US",
+              line1: "here",
+              line2: "there",
+              line3: "anywhere",
+              zip: "560090",
+              state: "Washingtonr",
+              first_name: "One",
+              last_name: "Two",
+            },
+            phone: {
+              number: "1234567890",
+              country_code: "+1",
+            },
+            email: "guest@example.com",
+          },
+          card: successfulNo3DSCardDetails,
+        },
+        currency: "USD",
+        customer_acceptance: null,
+        setup_future_usage: "on_session",
+        billing: billing_with_newline,
+      },
+      Response: {
+        status: 400,
+        body: {
+          type: "invalid_request",
+          message:
+            "You cannot confirm this payment because it has status failed, you can enable `manual_retry` in profile to try this payment again",
+          code: "IR_16",
+        },
+      },
+    },
+    ManualRetryPaymentEnabled: {
+      Request: {
+        payment_method: "card",
+        payment_method_data: {
+          billing: {
+            address: {
+              city: "sakilmostak",
+              country: "US",
+              line1: "here",
+              line2: "there",
+              line3: "anywhere",
+              zip: "560090",
+              state: "Washington",
+              first_name: "One",
+              last_name: "Two",
+            },
+            phone: {
+              number: "1234567890",
+              country_code: "+1",
+            },
+            email: "guest@example.com",
+          },
+          card: successfulNo3DSCardDetails,
+        },
+        currency: "USD",
+        customer_acceptance: null,
+        setup_future_usage: "on_session",
+        billing: billing_with_newline,
+      },
+      Response: {
+        status: 200,
+        body: {
+          status: "succeeded",
+          payment_method: "card",
+          attempt_count: 2,
+        },
+      },
+    },
+    ManualRetryPaymentCutoffExpired: {
+      Request: {
+        payment_method: "card",
+        payment_method_data: {
+          billing: {
+            address: {
+              city: "sakilmostak",
+              country: "US",
+              line1: "here",
+              line2: "there",
+              line3: "anywhere",
+              zip: "560090",
+              state: "Washington",
+              first_name: "One",
+              last_name: "Two",
+            },
+            phone: {
+              number: "1234567890",
+              country_code: "+1",
+            },
+            email: "guest@example.com",
+          },
+          card: successfulNo3DSCardDetails,
+        },
+        currency: "USD",
+        customer_acceptance: null,
+        setup_future_usage: "on_session",
+        billing: billing_with_newline,
+      },
+      Response: {
+        status: 400,
+        body: {
+          type: "invalid_request",
+          message:
+            "You cannot confirm this payment using `manual_retry` because the allowed duration has expired",
+          code: "IR_16",
+        },
+      },
+    },
+    UseBillingAsPaymentMethodBilling: {
+      Request: {
+        payment_method: "card",
+        payment_method_data: {
+          card: successfulNo3DSCardDetails,
+        },
+        currency: "USD",
+      },
+      Response: {
+        status: 200,
+        body: {
+          status: "succeeded",
+        },
+      },
+    },
+    UseBillingAsPaymentMethodBillingDisabled: {
+      Request: {
+        payment_method: "card",
+        payment_method_data: {
+          card: successfulNo3DSCardDetails,
+        },
+        currency: "USD",
+      },
+      Response: {
+        status: 200,
+        body: {
+          status: "failed",
+          error_code: "MISSING_FIELD",
+        },
+      },
+    },
+    PaymentIntentWithFeatureMetadata: {
+      Request: {
+        currency: "USD",
+        amount: 6540,
+        feature_metadata: {
+          search_tags: ["qa-test", "feature-metadata-test", "automated"],
+        },
+      },
+      Response: {
+        status: 200,
+        body: {
+          status: "requires_payment_method",
+        },
+      },
+    },
+    PaymentWithFeatureMetadata: {
+      Request: {
+        currency: "USD",
+        amount: 6540,
+        feature_metadata: {
+          search_tags: ["qa-test", "feature-metadata-test"],
+        },
+        payment_method: "card",
+        payment_method_data: {
+          card: successfulNo3DSCardDetails,
+        },
+        customer_acceptance: null,
+        setup_future_usage: "on_session",
+      },
+      Response: {
+        status: 200,
+        body: {
+          status: "succeeded",
+        },
+      },
+    },
+    RequiresCVVOnSession: {
+      Request: {
+        payment_method: "card",
+        payment_method_data: {
+          card: successfulNo3DSCardDetails,
+        },
+        currency: "USD",
+        customer_acceptance: customerAcceptance,
+        setup_future_usage: "on_session",
+      },
+      Response: {
+        status: 200,
+        body: {
+          status: "succeeded",
+        },
+      },
+      Configs: {
+        // BofA sandbox returns billing=null in retrieve response for on-session flows — skip billing assertion
+        skipBillingAssertion: true,
+      },
+    },
+    RequiresCVVOffSessionMandate: {
+      Request: {
+        payment_method: "card",
+        payment_method_data: {
+          card: successfulNo3DSCardDetails,
+        },
+        currency: "USD",
+        setup_future_usage: "off_session",
+        customer_acceptance: customerAcceptance,
+      },
+      Response: {
+        status: 200,
+        body: {
+          status: "succeeded",
+        },
+      },
+    },
+    RequiresCVVSavedCardWithCVV: {
+      Request: {
+        card_cvc: "123",
+      },
+      Response: {
+        status: 200,
+        body: {
+          status: "succeeded",
+        },
+      },
+    },
+    RequiresCVVSavedCardWithoutCVV: {
+      Request: {
+        setup_future_usage: "off_session",
+      },
+      Response: {
+        status: 200,
+        body: {
+          status: "succeeded",
+        },
+      },
+    },
+    RequiresCVVInvalidCVVShort: {
+      Request: {
+        payment_method: "card",
+        payment_method_data: {
+          card: {
+            card_number: "4242424242424242",
+            card_exp_month: "12",
+            card_exp_year: "2030",
+            card_holder_name: "Test User",
+            card_cvc: "12",
+          },
+        },
+        currency: "USD",
+        customer_acceptance: customerAcceptance,
+      },
+      Response: {
+        status: 400,
+        body: {
+          error: {
+            type: "invalid_request",
+            code: "IR_16",
+            message: "Invalid card_cvc length",
+          },
+        },
+      },
+    },
+    RequiresCVVInvalidCVVLong: {
+      Request: {
+        payment_method: "card",
+        payment_method_data: {
+          card: {
+            card_number: "4242424242424242",
+            card_exp_month: "12",
+            card_exp_year: "2030",
+            card_holder_name: "Test User",
+            card_cvc: "12345",
+          },
+        },
+        currency: "USD",
+        customer_acceptance: customerAcceptance,
+      },
+      Response: {
+        status: 400,
+        body: {
+          error: {
+            type: "invalid_request",
+            code: "IR_16",
+            message: "Invalid card_cvc length",
+          },
+        },
+      },
+    },
+    RequiresCVVInvalidCVVNonNumeric: {
+      Request: {
+        payment_method: "card",
+        payment_method_data: {
+          card: {
+            card_number: "4242424242424242",
+            card_exp_month: "12",
+            card_exp_year: "2030",
+            card_holder_name: "Test User",
+            card_cvc: "abc",
+          },
+        },
+        currency: "USD",
+        customer_acceptance: customerAcceptance,
+      },
+      Response: {
+        status: 400,
+        body: {
+          error: {
+            type: "invalid_request",
+            code: "IR_07",
+            message: "Invalid value provided: card_cvc",
+          },
+        },
+      },
+    },
+    RequiresCVVListPMOnSession: {
+      Response: { status: 200, body: { requires_cvv: true } },
+    },
+    RequiresCVVListPMOffSession: {
+      Response: { status: 200, body: { requires_cvv: false } },
+    },
+    RequiresCVVFalsePaymentIntent: {
+      Request: {
+        currency: "USD",
+        customer_acceptance: null,
+        setup_future_usage: "off_session",
+      },
+      Response: {
+        status: 200,
+        body: {
+          status: "requires_payment_method",
+        },
+      },
+    },
+    RequiresCVVFalseSavedCardWithoutCVV: {
+      Request: {
+        setup_future_usage: "off_session",
+      },
+      Response: {
+        status: 200,
+        body: {
+          status: "succeeded",
+        },
+      },
+    },
+    RequiresCVVPaymentIntent: {
+      Request: {
+        currency: "USD",
+        customer_acceptance: null,
+      },
+      Response: {
+        status: 200,
+        body: {
+          status: "requires_payment_method",
+        },
+      },
+    },
+    CardTestingGuard: {
+      FailConfirm: {
+        Request: {
+          payment_method: "card",
+          payment_method_data: {
+            billing: cardTestingGuardBilling,
+            card: successfulNo3DSCardDetails,
+          },
+          customer_acceptance: null,
+          setup_future_usage: "on_session",
+          billing: billing_with_newline,
+        },
+        Response: {
+          status: 200,
+          body: {
+            status: "failed",
+          },
+        },
+      },
+      GuestFailConfirm: {
+        Request: {
+          payment_method: "card",
+          payment_method_data: {
+            billing: cardTestingGuardBilling,
+            card: successfulNo3DSCardDetails,
+          },
+          customer_acceptance: null,
+          billing: billing_with_newline,
+        },
+        Response: {
+          status: 200,
+          expectBlockedPayment: true,
+          body: {
+            status: "failed",
+          },
+        },
+      },
+      BlockedConfirm: {
+        Request: {
+          payment_method: "card",
+          payment_method_data: {
+            card: successfulNo3DSCardDetails,
+          },
+          customer_acceptance: null,
+          setup_future_usage: "on_session",
+        },
+        Response: {
+          status: 400,
+          body: {
+            error: {
+              type: "invalid_request",
+              code: "IR_16",
+              message: "Blocked due to suspicious activity",
+            },
+          },
+        },
+      },
+      GuestBlockedConfirm: {
+        Request: {
+          payment_method: "card",
+          payment_method_data: {
+            card: successfulNo3DSCardDetails,
+          },
+          customer_acceptance: null,
+        },
+        Response: {
+          status: 400,
+          body: {
+            error: {
+              type: "invalid_request",
+              code: "IR_16",
+              message: "Blocked due to suspicious activity",
+            },
+          },
+        },
+      },
+    },
   },
   pm_list: {
     PmListResponse: {
@@ -712,7 +1279,7 @@ export const connectorDetails = {
                         options: ["ALL"],
                       },
                     },
-                    value: "PL",
+                    value: "US",
                   },
                   "payment_method_data.card.card_exp_year": {
                     required_field: "payment_method_data.card.card_exp_year",

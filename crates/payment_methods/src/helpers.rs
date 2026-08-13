@@ -22,8 +22,10 @@ pub async fn populate_bin_details_for_payment_method_create(
             card_network: card_details.card_network.clone(),
             card_type: card_details.card_type.to_owned(),
             card_issuing_country: card_details.card_issuing_country.to_owned(),
+            card_issuing_country_code: card_details.card_issuing_country_code.to_owned(),
             card_exp_month: card_details.card_exp_month.clone(),
             card_exp_year: card_details.card_exp_year.clone(),
+            card_cvc: card_details.card_cvc.clone(),
             card_holder_name: card_details.card_holder_name.clone(),
             card_number: card_details.card_number.clone(),
             nick_name: card_details.nick_name.clone(),
@@ -44,8 +46,10 @@ pub async fn populate_bin_details_for_payment_method_create(
                 card_network: card_info.card_network.clone(),
                 card_type: card_info.card_type,
                 card_issuing_country: card_info.card_issuing_country,
+                card_issuing_country_code: card_details.card_issuing_country_code,
                 card_exp_month: card_details.card_exp_month.clone(),
                 card_exp_year: card_details.card_exp_year.clone(),
+                card_cvc: card_details.card_cvc.clone(),
                 card_holder_name: card_details.card_holder_name.clone(),
                 card_number: card_details.card_number.clone(),
                 nick_name: card_details.nick_name.clone(),
@@ -55,6 +59,8 @@ pub async fn populate_bin_details_for_payment_method_create(
             card_network: None,
             card_type: None,
             card_issuing_country: None,
+            card_issuing_country_code: None,
+            card_cvc: card_details.card_cvc.clone(),
             card_exp_month: card_details.card_exp_month.clone(),
             card_exp_year: card_details.card_exp_year.clone(),
             card_holder_name: card_details.card_holder_name.clone(),
@@ -100,6 +106,7 @@ pub fn validate_payment_method_type_against_payment_method(
                 | api_enums::PaymentMethodType::Walley
                 | api_enums::PaymentMethodType::Breadpay
                 | api_enums::PaymentMethodType::Flexiti
+                | api_enums::PaymentMethodType::Payjustnow
         ),
         api_enums::PaymentMethod::Wallet => matches!(
             payment_method_type,
@@ -153,6 +160,7 @@ pub fn validate_payment_method_type_against_payment_method(
                 | api_enums::PaymentMethodType::Interac
                 | api_enums::PaymentMethodType::OpenBankingUk
                 | api_enums::PaymentMethodType::OpenBankingPIS
+                | api_enums::PaymentMethodType::OpenBanking
         ),
         api_enums::PaymentMethod::BankTransfer => matches!(
             payment_method_type,
@@ -161,6 +169,10 @@ pub fn validate_payment_method_type_against_payment_method(
                 | api_enums::PaymentMethodType::Bacs
                 | api_enums::PaymentMethodType::Multibanco
                 | api_enums::PaymentMethodType::Pix
+                | api_enums::PaymentMethodType::PixAutomaticoPush
+                | api_enums::PaymentMethodType::PixAutomaticoQr
+                | api_enums::PaymentMethodType::PixEmv
+                | api_enums::PaymentMethodType::PixQr
                 | api_enums::PaymentMethodType::Pse
                 | api_enums::PaymentMethodType::PermataBankTransfer
                 | api_enums::PaymentMethodType::BcaBankTransfer
@@ -178,7 +190,9 @@ pub fn validate_payment_method_type_against_payment_method(
         api_enums::PaymentMethod::BankDebit => matches!(
             payment_method_type,
             api_enums::PaymentMethodType::Ach
+                | api_enums::PaymentMethodType::EftDebitOrder
                 | api_enums::PaymentMethodType::Sepa
+                | api_enums::PaymentMethodType::SepaGuarenteedDebit
                 | api_enums::PaymentMethodType::Bacs
                 | api_enums::PaymentMethodType::Becs
         ),
@@ -196,10 +210,13 @@ pub fn validate_payment_method_type_against_payment_method(
                 | api_enums::PaymentMethodType::DuitNow
                 | api_enums::PaymentMethodType::PromptPay
                 | api_enums::PaymentMethodType::VietQr
+                | api_enums::PaymentMethodType::Qris
         ),
         api_enums::PaymentMethod::Upi => matches!(
             payment_method_type,
-            api_enums::PaymentMethodType::UpiCollect | api_enums::PaymentMethodType::UpiIntent
+            api_enums::PaymentMethodType::UpiCollect
+                | api_enums::PaymentMethodType::UpiIntent
+                | api_enums::PaymentMethodType::UpiQr
         ),
         api_enums::PaymentMethod::Voucher => matches!(
             payment_method_type,
@@ -239,6 +256,10 @@ pub fn validate_payment_method_type_against_payment_method(
             payment_method_type,
             api_enums::PaymentMethodType::DirectCarrierBilling
         ),
+        api_enums::PaymentMethod::NetworkToken => matches!(
+            payment_method_type,
+            api_enums::PaymentMethodType::NetworkToken
+        ),
     }
 }
 
@@ -263,7 +284,7 @@ impl ForeignFrom<(Option<api::CardDetailFromLocker>, domain::PaymentMethod)>
     ) -> Self {
         Self {
             merchant_id: item.merchant_id.to_owned(),
-            customer_id: Some(item.customer_id.to_owned()),
+            customer_id: item.customer_id.to_owned(),
             payment_method_id: item.get_id().clone(),
             payment_method: item.get_payment_method_type(),
             payment_method_type: item.get_payment_method_subtype(),

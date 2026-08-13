@@ -13,7 +13,7 @@ use hyperswitch_domain_models::{
         ErrorResponse, PaymentMethodToken, RouterData,
     },
     router_flow_types::refunds::{Execute, RSync},
-    router_request_types::{BrowserInformation, PaymentsAuthorizeData, ResponseId},
+    router_request_types::{BrowserInformation, ResponseId},
     router_response_types::{PaymentsResponseData, RedirectForm, RefundsResponseData},
     types::{
         PaymentsAuthorizeRouterData, PaymentsCancelRouterData, PaymentsCaptureRouterData,
@@ -24,13 +24,14 @@ use hyperswitch_interfaces::{
     consts::{NO_ERROR_CODE, NO_ERROR_MESSAGE},
     errors,
 };
-use masking::{ExposeInterface, Secret};
+use hyperswitch_masking::{ExposeInterface, Secret};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     types::{
         PaymentsCancelResponseRouterData, PaymentsCaptureResponseRouterData,
-        PaymentsSyncResponseRouterData, RefundsResponseRouterData, ResponseRouterData,
+        PaymentsResponseRouterData, PaymentsSyncResponseRouterData, RefundsResponseRouterData,
+        ResponseRouterData,
     },
     unimplemented_payment_method,
     utils::{self, AddressDetailsData, CardData, PaymentsAuthorizeRequestData, RouterData as _},
@@ -208,6 +209,9 @@ impl TryFrom<&HipayRouterData<&PaymentsAuthorizeRouterData>> for HipayPaymentsRe
                         | Some(CardNetwork::Accel)
                         | Some(CardNetwork::Pulse)
                         | Some(CardNetwork::Nyce)
+                        | Some(CardNetwork::Prop)
+                        | Some(CardNetwork::PrivateLabel)
+                        | Some(CardNetwork::Dinacard)
                         | None => "".to_string(),
                     },
                 },
@@ -281,6 +285,7 @@ impl From<&HipayTokenResponse> for AdditionalPaymentMethodConnectorResponse {
             payment_checks: None,
             card_network: Some(hipay_token_response.brand.clone()),
             domestic_network: hipay_token_response.domestic_network.clone(),
+            auth_code: None,
         }
     }
 }
@@ -349,19 +354,10 @@ pub struct HipayMaintenanceResponse<S> {
     message: String,
     transaction_reference: String,
 }
-impl<F>
-    TryFrom<
-        ResponseRouterData<F, HipayPaymentsResponse, PaymentsAuthorizeData, PaymentsResponseData>,
-    > for RouterData<F, PaymentsAuthorizeData, PaymentsResponseData>
-{
+impl TryFrom<PaymentsResponseRouterData<HipayPaymentsResponse>> for PaymentsAuthorizeRouterData {
     type Error = error_stack::Report<errors::ConnectorError>;
     fn try_from(
-        item: ResponseRouterData<
-            F,
-            HipayPaymentsResponse,
-            PaymentsAuthorizeData,
-            PaymentsResponseData,
-        >,
+        item: PaymentsResponseRouterData<HipayPaymentsResponse>,
     ) -> Result<Self, Self::Error> {
         let status = common_enums::AttemptStatus::from(item.response.status);
         let response = if status == enums::AttemptStatus::Failure {
@@ -371,6 +367,7 @@ impl<F>
                 reason: Some(item.response.message.clone()),
                 attempt_status: None,
                 connector_transaction_id: Some(item.response.transaction_reference),
+                connector_response_reference_id: None,
                 status_code: item.http_code,
                 network_advice_code: None,
                 network_decline_code: None,
@@ -393,8 +390,10 @@ impl<F>
                 mandate_reference: Box::new(None),
                 connector_metadata: None,
                 network_txn_id: None,
+                network_txn_link_id: None,
                 connector_response_reference_id: None,
                 incremental_authorization_allowed: None,
+                authentication_data: None,
                 charges: None,
             })
         };
@@ -627,8 +626,10 @@ impl TryFrom<PaymentsCaptureResponseRouterData<HipayMaintenanceResponse<HipayPay
                 mandate_reference: Box::new(None),
                 connector_metadata: None,
                 network_txn_id: None,
+                network_txn_link_id: None,
                 connector_response_reference_id: None,
                 incremental_authorization_allowed: None,
+                authentication_data: None,
                 charges: None,
             }),
             ..item.data
@@ -652,8 +653,10 @@ impl TryFrom<PaymentsCancelResponseRouterData<HipayMaintenanceResponse<HipayPaym
                 mandate_reference: Box::new(None),
                 connector_metadata: None,
                 network_txn_id: None,
+                network_txn_link_id: None,
                 connector_response_reference_id: None,
                 incremental_authorization_allowed: None,
+                authentication_data: None,
                 charges: None,
             }),
             ..item.data
@@ -724,6 +727,7 @@ impl TryFrom<PaymentsSyncResponseRouterData<HipaySyncResponse>> for PaymentsSync
                     reason: Some(message.clone()),
                     attempt_status: None,
                     connector_transaction_id: None,
+                    connector_response_reference_id: None,
                     status_code: item.http_code,
                     network_advice_code: None,
                     network_decline_code: None,
@@ -753,6 +757,7 @@ impl TryFrom<PaymentsSyncResponseRouterData<HipaySyncResponse>> for PaymentsSync
                         status_code: item.http_code,
                         attempt_status: None,
                         connector_transaction_id: None,
+                        connector_response_reference_id: None,
                         network_advice_code: None,
                         network_decline_code: None,
                         network_error_message: None,
@@ -765,8 +770,10 @@ impl TryFrom<PaymentsSyncResponseRouterData<HipaySyncResponse>> for PaymentsSync
                         mandate_reference: Box::new(None),
                         connector_metadata: None,
                         network_txn_id: None,
+                        network_txn_link_id: None,
                         connector_response_reference_id: None,
                         incremental_authorization_allowed: None,
+                        authentication_data: None,
                         charges: None,
                     })
                 };

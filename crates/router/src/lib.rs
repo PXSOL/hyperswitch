@@ -7,6 +7,8 @@ pub mod consts;
 pub mod core;
 pub mod cors;
 pub mod db;
+#[cfg(feature = "deja")]
+pub mod deja_boot;
 pub mod env;
 pub mod locale;
 pub(crate) mod macros;
@@ -39,6 +41,70 @@ pub use self::env::logger;
 pub(crate) use self::macros::*;
 use crate::{configs::settings, core::errors};
 
+#[cfg(feature = "deja")]
+struct SuperpositionDejaRecordingSampler {
+    superposition_service: std::sync::Arc<external_services::superposition::SuperpositionClient>,
+    superposition_enabled: bool,
+    record_key: String,
+    timeout_ms: u64,
+    /// Decision when the sampling source cannot answer (superposition
+    /// disabled, lookup error, or timeout): `true` → don't record
+    /// (production-safe default), `false` → record (demo/dev rigs that must
+    /// never silently produce an empty tape).
+    fail_closed: bool,
+}
+
+#[cfg(feature = "deja")]
+impl router_env::request_id::RequestRecordingSampler for SuperpositionDejaRecordingSampler {
+    fn should_record(
+        &self,
+        facts: router_env::request_id::RequestRecordingFacts,
+    ) -> router_env::request_id::RequestRecordingSamplerFuture<'_> {
+        // No sampling source to consult: the configured failure default
+        // decides, exactly as it does for lookup errors and timeouts below.
+        let failure_default = !self.fail_closed;
+        if !self.superposition_enabled {
+            return Box::pin(async move { failure_default });
+        }
+
+        let superposition_service = std::sync::Arc::clone(&self.superposition_service);
+        let record_key = self.record_key.clone();
+        let timeout_ms = self.timeout_ms.max(1);
+        Box::pin(async move {
+            let context = external_services::superposition::ConfigContext::new()
+                .with("method", &facts.method)
+                .with("path", &facts.path);
+            let lookup = superposition_service.get_config_value::<bool>(
+                &record_key,
+                Some(&context),
+                Some(&facts.request_id),
+            );
+
+            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), lookup).await {
+                Ok(Ok(decision)) => decision,
+                Ok(Err(error)) => {
+                    router_env::logger::warn!(
+                        error = ?error,
+                        request_id = %facts.request_id,
+                        failure_default,
+                        "Failed to resolve Deja recording sampler decision; using configured failure default"
+                    );
+                    failure_default
+                }
+                Err(_elapsed) => {
+                    router_env::logger::warn!(
+                        timeout_ms,
+                        request_id = %facts.request_id,
+                        failure_default,
+                        "Timed out resolving Deja recording sampler decision; using configured failure default"
+                    );
+                    failure_default
+                }
+            }
+        })
+    }
+}
+
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -67,6 +133,7 @@ pub mod headers {
     pub const X_API_VERSION: &str = "X-ApiVersion";
     pub const X_FORWARDED_FOR: &str = "X-Forwarded-For";
     pub const X_MERCHANT_ID: &str = "X-Merchant-Id";
+    pub const X_INTERNAL_API_KEY: &str = "X-Internal-Api-Key";
     pub const X_ORGANIZATION_ID: &str = "X-Organization-Id";
     pub const X_LOGIN: &str = "X-Login";
     pub const X_TRANS_KEY: &str = "X-Trans-Key";
@@ -89,6 +156,7 @@ pub mod headers {
     pub const X_APP_ID: &str = "x-app-id";
     pub const X_REDIRECT_URI: &str = "x-redirect-uri";
     pub const X_TENANT_ID: &str = "x-tenant-id";
+    pub const X_FINGERPRINT_ID: &str = "x-fingerprint-id";
     pub const X_CLIENT_SECRET: &str = "X-Client-Secret";
     pub const X_CUSTOMER_ID: &str = "X-Customer-Id";
     pub const X_CONNECTED_MERCHANT_ID: &str = "x-connected-merchant-id";
@@ -98,6 +166,8 @@ pub mod headers {
     pub const X_CONNECTOR_HTTP_STATUS_CODE: &str = "connector_http_status_code";
     #[cfg(feature = "v2")]
     pub const X_CONNECTOR_HTTP_STATUS_CODE: &str = "x-connector-http-status-code";
+
+    pub const X_REFERENCE_ID: &str = "X-Reference-Id";
 }
 
 pub mod pii {
@@ -105,7 +175,7 @@ pub mod pii {
 
     pub(crate) use common_utils::pii::Email;
     #[doc(inline)]
-    pub use masking::*;
+    pub use hyperswitch_masking::*;
 }
 
 pub fn mk_app(
@@ -120,7 +190,39 @@ pub fn mk_app(
         InitError = (),
     >,
 > {
-    let mut server_app = get_application_builder(request_body_limit, state.conf.cors.clone());
+    // The recording sampler exists exactly when the process records: record
+    // mode always consults the sampling source per request, every other mode
+    // has nothing to sample.
+    #[cfg(feature = "deja")]
+    let deja_recording_sampler: Option<
+        std::sync::Arc<dyn router_env::request_id::RequestRecordingSampler>,
+    > = matches!(state.conf.deja.mode, settings::DejaMode::Record).then(|| {
+        let sampler: std::sync::Arc<dyn router_env::request_id::RequestRecordingSampler> =
+            std::sync::Arc::new(SuperpositionDejaRecordingSampler {
+                superposition_service: state.superposition_service.clone(),
+                superposition_enabled: state.conf.superposition.get_inner().validate().is_ok(),
+                record_key: state
+                    .conf
+                    .deja
+                    .sampler
+                    .record_key
+                    .as_deref()
+                    .filter(|record_key| !record_key.is_empty())
+                    .unwrap_or("deja_record")
+                    .to_owned(),
+                timeout_ms: state.conf.deja.sampler.timeout_ms,
+                fail_closed: state.conf.deja.sampler.fail_closed,
+            });
+        sampler
+    });
+
+    let mut server_app = get_application_builder(
+        request_body_limit,
+        state.conf.cors.clone(),
+        state.conf.trace_header.clone(),
+        #[cfg(feature = "deja")]
+        deja_recording_sampler,
+    );
 
     #[cfg(feature = "dummy_connector")]
     {
@@ -175,7 +277,9 @@ pub fn mk_app(
             server_app = server_app
                 .service(routes::Refunds::server(state.clone()))
                 .service(routes::Mandates::server(state.clone()))
-                .service(routes::Authentication::server(state.clone()));
+                .service(routes::Authentication::server(state.clone()))
+                .service(routes::SdkConfig::server(state.clone()))
+                .service(routes::SuperpositionProxy::server(state.clone()));
         }
     }
 
@@ -196,6 +300,7 @@ pub fn mk_app(
             .service(routes::User::server(state.clone()))
             .service(routes::ApiKeys::server(state.clone()))
             .service(routes::Routing::server(state.clone()))
+            .service(routes::UnifiedConnectorService::server(state.clone()))
             .service(routes::Chat::server(state.clone()));
 
         #[cfg(all(feature = "olap", any(feature = "v1", feature = "v2")))]
@@ -209,13 +314,16 @@ pub fn mk_app(
                 .service(routes::Files::server(state.clone()))
                 .service(routes::Disputes::server(state.clone()))
                 .service(routes::Blocklist::server(state.clone()))
+                .service(routes::CardIssuers::server(state.clone()))
+                .service(routes::Subscription::server(state.clone()))
                 .service(routes::Gsm::server(state.clone()))
                 .service(routes::ApplePayCertificatesMigration::server(state.clone()))
                 .service(routes::PaymentLink::server(state.clone()))
                 .service(routes::ConnectorOnboarding::server(state.clone()))
                 .service(routes::Analytics::server(state.clone()))
                 .service(routes::WebhookEvents::server(state.clone()))
-                .service(routes::FeatureMatrix::server(state.clone()));
+                .service(routes::FeatureMatrix::server(state.clone()))
+                .service(routes::Embedded::server(state.clone()));
         }
 
         #[cfg(feature = "v2")]
@@ -224,7 +332,9 @@ pub fn mk_app(
                 .service(routes::UserDeprecated::server(state.clone()))
                 .service(routes::ProcessTrackerDeprecated::server(state.clone()))
                 .service(routes::ProcessTracker::server(state.clone()))
-                .service(routes::Gsm::server(state.clone()));
+                .service(routes::Gsm::server(state.clone()))
+                .service(routes::RecoveryDataBackfill::server(state.clone()))
+                .service(routes::Analytics::server(state.clone()));
         }
     }
 
@@ -247,17 +357,19 @@ pub fn mk_app(
         server_app = server_app.service(routes::Proxy::server(state.clone()));
     }
 
-    #[cfg(all(feature = "recon", feature = "v1"))]
-    {
-        server_app = server_app.service(routes::Recon::server(state.clone()));
-    }
-
     server_app = server_app.service(routes::Cache::server(state.clone()));
     server_app = server_app.service(routes::Health::server(state.clone()));
+    server_app = server_app.service(routes::OfferEngine::server(state.clone()));
 
     #[cfg(feature = "v1")]
     {
         server_app = server_app.service(routes::Diagnostic::server(state.clone()));
+    }
+
+    // Registered at the end because this entry has an empty scope
+    #[cfg(feature = "olap")]
+    {
+        server_app = server_app.service(routes::Oidc::server(state.clone()));
     }
 
     server_app
@@ -269,21 +381,31 @@ pub fn mk_app(
 ///
 ///  Unwrap used because without the value we can't start the server
 #[allow(clippy::expect_used, clippy::unwrap_used)]
-pub async fn start_server(conf: settings::Settings<SecuredSecret>) -> ApplicationResult<Server> {
+pub async fn start_server(
+    conf: settings::Settings<SecuredSecret>,
+    service_name: &'static str,
+) -> ApplicationResult<Server> {
     logger::debug!(startup_config=?conf);
     let server = conf.server.clone();
     let (tx, rx) = oneshot::channel();
     let api_client = Box::new(services::ProxyClient::new(&conf.proxy).map_err(|error| {
         errors::ApplicationError::ApiClientError(error.current_context().clone())
     })?);
-    let state = Box::pin(AppState::new(conf, tx, api_client)).await;
+    let state = Box::pin(AppState::new(conf, tx, api_client, service_name)).await;
     let request_body_limit = server.request_body_limit;
 
     let server_builder =
         actix_web::HttpServer::new(move || mk_app(state.clone(), request_body_limit))
             .bind((server.host.as_str(), server.port))?
             .workers(server.workers)
-            .shutdown_timeout(server.shutdown_timeout);
+            .shutdown_timeout(server.shutdown_timeout)
+            .keep_alive(Some(std::time::Duration::from_secs(server.keep_alive)))
+            .client_request_timeout(std::time::Duration::from_millis(
+                server.client_request_timeout,
+            ))
+            .client_disconnect_timeout(std::time::Duration::from_millis(
+                server.client_disconnect_timeout,
+            ));
 
     #[cfg(feature = "tls")]
     let server = match server.tls {
@@ -374,6 +496,10 @@ impl Stop for mpsc::Sender<()> {
 pub fn get_application_builder(
     request_body_limit: usize,
     cors: settings::CorsSettings,
+    trace_header: settings::TraceHeaderConfig,
+    #[cfg(feature = "deja")] deja_recording_sampler: Option<
+        std::sync::Arc<dyn router_env::request_id::RequestRecordingSampler>,
+    >,
 ) -> actix_web::App<
     impl ServiceFactory<
         ServiceRequest,
@@ -388,8 +514,34 @@ pub fn get_application_builder(
         .content_type_required(true)
         .error_handler(utils::error_parser::custom_json_error_handler);
 
+    let multipart_cfg = actix_multipart::form::MultipartFormConfig::default()
+        .memory_limit(consts::MULTIPART_MEMORY_LIMIT);
+
+    let request_identifier = router_env::RequestIdentifier::new(&trace_header.header_name)
+        .use_incoming_id({
+            #[cfg(feature = "deja")]
+            {
+                if deja::replay_is_active() {
+                    router_env::IdReuse::UseIncoming
+                } else {
+                    trace_header.id_reuse_strategy
+                }
+            }
+            #[cfg(not(feature = "deja"))]
+            {
+                trace_header.id_reuse_strategy
+            }
+        });
+
+    #[cfg(feature = "deja")]
+    let request_identifier = match deja_recording_sampler {
+        Some(sampler) => request_identifier.with_recording_sampler(sampler),
+        None => request_identifier,
+    };
+
     actix_web::App::new()
         .app_data(json_cfg)
+        .app_data(multipart_cfg)
         .wrap(ErrorHandlers::new().handler(
             StatusCode::NOT_FOUND,
             errors::error_handlers::custom_error_handlers,
@@ -399,12 +551,14 @@ pub fn get_application_builder(
             errors::error_handlers::custom_error_handlers,
         ))
         .wrap(middleware::default_response_headers())
-        .wrap(middleware::RequestId)
         .wrap(cors::cors(cors))
         // this middleware works only for Http1.1 requests
         .wrap(middleware::Http400RequestDetailsLogger)
         .wrap(middleware::AddAcceptLanguageHeader)
         .wrap(middleware::RequestResponseMetrics)
         .wrap(middleware::LogSpanInitializer)
-        .wrap(router_env::tracing_actix_web::TracingLogger::default())
+        .wrap(router_env::tracing_actix_web::TracingLogger::<
+            router_env::CustomRootSpanBuilder,
+        >::new())
+        .wrap(request_identifier)
 }

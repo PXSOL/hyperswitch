@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use hyperswitch_domain_models::address::{Address, AddressDetails, PhoneDetails};
-use masking::Secret;
+use hyperswitch_masking::Secret;
 use router::types::{self, storage::enums, PaymentAddress};
 
 use crate::{
@@ -110,15 +110,17 @@ impl AdyenTest {
                         expiry_month: Secret::new("3".to_string()),
                         expiry_year: Secret::new("2030".to_string()),
                         card_holder_name: Some(Secret::new("John Doe".to_string())),
+                        card_network: None,
                     },
                 )),
-                enums::PayoutType::Bank => Some(types::api::PayoutMethodData::Bank(
-                    types::api::payouts::BankPayout::Sepa(types::api::SepaBankTransfer {
+                enums::PayoutType::Bank => Some(types::api::PayoutMethodData::BankTransfer(
+                    types::api::payouts::BankTransferPayout::Sepa(types::api::SepaBankTransfer {
                         iban: "NL46TEST0136169112".to_string().into(),
                         bic: Some("ABNANL2A".to_string().into()),
                         bank_name: Some("Deutsche Bank".to_string()),
                         bank_country_code: Some(enums::CountryAlpha2::NL),
                         bank_city: Some("Amsterdam".to_string()),
+                        account_holder_name: None,
                     }),
                 )),
                 enums::PayoutType::Wallet => Some(types::api::PayoutMethodData::Wallet(
@@ -128,6 +130,16 @@ impl AdyenTest {
                         paypal_id: None,
                     }),
                 )),
+                enums::PayoutType::BankRedirect => {
+                    Some(types::api::PayoutMethodData::BankRedirect(
+                        types::api::payouts::BankRedirectPayout::Interac(
+                            api_models::payouts::Interac {
+                                email: Email::from_str("EmailUsedForPayPalAccount@example.com")
+                                    .ok()?,
+                            },
+                        ),
+                    ))
+                }
             },
             ..Default::default()
         })
@@ -152,14 +164,13 @@ impl AdyenTest {
                 card_network: None,
                 card_type: None,
                 card_issuing_country: None,
+                card_issuing_country_code: None,
                 bank_code: None,
                 nick_name: Some(Secret::new("nick_name".into())),
                 card_holder_name: Some(Secret::new("card holder name".into())),
                 co_badged_card_data: None,
             }),
             confirm: true,
-            statement_descriptor_suffix: None,
-            statement_descriptor: None,
             setup_future_usage: None,
             mandate_id: None,
             off_session: None,
@@ -185,6 +196,7 @@ impl AdyenTest {
             authentication_data: None,
             customer_acceptance: None,
             locale: None,
+            billing_descriptor: None,
             ..utils::PaymentAuthorizeType::default().0
         })
     }

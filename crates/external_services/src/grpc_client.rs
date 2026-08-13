@@ -10,11 +10,23 @@ pub mod revenue_recovery;
 
 /// gRPC based Unified Connector Service Client interface implementation
 pub mod unified_connector_service;
+
+/// Deja gRPC egress boundary: the transport-layer tower Service wrapper.
+/// Installed at transport construction
+/// sites so every unary rpc crosses one deja boundary; identity is rank-2
+/// span-path (no explicit call-site tag), routing hardcoded Substitute.
+#[cfg(feature = "deja")]
+pub mod deja_transport;
+/// Deja gRPC egress semantics: recorded result envelope, byte-faithful response
+/// reconstruction.
+#[cfg(feature = "deja")]
+pub mod semantic_boundary;
+
 use std::{fmt::Debug, sync::Arc};
 
 #[cfg(feature = "dynamic_routing")]
 use common_utils::consts;
-use common_utils::id_type;
+use common_utils::{id_type, ucs_types};
 #[cfg(feature = "dynamic_routing")]
 use dynamic_routing::{DynamicRoutingClientConfig, RoutingStrategy};
 #[cfg(feature = "dynamic_routing")]
@@ -23,7 +35,7 @@ use health_check_client::HealthCheckClient;
 use hyper_util::client::legacy::connect::HttpConnector;
 #[cfg(any(feature = "dynamic_routing", feature = "revenue_recovery"))]
 use router_env::logger;
-use serde_urlencoded;
+use router_env::RequestId;
 #[cfg(any(feature = "dynamic_routing", feature = "revenue_recovery"))]
 use tonic::body::Body;
 use typed_builder::TypedBuilder;
@@ -40,9 +52,25 @@ use crate::grpc_client::unified_connector_service::{
     UnifiedConnectorServiceClient, UnifiedConnectorServiceClientConfig,
 };
 
-#[cfg(any(feature = "dynamic_routing", feature = "revenue_recovery"))]
+#[cfg(all(
+    any(feature = "dynamic_routing", feature = "revenue_recovery"),
+    not(feature = "deja")
+))]
 /// Hyper based Client type for maintaining connection pool for all gRPC services
 pub type Client = hyper_util::client::legacy::Client<HttpConnector, Body>;
+
+#[cfg(all(
+    any(feature = "dynamic_routing", feature = "revenue_recovery"),
+    feature = "deja"
+))]
+/// Hyper based Client type for maintaining connection pool for all gRPC services.
+///
+/// Under the `deja` feature the pool is wrapped in the deja gRPC egress boundary
+/// at this single definition site — every unary rpc on every service client built
+/// over it (dynamic routing, health check, recovery decider, future) is
+/// recorded/substituted at the wire level with zero call-site changes.
+pub type Client =
+    deja_transport::DejaGrpcTransport<hyper_util::client::legacy::Client<HttpConnector, Body>>;
 
 /// Struct contains all the gRPC Clients
 #[derive(Debug, Clone)]
@@ -85,6 +113,13 @@ impl GrpcClientSettings {
             hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
                 .http2_only(true)
                 .build_http();
+        // deja: wrap the shared pool in the gRPC egress boundary at its one
+        // construction site.
+        #[cfg(all(
+            any(feature = "dynamic_routing", feature = "revenue_recovery"),
+            feature = "deja"
+        ))]
+        let client = deja_transport::DejaGrpcTransport::new(client);
 
         #[cfg(feature = "dynamic_routing")]
         let dynamic_routing_connection = self
@@ -156,26 +191,62 @@ pub struct GrpcHeaders {
 pub struct GrpcHeadersUcs {
     /// Tenant id
     tenant_id: String,
+    /// Request id
+    request_id: Option<RequestId>,
     /// Lineage ids
     lineage_ids: LineageIds,
     /// External vault proxy metadata
     external_vault_proxy_metadata: Option<String>,
+    /// Merchant Reference Id
+    merchant_reference_id: Option<ucs_types::UcsReferenceId>,
+    /// Resource id
+    resource_id: Option<ucs_types::UcsResourceId>,
+
+    shadow_mode: Option<bool>,
+    /// Proxy name for UCS to select the proxy to route the request through
+    proxy_name: Option<&'static str>,
+    /// Config override as JSON string to pass to UCS
+    config_override: Option<String>,
 }
+
 /// Type aliase for GrpcHeaders builder in initial stage
-pub type GrpcHeadersUcsBuilderInitial = GrpcHeadersUcsBuilder<((String,), (), ())>;
+pub type GrpcHeadersUcsBuilderInitial = GrpcHeadersUcsBuilder<(
+    (String,),
+    (Option<RequestId>,),
+    (),
+    (),
+    (),
+    (),
+    (Option<bool>,),
+    (Option<&'static str>,),
+    (Option<String>,),
+)>;
 /// Type aliase for GrpcHeaders builder in intermediate stage
-pub type GrpcHeadersUcsBuilderIntermediate =
-    GrpcHeadersUcsBuilder<((String,), (), (Option<String>,))>;
+pub type GrpcHeadersUcsBuilderFinal = GrpcHeadersUcsBuilder<(
+    (String,),
+    (Option<RequestId>,),
+    (LineageIds,),
+    (Option<String>,),
+    (Option<ucs_types::UcsReferenceId>,),
+    (Option<ucs_types::UcsResourceId>,),
+    (Option<bool>,),
+    (Option<&'static str>,),
+    (Option<String>,),
+)>;
 
 /// struct to represent set of Lineage ids
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct LineageIds {
     merchant_id: id_type::MerchantId,
+    profile_id: id_type::ProfileId,
 }
 impl LineageIds {
     /// constructor for LineageIds
-    pub fn new(merchant_id: id_type::MerchantId) -> Self {
-        Self { merchant_id }
+    pub fn new(merchant_id: id_type::MerchantId, profile_id: id_type::ProfileId) -> Self {
+        Self {
+            merchant_id,
+            profile_id,
+        }
     }
     /// get url encoded string representation of LineageIds
     pub fn get_url_encoded_string(self) -> Result<String, serde_urlencoded::ser::Error> {

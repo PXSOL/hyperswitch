@@ -17,7 +17,7 @@ use hyperswitch_interfaces::{
     consts::{NO_ERROR_CODE, NO_ERROR_MESSAGE},
     errors,
 };
-use masking::Secret;
+use hyperswitch_masking::Secret;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -263,6 +263,12 @@ pub struct DataPaymentCaptureRequest {
     pub refno: String,
 }
 
+// Datatrans cancel expects an empty JSON object `{}` as the body when
+// Content-Type is application/json. Sending anything else (e.g. a bare JSON
+// string) triggers `INVALID_JSON_PAYLOAD`.
+#[derive(Debug, Serialize, Clone)]
+pub struct DatatransCancelRequest {}
+
 impl<T> TryFrom<(MinorUnit, T)> for DatatransRouterData<T> {
     type Error = error_stack::Report<errors::ConnectorError>;
     fn try_from((amount, item): (MinorUnit, T)) -> Result<Self, Self::Error> {
@@ -319,7 +325,12 @@ impl TryFrom<&types::SetupMandateRouterData> for DatatransPaymentsRequest {
             | PaymentMethodData::OpenBanking(_)
             | PaymentMethodData::CardToken(_)
             | PaymentMethodData::NetworkToken(_)
-            | PaymentMethodData::CardDetailsForNetworkTransactionId(_) => {
+            | PaymentMethodData::CardDetailsForNetworkTransactionId(_)
+            | PaymentMethodData::CardWithOptionalCVC(_)
+            | PaymentMethodData::CardWithNetworkTokenDetails(_)
+            | PaymentMethodData::CardWithLimitedDetails(_)
+            | PaymentMethodData::DecryptedWalletTokenDetailsForNetworkTransactionId(_)
+            | PaymentMethodData::NetworkTokenDetailsForNetworkTransactionId(_) => {
                 Err(errors::ConnectorError::NotImplemented(
                     get_unimplemented_payment_method_error_message("Datatrans"),
                 ))?
@@ -404,7 +415,12 @@ impl TryFrom<&DatatransRouterData<&types::PaymentsAuthorizeRouterData>>
             | PaymentMethodData::OpenBanking(_)
             | PaymentMethodData::CardToken(_)
             | PaymentMethodData::NetworkToken(_)
-            | PaymentMethodData::CardDetailsForNetworkTransactionId(_) => {
+            | PaymentMethodData::CardDetailsForNetworkTransactionId(_)
+            | PaymentMethodData::CardWithOptionalCVC(_)
+            | PaymentMethodData::CardWithNetworkTokenDetails(_)
+            | PaymentMethodData::CardWithLimitedDetails(_)
+            | PaymentMethodData::DecryptedWalletTokenDetailsForNetworkTransactionId(_)
+            | PaymentMethodData::NetworkTokenDetailsForNetworkTransactionId(_) => {
                 Err(errors::ConnectorError::NotImplemented(
                     get_unimplemented_payment_method_error_message("Datatrans"),
                 ))?
@@ -559,6 +575,7 @@ impl<F>
                 reason: Some(error.message.clone()),
                 attempt_status: None,
                 connector_transaction_id: None,
+                connector_response_reference_id: None,
                 status_code: item.http_code,
                 network_advice_code: None,
                 network_decline_code: None,
@@ -574,8 +591,10 @@ impl<F>
                     mandate_reference: Box::new(None),
                     connector_metadata: None,
                     network_txn_id: None,
+                    network_txn_link_id: None,
                     connector_response_reference_id: None,
                     incremental_authorization_allowed: None,
+                    authentication_data: None,
                     charges: None,
                 })
             }
@@ -596,8 +615,10 @@ impl<F>
                     mandate_reference: Box::new(None),
                     connector_metadata: None,
                     network_txn_id: None,
+                    network_txn_link_id: None,
                     connector_response_reference_id: None,
                     incremental_authorization_allowed: None,
+                    authentication_data: None,
                     charges: None,
                 })
             }
@@ -632,6 +653,7 @@ impl<F>
                 reason: Some(error.message.clone()),
                 attempt_status: None,
                 connector_transaction_id: None,
+                connector_response_reference_id: None,
                 status_code: item.http_code,
                 network_advice_code: None,
                 network_decline_code: None,
@@ -647,8 +669,10 @@ impl<F>
                     mandate_reference: Box::new(None),
                     connector_metadata: None,
                     network_txn_id: None,
+                    network_txn_link_id: None,
                     connector_response_reference_id: None,
                     incremental_authorization_allowed: None,
+                    authentication_data: None,
                     charges: None,
                 })
             }
@@ -669,8 +693,10 @@ impl<F>
                     mandate_reference: Box::new(None),
                     connector_metadata: None,
                     network_txn_id: None,
+                    network_txn_link_id: None,
                     connector_response_reference_id: None,
                     incremental_authorization_allowed: None,
+                    authentication_data: None,
                     charges: None,
                 })
             }
@@ -711,6 +737,7 @@ impl TryFrom<RefundsResponseRouterData<Execute, DatatransRefundsResponse>>
                     reason: Some(error.message),
                     attempt_status: None,
                     connector_transaction_id: None,
+                    connector_response_reference_id: None,
                     status_code: item.http_code,
                     network_advice_code: None,
                     network_decline_code: None,
@@ -744,6 +771,7 @@ impl TryFrom<RefundsResponseRouterData<RSync, DatatransSyncResponse>>
                 reason: Some(error.message),
                 attempt_status: None,
                 connector_transaction_id: None,
+                connector_response_reference_id: None,
                 status_code: item.http_code,
                 network_advice_code: None,
                 network_decline_code: None,
@@ -777,6 +805,7 @@ impl TryFrom<PaymentsSyncResponseRouterData<DatatransSyncResponse>>
                     reason: Some(error.message),
                     attempt_status: None,
                     connector_transaction_id: None,
+                    connector_response_reference_id: None,
                     status_code: item.http_code,
                     network_advice_code: None,
                     network_decline_code: None,
@@ -805,6 +834,7 @@ impl TryFrom<PaymentsSyncResponseRouterData<DatatransSyncResponse>>
                         status_code: item.http_code,
                         attempt_status: None,
                         connector_transaction_id: None,
+                        connector_response_reference_id: None,
                         network_advice_code: None,
                         network_decline_code: None,
                         network_error_message: None,
@@ -829,8 +859,10 @@ impl TryFrom<PaymentsSyncResponseRouterData<DatatransSyncResponse>>
                         mandate_reference: Box::new(mandate_reference),
                         connector_metadata: None,
                         network_txn_id: None,
+                        network_txn_link_id: None,
                         connector_response_reference_id: None,
                         incremental_authorization_allowed: None,
+                        authentication_data: None,
                         charges: None,
                     })
                 };

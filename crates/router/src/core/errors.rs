@@ -1,6 +1,10 @@
 pub mod chat;
 pub mod customers_error_response;
 pub mod error_handlers;
+#[cfg(feature = "olap")]
+pub mod launch_sage;
+#[cfg(feature = "olap")]
+pub mod oidc;
 pub mod transformers;
 #[cfg(feature = "olap")]
 pub mod user;
@@ -147,6 +151,8 @@ pub enum WebhooksFlowError {
     CallToMerchantFailed,
     #[error("Webhook not received by merchant")]
     NotReceivedByMerchant,
+    #[error("Webhook not received by recipient")]
+    NotReceivedByRecipient,
     #[error("Dispute webhook status validation failed")]
     DisputeWebhookValidationFailed,
     #[error("Outgoing webhook body encoding failed")]
@@ -157,6 +163,12 @@ pub enum WebhooksFlowError {
     OutgoingWebhookRetrySchedulingFailed,
     #[error("Outgoing webhook response encoding failed")]
     OutgoingWebhookResponseEncodingFailed,
+    #[error("ID generation failed")]
+    IdGenerationFailed,
+    #[error("Webhook API call failed")]
+    WebhookCallFailed,
+    #[error("Webhook request construction failed")]
+    WebhookRequestConstructionFailed,
 }
 
 impl WebhooksFlowError {
@@ -165,7 +177,8 @@ impl WebhooksFlowError {
             Self::MerchantConfigNotFound
             | Self::MerchantWebhookDetailsNotFound
             | Self::MerchantWebhookUrlNotConfigured
-            | Self::OutgoingWebhookResponseEncodingFailed => false,
+            | Self::OutgoingWebhookResponseEncodingFailed
+            | Self::WebhookRequestConstructionFailed => false,
 
             Self::WebhookEventUpdationFailed
             | Self::OutgoingWebhookSigningFailed
@@ -174,7 +187,10 @@ impl WebhooksFlowError {
             | Self::DisputeWebhookValidationFailed
             | Self::OutgoingWebhookEncodingFailed
             | Self::OutgoingWebhookProcessTrackerTaskUpdateFailed
-            | Self::OutgoingWebhookRetrySchedulingFailed => true,
+            | Self::OutgoingWebhookRetrySchedulingFailed
+            | Self::IdGenerationFailed
+            | Self::WebhookCallFailed
+            | Self::NotReceivedByRecipient => true,
         }
     }
 }
@@ -257,46 +273,6 @@ pub enum GooglePayDecryptionError {
     ParsingFailed,
 }
 
-#[cfg(feature = "detailed_errors")]
-pub mod error_stack_parsing {
-
-    #[derive(serde::Deserialize)]
-    pub struct NestedErrorStack<'a> {
-        context: std::borrow::Cow<'a, str>,
-        attachments: Vec<std::borrow::Cow<'a, str>>,
-        sources: Vec<NestedErrorStack<'a>>,
-    }
-
-    #[derive(serde::Serialize, Debug)]
-    struct LinearErrorStack<'a> {
-        context: std::borrow::Cow<'a, str>,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        attachments: Vec<std::borrow::Cow<'a, str>>,
-    }
-
-    #[derive(serde::Serialize, Debug)]
-    pub struct VecLinearErrorStack<'a>(Vec<LinearErrorStack<'a>>);
-
-    impl<'a> From<Vec<NestedErrorStack<'a>>> for VecLinearErrorStack<'a> {
-        fn from(value: Vec<NestedErrorStack<'a>>) -> Self {
-            let multi_layered_errors: Vec<_> = value
-                .into_iter()
-                .flat_map(|current_error| {
-                    [LinearErrorStack {
-                        context: current_error.context,
-                        attachments: current_error.attachments,
-                    }]
-                    .into_iter()
-                    .chain(Into::<VecLinearErrorStack<'a>>::into(current_error.sources).0)
-                })
-                .collect();
-            Self(multi_layered_errors)
-        }
-    }
-}
-#[cfg(feature = "detailed_errors")]
-pub use error_stack_parsing::*;
-
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum RoutingError {
     #[error("Merchant routing algorithm not found in cache")]
@@ -325,6 +301,8 @@ pub enum RoutingError {
     KgraphCacheFailure,
     #[error("failed to refresh the kgraph cache")]
     KgraphCacheRefreshFailed,
+    #[error("failed to fetch merchant connector accounts")]
+    MerchantConnectorAccountsFetchFailed,
     #[error("there was an error during the kgraph analysis phase")]
     KgraphAnalysisError,
     #[error("'profile_id' was not provided")]
@@ -435,6 +413,12 @@ pub enum NetworkTokenizationError {
     NotSupported { message: String },
     #[error("Failed to encrypt the NetworkToken payment method details")]
     NetworkTokenDetailsEncryptionFailed,
+    #[error("Failed to fetch Alt-ID from network token service")]
+    FetchAltIdFailed,
+    #[error("Failed to encrypt card data")]
+    CardDataEncryptionFailed,
+    #[error("Failed to decrypt response data")]
+    ResponseDecryptionFailed,
 }
 
 #[derive(Debug, thiserror::Error)]

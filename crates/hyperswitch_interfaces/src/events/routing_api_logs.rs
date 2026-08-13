@@ -4,7 +4,7 @@ use std::fmt;
 
 use api_models::routing::RoutableConnectorChoice;
 use common_utils::request::Method;
-use router_env::tracing_actix_web::RequestId;
+use router_env::RequestId;
 use serde::Serialize;
 use serde_json::json;
 use time::OffsetDateTime;
@@ -91,7 +91,7 @@ impl RoutingEvent {
             created_at: OffsetDateTime::now_utc().unix_timestamp_nanos(),
             status_code: None,
             request_id: request_id
-                .map(|i| i.as_hyphenated().to_string())
+                .map(|i| i.to_string())
                 .unwrap_or("NO_REQUEST_ID".to_string()),
             routing_engine,
             payment_connector: None,
@@ -101,7 +101,7 @@ impl RoutingEvent {
 
     /// fn set_response_body
     pub fn set_response_body<T: Serialize>(&mut self, response: &T) {
-        match masking::masked_serialize(response) {
+        match hyperswitch_masking::masked_serialize(response) {
             Ok(masked) => {
                 self.response = Some(masked.to_string());
             }
@@ -111,7 +111,7 @@ impl RoutingEvent {
 
     /// fn set_error_response_body
     pub fn set_error_response_body<T: Serialize>(&mut self, response: &T) {
-        match masking::masked_serialize(response) {
+        match hyperswitch_masking::masked_serialize(response) {
             Ok(masked) => {
                 self.error = Some(masked.to_string());
             }

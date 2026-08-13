@@ -4,7 +4,7 @@ use common_utils::errors::CustomResult;
 use diesel_models::enums::{self, ProcessTrackerStatus};
 pub use diesel_models::process_tracker as storage;
 use error_stack::{report, ResultExt};
-use redis_interface::{RedisConnectionPool, RedisEntryId};
+use redis_interface::{RedisConnectionWithContext, RedisEntryId};
 use router_env::{instrument, tracing};
 use uuid::Uuid;
 
@@ -22,12 +22,18 @@ pub async fn divide_and_append_tasks<T>(
     flow: SchedulerFlow,
     tasks: Vec<storage::ProcessTracker>,
     settings: &SchedulerSettings,
+    application_source: enums::ApplicationSource,
 ) -> CustomResult<(), errors::ProcessTrackerError>
 where
     T: SchedulerInterface + Send + Sync + ?Sized,
 {
-    let batches = divide(tasks, settings);
+    let batches = divide(tasks, settings, application_source);
     // Safety: Assuming we won't deal with more than `u64::MAX` batches at once
+    logger::info!(
+        "Adding {} batches for application_source: {:?}",
+        batches.len(),
+        application_source
+    );
     #[allow(clippy::as_conversions)]
     metrics::BATCHES_CREATED.add(batches.len() as u64, &[]); // Metrics
     for batch in batches {
@@ -147,10 +153,11 @@ where
 pub fn divide(
     tasks: Vec<storage::ProcessTracker>,
     conf: &SchedulerSettings,
+    application_source: enums::ApplicationSource,
 ) -> Vec<ProcessTrackerBatch> {
     let now = common_utils::date_time::now();
     let batch_size = conf.producer.batch_size;
-    divide_into_batches(batch_size, tasks, now, conf)
+    divide_into_batches(batch_size, tasks, now, conf, application_source)
 }
 
 pub fn divide_into_batches(
@@ -158,8 +165,14 @@ pub fn divide_into_batches(
     tasks: Vec<storage::ProcessTracker>,
     batch_creation_time: time::PrimitiveDateTime,
     conf: &SchedulerSettings,
+    application_source: enums::ApplicationSource,
 ) -> Vec<ProcessTrackerBatch> {
     let batch_id = Uuid::new_v4().to_string();
+
+    let stream_name = match application_source {
+        enums::ApplicationSource::Main => &conf.stream,
+        enums::ApplicationSource::Cug => &conf.cug_stream,
+    };
 
     tasks
         .chunks(batch_size)
@@ -167,7 +180,7 @@ pub fn divide_into_batches(
             let batch = ProcessTrackerBatch {
                 id: batch_id.clone(),
                 group_name: conf.consumer.consumer_group.clone(),
-                stream_name: conf.stream.clone(),
+                stream_name: stream_name.to_string(),
                 connection_name: String::new(),
                 created_time: batch_creation_time,
                 rule: String::new(), // is it required?
@@ -180,15 +193,15 @@ pub fn divide_into_batches(
 }
 
 pub async fn get_batches(
-    conn: &RedisConnectionPool,
+    conn: &RedisConnectionWithContext,
     stream_name: &str,
     group_name: &str,
     consumer_name: &str,
 ) -> CustomResult<Vec<ProcessTrackerBatch>, errors::ProcessTrackerError> {
     let response = match conn
         .stream_read_with_options(
-            stream_name,
-            RedisEntryId::UndeliveredEntryID,
+            &[stream_name.into()],
+            vec![RedisEntryId::UndeliveredEntryID.to_stream_id()],
             // Update logic for collecting to Vec and flattening, if count > 1 is provided
             Some(1),
             None,
@@ -211,21 +224,26 @@ pub async fn get_batches(
 
     metrics::BATCHES_CONSUMED.add(1, &[]);
 
-    let (batches, entry_ids): (Vec<Vec<ProcessTrackerBatch>>, Vec<Vec<String>>) = response.into_values().map(|entries| {
-        entries.into_iter().try_fold(
-            (Vec::new(), Vec::new()),
-            |(mut batches, mut entry_ids), entry| {
-                // Redis entry ID
-                entry_ids.push(entry.0);
-                // Value HashMap
-                batches.push(ProcessTrackerBatch::from_redis_stream_entry(entry.1)?);
-
-                Ok((batches, entry_ids))
-            },
-        )
-    }).collect::<CustomResult<Vec<(Vec<ProcessTrackerBatch>, Vec<String>)>, errors::ProcessTrackerError>>()?
-    .into_iter()
-    .unzip();
+    // StreamReadResult: stream key → Vec<(entry_id, HashMap<String, RedisValue>)>
+    let (batches, entry_ids): (Vec<Vec<ProcessTrackerBatch>>, Vec<Vec<String>>) = response
+        .into_values()
+        .map(|entries| {
+            entries.into_iter().try_fold(
+                (Vec::new(), Vec::new()),
+                |(mut batches, mut entry_ids), (entry_id, fields)| {
+                    entry_ids.push(entry_id);
+                    let fields: std::collections::HashMap<String, Option<String>> = fields
+                        .into_iter()
+                        .map(|(k, v)| (k, v.as_string()))
+                        .collect();
+                    batches.push(ProcessTrackerBatch::from_redis_stream_entry(fields)?);
+                    Ok((batches, entry_ids))
+                },
+            )
+        })
+        .collect::<CustomResult<Vec<_>, errors::ProcessTrackerError>>()?
+        .into_iter()
+        .unzip();
     // Flattening the Vec's since the count provided above is 1. This needs to be updated if a
     // count greater than 1 is provided.
     let batches = batches.into_iter().flatten().collect::<Vec<_>>();
@@ -237,7 +255,7 @@ pub async fn get_batches(
             logger::error!(?error, "Error acknowledging batch in stream");
             error.change_context(errors::ProcessTrackerError::BatchUpdateFailed)
         })?;
-    conn.stream_delete_entries(&stream_name.into(), entry_ids.clone())
+    conn.stream_delete_entries(&stream_name.into(), entry_ids)
         .await
         .map_err(|error| {
             logger::error!(?error, "Error deleting batch from stream");
@@ -316,13 +334,9 @@ pub fn add_histogram_metrics(
 
 pub fn get_schedule_time(
     mapping: process_data::ConnectorPTMapping,
-    merchant_id: &common_utils::id_type::MerchantId,
     retry_count: i32,
 ) -> Option<i32> {
-    let mapping = match mapping.custom_merchant_mapping.get(merchant_id) {
-        Some(map) => map.clone(),
-        None => mapping.default_mapping,
-    };
+    let mapping = mapping.default_mapping;
 
     // For first try, get the `start_after` time
     if retry_count == 0 {
@@ -351,13 +365,9 @@ pub fn get_pm_schedule_time(
 
 pub fn get_outgoing_webhook_retry_schedule_time(
     mapping: process_data::OutgoingWebhookRetryProcessTrackerMapping,
-    merchant_id: &common_utils::id_type::MerchantId,
     retry_count: i32,
 ) -> Option<i32> {
-    let retry_mapping = match mapping.custom_merchant_mapping.get(merchant_id) {
-        Some(map) => map.clone(),
-        None => mapping.default_mapping,
-    };
+    let retry_mapping = mapping.default_mapping;
 
     // For first try, get the `start_after` time
     if retry_count == 0 {
@@ -369,6 +379,21 @@ pub fn get_outgoing_webhook_retry_schedule_time(
 
 pub fn get_pcr_payments_retry_schedule_time(
     mapping: process_data::RevenueRecoveryPaymentProcessTrackerMapping,
+    retry_count: i32,
+) -> Option<i32> {
+    let mapping = mapping.default_mapping;
+    // TODO: check if the current scheduled time is not more than the configured timerange
+
+    // For first try, get the `start_after` time
+    if retry_count == 0 {
+        Some(mapping.start_after)
+    } else {
+        get_delay(retry_count, &mapping.frequencies)
+    }
+}
+
+pub fn get_subscription_invoice_sync_retry_schedule_time(
+    mapping: process_data::SubscriptionInvoiceSyncPTMapping,
     merchant_id: &common_utils::id_type::MerchantId,
     retry_count: i32,
 ) -> Option<i32> {
@@ -376,9 +401,7 @@ pub fn get_pcr_payments_retry_schedule_time(
         Some(map) => map.clone(),
         None => mapping.default_mapping,
     };
-    // TODO: check if the current scheduled time is not more than the configured timerange
 
-    // For first try, get the `start_after` time
     if retry_count == 0 {
         Some(mapping.start_after)
     } else {

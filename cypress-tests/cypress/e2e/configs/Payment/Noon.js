@@ -47,8 +47,8 @@ const payment_method_data_3ds = {
     last4: "1091",
     card_type: "CREDIT",
     card_network: "Visa",
-    card_issuer: "INTL HDQTRS-CENTER OWNED",
-    card_issuing_country: "UNITEDSTATES",
+    card_issuer: "INTL HDQTRS CENTER OWNED",
+    card_issuing_country: "UNITED STATES OF AMERICA",
     card_isin: "400000",
     card_extended_bin: null,
     card_exp_month: "01",
@@ -56,6 +56,7 @@ const payment_method_data_3ds = {
     card_holder_name: "joseph Doe",
     payment_checks: null,
     authentication_data: null,
+    auth_code: null,
   },
   billing: null,
 };
@@ -99,6 +100,7 @@ export const connectorDetails = {
       Request: {
         currency: "AED",
         shipping_cost: 50,
+        amount: 9000,
       },
       Response: {
         status: 200,
@@ -106,6 +108,7 @@ export const connectorDetails = {
           status: "requires_payment_method",
           shipping_cost: 50,
           amount: 9000,
+          amount_capturable: 9050,
         },
       },
     },
@@ -459,6 +462,24 @@ export const connectorDetails = {
         },
       },
     },
+    MITAutoCaptureWithCustomerAcceptance: {
+      Request: {
+        customer_acceptance: {
+          acceptance_type: "offline",
+          accepted_at: "1963-05-03T04:07:52.723Z",
+          online: {
+            ip_address: "127.0.0.1",
+            user_agent: "amet irure esse",
+          },
+        },
+      },
+      Response: {
+        status: 200,
+        body: {
+          status: "succeeded",
+        },
+      },
+    },
     MITManualCapture: {
       Request: {},
       Response: {
@@ -502,6 +523,8 @@ export const connectorDetails = {
         payment_method_data: {
           card: successfulNo3DSCardDetails,
         },
+        mandate_data: null,
+        customer_acceptance: customerAcceptance,
       },
       Response: {
         status: 501,
@@ -728,6 +751,72 @@ export const connectorDetails = {
           status: "requires_customer_action",
         },
       },
+    },
+    No3DSFailPayment: {
+      Request: {
+        payment_method: "card",
+        payment_method_data: {
+          card: successfulThreeDSTestCardDetails,
+        },
+        customer_acceptance: null,
+        setup_future_usage: "on_session",
+      },
+      Response: {
+        status: 200,
+        body: {
+          status: "requires_customer_action", // Noon doesn't have fail scenario for card payments, it goes to requires_customer_action.
+        },
+      },
+    },
+    ConnectorTestingData: {
+      Request: {
+        currency: "AED",
+        amount: 9000,
+        connector_metadata: {
+          noon: { order_category: "pay" },
+        },
+        customer_acceptance: null,
+        setup_future_usage: "on_session",
+      },
+      Response: {
+        status: 200,
+        body: {
+          status: "requires_payment_method",
+        },
+      },
+    },
+    ConnectorTestingDataConfirm: {
+      Request: {
+        payment_method: "card",
+        payment_method_data: {
+          card: {
+            card_number: "4242424242424242",
+            card_exp_month: "01",
+            card_exp_year: "2030",
+            card_cvc: "123",
+            card_holder_name: "joseph Doe",
+          },
+        },
+        connector_metadata: {
+          noon: { order_category: "pay" },
+        },
+        customer_acceptance: null,
+        setup_future_usage: "on_session",
+      },
+      Response: {
+        status: 200,
+        body: {
+          status: "requires_customer_action",
+        },
+      },
+    },
+  },
+  webhook: {
+    TransactionIdConfig: {
+      // Defines how to locate and parse the payment reference ID from connector-specific webhook payloads
+      path: "orderId",
+      // Type of payment reference ID
+      type: "number",
     },
   },
 };

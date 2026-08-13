@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::enums::PayoutStatus;
 use crate::enums::{
     AttemptStatus, Country, CountryAlpha2, CountryAlpha3, DisputeStatus, EventType, IntentStatus,
-    MandateStatus, PaymentMethod, PaymentMethodType, RefundStatus,
+    MandateStatus, PaymentMethod, PaymentMethodType, RefundStatus, SubscriptionStatus,
 };
 
 impl Display for NumericCountryCodeParseError {
@@ -1831,6 +1831,7 @@ impl From<PaymentMethodType> for PaymentMethod {
             PaymentMethodType::Fps => Self::RealTimePayment,
             PaymentMethodType::DuitNow => Self::RealTimePayment,
             PaymentMethodType::Eft => Self::BankRedirect,
+            PaymentMethodType::EftDebitOrder => Self::BankDebit,
             PaymentMethodType::Eps => Self::BankRedirect,
             PaymentMethodType::Evoucher => Self::Reward,
             PaymentMethodType::Giropay => Self::BankRedirect,
@@ -1839,6 +1840,7 @@ impl From<PaymentMethodType> for PaymentMethod {
             PaymentMethodType::Gcash => Self::Wallet,
             PaymentMethodType::Mifinity => Self::Wallet,
             PaymentMethodType::Ideal => Self::BankRedirect,
+            PaymentMethodType::Qris => Self::RealTimePayment,
             PaymentMethodType::Klarna => Self::PayLater,
             PaymentMethodType::KakaoPay => Self::Wallet,
             PaymentMethodType::Knet => Self::CardRedirect,
@@ -1864,6 +1866,10 @@ impl From<PaymentMethodType> for PaymentMethod {
             PaymentMethodType::Paze => Self::Wallet,
             PaymentMethodType::PermataBankTransfer => Self::BankTransfer,
             PaymentMethodType::Pix => Self::BankTransfer,
+            PaymentMethodType::PixKey => Self::BankTransfer,
+            PaymentMethodType::PixEmv | PaymentMethodType::PixQr => Self::BankTransfer,
+            PaymentMethodType::PixAutomaticoPush => Self::BankTransfer,
+            PaymentMethodType::PixAutomaticoQr => Self::BankTransfer,
             PaymentMethodType::Pse => Self::BankTransfer,
             PaymentMethodType::LocalBankTransfer => Self::BankTransfer,
             PaymentMethodType::PayBright => Self::PayLater,
@@ -1873,6 +1879,7 @@ impl From<PaymentMethodType> for PaymentMethod {
             PaymentMethodType::PromptPay => Self::RealTimePayment,
             PaymentMethodType::SamsungPay => Self::Wallet,
             PaymentMethodType::Sepa => Self::BankDebit,
+            PaymentMethodType::SepaGuarenteedDebit => Self::BankDebit,
             PaymentMethodType::SepaBankTransfer => Self::BankTransfer,
             PaymentMethodType::Sofort => Self::BankRedirect,
             PaymentMethodType::Swish => Self::BankRedirect,
@@ -1880,6 +1887,7 @@ impl From<PaymentMethodType> for PaymentMethod {
             PaymentMethodType::Twint => Self::Wallet,
             PaymentMethodType::UpiCollect => Self::Upi,
             PaymentMethodType::UpiIntent => Self::Upi,
+            PaymentMethodType::UpiQr => Self::Upi,
             PaymentMethodType::Vipps => Self::Wallet,
             PaymentMethodType::Venmo => Self::Wallet,
             PaymentMethodType::VietQr => Self::RealTimePayment,
@@ -1887,6 +1895,7 @@ impl From<PaymentMethodType> for PaymentMethod {
             PaymentMethodType::WeChatPay => Self::Wallet,
             PaymentMethodType::TouchNGo => Self::Wallet,
             PaymentMethodType::Atome => Self::PayLater,
+            PaymentMethodType::Payjustnow => Self::PayLater,
             PaymentMethodType::Boleto => Self::Voucher,
             PaymentMethodType::Efecty => Self::Voucher,
             PaymentMethodType::PagoEfectivo => Self::Voucher,
@@ -1907,6 +1916,8 @@ impl From<PaymentMethodType> for PaymentMethod {
             PaymentMethodType::DirectCarrierBilling => Self::MobilePayment,
             PaymentMethodType::RevolutPay => Self::Wallet,
             PaymentMethodType::IndonesianBankTransfer => Self::BankTransfer,
+            PaymentMethodType::OpenBanking => Self::BankRedirect,
+            PaymentMethodType::NetworkToken => Self::NetworkToken,
         }
     }
 }
@@ -2128,6 +2139,7 @@ impl From<AttemptStatus> for IntentStatus {
             AttemptStatus::VoidedPostCharge => Self::CancelledPostCapture,
             AttemptStatus::Expired => Self::Expired,
             AttemptStatus::PartiallyAuthorized => Self::PartiallyAuthorizedAndRequiresCapture,
+            AttemptStatus::CaptureReview => Self::Review,
         }
     }
 }
@@ -2137,10 +2149,13 @@ impl From<IntentStatus> for Option<EventType> {
         match value {
             IntentStatus::Succeeded => Some(EventType::PaymentSucceeded),
             IntentStatus::Failed => Some(EventType::PaymentFailed),
-            IntentStatus::Processing => Some(EventType::PaymentProcessing),
+            IntentStatus::Processing | IntentStatus::PartiallyCapturedAndProcessing => {
+                Some(EventType::PaymentProcessing)
+            }
             IntentStatus::RequiresMerchantAction
             | IntentStatus::RequiresCustomerAction
-            | IntentStatus::Conflicted => Some(EventType::ActionRequired),
+            | IntentStatus::Conflicted
+            | IntentStatus::Review => Some(EventType::ActionRequired),
             IntentStatus::Cancelled => Some(EventType::PaymentCancelled),
             IntentStatus::CancelledPostCapture => Some(EventType::PaymentCancelledPostCapture),
             IntentStatus::Expired => Some(EventType::PaymentExpired),
@@ -2178,6 +2193,9 @@ impl From<PayoutStatus> for Option<EventType> {
             PayoutStatus::Initiated => Some(EventType::PayoutInitiated),
             PayoutStatus::Expired => Some(EventType::PayoutExpired),
             PayoutStatus::Reversed => Some(EventType::PayoutReversed),
+            // Terminal refusal (e.g. VoP no-match) Contrast with `Ineligible` below,
+            // which is non-terminal and intentionally emits no webhook.
+            PayoutStatus::NotPermitted => Some(EventType::PayoutNotPermitted),
             PayoutStatus::Ineligible
             | PayoutStatus::Pending
             | PayoutStatus::RequiresCreation
@@ -2213,10 +2231,17 @@ impl From<MandateStatus> for Option<EventType> {
     }
 }
 
+impl From<SubscriptionStatus> for Option<EventType> {
+    fn from(value: SubscriptionStatus) -> Self {
+        match value {
+            SubscriptionStatus::Active => Some(EventType::InvoicePaid),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
-
     use super::*;
 
     #[derive(serde::Serialize)]

@@ -25,21 +25,19 @@ use crate::{
 #[cfg(feature = "v2")]
 pub async fn list_payment_methods(
     state: routes::SessionState,
-    merchant_context: domain::MerchantContext,
+    platform: domain::Platform,
     profile: domain::Profile,
     payment_id: id_type::GlobalPaymentId,
     req: api_models::payments::ListMethodsForPaymentsRequest,
     header_payload: &hyperswitch_domain_models::payments::HeaderPayload,
 ) -> errors::RouterResponse<api_models::payments::PaymentMethodListResponseForPayments> {
     let db = &*state.store;
-    let key_manager_state = &(&state).into();
 
     let payment_intent = db
         .find_payment_intent_by_id(
-            key_manager_state,
             &payment_id,
-            merchant_context.get_merchant_key_store(),
-            merchant_context.get_merchant_account().storage_scheme,
+            platform.get_processor().get_key_store(),
+            platform.get_processor().get_account().storage_scheme,
         )
         .await
         .to_not_found_response(errors::ApiErrorResponse::PaymentNotFound)?;
@@ -48,9 +46,8 @@ pub async fn list_payment_methods(
 
     let payment_connector_accounts = db
         .list_enabled_connector_accounts_by_profile_id(
-            key_manager_state,
             profile.get_id(),
-            merchant_context.get_merchant_key_store(),
+            platform.get_processor().get_key_store(),
             common_enums::ConnectorType::PaymentProcessor,
         )
         .await
@@ -61,8 +58,9 @@ pub async fn list_payment_methods(
         Some(customer_id) => Some(
             payment_methods::list_customer_payment_methods_core(
                 &state,
-                &merchant_context,
+                platform.get_provider(),
                 customer_id,
+                false, // include_new field is false because we want to fetch saved payment methods for the customer, and not fetch new payment methods based on the current request
             )
             .await?,
         ),
@@ -73,11 +71,12 @@ pub async fn list_payment_methods(
         FlattenedPaymentMethodsEnabled(hyperswitch_domain_models::merchant_connector_account::FlattenedPaymentMethodsEnabled::from_payment_connectors_list(payment_connector_accounts))
             .perform_filtering(
                 &state,
-                &merchant_context,
+                &platform,
                 profile.get_id(),
                 &req,
                 &payment_intent,
             ).await?
+            .store_gift_card_mca_in_redis(&payment_id, db, &profile).await
             .merge_and_transform()
             .get_required_fields(RequiredFieldsInput::new(state.conf.required_fields.clone(), payment_intent.setup_future_usage))
             .perform_surcharge_calculation()
@@ -188,6 +187,50 @@ impl FilteredPaymentMethodsEnabled {
             )
             .collect();
         MergedEnabledPaymentMethodTypes(values)
+    }
+    async fn store_gift_card_mca_in_redis(
+        self,
+        payment_id: &id_type::GlobalPaymentId,
+        db: &dyn crate::db::StorageInterface,
+        profile: &domain::Profile,
+    ) -> Self {
+        let gift_card_connector_id = self
+            .0
+            .iter()
+            .find(|item| item.payment_method == common_enums::PaymentMethod::GiftCard)
+            .map(|item| &item.merchant_connector_id);
+
+        if let Some(gift_card_mca) = gift_card_connector_id {
+            let gc_key = payment_id.get_gift_card_connector_key();
+            let redis_expiry = profile
+                .get_order_fulfillment_time()
+                .unwrap_or(common_utils::consts::DEFAULT_INTENT_FULFILLMENT_TIME);
+
+            let redis_conn = db
+                .get_redis_conn()
+                .map_err(|redis_error| logger::error!(?redis_error))
+                .ok();
+
+            if let Some(rc) = redis_conn {
+                rc.set_key_with_expiry(
+                    &gc_key.as_str().into(),
+                    gift_card_mca.get_string_repr().to_string(),
+                    redis_expiry,
+                )
+                .await
+                .attach_printable("Failed to store gift card mca_id in redis")
+                .unwrap_or_else(|error| {
+                    logger::error!(?error);
+                })
+            };
+        } else {
+            logger::error!(
+                "Could not find any configured MCA supporting gift card for payment_id -> {}",
+                payment_id.get_string_repr()
+            );
+        }
+
+        self
     }
 }
 
@@ -365,7 +408,8 @@ fn get_pm_subtype_specific_data(
         | common_enums::PaymentMethod::Upi
         | common_enums::PaymentMethod::Voucher
         | common_enums::PaymentMethod::GiftCard
-        | common_enums::PaymentMethod::MobilePayment => None,
+        | common_enums::PaymentMethod::MobilePayment
+        | common_enums::PaymentMethod::NetworkToken => None,
     }
 }
 
@@ -448,7 +492,7 @@ impl FlattenedPaymentMethodsEnabled {
     async fn perform_filtering(
         self,
         state: &routes::SessionState,
-        merchant_context: &domain::MerchantContext,
+        platform: &domain::Platform,
         profile_id: &id_type::ProfileId,
         req: &api_models::payments::ListMethodsForPaymentsRequest,
         payment_intent: &hyperswitch_domain_models::payments::PaymentIntent,
@@ -547,9 +591,9 @@ fn filter_country_based(
     address: Option<&hyperswitch_domain_models::address::AddressDetails>,
     pm: &common_types::payment_methods::RequestPaymentMethodTypes,
 ) -> bool {
-    address.map_or(true, |address| {
-        address.country.as_ref().map_or(true, |country| {
-            pm.accepted_countries.as_ref().map_or(true, |ac| match ac {
+    address.is_none_or(|address| {
+        address.country.as_ref().is_none_or(|country| {
+            pm.accepted_countries.as_ref().is_none_or(|ac| match ac {
                 common_types::payment_methods::AcceptedCountries::EnableOnly(acc) => {
                     acc.contains(country)
                 }
@@ -568,7 +612,7 @@ fn filter_currency_based(
     currency: common_enums::Currency,
     pm: &common_types::payment_methods::RequestPaymentMethodTypes,
 ) -> bool {
-    pm.accepted_currencies.as_ref().map_or(true, |ac| match ac {
+    pm.accepted_currencies.as_ref().is_none_or(|ac| match ac {
         common_types::payment_methods::AcceptedCurrencies::EnableOnly(acc) => {
             acc.contains(&currency)
         }
@@ -641,9 +685,7 @@ fn filter_recurring_based(
     payment_method: &common_types::payment_methods::RequestPaymentMethodTypes,
     recurring_enabled: Option<bool>,
 ) -> bool {
-    recurring_enabled.map_or(true, |enabled| {
-        payment_method.recurring_enabled == Some(enabled)
-    })
+    recurring_enabled.is_none_or(|enabled| payment_method.recurring_enabled == Some(enabled))
 }
 
 // filter based on valid amount range of payment method type
@@ -704,7 +746,7 @@ fn filter_allowed_payment_method_types_based(
     allowed_types: Option<&Vec<api_models::enums::PaymentMethodType>>,
     payment_method_type: api_models::enums::PaymentMethodType,
 ) -> bool {
-    allowed_types.map_or(true, |pm| pm.contains(&payment_method_type))
+    allowed_types.is_none_or(|pm| pm.contains(&payment_method_type))
 }
 
 // filter based on card networks
@@ -747,9 +789,11 @@ fn validate_payment_status_for_payment_method_list(
         | common_enums::IntentStatus::RequiresCapture
         | common_enums::IntentStatus::PartiallyAuthorizedAndRequiresCapture
         | common_enums::IntentStatus::PartiallyCaptured
+        | common_enums::IntentStatus::PartiallyCapturedAndProcessing
         | common_enums::IntentStatus::RequiresConfirmation
         | common_enums::IntentStatus::PartiallyCapturedAndCapturable
-        | common_enums::IntentStatus::Expired => {
+        | common_enums::IntentStatus::Expired
+        | common_enums::IntentStatus::Review => {
             Err(errors::ApiErrorResponse::PaymentUnexpectedState {
                 current_flow: "list_payment_methods".to_string(),
                 field_name: "status".to_string(),

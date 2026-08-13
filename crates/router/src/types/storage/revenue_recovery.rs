@@ -9,7 +9,7 @@ use hyperswitch_domain_models::{
     payment_method_data::{Card, PaymentMethodData},
     payments::{payment_attempt::PaymentAttempt, PaymentIntent, PaymentStatusData},
 };
-use masking::PeekInterface;
+use hyperswitch_masking::PeekInterface;
 use router_env::logger;
 use serde::{Deserialize, Serialize};
 
@@ -55,9 +55,25 @@ impl RevenueRecoveryPaymentData {
             }
             enums::RevenueRecoveryAlgorithmType::Cascading => {
                 logger::info!("Cascading type found for Revenue Recovery retry payment");
+                let connector = payment_attempt.connector.as_ref().and_then(|c| {
+                    c.parse::<common_enums::connector_enums::Connector>()
+                        .map_err(|e| {
+                            logger::error!(
+                                "Failed to parse connector {:?} for payment_attempt {:?}: {:?}",
+                                c,
+                                payment_attempt.payment_id,
+                                e
+                            )
+                        })
+                        .ok()
+                })?;
+                let dimensions = crate::core::configs::dimension_state::Dimensions::new()
+                    .with_processor_merchant_id(merchant_id.clone().into())
+                    .with_connector(connector);
                 revenue_recovery::get_schedule_time_to_retry_mit_payments(
                     state.store.as_ref(),
-                    merchant_id,
+                    state.superposition_service.as_ref(),
+                    &dimensions,
                     retry_count,
                 )
                 .await
@@ -83,6 +99,7 @@ pub struct RecoveryTimestamp {
     pub reopen_workflow_buffer_time_in_seconds: i64,
     pub max_random_schedule_delay_in_seconds: i64,
     pub redis_ttl_buffer_in_seconds: i64,
+    pub unretried_invoice_schedule_time_offset_seconds: i64,
 }
 
 impl Default for RecoveryTimestamp {
@@ -93,6 +110,7 @@ impl Default for RecoveryTimestamp {
             reopen_workflow_buffer_time_in_seconds: 60,
             max_random_schedule_delay_in_seconds: 300,
             redis_ttl_buffer_in_seconds: 300,
+            unretried_invoice_schedule_time_offset_seconds: 300,
         }
     }
 }
