@@ -271,3 +271,22 @@ creds.json
 # Nix services data
 /data
 .pre-commit-config.yaml
+
+# Herramientas locales de homologación Fiserv
+/fiserv_homologacion_secrets/
+/fiserv_homologacion_logs/
+# Los dos scripts viejos tienen las credenciales CERT hardcodeadas.
+# fiserv_homologacion.py no: lee de fiserv_homologacion_secrets/creds.env.
+/fiserv_homologacion.sh
+/fiserv_3ds_local.py
+__pycache__/
+
+# Material local de la integración Fiserv / PXSOL: documentación del vendor, planillas de
+# homologación y scripts de prueba. Nada de esto va al repo.
+/PXSOL SAS/
+/homologacion_fiserv_checklist.csv
+/homologacion_fiserv_checklist.xlsx
+/homologacion_fiserv_mail.md
+/payway_apim_test.sh
+/wompi_tests/
+/.claude/
