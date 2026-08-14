@@ -19,6 +19,7 @@ use common_utils::{
 };
 use error_stack::{report, ResultExt};
 use hyperswitch_domain_models::{
+    payment_method_data::PaymentMethodData,
     router_data::{AccessToken, ErrorResponse, RouterData},
     router_flow_types::{
         access_token_auth::AccessTokenAuth,
@@ -559,7 +560,26 @@ impl ConnectorCommon for Fiservemea {
     }
 }
 
-impl ConnectorValidation for Fiservemea {}
+impl ConnectorValidation for Fiservemea {
+    /// Sin este override el pago con mandato nunca llega al gateway: el default del trait rechaza
+    /// TODO método de pago (`{pm_type} mandate payment is not supported by fiservemea`, IR_19), así
+    /// que el router cortaba el CIT de Card on File aunque el conector tenga el flujo implementado
+    /// y la config lo habilite en `[mandates.supported_payment_methods]`.
+    ///
+    /// Se aceptan los dos métodos que la rama de Card on File del conector realmente arma: la
+    /// tarjeta con PAN (`CREDENTIAL_ON_FILE_FIRST` + `schemeTransactionId`) y el network token.
+    fn validate_mandate_payment(
+        &self,
+        pm_type: Option<enums::PaymentMethodType>,
+        pm_data: PaymentMethodData,
+    ) -> CustomResult<(), errors::ConnectorError> {
+        let mandate_supported_pmd = std::collections::HashSet::from([
+            utils::PaymentMethodDataType::Card,
+            utils::PaymentMethodDataType::NetworkToken,
+        ]);
+        utils::is_mandate_supported(pm_data, pm_type, mandate_supported_pmd, self.id())
+    }
+}
 
 impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData> for Fiservemea {
     fn get_headers(
