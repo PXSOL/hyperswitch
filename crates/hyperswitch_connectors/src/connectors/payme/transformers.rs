@@ -433,11 +433,14 @@ impl TryFrom<&PaymentMethodData> for SalePaymentMethod {
                 | WalletData::SwishQr(_)
                 | WalletData::Mifinity(_)
                 | WalletData::RevolutPay(_)
-                | WalletData::MercadoPagoSdk(_) => Err(errors::ConnectorError::NotSupported {
-                    message: "Wallet".to_string(),
-                    connector: "payme",
+                | WalletData::MercadoPagoSdk(_)
+                | WalletData::MercadoPagoCheckoutPro {} => {
+                    Err(errors::ConnectorError::NotSupported {
+                        message: "Wallet".to_string(),
+                        connector: "payme",
+                    }
+                    .into())
                 }
-                .into()),
             },
             PaymentMethodData::PayLater(_)
             | PaymentMethodData::BankRedirect(_)

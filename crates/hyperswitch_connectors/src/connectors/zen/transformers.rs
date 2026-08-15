@@ -516,9 +516,12 @@ impl
             | WalletData::WeChatPayQr(_)
             | WalletData::Mifinity(_)
             | WalletData::RevolutPay(_)
-                | WalletData::MercadoPagoSdk(_) => Err(errors::ConnectorError::NotImplemented(
-                utils::get_unimplemented_payment_method_error_message("Zen"),
-            ))?,
+            | WalletData::MercadoPagoSdk(_)
+            | WalletData::MercadoPagoCheckoutPro {} => {
+                Err(errors::ConnectorError::NotImplemented(
+                    utils::get_unimplemented_payment_method_error_message("Zen"),
+                ))?
+            }
         };
         let terminal_uuid = session_data
             .terminal_uuid

@@ -8,7 +8,6 @@ use common_utils::{
     types::{AmountConvertor, FloatMajorUnit, FloatMajorUnitForConnector},
 };
 use error_stack::ResultExt;
-use crate::utils::RefundsRequestData;
 use hyperswitch_domain_models::{
     payment_method_data::PaymentMethodData,
     router_data::{AccessToken, ConnectorAuthType, ErrorResponse, RouterData},
@@ -42,7 +41,7 @@ use hyperswitch_interfaces::{
 use masking::{Mask, PeekInterface};
 use transformers as mercadopago;
 
-use crate::{constants::headers, types::ResponseRouterData, utils};
+use crate::{constants::headers, types::ResponseRouterData, utils, utils::RefundsRequestData};
 
 const PXSOL_PLATFORM_ID: &str = "dev_ab8e21775bb211ed88d80242ac130004";
 
@@ -133,7 +132,10 @@ impl ConnectorIntegration<PaymentMethodToken, PaymentMethodTokenizationData, Pay
         data: &hyperswitch_domain_models::types::TokenizationRouterData,
         event_builder: Option<&mut ConnectorEvent>,
         res: Response,
-    ) -> CustomResult<hyperswitch_domain_models::types::TokenizationRouterData, errors::ConnectorError>
+    ) -> CustomResult<
+        hyperswitch_domain_models::types::TokenizationRouterData,
+        errors::ConnectorError,
+    >
     where
         PaymentsResponseData: Clone,
     {
@@ -296,16 +298,25 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
             masking::Secret::new(PXSOL_PLATFORM_ID.to_string()).into_masked(),
         ));
         // Add X-meli-session-id header if device_id is provided in metadata or frm_metadata (for anti-fraud)
-        let device_id = req.request.metadata.as_ref()
-            .and_then(|m| serde_json::from_value::<mercadopago::MercadopagoMetadata>(m.clone()).ok())
+        let device_id = req
+            .request
+            .metadata
+            .as_ref()
+            .and_then(|m| {
+                serde_json::from_value::<mercadopago::MercadopagoMetadata>(m.clone()).ok()
+            })
             .and_then(|mp| mp.device_id)
             .or_else(|| {
                 // Fallback to frm_metadata
-                req.frm_metadata.as_ref()
-                    .and_then(|m| serde_json::from_value::<mercadopago::MercadopagoMetadata>(m.peek().clone()).ok())
+                req.frm_metadata
+                    .as_ref()
+                    .and_then(|m| {
+                        serde_json::from_value::<mercadopago::MercadopagoMetadata>(m.peek().clone())
+                            .ok()
+                    })
                     .and_then(|mp| mp.device_id)
             });
-        
+
         if let Some(device_id) = device_id {
             headers.push((
                 "X-meli-session-id".to_string(),
@@ -321,10 +332,21 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
 
     fn get_url(
         &self,
-        _req: &PaymentsAuthorizeRouterData,
+        req: &PaymentsAuthorizeRouterData,
         connectors: &Connectors,
     ) -> CustomResult<String, errors::ConnectorError> {
-        Ok(format!("{}/v1/payments", self.base_url(connectors)))
+        // Checkout Pro (hosted checkout) creates a preference; the card-token flow
+        // posts a payment directly.
+        if mercadopago::MercadopagoAuthorizeRequest::is_checkout_pro(
+            &req.request.payment_method_data,
+        ) {
+            Ok(format!(
+                "{}/checkout/preferences",
+                self.base_url(connectors)
+            ))
+        } else {
+            Ok(format!("{}/v1/payments", self.base_url(connectors)))
+        }
     }
 
     fn get_request_body(
@@ -340,7 +362,7 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
 
         let connector_router_data = mercadopago::MercadopagoRouterData::from((amount, req));
         let connector_req =
-            mercadopago::MercadopagoPaymentsRequest::try_from(&connector_router_data)?;
+            mercadopago::MercadopagoAuthorizeRequest::try_from(&connector_router_data)?;
         Ok(RequestContent::Json(Box::new(connector_req)))
     }
 
@@ -372,9 +394,9 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         event_builder: Option<&mut ConnectorEvent>,
         res: Response,
     ) -> CustomResult<PaymentsAuthorizeRouterData, errors::ConnectorError> {
-        let response: mercadopago::MercadopagoPaymentsResponse = res
+        let response: mercadopago::MercadopagoAuthorizeResponse = res
             .response
-            .parse_struct("MercadopagoPaymentsResponse")
+            .parse_struct("MercadopagoAuthorizeResponse")
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
@@ -416,17 +438,32 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Mer
         req: &PaymentsSyncRouterData,
         connectors: &Connectors,
     ) -> CustomResult<String, errors::ConnectorError> {
-        let connector_payment_id = req
+        let base_url = self.base_url(connectors);
+
+        // Checkout Pro: the MP payment id does not exist until the buyer pays, so a
+        // wallet attempt without a transaction id syncs by searching OUR
+        // external_reference. The payment_id from the redirect query string is
+        // deliberately NOT used: it is buyer-controllable input (cross-payment
+        // substitution / bogus-id kills). The resource_id the sync returns is
+        // persisted on the attempt, promoting the real id.
+        match req
             .request
             .connector_transaction_id
             .get_connector_transaction_id()
-            .change_context(errors::ConnectorError::MissingConnectorTransactionID)?;
-
-        Ok(format!(
-            "{}/v1/payments/{}",
-            self.base_url(connectors),
-            connector_payment_id
-        ))
+        {
+            Ok(connector_payment_id) => {
+                Ok(format!("{base_url}/v1/payments/{connector_payment_id}"))
+            }
+            Err(_) if req.payment_method == enums::PaymentMethod::Wallet => Ok(format!(
+                "{}/v1/payments/search?external_reference={}&sort=date_created&criteria=desc",
+                base_url, req.connector_request_reference_id
+            )),
+            // Card-flow attempts always have the id from Authorize; without it there
+            // is nothing safe to sync against (keeps the pre-Checkout-Pro behavior).
+            Err(err) => {
+                Err(err).change_context(errors::ConnectorError::MissingConnectorTransactionID)
+            }
+        }
     }
 
     fn build_request(
@@ -450,9 +487,9 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Mer
         event_builder: Option<&mut ConnectorEvent>,
         res: Response,
     ) -> CustomResult<PaymentsSyncRouterData, errors::ConnectorError> {
-        let response: mercadopago::MercadopagoPaymentsResponse = res
+        let response: mercadopago::MercadopagoPSyncResponse = res
             .response
-            .parse_struct("MercadopagoPaymentsResponse")
+            .parse_struct("MercadopagoPSyncResponse")
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
@@ -516,8 +553,10 @@ impl ConnectorIntegration<Capture, PaymentsCaptureData, PaymentsResponseData> fo
             req.request.minor_amount_to_capture,
             req.request.currency,
         )?;
-        let connector_router_data = mercadopago::MercadopagoRouterData::from((amount_to_capture, req));
-        let connector_req = mercadopago::MercadopagoCaptureRequest::try_from(&connector_router_data)?;
+        let connector_router_data =
+            mercadopago::MercadopagoRouterData::from((amount_to_capture, req));
+        let connector_req =
+            mercadopago::MercadopagoCaptureRequest::try_from(&connector_router_data)?;
         Ok(RequestContent::Json(Box::new(connector_req)))
     }
 
@@ -953,7 +992,9 @@ impl webhooks::IncomingWebhook for Mercadopago {
             .or_else(|| {
                 request
                     .body
-                    .parse_struct::<mercadopago::MercadopagoWebhookBodyEnum>("MercadopagoWebhookBodyEnum")
+                    .parse_struct::<mercadopago::MercadopagoWebhookBodyEnum>(
+                        "MercadopagoWebhookBodyEnum",
+                    )
                     .ok()
                     .map(|body| body.get_resource_id().to_lowercase())
             })
@@ -1063,10 +1104,11 @@ impl webhooks::IncomingWebhook for Mercadopago {
 // Connector Specifications
 // ============================================================================
 
+use std::sync::LazyLock;
+
 use hyperswitch_domain_models::router_response_types::{
     ConnectorInfo, PaymentMethodDetails, SupportedPaymentMethods, SupportedPaymentMethodsExt,
 };
-use std::sync::LazyLock;
 
 static MERCADOPAGO_SUPPORTED_PAYMENT_METHODS: LazyLock<SupportedPaymentMethods> =
     LazyLock::new(|| {
@@ -1101,6 +1143,21 @@ static MERCADOPAGO_SUPPORTED_PAYMENT_METHODS: LazyLock<SupportedPaymentMethods> 
             },
         );
 
+        // Checkout Pro (hosted checkout redirect). Auto-capture only: the payment is
+        // created and captured by Mercado Pago on its hosted page. Without this entry
+        // the router rejects wallet payments before reaching the connector
+        // (validate_connector_against_payment_request).
+        supported_payment_methods.add(
+            enums::PaymentMethod::Wallet,
+            enums::PaymentMethodType::MercadoPago,
+            PaymentMethodDetails {
+                mandates: enums::FeatureStatus::NotSupported,
+                refunds: enums::FeatureStatus::Supported,
+                supported_capture_methods: vec![enums::CaptureMethod::Automatic],
+                specific_features: None,
+            },
+        );
+
         supported_payment_methods
     });
 
@@ -1111,10 +1168,8 @@ static MERCADOPAGO_CONNECTOR_INFO: ConnectorInfo = ConnectorInfo {
     integration_status: enums::ConnectorIntegrationStatus::Sandbox,
 };
 
-static MERCADOPAGO_SUPPORTED_WEBHOOK_FLOWS: [enums::EventClass; 2] = [
-    enums::EventClass::Payments,
-    enums::EventClass::Refunds,
-];
+static MERCADOPAGO_SUPPORTED_WEBHOOK_FLOWS: [enums::EventClass; 2] =
+    [enums::EventClass::Payments, enums::EventClass::Refunds];
 
 impl ConnectorSpecifications for Mercadopago {
     fn get_connector_about(&self) -> Option<&'static ConnectorInfo> {

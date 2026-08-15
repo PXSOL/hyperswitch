@@ -238,9 +238,12 @@ impl TryFrom<&SetupMandateRouterData> for WellsfargoZeroMandateRequest {
                 | WalletData::SwishQr(_)
                 | WalletData::Mifinity(_)
                 | WalletData::RevolutPay(_)
-                | WalletData::MercadoPagoSdk(_) => Err(errors::ConnectorError::NotImplemented(
-                    utils::get_unimplemented_payment_method_error_message("Wellsfargo"),
-                ))?,
+                | WalletData::MercadoPagoSdk(_)
+                | WalletData::MercadoPagoCheckoutPro {} => {
+                    Err(errors::ConnectorError::NotImplemented(
+                        utils::get_unimplemented_payment_method_error_message("Wellsfargo"),
+                    ))?
+                }
             },
             PaymentMethodData::CardRedirect(_)
             | PaymentMethodData::PayLater(_)
@@ -1328,10 +1331,13 @@ impl TryFrom<&WellsfargoRouterData<&PaymentsAuthorizeRouterData>> for Wellsfargo
                         | WalletData::SwishQr(_)
                         | WalletData::Mifinity(_)
                         | WalletData::RevolutPay(_)
-                | WalletData::MercadoPagoSdk(_) => Err(errors::ConnectorError::NotImplemented(
-                            utils::get_unimplemented_payment_method_error_message("Wellsfargo"),
-                        )
-                        .into()),
+                        | WalletData::MercadoPagoSdk(_)
+                        | WalletData::MercadoPagoCheckoutPro {} => {
+                            Err(errors::ConnectorError::NotImplemented(
+                                utils::get_unimplemented_payment_method_error_message("Wellsfargo"),
+                            )
+                            .into())
+                        }
                     },
                     // If connector_mandate_id is present MandatePayment will be the PMD, the case will be handled in the first `if` clause.
                     // This is a fallback implementation in the event of catastrophe.

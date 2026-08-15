@@ -1211,7 +1211,8 @@ fn get_stripe_payment_method_type_from_wallet_data(
         | WalletData::SwishQr(_)
         | WalletData::WeChatPayRedirect(_)
         | WalletData::Mifinity(_)
-        | WalletData::MercadoPagoSdk(_) => Err(ConnectorError::NotImplemented(
+        | WalletData::MercadoPagoSdk(_)
+        | WalletData::MercadoPagoCheckoutPro {} => Err(ConnectorError::NotImplemented(
             get_unimplemented_payment_method_error_message("stripe"),
         )),
     }
@@ -1691,7 +1692,8 @@ impl TryFrom<(&WalletData, Option<PaymentMethodToken>)> for StripePaymentMethodD
             | WalletData::SwishQr(_)
             | WalletData::WeChatPayRedirect(_)
             | WalletData::Mifinity(_)
-            | WalletData::MercadoPagoSdk(_) => Err(ConnectorError::NotImplemented(
+            | WalletData::MercadoPagoSdk(_)
+            | WalletData::MercadoPagoCheckoutPro {} => Err(ConnectorError::NotImplemented(
                 get_unimplemented_payment_method_error_message("stripe"),
             )
             .into()),

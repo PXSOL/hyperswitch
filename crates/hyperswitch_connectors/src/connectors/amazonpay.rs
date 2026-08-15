@@ -393,7 +393,8 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
                 | WalletDataPaymentMethod::Paysera(_)
                 | WalletDataPaymentMethod::Skrill(_)
                 | WalletDataPaymentMethod::Mifinity(_)
-                | WalletDataPaymentMethod::MercadoPagoSdk(_) => {
+                | WalletDataPaymentMethod::MercadoPagoSdk(_)
+                | WalletDataPaymentMethod::MercadoPagoCheckoutPro {} => {
                     Err(errors::ConnectorError::NotImplemented(
                         utils::get_unimplemented_payment_method_error_message("amazonpay"),
                     )

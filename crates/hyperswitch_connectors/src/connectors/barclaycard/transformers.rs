@@ -1559,10 +1559,13 @@ impl TryFrom<&BarclaycardRouterData<&PaymentsAuthorizeRouterData>> for Barclayca
                 | WalletData::BluecodeRedirect {}
                 | WalletData::AmazonPay(_)
                 | WalletData::Mifinity(_)
-                | WalletData::MercadoPagoSdk(_) => Err(errors::ConnectorError::NotImplemented(
-                    utils::get_unimplemented_payment_method_error_message("Barclaycard"),
-                )
-                .into()),
+                | WalletData::MercadoPagoSdk(_)
+                | WalletData::MercadoPagoCheckoutPro {} => {
+                    Err(errors::ConnectorError::NotImplemented(
+                        utils::get_unimplemented_payment_method_error_message("Barclaycard"),
+                    )
+                    .into())
+                }
             },
             PaymentMethodData::MandatePayment
             | PaymentMethodData::CardRedirect(_)

@@ -191,10 +191,13 @@ impl TryFrom<&MifinityRouterData<&types::PaymentsAuthorizeRouterData>> for Mifin
                 | WalletData::CashappQr(_)
                 | WalletData::SwishQr(_)
                 | WalletData::RevolutPay(_)
-                | WalletData::MercadoPagoSdk(_) => Err(errors::ConnectorError::NotImplemented(
-                    utils::get_unimplemented_payment_method_error_message("Mifinity"),
-                )
-                .into()),
+                | WalletData::MercadoPagoSdk(_)
+                | WalletData::MercadoPagoCheckoutPro {} => {
+                    Err(errors::ConnectorError::NotImplemented(
+                        utils::get_unimplemented_payment_method_error_message("Mifinity"),
+                    )
+                    .into())
+                }
             },
             PaymentMethodData::Card(_)
             | PaymentMethodData::CardRedirect(_)

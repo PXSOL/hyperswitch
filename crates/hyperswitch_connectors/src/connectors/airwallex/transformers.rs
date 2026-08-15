@@ -831,7 +831,8 @@ fn get_wallet_details(
         | WalletData::SwishQr(_)
         | WalletData::Mifinity(_)
         | WalletData::RevolutPay(_)
-                | WalletData::MercadoPagoSdk(_) => Err(errors::ConnectorError::NotImplemented(
+        | WalletData::MercadoPagoSdk(_)
+        | WalletData::MercadoPagoCheckoutPro {} => Err(errors::ConnectorError::NotImplemented(
             utils::get_unimplemented_payment_method_error_message("airwallex"),
         ))?,
     };

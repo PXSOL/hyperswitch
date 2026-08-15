@@ -302,6 +302,7 @@ pub enum WalletData {
     PaypalRedirect(PaypalRedirection),
     PaypalSdk(PayPalWalletData),
     MercadoPagoSdk(MercadoPagoSdkData),
+    MercadoPagoCheckoutPro {},
     Paze(PazeWalletData),
     SamsungPay(Box<SamsungPayWalletData>),
     TwintRedirect {},
@@ -1284,6 +1285,9 @@ impl From<api_models::payments::WalletData> for WalletData {
                     device_id: mp_sdk_data.device_id,
                 })
             }
+            api_models::payments::WalletData::MercadoPagoCheckoutPro {} => {
+                Self::MercadoPagoCheckoutPro {}
+            }
             api_models::payments::WalletData::Paze(paze_data) => {
                 Self::Paze(PazeWalletData::from(paze_data))
             }
@@ -2119,7 +2123,9 @@ impl GetPaymentMethodType for WalletData {
             Self::MbWayRedirect(_) => api_enums::PaymentMethodType::MbWay,
             Self::MobilePayRedirect(_) => api_enums::PaymentMethodType::MobilePay,
             Self::PaypalRedirect(_) | Self::PaypalSdk(_) => api_enums::PaymentMethodType::Paypal,
-            Self::MercadoPagoSdk(_) => api_enums::PaymentMethodType::MercadoPago,
+            Self::MercadoPagoSdk(_) | Self::MercadoPagoCheckoutPro {} => {
+                api_enums::PaymentMethodType::MercadoPago
+            }
             Self::Paze(_) => api_enums::PaymentMethodType::Paze,
             Self::SamsungPay(_) => api_enums::PaymentMethodType::SamsungPay,
             Self::TwintRedirect {} => api_enums::PaymentMethodType::Twint,
