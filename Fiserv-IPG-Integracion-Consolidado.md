@@ -23,14 +23,54 @@
 - **`> [Imagen en el documento original]`** marca un lugar donde el PDF tenía una captura o diagrama que no sobrevive a la extracción de texto. Si necesitás ese detalle visual, hay que ir al PDF.
 - **`// [contenido truncado en el PDF original]`** marca un payload que ya venía cortado en el PDF fuente.
 - Cada sección lleva una línea *Fuente:* con el archivo y la sección de origen.
+- **Andamiaje editorial.** Tres cosas de este documento no vienen de los PDFs: los títulos "Parte N" y sus bajadas, las líneas *Fuente:*, y los captions del tipo "Bloque original tal como aparece en el PDF" que preceden a una transcripción cruda del layout. Además, unas pocas tablas del original no traían encabezado de columna y se les agregó uno (`Campo` / `Descripción`) para que rendericen. Ningún dato técnico fue agregado ni interpretado.
+
+## Requisitos obligatorios por marca
+
+Resumen de lo que cada marca exige, armado cruzando los ocho documentos. Cada fila remite a la sección donde está el detalle.
+
+| | **Visa** | **Mastercard** |
+|---|---|---|
+| **3D Secure** | **Opcional.** Sin cargo. | **Obligatorio.** Hay que elegir entre *Data Only* o *EMV 3DS Full Authentication*. |
+| **Costo 3DS** | Sin cargo (servicio opcional). | Data Only: sin cargo. Full: 0,025% de la transacción, tope USD 3 + IVA ("Cargo 3DS MC"). No autenticar: **SEF** de 0,025% por transacción no autenticada, tope USD 3. |
+| **Network Token** | **Obligatorio.** *"Todas las transacciones realizadas con tarjetas Visa deben utilizar Network Token"*. | Compatible, no obligatorio. |
+| **Recurrencia — FIRST** | Guardar el `SchemeTransactionId` que llega en la respuesta. Con Network Tokenization, enviar el criptograma. | Agregar los parámetros de 3DS **Data Only**. Con Network Tokenization, enviar el criptograma. |
+| **Recurrencia — REPEAT** | Enviar el valor guardado en `ReferencedSchemeTransactionId`. Con NT, **no** hace falta el criptograma. | Enviar **sin 3DS**. Con NT, **no** hace falta el criptograma. |
+| **MIT** | No disponible por ahora. | Disponible. |
+| **Network Token passthrough** | `order.tokenCryptogram`. | `order.tokenCryptogram` **más** el bloque `storedCredentials` (`sequence`, `scheduled`, `initiator`, `indicatorSubcategory`). |
+| **Reintentos** | 4 categorías según código ISO. Exceder: USD 0,10 local / USD 0,25 internacional. | Merchant Advice Code (MAC) por transacción. Exceder: USD 0,50, acumulable con la penalidad general de USD 0,50. Sin MAC en la respuesta: 7/día, máx. 35 en 30 días. |
+| **Dónde leer el rechazo** | REST `associationResponseCode` / SOAP `ProcessorAssociationResponseCode`. | Igual, más `MerchantAdviceCodeIndicator` (descripción en `declineReasonCode` REST / `TransactionDeclineReason` SOAP). |
+
+### 3DS Data Only — campos exactos
+
+Data Only existe **solo para Mastercard**. Los campos cambian según quién autentica:
+
+| Escenario | Bloque | Campos |
+|---|---|---|
+| Proveedor propio (§10.1.6) | `authenticationRequest` | `authenticationType: "Secure3DAuthenticationRequest"`, `termURL`, `methodNotificationURL`, `messageCategory: "80"` |
+| Proveedor externo / passthrough (§10.2.2) | `authenticationResult` | `authenticationType: "Secure3DAuthenticationResult"`, `authenticationResponse: "U"`, `cavv`, `dsTransactionId`, `transactionStatus: "Y"`, `messageCategory: "80"` |
+| Zero Auth sobre Mastercard | `authenticationRequest` | `authenticationType: "Secure3DAuthenticationRequest"`, `messageCategory: "80"`, `methodNotificationURL`, `termURL`. En SOAP: `<v1:CreditCard3DSecure>` con `AuthenticateTransaction=true` y `ThreeDSEmvCoMessageCategory=80` |
+
+En la respuesta, Data Only devuelve `secure3dResponse.responseCode3dSecure` = **`A`** (Data Only exitosa) o **`B`** (no exitosa). Ambos mapean a **ECI7** y **no** dan liability shift: ante un desconocimiento, el contracargo lo asume el comercio. La transacción igualmente pasa a autorización.
+
+### Network Token (MTRG) — lo que no se puede pasar por alto
+
+- **Dos flujos.** *OnTheGo*: se manda el PAN y Fiserv consigue el token al instante. *Asíncrono*: se crea un `HostedDataID` y el token se provisiona en hasta 20 segundos.
+- **Emparejamiento obligatorio.** En cada transacción aprobada hay que guardar BIN + últimos 4 del PAN **y** BIN + últimos 4 del Network Token. Sin eso no se pueden conciliar ni atender desconocimientos, porque lo que se procesa (y lo que vuelve) es el token, no el PAN.
+- **En SOAP el orden de los parámetros importa**: mandarlos en otro orden genera errores.
+- En passthrough, el token viaja en `CardNumber` (16 dígitos, como un PAN), con su propio `ExpMonth`/`ExpYear`, y el criptograma en base64. `CardCodeValue` no se requiere.
+
+> **Este archivo contiene credenciales de sandbox.** La Parte 1 incluye las API Key / API Secret de certificación de PXSOL para Argentina y Uruguay. Son de prueba, pero conviene tratar el archivo como interno.
 
 ## Índice
 
+0. [Requisitos obligatorios por marca](#requisitos-obligatorios-por-marca)
 1. [Parte 1 — Fundamentos, credenciales y entorno](#parte-1--fundamentos-credenciales-y-entorno)
    - [0. Metadatos del documento original](#0-metadatos-del-documento-original)
    - [1. Introducción](#1-introducción)
    - [2. Flujo de integración](#2-flujo-de-integración)
    - [3. Primeros Pasos](#3-primeros-pasos)
+   - [Credenciales de prueba (Sandbox / CERT) — PXSOL](#credenciales-de-prueba-sandbox--cert--pxsol)
    - [4. Estructura de las solicitudes HTTP](#4-estructura-de-las-solicitudes-http)
    - [Apéndice II. Generación de Message-signature](#apéndice-ii-generación-de-message-signature)
    - [Apéndice I. Estructura de objetos JSON.](#apéndice-i-estructura-de-objetos-json)
@@ -59,6 +99,8 @@
 8. [Parte 8 — Manejo de errores, rechazos y reintentos](#parte-8--manejo-de-errores-rechazos-y-reintentos)
    - [Códigos de rechazo (declined / failed)](#códigos-de-rechazo-declined--failed)
    - [Penalización por reintentos (Visa / Mastercard)](#penalización-por-reintentos-visa--mastercard)
+   - [Tabla de reintentos VISA (adjunto recuperado)](#tabla-de-reintentos-visa-adjunto-recuperado)
+   - [Tabla de reintentos MASTERCARD (adjunto recuperado)](#tabla-de-reintentos-mastercard-adjunto-recuperado)
 9. [Parte 9 — Buenas prácticas y seguridad](#parte-9--buenas-prácticas-y-seguridad)
    - [14. Buenas prácticas y anotaciones técnicas](#14-buenas-prácticas-y-anotaciones-técnicas)
 10. [Parte 10 — Tarjetas y datos de prueba](#parte-10--tarjetas-y-datos-de-prueba)
@@ -67,6 +109,10 @@
    - [Tarjetas de prueba (Credit cards for test)](#tarjetas-de-prueba-credit-cards-for-test)
 11. [Parte 11 — Homologación](#parte-11--homologación)
    - [Checklist de homologación — 3DS FULL / API / Token (PXSOL)](#checklist-de-homologación--3ds-full--api--token-pxsol)
+     - [Stores a usar y dónde está documentado cada caso](#stores-a-usar-y-dónde-está-documentado-cada-caso)
+     - [⚠ Las tarjetas del checklist no coinciden con el Apéndice V](#-las-tarjetas-del-checklist-no-coinciden-con-el-apéndice-v-de-la-guía)
+     - [Verificado en vivo contra CERT (2026-08-06)](#verificado-en-vivo-contra-cert-2026-08-06)
+     - [Preguntas abiertas para Fiserv](#preguntas-abiertas-para-fiserv)
 
 ---
 
@@ -124,6 +170,40 @@ Para comenzar la integración con la Rest API, asegúrate de contar con la sigui
 - **API Secret.** Es el equivalente a una contraseña PRIVADA y no debe ser compartida con nadie, se utiliza en conjunto con API Key para autenticarte cada que envías una solicitud HTTP.
 - **Archivo postman_environment.json.** Es la definición de tu entorno personalizado para realizar pruebas.
 - **Archivo postman_collection.json.** Es una colección de solicitudes HTTP preconstruidas que contienen transacciones de ejemplo para probar la API.
+
+## Credenciales de prueba (Sandbox / CERT) — PXSOL
+
+*Fuente: credenciales provistas por Fiserv al equipo de PXSOL. No forman parte de los PDFs originales.*
+
+> **Solo entorno de certificación.** Estas credenciales apuntan a `cert.api.firstdata.com` y sirven únicamente para pruebas y homologación. Aun así son secretos: este archivo no debería subirse a un repositorio público ni compartirse fuera del equipo. Las credenciales de producción son distintas y las entrega Fiserv al aprobar la homologación.
+
+**Endpoint (mismo para los dos países):**
+
+```http
+https://cert.api.firstdata.com/gateway/v2
+```
+
+### Argentina
+
+| | Valor |
+|---|---|
+| Store ID | `5926072901` |
+| Store ID | `5926072902` |
+| API Key | `4w7jLvtvJBoMWK9Jq5MfC0JUMaDLLr4Xs7YSGl660HWueGdz` |
+| API Secret | `d7nW6rbZkUag5RgatwUqAeNJhMMdsqLUfavNLq1eUDgokZCKu5RCXctLLWy0Mtjr` |
+
+Los dos stores no son intercambiables para la homologación: el checklist pide **`5926072902` para el caso de TOKEN GW** y **`5926072901` para el caso de TOKEN MTRG** (ver Parte 11).
+
+### Uruguay
+
+| | Valor |
+|---|---|
+| Store ID | `7726072903` |
+| Store ID | `7726072904` |
+| API Key | `w9viH4xlfULCEGU2upZ4sdRIGJf0RzXGw4u2wXtkih4owGuV` |
+| API Secret | `3Kv5W8MnHgT6ut1keiOuU7aiqTA7GhOGRnrxbOqfF3BA3nyaBWA9cV81mMRXzVgA` |
+
+El API Key y el API Secret se usan para firmar cada request: ver §4 (headers) y el Apéndice II (generación de `Message-signature`), donde el secret entra como clave del HMAC-SHA256 y el key como primer término de la cadena a firmar.
 
 ## 4. Estructura de las solicitudes HTTP
 
@@ -213,7 +293,7 @@ b64Hash = strToBase64 (strHash)
 
 La estructura base de un objeto JSON es la siguiente:
 
-```json
+```text
 {
      “key1”:”value1”,
      “key2”:”value2”,
@@ -535,6 +615,7 @@ A continuación, algunas transacciones más comunes:
        }
     },
 // [contenido truncado en el PDF original]
+// la llave de cierre siguiente NO está en el PDF: se agregó solo para cerrar el bloque
 }
 ```
 
@@ -1268,6 +1349,21 @@ Los campos que deben modificar su mensajería para Network Tokenization Passthro
 ## Network Token (MTRG)
 
 *Fuente: Manual NetworkToken MTRG.pdf*
+
+> **Código de colores recuperado.** El manual resalta los parámetros con tres colores que no sobreviven a la extracción de texto. Se recuperaron leyendo los rectángulos de resaltado del PDF:
+>
+> | Color | Significado | Campos que marca |
+> |---|---|---|
+> | Verde | Parámetros de **NetworkToken** | `Bin` / `Last4` de nivel superior, `HostedDataType: NETWORK_TOKEN`, `NetworkTokenProvisionStatus`, `type: "NETWORK_TOKEN"`, `requestStatus` |
+> | Amarillo | Parámetros de **PAN** | `CardNumber`, `ExpMonth`, `ExpYear`, `CardCodeValue`, `FundingCardNumberBin`, `FundingCardNumberLast4` |
+> | Celeste | **HostedDataID** | `HostedDataID`, `HostedDataStoreID`, `AssignToken`, `tokenOriginStoreId`, `paymentToken.value` |
+>
+> **⚠ Contradicción en el manual.** En el ejemplo REST del flujo OnTheGo (pág. 11 del PDF) el resaltado está invertido respecto del ejemplo SOAP equivalente (pág. 6) y del ejemplo REST asíncrono (pág. 15): marca `fundingCardNumber.bin/last4` (462294 / 2358) como NetworkToken y `bin`/`last4` de nivel superior (489537 / 5144) como PAN. Por el significado del campo y por los otros dos ejemplos, la lectura correcta es la inversa:
+>
+> - `paymentMethodDetails.paymentCard.fundingCardNumber.{bin,last4}` → **PAN original**
+> - `paymentMethodDetails.paymentCard.{bin,last4}` → **Network Token**
+>
+> Esto importa porque §2 del manual obliga a guardar el emparejamiento entre ambos pares en cada transacción aprobada. Confirmar con Fiserv antes de persistir los datos.
 
 Manual de integración — NetworkToken MTRG
 
@@ -2010,6 +2106,8 @@ El objeto authenticationResponse contendrá los siguientes valores:
 
 El siguiente documento JSON representa un ejemplo de una respuesta:
 
+> **⚠ Advertencia sobre este payload.** El valor de `methodForm` es un formulario HTML completo embebido como string. En el PDF original viene partido en múltiples líneas y con espacios espurios dentro de las entidades HTML (`& lt;` en lugar de `&lt;`, `& amp;#10;` en lugar de `&amp;#10;`), producto de cómo el PDF renderiza el texto. **No copiar este bloque literalmente**: el `methodForm` real hay que tomarlo de la respuesta de la API. Se transcribe tal cual solo como referencia de estructura.
+
 ```json
 {
   "clientRequestId": "30dd879c-ee2f-11db-8314-0800200c9a66",
@@ -2449,6 +2547,8 @@ Request:
 }
 ```
 
+> **⚠ El ejemplo de respuesta de esta sección es inconsistente en el PDF original.** El request usa una Mastercard (`5165850000000008`, `storeId 5919122412`, total `110.00`), pero la respuesta que lo acompaña devuelve `"brand": "VISA"`, `"bin": "414746"`, `"country": "Singapore"` y un importe de `5.00`. Como Data Only es exclusivo de Mastercard, la respuesta parece copiada de otro ejemplo. Lo único que hay que leer de ahí es la forma del campo `secure3dResponse.responseCode3dSecure`. La respuesta correcta para Data Only sobre Mastercard está en §10.2.2.
+
 Response:
 
 ```json
@@ -2837,6 +2937,8 @@ Bloque original tal como aparece en el PDF (para referencia de layout):
 
 El payload del ejemplo anterior pertenece a una transacción de venta autenticada con 3DS. La respuesta obtenida por parte de IPG deberá ser similar a la siguiente:
 
+> **⚠ Advertencia sobre este payload.** Los valores de `payerAuthenticationRequest` y `merchantData` venían partidos en varias líneas en el PDF original; acá se unieron en una sola cadena. Aun así conservan artefactos del PDF (un espacio dentro del base64 de `payerAuthenticationRequest`, y espacios alrededor de los guiones en el UUID final de `merchantData`). **No copiarlos literalmente**: son valores de ejemplo y los reales vienen en la respuesta de la API.
+
 ```json
 {
   "clientRequestId": "91e98916-c5f0-4520-93b3-d520e635fc30",
@@ -2863,21 +2965,9 @@ El payload del ejemplo anterior pertenece a una transacción de venta autenticad
      "type": "3D_SECURE",
      "version": "1.0",
      "params": {
-       "payerAuthenticationRequest": "eJxVUttuwjAM/ZWK9zZJKVCQiQRD00ACFZimaW
-8hdaGMpqWXwfb1S0o7mF/ic+w49nHg9ZAjzrYoqxw5LLEoxB6tOBx3gs16Y/ej0BWRiOyQ9YXt0V1oi95
-gaPt0hz0W+R4Vww6HYLLBM4cvzIs4VZw51HGBtFCXzeVBqJKDkOfpfMV7tQFpICSYz2ec3Q3IjQIlEuSr
-WH5a64m1lWkZiyDdAql5kGmlyvybe74HpAVQ5Sd+KMusGBFyuVycTOzTIlWnWKGTXIGYOJB7U0FlvELXu
-8YhRxI8V9GyeCeLadL1s2PZPb8tPuKf43IMxGRAKErkLnUp7dKuxQYjzxuxPpCaB5GYRjijVA948yEzT0
-weAo8EaPFzVLKdo0WA1yxVqDO0mH8+hFhI3X9z3Jt/ejH6ylLL5ruM+gOfGYVrwpSKtTauy261DABirpB meaRZvvb+fYpfztmzWQ==",
+       "payerAuthenticationRequest": "eJxVUttuwjAM/ZWK9zZJKVCQiQRD00ACFZimaW8hdaGMpqWXwfb1S0o7mF/ic+w49nHg9ZAjzrYoqxw5LLEoxB6tOBx3gs16Y/ej0BWRiOyQ9YXt0V1oi95gaPt0hz0W+R4Vww6HYLLBM4cvzIs4VZw51HGBtFCXzeVBqJKDkOfpfMV7tQFpICSYz2ec3Q3IjQIlEuSrWH5a64m1lWkZiyDdAql5kGmlyvybe74HpAVQ5Sd+KMusGBFyuVycTOzTIlWnWKGTXIGYOJB7U0FlvELXu8YhRxI8V9GyeCeLadL1s2PZPb8tPuKf43IMxGRAKErkLnUp7dKuxQYjzxuxPpCaB5GYRjijVA948yEzT0weAo8EaPFzVLKdo0WA1yxVqDO0mH8+hFhI3X9z3Jt/ejH6ylLL5ruM+gOfGYVrwpSKtTauy261DABirpB meaRZvvb+fYpfztmzWQ==",
        "termURL": "http://localhost/3DS/finalize.php",
-       "merchantData": "MD___________100202003031744162484e/PFufMsX/JBm38pjt
-3qVJZizjM=_____555555_____________11111111111______R-6fd2afaf-d16a-
-40bda5790ww_______________________________________________________________
-___________
-       _______________returnurl ?
-___________________________________________________________________________
-__
-__________VRQR - 6fd2afaf - d16a - 40bd - a579 - 80be51f840a999e3af",
+       "merchantData": "MD___________100202003031744162484e/PFufMsX/JBm38pjt3qVJZizjM=_____555555_____________11111111111______R-6fd2afaf-d16a-40bda5790ww_________________________________________________________________________________________returnurl ?_______________________________________________________________________________________VRQR - 6fd2afaf - d16a - 40bd - a579 - 80be51f840a999e3af",
        "acsURL": "https://3ds-acs.test.modirum.com/mdpayacs/pareq"
      }
   }
@@ -2895,8 +2985,6 @@ Agregá una capa adicional de seguridad a las ventas online
 El comercio online está en pleno auge en la región, lo que hace indispensable contar con medidas de seguridad. En respuesta a ello, Mastercard exige que los comercios implementen 3DS en las ventas que realicen con su marca. Para Visa es opcional.
 
 > **[Imagen/diagrama en el documento original]** — ilustración extraída del documento "Data-Only-Infographic.pdf" de Mastercard.
-
-Ilustración extraída del documento "Data-Only-Infographic.pdf" de Mastercard.
 
 ### ¿Qué es 3DS?
 
@@ -2930,20 +3018,23 @@ Antes de autorizar la venta, la entidad emisora autentica la identidad de la per
 
 ### Diferencias entre EMV 3DS Full y 3DS Data Only
 
-> **[Imagen/diagrama en el documento original]** — cuadro comparativo cuyas celdas se indicaban con iconos (tildes) que no se extrajeron; solo sobrevivió el texto de los encabezados y la aclaración "Posibilidad de un desafío" para EMV 3DS Full Authentication.
+> **Reconstruida a partir de la página renderizada.** El cuadro original marca cada celda con un tilde gráfico que no sobrevive a la extracción de texto; además el orden de las columnas que devolvía la extracción no era el real. Esta versión se transcribió mirando la página.
 
-| | Liability Shift | Experiencia sin fricción | Influir en la decisión de aprobación del emisor | Sin retraso en la transacción | Evaluación de riesgos en tiempo real |
+| | Experiencia sin fricción | Influir en la decisión de aprobación del emisor | Sin retraso en la transacción | Liability Shift | Evaluación de riesgos en tiempo real |
 | --- | --- | --- | --- | --- | --- |
-| 3DS Data Only | | | | | |
-| EMV 3DS Full Authentication | | Posibilidad de un desafío | | | |
+| **3DS Data Only** | Sí | Sí | Sí | — | Sí |
+| **EMV 3DS Full Authentication** | Posibilidad de un desafío | Sí | — | Sí | Sí |
 
 ### Costos del servicio
 
 Desde el 1 de febrero de 2023, Fiserv factura al comercio o Payfac el SEF y el Servicio 3DS, según corresponda.
 
-| 3DS Data Only | EMV 3DS Full Authentication |
-| --- | --- |
-| Sin cargo. Si se desconoce la transacción, el comercio será quien asuma el contracargo. | 0,025% de la transacción con tope equivalente a USD 3*. No incluye IVA. Sin cargo. El servicio es opcional. |
+| | 3DS Data Only | EMV 3DS Full Authentication |
+| --- | --- | --- |
+| **Mastercard** | Sin cargo. Si se desconoce la transacción, el comercio será quien asuma el contracargo. | 0,025% de la transacción con tope equivalente a USD 3*. No incluye IVA. |
+| **Visa** | — | Sin cargo. El servicio es opcional. |
+
+> **Nota de conversión:** en el PDF original esta información está en dos recuadros; el de "EMV 3DS Full Authentication" se subdivide por marca con los logos de Mastercard y Visa. La tabla de arriba se reconstruyó mirando la página renderizada, porque la extracción de texto plana fusionaba ambas filas y hacía parecer que el servicio era a la vez arancelado y sin cargo.
 
 #### Cargo por incumplimiento: Security Enhacement Fee (SEF)
 
@@ -3825,6 +3916,190 @@ Operar con www.fiserv.com.ar implica aceptar los Términos y Condiciones en los 
 
 ---
 
+## Tabla de reintentos VISA (adjunto recuperado)
+
+*Fuente: `TABLA_REINTENTOS_VISA_062024.pdf` — adjunto enlazado desde `Penalizacion por Reintentos Visa - Master.pdf` (https://destinab.ly/storage/fiserv/TABLA_REINTENTOS_VISA_062024.pdf). El archivo no estaba en la carpeta; se recuperó desde el enlace embebido en el PDF.*
+
+En caso de exceder los reintentos permitidos, se aplicará un cargo de **USD 0,10\*** para las transacciones locales y **USD 0,25\*** para las transacciones internacionales, en base a las siguientes categorías:
+
+| Categoría | Reintentos aceptados |
+| --- | --- |
+| 1 | Reintentos no permitidos |
+| 2 | Hasta 15 reintentos permitidos en 30 días |
+| 3 | Revalidar la información de pago antes de reintentar. Hasta 15 reintentos permitidos en 30 días. |
+| 4 | Hasta 14 reintentos permitidos en 30 días. |
+
+### Respuestas ISO VISA y su categoría de reintento
+
+| ISO CODE | Descripción | Categoría |
+| --- | --- | --- |
+| 00 | Approved | — |
+| 01 | Contact card issue | 4 |
+| 02 | Contact card issue, special condition | 4 |
+| 03 | Not approved. Invalid merchant | 2 |
+| 04 | Not approved. Pick up card (no fraud) | 1 |
+| 05 | Do not honor | 4 |
+| 06 | Error | 4 |
+| 07 | Not approved. Authentication not completed | 1 |
+| 10 | Partial approval | — |
+| 11 | Approved VIP | — |
+| 12 | Invalid transaction | 1 |
+| 13 | Invalid amount / Currency convertion field overflow | 4 |
+| 14 | Invalid account number | 1 |
+| 15 | No such issuer | 1 |
+| 19 | Re-enter transaction | 2 |
+| 21 | No action taken | 4 |
+| 25 | Uneable to locate record in file | 4 |
+| 28 | File is temporarily unavailable for update or inquiry | 4 |
+| 39 | No credit account | 4 |
+| 41 | Lost card, fraud account | 1 |
+| 43 | Stolen card, fraud account | 1 |
+| 46 | Closed account | 1 |
+| 51 | Not sufficient funds | 2 |
+| 52 | No checking account | 4 |
+| 53 | No savings account | 4 |
+| 54 | Expired card or expiration date missing | 3 |
+| 55 | Incorrect PIN | 3 |
+| 57 | Transaction not permitted to cardholder | 1 |
+| 58 | Transaction not allowed in this terminal | 4 |
+| 59 | Suspected fraud | 2 |
+| 61 | Exceeds limit approval amount | 2 |
+| 62 | Restricted card (card invalid in region or country) | 2 |
+| 63 | Security violation | 2 |
+| 64 | Not approved. Transaction does not fulfill requirement | 4 |
+| 65 | Exceeds limit of withdrawl frequency | 4 |
+| 70 | PIN data required | 2 |
+| 74 | Different value than that used for PIN encription errors | 3 |
+| 75 | PIN-entry tries exeeded | 4 |
+| 76 | Uneable to match reversal request to an original messsage | 2 |
+| 78 | Blocked, new cardholder not activated or card is temporarily blocked | 4 |
+| 79 | Reversed (by switch) | 2 |
+| 81 | Cryptographic error found in PIN | 4 |
+| 82 | PIN authenticaton interrupted | 4 |
+| 85 | Approved | 3 |
+| 86 | Cannot verify PIN | — |
+| 91 | Time out / System inoperative | 2 |
+| 92 | Financial institution or intermediate network facility cannot be found for routing (receiving institution ID invalid) | 2 |
+| 93 | Transaction can not be completed, violation of law | 4 |
+| 92 | Duplicated transmition for transaction | 2 |
+| 96 | System malfuntion | 4 |
+| 1A | Additional customer authentication required | 2 |
+| 6P | Verification data failed | 3 |
+| N0 | Issuer forzed authorization via STIP (VIP) | 3 |
+| N7 | Decline for CVV2 failure | 4 |
+| N8 | Transaction amount exceeds pre authorized approval amount | 3 |
+| Q1 | Card authentication failed or PIN authentication interrumpted | 4 |
+| R0 | Stop payment order | 4 |
+| R1 | Stop all future payments | 1 |
+| R2 | Transaction does not qualify for Visa PIN | 1 |
+| R3 | Stop all payments | 4 |
+| Z3 | Uneable to go online; offline-declined | 1 |
+
+> **⚠ Cuidado al leer esta tabla.** En el PDF original la columna "Categoría" está impresa como una lista suelta al costado, separada de la tabla de códigos. El emparejamiento código→categoría de arriba respeta el orden en que aparecen ambas listas, pero como el PDF trae **61 códigos y 61 categorías en dos bloques independientes**, y además repite el código `92` en dos filas distintas, conviene validar el mapeo con Fiserv antes de usarlo para lógica de reintentos.
+
+**Dónde llega el código ISO:**
+
+- **API SOAP:** `ProcessorAssociationResponseCode`, con la descripción en `ProcessorAssociationResponseMessage`.
+- **API REST:** `AssociationResponseCode`, con la descripción en `AssociationResponseMessage`.
+
+\* Ver el aviso de tarifas del comunicado original.
+
+## Tabla de reintentos MASTERCARD (adjunto recuperado)
+
+*Fuente: `TABLA_REINTENTOS_MASTERCARD_062024.pdf` — adjunto enlazado desde `Penalizacion por Reintentos Visa - Master.pdf` (https://destinab.ly/storage/fiserv/TABLA_REINTENTOS_MASTERCARD_062024.pdf). El archivo no estaba en la carpeta; se recuperó desde el enlace embebido en el PDF.*
+
+Cada transacción rechazada por los emisores tendrá relacionado al código ISO un **Merchant Advice Code (MAC)**, el cual informará la cantidad de reintentos permitidos en cada caso. En caso de superar los reintentos informados por el MAC, se procederá al cobro de **USD 0,50\*** por transacción.
+
+> **IMPORTANTE.** En caso de no recibir en la transacción el `MerchantAdviceCodeIndicator`, la cantidad de reintentos permitidos será de **7 por día con un máximo de 35 en 30 días**.
+
+### Merchant Advice Code (MAC) Mastercard
+
+| MAC | Descripción | Reintentos permitidos |
+| --- | --- | --- |
+| 01 | Nueva Información de Cuenta Disponible | 7 x día con un máx. de 35 en 30 días |
+| 02 | No se puede aprobar en este momento | 7 x día con un máx. de 35 en 30 días |
+| 03 | No Lo Intente De Nuevo | No reintentar |
+| 04 | No se cumplieron los requisitos del token para este tipo de token | 7 x día con un máx. de 35 en 30 días |
+| 05 | Valor negociado no aprobado | 7 x día con un máx. de 35 en 30 días |
+| 21 | Cancelación de Pago (sólo para uso de Mastercard) | No reintentar |
+| 22 | El comercio no califica para el código de producto | 7 x día con un máx. de 35 en 30 días |
+| 24 | Reintentar después de 1 hora (uso de Mastercard solamente) | Reintentar después de 1 hora |
+| 25 | Reintentar después de 24 horas (uso de Mastercard solamente) | Reintentar después de 24 horas |
+| 26 | Reintentar después de 2 días (uso de Mastercard solamente) | Reintentar después de 2 días |
+| 27 | Reintentar después de 4 días (uso de Mastercard solamente) | Reintentar después de 4 días |
+| 28 | Reintentar después de 6 días (uso de Mastercard solamente) | Reintentar después de 6 días |
+| 29 | Reintentar después de 8 días (uso de Mastercard solamente) | Reintentar después de 8 días |
+| 30 | Reintentar después de 10 días (uso de Mastercard solamente) | Reintentar después de 10 días |
+
+**Dónde llega el MAC:**
+
+- **API SOAP:** `MerchantAdviceCodeIndicator`, con la descripción en `TransactionDeclineReason`.
+- **API REST:** `MerchantAdviceCodeIndicator`, con la descripción en `declineReasonCode`.
+
+### Doble penalidad
+
+En caso de superar los reintentos informados por el MAC se cobra USD 0,50\* por transacción por incumplimiento del mandato del MAC. **En paralelo**, de corresponder, se aplica la penalidad general por reintentos indebidos, por otros USD 0,50\* por transacción.
+
+Ejemplos del documento original:
+
+- El comercio recibe un rechazo con MAC 3. Si reintenta: penalidad por incumplir el MAC, porque el MAC 3 indica no reintentar (USD 0,50).
+- El comercio recibe un rechazo con MAC 26. Si reintenta antes de los 2 días: penalidad por incumplir el MAC (USD 0,50).
+- El comercio recibe un rechazo con MAC 26. Si reintenta antes de los 2 días, a partir del reintento 8 recibirá: penalidad por incumplir el MAC (USD 0,50) **más** penalidad por superar el número general de reintentos indebidos (USD 0,50).
+
+### Respuestas ISO Mastercard
+
+| ISO CODE | Descripción |
+| --- | --- |
+| 00 | Approved |
+| 01 | Contact card issuer |
+| 03 | Invalid merchant |
+| 04 | Hold card |
+| 05 | Do not honor |
+| 08 | Approved with identification |
+| 10 | Partial approval |
+| 12 | Invalid transaction |
+| 13 | Invalid amount |
+| 14 | Invalid card number |
+| 15 | Invalid issuer |
+| 30 | Formar error |
+| 41 | Lost card, Hold |
+| 43 | Stolen card, Hold |
+| 51 | insufficient funds |
+| 54 | Expired card |
+| 55 | Invalid PIN |
+| 57 | Transaction no permitted to issuer |
+| 58 | Transaction not permited |
+| 62 | Resctricted card |
+| 63 | Security violation |
+| 65 | Authentification needed |
+| 70 | Contact card issuer |
+| 71 | PIN not changed |
+| 75 | PIN tries exceeded |
+| 76 | Invalid transaction. Account non existent |
+| 77 | Invalid transaction. Account non existent |
+| 78 | Invalid transaction. Account non existent |
+| 79 | Post authorization days complete |
+| 81 | Domestic debit transaction not allowed |
+| 82 | Validate card address |
+| 83 | Fraud / Security (Mastercard use only) |
+| 84 | Invalid post Authorisations, days past |
+| 85 | Approved |
+| 86 | PIN Validation not possible |
+| 87 | Pourchase amount only, no cash back allowed |
+| 88 | Cryptographic failure |
+| 89 | Unacceptable PIN - Transaction declined - Retry |
+| 91 | Authoritation System or Issuer System inoperative |
+| 92 | Unable to route transaction |
+| 94 | Duplicate transmition detected |
+| 96 | System error |
+
+**Dónde llega el código ISO:** igual que en Visa — `ProcessorAssociationResponseCode` / `ProcessorAssociationResponseMessage` en SOAP, `AssociationResponseCode` / `AssociationResponseMessage` en REST.
+
+\* Ver el aviso de tarifas del comunicado original.
+
+
+---
+
 # Parte 9 — Buenas prácticas y seguridad
 
 ## 14. Buenas prácticas y anotaciones técnicas
@@ -4295,11 +4570,248 @@ StoreID (Numero de la Tienda):
 | --- | --- | --- | --- | --- | --- | --- |
 | DataOnly | 5239290700000028 | 12 | 29 | 123 | | |
 
+### Stores a usar y dónde está documentado cada caso
+
+Los dos stores de Argentina no son intercambiables: el checklist asigna uno a cada tipo de token.
+
+| Caso del checklist | Store | Dónde está explicado en este documento |
+|---|---|---|
+| Sale en 1 pago | `5926072901` / `5926072902` | §7 Transacciones básicas |
+| Sale en 1 pago con DÓLAR | idem | §7 — cambiar `transactionAmount.currency` |
+| Sale con ZEROAUTH | idem | Parte 3 — Zero Auth (`total: "0"`) |
+| Sale en cuotas con **TOKEN GW** — tarjeta `5165850000000008` | **`5926072902`** | §9.1 Tokenización IPG + `order.installmentOptions` |
+| Sale en cuotas con **TOKEN MTRG** — tarjeta `4622943127032366` | **`5926072901`** | Parte 4 — Network Token (MTRG) + §9.2 passthrough |
+| INQUIRY ORDER | idem | §7.3 Consulta del estado de la transacción |
+| DYNAMIC MERCHANT NAME | idem | `SoftDescriptor/dinamycMerchantName` (§7.2 y Apéndice III) |
+| Void (anulación) | idem | §7.2 — `VoidTransaction` / `VoidPreAuthTransactions` |
+| Return total y parcial | idem | §7.2 — `ReturnTransaction` |
+| 3DS Frictionless / Method / Challenge | idem | §10.1 (proveedor propio) o §10.2 (passthrough) |
+| DataOnly — tarjeta `5239290700000028` | idem | §10.1.6 / §10.2.2 — `messageCategory: "80"` |
+
+Las credenciales de estos stores están en la Parte 1.
+
+### ⚠ Las tarjetas del checklist no coinciden con el Apéndice V de la guía
+
+Al cruzar las 16 tarjetas 3DS del checklist contra el Apéndice V ("Tarjetas de test para 3DS"), **3 no coinciden**. Como usar la tarjeta equivocada devuelve otro `transStatus` y el caso se da por fallido, conviene resolver esto antes de empezar:
+
+| Escenario del checklist | Tarjeta que pide el checklist | Lo que dice el Apéndice V | Situación |
+|---|---|---|---|
+| 3DSMethod **Not** Authenticated | `4265880000000015` | `4099000000001986` (Frictionless + 3DSMethod, código 3 / N) | La tarjeta del checklist **no figura en el Apéndice V** |
+| 3DSMethod **Rejected** Authentication | `4016360000000085` | `4265880000000031` (Frictionless + 3DSMethod, código 3 / R) | `4016360000000085` sí existe, pero el Apéndice V la ubica en el flujo Frictionless **sin** 3DSMethod |
+| Challenge + Method — **Challenge - R** | `4149011500000535` | `4147463011110034` (Challenge Flow + 3DSMethod, código 3 / R) | La tarjeta del checklist **no figura en el Apéndice V** |
+
+Las otras 13 coinciden exactamente. Criterio sugerido: usar las del checklist, porque es el documento contra el que Fiserv evalúa los logs, y pedirles por escrito que confirmen las tres discrepancias.
+
+Nota aparte: la tarjeta de DataOnly del checklist (`5239290700000028`) figura en el Apéndice V como la Mastercard de "Frictionless - Fully Authenticated" (código 1 / Y). Es coherente — Data Only es exclusivo de Mastercard y se activa con `messageCategory: "80"`, no con una tarjeta distinta.
+
 Atentamente,
 
 Equipo Soporte IPG - Homologación
 
 soporte.latam@softwareexpress.com.br
+<!-- fin del texto original de Fiserv -->
+
+### Verificado en vivo contra CERT (2026-08-06)
+
+Todo lo de esta subsección se comprobó ejecutando los casos contra
+`https://cert.api.firstdata.com/gateway/v2` con las credenciales de PXSOL, no
+sale de la lectura del doc. El harness que lo reproduce es
+`./fiserv_homologacion.py` (evidencia en `fiserv_homologacion_logs/<corrida>/`).
+
+**Los updates de 3DS son `PATCH`, no `POST`.** El doc lo dice en prosa
+("realizando una operación PATCH", §10.1.4.a y §10.1.5.d) pero ningún ejemplo
+muestra el verbo. Con `POST /payments/{id}` el gateway responde
+`INVALID_INPUT` / `{"field":"requestType","message":"Request type missing."}`,
+porque en POST el discriminador es `requestType` y en PATCH es
+`authenticationType`. Aplica tanto al update de `methodNotificationStatus` como
+al de `acsResponse.cRes`.
+
+**El paso 3DSMethod se puede ejecutar de verdad sin browser.** El `methodForm`
+que devuelve el gateway es un form que postea `3DSMethodData` y
+`threeDSMethodData` a `https://3ds-acs.test.modirum.com/mdpayacs/3ds-method`.
+Posteándolo server-side, el ACS responde con el form de notificación que apunta
+al `methodNotificationURL` declarado — o sea que la notificación se emite igual
+que con el iframe del browser, y recién entonces corresponde mandar el `PATCH`
+con `methodNotificationStatus: "RECEIVED"`. (Un `PATCH` con `RECEIVED` a secas
+también completa la autenticación, pero declara algo que no pasó.)
+
+**El ACS de test (Modirum) tiene un simulador con el que se elige el resultado
+del challenge.** Eso es lo que significan las filas "Challenge - configurable /
+response 1 / 4 / 3 / 6": es la misma tarjeta y se aprieta un botón distinto.
+Al postear el `cReq` a `acsURL`, el ACS devuelve una pantalla con cinco botones
+`name="result"`; el resultado final medido es:
+
+| Botón del ACS | `result` | `responseCode3dSecure` | Estado de la transacción |
+|---|---|---|---|
+| Yes | `y` | **1** | APPROVED |
+| Attempt | `a` | **4** | APPROVED |
+| No | `n` | **3** (reason 1) | VALIDATION_FAILED / 50716 |
+| Rejected | `r` | **3** (reason 19) | VALIDATION_FAILED / 50716 |
+| Unavailable | `u` | **6** (reason 22) | APPROVED |
+
+Las tarjetas "Challenge - R" (`4147463011110034` y `4149011500000535`) no
+muestran el simulador: el ACS devuelve el `cRes` directo con `transStatus: N`,
+que da código 3. Como el ACS postea el `cRes` a `termURL`, todo el flujo se
+puede correr por HTTP sin browser apuntando `termURL` a `localhost`.
+
+**`softDescriptor` va dentro de `order`.** A nivel raíz del payload el gateway
+responde `No field named 'softDescriptor' exists for class
+PaymentCardSaleTransaction`. El nombre del campo interno es
+`dynamicMerchantName` (el doc lo escribe `dinamycMerchantName` en §7.2 y en el
+Apéndice III; esa grafía no existe en la API).
+
+**Data Only con proveedor propio falla; con proveedor externo funciona.** Con
+`authenticationRequest` → `authenticationType: "Secure3DAuthenticationRequest"` +
+`messageCategory: "80"` (§10.1.6) el gateway responde `VALIDATION_FAILED`,
+`error.code 50655 "Unable to verify card enrollment"` y
+`responseCode3dSecure: 8`. Se reprodujo con las dos Mastercard del doc
+(`5239290700000028` y `5165850000000008`) y en las dos tiendas AR
+(`5926072901` y `5926072902`).
+
+Pero la modalidad **sí está operativa en esas tiendas**: por la vía de proveedor
+externo (§10.2.2, bloque `authenticationResult` con `messageCategory: "80"`) la
+misma tienda aprueba y devuelve `responseCode3dSecure: A`. Controles que acotan
+dónde está el problema:
+
+- la misma MC sin `messageCategory` entra normal al flujo 3DS 2.2 (WAITING + `secure3dMethod`);
+- con `messageCategory: "02"` responde `50734 "Invalid NPA Transaction Amount"`, y
+  con un valor fuera del enum falla el parseo del JSON: el campo se valida por valor;
+- con una **Visa** y `messageCategory: "80"` responde
+  `50738 "Invalid Message Category"`: valida también por marca.
+
+> **Ojo con la conclusión fácil.** El código que Fiserv usa para "tienda sin
+> habilitar" es `N:-30055 "Not configured for 3DSecure"`, no el `-50655` que
+> recibimos, y `-50655` no figura en el PDF de códigos de rechazo. Con lo
+> verificado no alcanza para afirmar que falte una habilitación: lo que se puede
+> sostener es que falla la modalidad con proveedor propio sobre las tarjetas de
+> prueba, y que hay que preguntarle a Fiserv si es enrolamiento de esas PAN en el
+> Directory Server de test u otra cosa.
+>
+> Cerrar el caso del checklist con el flujo §10.2.2 **no** es una opción: esa
+> modalidad es para cuando la autenticación la resolvió un proveedor externo, y
+> usar el `cavv` de ejemplo de la guía sería fabricar una autenticación.
+
+**`messageCategory` no existe en `Secure3D21AuthenticationRequest`.** Hay que
+usar la clase base `Secure3DAuthenticationRequest`, tal como dice §10.1.6. Con
+la subclase el gateway responde `No field named 'messageCategory' exists for
+class Secure3D21AuthenticationRequest`. Son los dos únicos valores válidos de
+`authenticationType` para el request de inicio: cualquier otro rompe la
+deserialización polimórfica y devuelve `Request type missing`.
+
+**El caso del checklist "TOKEN MTRG" es el flujo integrado, no el passthrough.**
+El checklist da la tarjeta **con CVV**, y eso lo define: el manual de Network
+Token sólo tiene dos flujos, *OnTheGo* (se manda el PAN real con CVV y Fiserv le
+pide el token a la marca) y *Asíncrono* (se crea un `HostedDataID` y se vende con
+él). El passthrough de §9.2 es otro producto, para comercios con TSP propio.
+Mandar el PAN del checklist como si fuera un token, sin CVV y con
+`order.tokenCryptogram`, **no produce ninguna tokenización**: la respuesta vuelve
+con `fundingCardNumber.bin` igual a `paymentCard.bin`. En el flujo correcto sí
+hay sustitución: `462294/2366` → `432312/7867`.
+
+**Las cuotas se rechazan por tarjeta no local, no por Network Token.** Con
+`order.installmentOptions` el gateway responde `N:-11101:installment not
+supported` / `installment only supported for local cards` (código documentado en
+el PDF de códigos de rechazo). Se reproduce en los dos flujos, con 6 y con 3
+cuotas; con `numberOfInstallments: 1` y sin `installmentOptions` aprueba.
+
+No confundir la causa: en la misma tienda, la Visa `4704550000000005` **también**
+se procesa sustituida por Network Token (`470455` → `451718`) y **sí** acepta 6
+cuotas. O sea que el Network Token no bloquea cuotas; lo que falla es que el PAN
+de prueba de MTRG no resuelve como tarjeta local argentina.
+
+**El criptograma del network token no se valida en CERT** (aplica al passthrough
+§9.2, no al flujo MTRG integrado). El doc lo declara obligatorio en cada
+transacción, pero una venta sin `order.tokenCryptogram` sale APPROVED igual. Lo
+único que se valida es el largo: entre 20 y 256 caracteres. No apoyarse en CERT
+para verificar este requisito.
+
+**De las tres discrepancias de tarjetas, sólo una es real.** Corriendo las seis
+tarjetas:
+
+| Caso | Tarjeta del checklist | Resultado | Tarjeta del Apéndice V | Resultado |
+|---|---|---|---|---|
+| 3DSMethod Not Authenticated | `4265880000000015` | código **3** ✅ | `4099000000001986` | código 3 |
+| 3DSMethod **Rejected** | `4016360000000085` | código **6** ❌ (reason 8) | `4265880000000031` | código **3** ✅ (reason 11) |
+| Challenge+Method - R | `4149011500000535` | código **3** ✅ (reason 11) | `4147463011110034` | código 3 |
+
+O sea: las del checklist sirven salvo en *3DSMethod Rejected*, donde la del
+checklist devuelve "Unable" (6) en vez de "Rejected" (3). Para ese caso hay que
+usar `4265880000000031` o pedirle a Fiserv que confirme cuál evalúan.
+
+### Preguntas abiertas para Fiserv
+
+1. **Data Only con proveedor propio**: ¿el `-50655` corresponde al enrolamiento
+   de las PAN de prueba en el Directory Server de test, o a otra cosa? El código
+   no figura en el PDF de códigos de rechazo. ¿Hay una tarjeta de prueba
+   específica para este flujo?
+2. **TOKEN MTRG en cuotas**: ¿hay un PAN de prueba para MTRG que resuelva como
+   tarjeta local argentina, o el caso se homologa en 1 pago?
+3. **3DSMethod Rejected**: la tarjeta del checklist (`4016360000000085`) aprueba
+   con código 6 y sin ejecutar 3DSMethod. ¿Se da por cumplida así, o se homologa
+   con `4265880000000031`?
+4. **ZEROAUTH sobre Mastercard**: el manual de Zero Auth pide los parámetros de
+   Data Only. ¿Se reenvía cuando se resuelva el punto 1, o se homologa con Visa?
+5. **Criptograma de network token** (sólo si se usa passthrough): ¿hay
+   criptogramas de test válidos, o CERT acepta cualquiera de largo 20-256?
+6. **Credencial almacenada / Card on File**: toda transacción que incluye el
+   bloque `storedCredentials` (con `order.installmentOptions.recurringType`)
+   es rechazada con *"The merchant is not setup to support the requested
+   service"*, en las dos tiendas. La misma venta con token **sin** ese bloque
+   devuelve HTTP 200, así que no es la tokenización: parece un servicio no
+   habilitado en la cuenta de certificación. ¿Se puede habilitar credencial
+   almacenada en 5926072901 / 5926072902? Este caso no está en el checklist,
+   pero la recurrencia se necesita para producción.
+
+Notas de método, para no repetir errores al armar estos reclamos:
+
+- El checklist declara un `3DS Response Code` esperado **sólo** en las tablas
+  *Challenge* y *Challenge + Method*. Para Frictionless, 3DS Method y DataOnly no
+  declara ninguno: comparar contra un valor "esperado" en esas filas es inventar
+  un requisito.
+- Antes de atribuirle una falla al gateway, buscar el control que la descarta.
+  Dos reclamos se cayeron así: el de cuotas (una Visa tokenizada sí acepta
+  cuotas) y el de Data Only (el passthrough sí devuelve `A`).
+- No afirmar pruebas que no estén en el archivo de evidencia que se adjunta.
+
+### Verificado a través del router de Hyperswitch (2026-08-14)
+
+Todo lo anterior se probó hablándole directo al gateway. Esto es la otra mitad: el
+conector `fiservemea` corriendo dentro del router, que es el camino que va a
+producción. Router local contra CERT, expuesto por un túnel público para que el ACS
+pueda alcanzar la `methodNotificationURL`.
+
+**44 casos, 41 con el resultado esperado.** Ninguna de las 3 diferencias es del
+conector:
+
+| Suite | Resultado |
+|---|---|
+| 21 casos 3DS (frictionless, method, challenge, challenge+method, dataonly) | 20/21 |
+| 13 casos Argentina sin 3DS | 11/13 |
+| 10 casos Uruguay | 10/10 |
+
+Cubierto por el router en las dos regiones: venta en 1 pago, dólar, cuotas,
+dynamic merchant name, zero auth, captura manual y parcial, void, return total y
+parcial, e inquiry con `force_sync`.
+
+Las 3 diferencias: `3DSMethod Rejected` (la discrepancia entre gateway y checklist
+ya descrita) y los dos casos de Card on File, que llegan al gateway y chocan con el
+servicio no habilitado (pregunta 6).
+
+**Dos hallazgos del lado del conector, ninguno bloquea la homologación:**
+
+1. **El mandato con tarjeta estaba cortado antes de llegar al gateway.** El
+   conector heredaba el `validate_mandate_payment` por defecto del router, que
+   rechaza todo método de pago. Por eso Card on File figuraba como "nunca
+   ejercitado": no faltaba probarlo, no se podía. Corregido; con eso el request
+   llega a Fiserv y aparece el punto 6.
+2. **`methodNotificationStatus` siempre viaja como `EXPECTED_BUT_NOT_RECEIVED`**,
+   incluso cuando el browser sí completó el 3DSMethod y la notificación llegó. El
+   dato vive en dos requests distintos y el conector no guarda estado entre ellos.
+   El arreglo directo —mandar el PATCH con `RECEIVED` en el callback del método—
+   se probó y **rompe el Challenge+Method**: ese request ocurre dentro del iframe
+   oculto, así que el desafío se renderiza donde el usuario no lo ve. Requiere
+   persistir el estado entre saltos.
+
 
 Fiserv | Software Express | Twitter | LinkedIn | Facebook
 
@@ -4333,6 +4845,22 @@ Se verificaron por algoritmo de Luhn los números de tarjeta transcriptos. Los s
 
 `6271700000000000` (KADICARD) · `504408000000000017` (FAVACARD) · `5043631200000001` (NEVADA) · `6391300085755808` (CLUB_LA_NACION) · `5049100100000000` (PYME_NACION) · `6034160000000000` (CONSUMAX) · `501063999000007007` (MAESTRO)
 
+## Payloads del original que no son JSON válido
+
+De los 56 bloques `json` del documento, 51 parsean sin errores. Los 5 restantes reproducen defectos que ya están en el material de Fiserv — se dejaron tal cual porque cambiarlos sería inventar:
+
+| Sección | Problema | Qué hacer |
+|---|---|---|
+| `Apéndice VI` — payload *Sale* | El PDF corta el JSON sin cerrarlo | La llave de cierre del MD está marcada como agregada |
+| `Apéndice VI` — fragmento `"order"` | Es un fragmento, no un objeto completo | Es intencional en el original |
+| `Zero Auth §3.3` | `"value": “{{TokenGateway}}"` usa comilla tipográfica de apertura | Reemplazar por comilla recta |
+| `§10.1.2` — `methodForm` | Formulario HTML embebido, partido en líneas y con entidades rotas (`& lt;`, `& amp;#10;`) por el renderizado del PDF | No copiar: tomar el valor real de la respuesta de la API |
+| `§10.1.5.d` | Falta una coma después de `"address2": "Suite 123"` | Errata del original |
+
+Dos valores largos de `§10.5` (`payerAuthenticationRequest` y `merchantData`) venían partidos en varias líneas en el PDF y acá se unieron en una sola cadena. Conservan artefactos del original (un espacio dentro del base64, espacios alrededor de los guiones del UUID final): son valores de ejemplo, no copiarlos.
+
+Los 12 bloques `xml` del documento parsean todos sin errores.
+
 ## Contenido que no sobrevive a la conversión
 
 Los originales contienen capturas de pantalla y diagramas de flujo que no son texto extraíble. Están señalados en línea con `> [Imagen en el documento original]`. Los casos relevantes:
@@ -4340,5 +4868,5 @@ Los originales contienen capturas de pantalla y diagramas de flujo que no son te
 - `§5` — 8 capturas de la configuración de Postman (importar colección, cargar entorno, credenciales, request "API TEST").
 - `Comunicacion comercios 3DS.pdf` — infografía de Mastercard y una tabla comparativa que usaba tildes gráficos.
 - `Manual NetworkToken MTRG.pdf` — leyendas de color que distinguían parámetros mandatorios de opcionales.
-- `Penalizacion por Reintentos Visa - Master.pdf` — los dos documentos adjuntos por Marca (Visa y Mastercard) con las categorías de rechazo. **No están en la carpeta**: hay que pedirlos.
+- `Penalizacion por Reintentos Visa - Master.pdf` — los dos adjuntos por Marca eran botones de descarga. **Recuperados** desde los enlaces embebidos en el PDF y transcriptos en la Parte 8 (`TABLA_REINTENTOS_VISA_062024.pdf` y `TABLA_REINTENTOS_MASTERCARD_062024.pdf`).
 - `Homologación ... .docx` — los casos obligatorios estaban marcados en rojo; el color no se preserva.
