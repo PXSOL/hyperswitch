@@ -200,9 +200,10 @@ impl TryFrom<(&WalletData, &PaymentsAuthorizeRouterData)> for PaymentDetails {
             | WalletData::GooglePayRedirect(_)
             | WalletData::Mifinity(_)
             | WalletData::RevolutPay(_)
-                | WalletData::MercadoPagoSdk(_) => Err(errors::ConnectorError::NotImplemented(
-                "Payment method".to_string(),
-            ))?,
+            | WalletData::MercadoPagoSdk(_)
+            | WalletData::MercadoPagoCheckoutPro {} => Err(
+                errors::ConnectorError::NotImplemented("Payment method".to_string()),
+            )?,
         };
         Ok(payment_data)
     }

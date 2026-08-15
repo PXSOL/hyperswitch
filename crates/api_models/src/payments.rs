@@ -2889,7 +2889,9 @@ impl GetPaymentMethodType for WalletData {
             Self::MbWayRedirect(_) => api_enums::PaymentMethodType::MbWay,
             Self::MobilePayRedirect(_) => api_enums::PaymentMethodType::MobilePay,
             Self::PaypalRedirect(_) | Self::PaypalSdk(_) => api_enums::PaymentMethodType::Paypal,
-            Self::MercadoPagoSdk(_) => api_enums::PaymentMethodType::MercadoPago,
+            Self::MercadoPagoSdk(_) | Self::MercadoPagoCheckoutPro {} => {
+                api_enums::PaymentMethodType::MercadoPago
+            }
             Self::Paze(_) => api_enums::PaymentMethodType::Paze,
             Self::SamsungPay(_) => api_enums::PaymentMethodType::SamsungPay,
             Self::TwintRedirect {} => api_enums::PaymentMethodType::Twint,
@@ -3899,6 +3901,9 @@ pub enum WalletData {
     /// The wallet data for Mercado Pago SDK (tokenized card)
     #[schema(title = "MercadoPagoSdk")]
     MercadoPagoSdk(MercadoPagoSdkData),
+    /// The wallet data for Mercado Pago Checkout Pro (hosted checkout redirect)
+    #[schema(title = "MercadoPagoCheckoutPro")]
+    MercadoPagoCheckoutPro {},
     /// The wallet data for Paysera
     #[schema(title = "Paysera")]
     Paysera(PayseraData),
@@ -3979,6 +3984,7 @@ impl GetAddressFromPaymentMethodData for WalletData {
             | Self::GooglePayThirdPartySdk(_)
             | Self::PaypalSdk(_)
             | Self::MercadoPagoSdk(_)
+            | Self::MercadoPagoCheckoutPro {}
             | Self::Paze(_)
             | Self::SamsungPay(_)
             | Self::TwintRedirect {}

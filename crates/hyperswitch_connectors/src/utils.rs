@@ -5560,6 +5560,7 @@ pub enum PaymentMethodDataType {
     PaypalRedirect,
     PaypalSdk,
     MercadoPagoSdk,
+    MercadoPagoCheckoutPro,
     Paze,
     SamsungPay,
     TwintRedirect,
@@ -5696,6 +5697,9 @@ impl From<PaymentMethodData> for PaymentMethodDataType {
                 payment_method_data::WalletData::PaypalRedirect(_) => Self::PaypalRedirect,
                 payment_method_data::WalletData::PaypalSdk(_) => Self::PaypalSdk,
                 payment_method_data::WalletData::MercadoPagoSdk(_) => Self::MercadoPagoSdk,
+                payment_method_data::WalletData::MercadoPagoCheckoutPro {} => {
+                    Self::MercadoPagoCheckoutPro
+                }
                 payment_method_data::WalletData::Paze(_) => Self::Paze,
                 payment_method_data::WalletData::SamsungPay(_) => Self::SamsungPay,
                 payment_method_data::WalletData::TwintRedirect {} => Self::TwintRedirect,

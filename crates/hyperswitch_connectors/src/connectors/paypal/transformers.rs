@@ -1100,9 +1100,12 @@ impl TryFrom<&PaypalRouterData<&PaymentsAuthorizeRouterData>> for PaypalPayments
                 | WalletData::Mifinity(_)
                 | WalletData::RevolutPay(_)
                 | WalletData::Paze(_)
-                | WalletData::MercadoPagoSdk(_) => Err(errors::ConnectorError::NotImplemented(
-                    utils::get_unimplemented_payment_method_error_message("Paypal"),
-                ))?,
+                | WalletData::MercadoPagoSdk(_)
+                | WalletData::MercadoPagoCheckoutPro {} => {
+                    Err(errors::ConnectorError::NotImplemented(
+                        utils::get_unimplemented_payment_method_error_message("Paypal"),
+                    ))?
+                }
             },
             PaymentMethodData::BankRedirect(ref bank_redirection_data) => {
                 let bank_redirect_intent = if item.router_data.request.is_auto_capture()? {

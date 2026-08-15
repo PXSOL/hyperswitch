@@ -5519,5 +5519,7 @@ api_key = "API Key"
 api_key = "API Key"
 
 [mercadopago]
+[[mercadopago.wallet]]
+  payment_method_type = "mercado_pago"
 [mercadopago.connector_auth.HeaderKey]
 api_key="Access Token"

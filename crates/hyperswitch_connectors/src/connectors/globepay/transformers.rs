@@ -89,9 +89,12 @@ impl TryFrom<&GlobepayRouterData<&types::PaymentsAuthorizeRouterData>> for Globe
                 | WalletData::SwishQr(_)
                 | WalletData::Mifinity(_)
                 | WalletData::RevolutPay(_)
-                | WalletData::MercadoPagoSdk(_) => Err(errors::ConnectorError::NotImplemented(
-                    get_unimplemented_payment_method_error_message("globepay"),
-                ))?,
+                | WalletData::MercadoPagoSdk(_)
+                | WalletData::MercadoPagoCheckoutPro {} => {
+                    Err(errors::ConnectorError::NotImplemented(
+                        get_unimplemented_payment_method_error_message("globepay"),
+                    ))?
+                }
             },
             PaymentMethodData::Card(_)
             | PaymentMethodData::CardRedirect(_)

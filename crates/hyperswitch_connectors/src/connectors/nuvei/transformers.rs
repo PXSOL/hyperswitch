@@ -1607,10 +1607,13 @@ where
                 | WalletData::WeChatPayQr(_)
                 | WalletData::RevolutPay(_)
                 | WalletData::Mifinity(_)
-                | WalletData::MercadoPagoSdk(_) => Err(errors::ConnectorError::NotImplemented(
-                    utils::get_unimplemented_payment_method_error_message("nuvei"),
-                )
-                .into()),
+                | WalletData::MercadoPagoSdk(_)
+                | WalletData::MercadoPagoCheckoutPro {} => {
+                    Err(errors::ConnectorError::NotImplemented(
+                        utils::get_unimplemented_payment_method_error_message("nuvei"),
+                    )
+                    .into())
+                }
             },
             PaymentMethodData::BankRedirect(redirect) => match redirect {
                 BankRedirectData::Eps { .. } => Self::foreign_try_from((
