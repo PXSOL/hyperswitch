@@ -442,7 +442,15 @@ where
                     .into(),
             ),
             ("Client-Request-Id".to_string(), client_request_id.into()),
-            (headers::API_KEY.to_string(), auth.api_key.expose().into()),
+            // `into_masked()` y no `into()`: el logger imprime el Debug de
+            // `Maskable<String>`, así que un valor sin enmascarar sale en texto plano al
+            // log. La API Key de Fiserv es una credencial y no debe quedar ahí (se
+            // verificó en logs de producción: aparecía completa junto al resto de los
+            // headers, mientras la firma HMAC sí salía enmascarada).
+            (
+                headers::API_KEY.to_string(),
+                auth.api_key.expose().into_masked(),
+            ),
             (headers::TIMESTAMP.to_string(), timestamp.to_string().into()),
             (headers::MESSAGE_SIGNATURE.to_string(), hmac.into_masked()),
         ];
