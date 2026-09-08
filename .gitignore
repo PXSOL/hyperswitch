@@ -287,6 +287,9 @@ __pycache__/
 /homologacion_fiserv_checklist.csv
 /homologacion_fiserv_checklist.xlsx
 /homologacion_fiserv_mail.md
+/homologacion_fiserv_mail_pendientes.md
 /payway_apim_test.sh
 /wompi_tests/
 /.claude/
+/homologacion_fiserv_respuesta_pruebas.md
+/t.logs
