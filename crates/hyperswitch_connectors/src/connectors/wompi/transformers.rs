@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use api_models::webhooks::IncomingWebhookEvent;
 use base64::Engine;
 use common_enums::enums;
 use common_utils::{
@@ -232,14 +233,17 @@ fn decode_jwt_exp(token: &str) -> Option<i64> {
 }
 
 const ACCESS_TOKEN_TTL_FALLBACK_SECONDS: i64 = 300;
-const ACCESS_TOKEN_TTL_MIN_SECONDS: i64 = 60;
 const ACCESS_TOKEN_TTL_MAX_SECONDS: i64 = 3600;
 
 /// TTL for the packed access token: the minimum `exp` of the two presigned
-/// JWTs minus now, clamped to a sane range. Falls back to a conservative 300s
-/// when neither token's `exp` claim can be parsed, so a decoding hiccup never
-/// caches the pair forever (max clamp) nor refetches on every request (an
-/// unclamped near-zero/negative TTL).
+/// JWTs minus now, clamped to `[0, ACCESS_TOKEN_TTL_MAX_SECONDS]`. Falls back to a
+/// conservative 300s when neither token's `exp` claim can be parsed, so a decoding
+/// hiccup never caches the pair forever (max clamp) nor refetches on every request
+/// (an unclamped near-zero/negative TTL). Never clamped UP to a minimum: an
+/// already-expired or near-expired pair must not be cached — the generic
+/// AccessTokenAuth cache subtracts its own margin (15s) before deciding whether to
+/// reuse a cached token, so a non-positive TTL here simply is not cached, which is
+/// the correct outcome for a pair that is already (nearly) dead.
 fn access_token_ttl_seconds(acceptance_token: &str, personal_auth_token: &str) -> i64 {
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     let min_exp = [
@@ -251,7 +255,7 @@ fn access_token_ttl_seconds(acceptance_token: &str, personal_auth_token: &str) -
     .min();
 
     match min_exp {
-        Some(exp) => (exp - now).clamp(ACCESS_TOKEN_TTL_MIN_SECONDS, ACCESS_TOKEN_TTL_MAX_SECONDS),
+        Some(exp) => (exp - now).clamp(0, ACCESS_TOKEN_TTL_MAX_SECONDS),
         None => ACCESS_TOKEN_TTL_FALLBACK_SECONDS,
     }
 }
@@ -376,10 +380,12 @@ impl TryFrom<&hyperswitch_domain_models::types::TokenizationRouterData> for Womp
                 field_name: "card_holder_name",
             })?;
 
-        // Wompi rejects a card holder shorter than 5 characters.
+        // Wompi rejects a card holder shorter than 5 characters. This is a value
+        // that IS present but malformed, not a missing one, so it is reported as
+        // `InvalidDataFormat` rather than `MissingRequiredField`.
         if card_holder.clone().expose().trim().chars().count() < 5 {
-            return Err(errors::ConnectorError::MissingRequiredField {
-                field_name: "card_holder_name (must be at least 5 characters)",
+            return Err(errors::ConnectorError::InvalidDataFormat {
+                field_name: "card_holder_name",
             }
             .into());
         }
@@ -507,7 +513,8 @@ impl TryFrom<&WompiRouterData<&PaymentsAuthorizeRouterData>> for WompiTransactio
         // Manual capture would require a separate Capture call, which this
         // connector does not implement; auto-capture is the only mode Wompi
         // is wired for here (`get_supported_payment_methods` already declares
-        // only `Automatic`, this is a defensive second gate).
+        // `Automatic` and `SequentialAutomatic`, never `Manual`; this is a
+        // defensive second gate).
         if !router_data.request.is_auto_capture()? {
             return Err(errors::ConnectorError::NotSupported {
                 message: "manual capture".to_string(),
@@ -629,8 +636,10 @@ impl<F, T> TryFrom<ResponseRouterData<F, WompiTransactionResponse, T, PaymentsRe
 /// Builds the RouterData outcome for one Wompi transaction: Charged/Pending/
 /// Voided become a `TransactionResponse`, DECLINED/ERROR become an `Err`
 /// carrying the connector's own reason so it is never lost even though Wompi
-/// answers a decline with HTTP 2xx.
-fn transaction_to_router_data<F, T>(
+/// answers a decline with HTTP 2xx. Shared with the card sync-by-reference path
+/// in wompi.rs (`card_sync_by_reference_response` below), not just the two
+/// `TryFrom` impls in this file.
+pub(super) fn transaction_to_router_data<F, T>(
     transaction: WompiTransactionData,
     data: RouterData<F, T, PaymentsResponseData>,
     http_code: u16,
@@ -894,6 +903,72 @@ fn parse_timestamp(value: Option<&str>) -> Option<time::OffsetDateTime> {
     time::OffsetDateTime::parse(value?, &time::format_description::well_known::Rfc3339).ok()
 }
 
+// ============================================================================
+// PSync — CARD retried by reference (see `syncs_by_reference` in wompi.rs): a
+// POST /transactions that timed out after Wompi accepted it leaves the attempt
+// without a connector transaction id, so it is resolved by the same
+// `GET /transactions?reference=` search as hosted checkout, but selected and
+// mapped differently below.
+// ============================================================================
+
+/// Pure (testable) selection over a CARD sync-by-reference search. Unlike
+/// `select_hosted_transaction` this never applies the buyer-retry window: there is
+/// no buyer retry to wait out here, POST /transactions either created the charge or
+/// it did not, so the strongest known outcome wins outright — an APPROVED
+/// transaction if one exists, else a still-live PENDING one, else the most
+/// recently finalized/created of whatever is left (declined/errored/voided).
+pub(super) fn select_card_transaction(
+    transactions: Vec<WompiTransactionData>,
+) -> Option<WompiTransactionData> {
+    if let Some(approved) = transactions
+        .iter()
+        .find(|t| t.status == WompiTransactionStatus::Approved)
+    {
+        return Some(approved.clone());
+    }
+
+    if let Some(pending) = transactions
+        .iter()
+        .find(|t| t.status == WompiTransactionStatus::Pending)
+    {
+        return Some(pending.clone());
+    }
+
+    transactions
+        .iter()
+        .max_by_key(|t| parse_timestamp(t.finalized_at.as_deref().or(t.created_at.as_deref())))
+        .cloned()
+}
+
+/// Maps a CARD sync-by-reference search to a RouterData outcome: the selected
+/// transaction (if any) goes through the same `transaction_to_router_data` as
+/// every other card response, and an empty search result becomes `Pending` with
+/// `NoResponseId` rather than an error — the charge may simply not exist at
+/// Wompi yet.
+pub(super) fn card_sync_by_reference_response<F, T>(
+    transactions: Vec<WompiTransactionData>,
+    data: RouterData<F, T, PaymentsResponseData>,
+    http_code: u16,
+) -> RouterData<F, T, PaymentsResponseData> {
+    match select_card_transaction(transactions) {
+        Some(transaction) => transaction_to_router_data(transaction, data, http_code),
+        None => RouterData {
+            status: enums::AttemptStatus::Pending,
+            response: Ok(PaymentsResponseData::TransactionResponse {
+                resource_id: ResponseId::NoResponseId,
+                redirection_data: Box::new(None),
+                mandate_reference: Box::new(None),
+                connector_metadata: None,
+                network_txn_id: None,
+                connector_response_reference_id: None,
+                incremental_authorization_allowed: None,
+                charges: None,
+            }),
+            ..data
+        },
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum HostedSyncOutcome {
     Charged {
@@ -1079,6 +1154,92 @@ pub struct WompiWebhookTransaction {
     pub status: WompiTransactionStatus,
 }
 
+fn parse_webhook_transaction(
+    webhook: &WompiWebhookBody,
+) -> CustomResult<WompiWebhookTransaction, errors::ConnectorError> {
+    serde_json::from_value(
+        webhook
+            .data
+            .get("transaction")
+            .cloned()
+            .ok_or(errors::ConnectorError::WebhookReferenceIdNotFound)?,
+    )
+    .change_context(errors::ConnectorError::WebhookReferenceIdNotFound)
+}
+
+/// Which identifier a webhook's object reference should resolve to, decided from
+/// SIGNED data only (security): see `webhook_payment_reference` below.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum WompiWebhookReference {
+    AttemptReference(String),
+    ConnectorTransactionId(String),
+}
+
+/// Picks the attempt lookup key from SIGNED data only. The checksum covers just the
+/// paths listed in `signature.properties`, so an unlisted field (usually
+/// `transaction.reference`) could be edited in a genuine signed payload to route it
+/// to a different attempt. Prefer the signed reference (our attempt id), else the
+/// signed `transaction.id` (Wompi's own id); if neither is signed the webhook is
+/// rejected. A hosted-checkout attempt whose connector id isn't known yet is simply
+/// not resolved by the webhook; the ordinary PSync poll resolves it instead.
+pub(super) fn webhook_payment_reference(
+    webhook: &WompiWebhookBody,
+) -> CustomResult<WompiWebhookReference, errors::ConnectorError> {
+    let transaction = parse_webhook_transaction(webhook)?;
+
+    let is_signed = |property: &str| {
+        webhook
+            .signature
+            .properties
+            .iter()
+            .any(|path| path == property)
+    };
+
+    if is_signed("transaction.reference") {
+        Ok(WompiWebhookReference::AttemptReference(
+            transaction.reference,
+        ))
+    } else if is_signed("transaction.id") {
+        Ok(WompiWebhookReference::ConnectorTransactionId(
+            transaction.id,
+        ))
+    } else {
+        Err(errors::ConnectorError::WebhookReferenceIdNotFound.into())
+    }
+}
+
+/// Maps a webhook payload to the router's event type. Checked in this order
+/// (event first) because non-`transaction.updated` events (`nequi_token.updated`,
+/// `bancolombia_transfer_token.updated`, and any future event Wompi's docs warn the
+/// list "can grow") do not necessarily carry a `transaction` object at all, so they
+/// must never reach the transaction parse below.
+pub(super) fn map_webhook_event(
+    webhook: &WompiWebhookBody,
+) -> CustomResult<IncomingWebhookEvent, errors::ConnectorError> {
+    if webhook.event != "transaction.updated" {
+        return Ok(IncomingWebhookEvent::EventNotSupported);
+    }
+
+    let transaction: WompiWebhookTransaction = serde_json::from_value(
+        webhook
+            .data
+            .get("transaction")
+            .cloned()
+            .ok_or(errors::ConnectorError::WebhookEventTypeNotFound)?,
+    )
+    .change_context(errors::ConnectorError::WebhookEventTypeNotFound)?;
+
+    Ok(match transaction.status {
+        WompiTransactionStatus::Approved => IncomingWebhookEvent::PaymentIntentSuccess,
+        WompiTransactionStatus::Declined | WompiTransactionStatus::Error => {
+            IncomingWebhookEvent::PaymentIntentFailure
+        }
+        WompiTransactionStatus::Pending => IncomingWebhookEvent::PaymentIntentProcessing,
+        WompiTransactionStatus::Voided => IncomingWebhookEvent::PaymentIntentCancelled,
+        WompiTransactionStatus::Unknown => IncomingWebhookEvent::EventNotSupported,
+    })
+}
+
 /// Extracts the value at a dot path (e.g. `transaction.status`) relative to
 /// `data`, stringifying scalars the way they appear in Wompi's checksum
 /// example (a number is its decimal digits, not JSON-quoted). Property paths
@@ -1123,6 +1284,8 @@ pub(super) fn build_webhook_message(webhook: &WompiWebhookBody, events_secret: &
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
 
     // ------------------------------------------------------------------
@@ -1519,12 +1682,14 @@ mod tests {
     }
 
     #[test]
-    fn access_token_ttl_clamps_up_to_minimum() {
+    fn access_token_ttl_never_clamps_an_expired_pair_up() {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        // Already expired: raw TTL would be negative, clamped up to 60s.
+        // Already expired: raw TTL would be negative, and must stay 0 (never
+        // cached) rather than being clamped up to a minimum that would cache a
+        // dead pair.
         let expired = make_jwt(now - 500);
         let ttl = access_token_ttl_seconds(&expired, &expired);
-        assert_eq!(ttl, ACCESS_TOKEN_TTL_MIN_SECONDS);
+        assert_eq!(ttl, 0);
     }
 
     #[test]
@@ -1584,5 +1749,605 @@ mod tests {
         );
         let manual_digest = Sha256.generate_digest(manual_message.as_bytes()).unwrap();
         assert_eq!(signature, hex::encode(manual_digest));
+    }
+
+    // ------------------------------------------------------------------
+    // Webhook object reference: SIGNED data only (see `webhook_payment_reference`)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn webhook_payment_reference_falls_back_when_reference_is_unsigned() {
+        // `sample_webhook_body()`'s `signature.properties` lists id/status/amount,
+        // never `transaction.reference` — the common real-world case.
+        let webhook = sample_webhook_body();
+        assert_eq!(
+            webhook_payment_reference(&webhook).unwrap(),
+            WompiWebhookReference::ConnectorTransactionId("1234-1610641025-49201".to_string())
+        );
+    }
+
+    #[test]
+    fn webhook_payment_reference_trusts_a_signed_reference() {
+        let mut webhook = sample_webhook_body();
+        webhook
+            .signature
+            .properties
+            .push("transaction.reference".to_string());
+        assert_eq!(
+            webhook_payment_reference(&webhook).unwrap(),
+            WompiWebhookReference::AttemptReference("MZQ3X2DE2SMX".to_string())
+        );
+    }
+
+    #[test]
+    fn webhook_payment_reference_rejects_a_payload_that_signs_neither_key() {
+        let mut webhook = sample_webhook_body();
+        webhook.signature.properties = vec![
+            "transaction.status".to_string(),
+            "transaction.amount_in_cents".to_string(),
+        ];
+        assert!(webhook_payment_reference(&webhook).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Webhook event type mapping
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn map_webhook_event_covers_every_transaction_status() {
+        let mut webhook = sample_webhook_body();
+
+        webhook.data["transaction"]["status"] = serde_json::json!("APPROVED");
+        assert_eq!(
+            map_webhook_event(&webhook).unwrap(),
+            IncomingWebhookEvent::PaymentIntentSuccess
+        );
+
+        webhook.data["transaction"]["status"] = serde_json::json!("DECLINED");
+        assert_eq!(
+            map_webhook_event(&webhook).unwrap(),
+            IncomingWebhookEvent::PaymentIntentFailure
+        );
+
+        webhook.data["transaction"]["status"] = serde_json::json!("PENDING");
+        assert_eq!(
+            map_webhook_event(&webhook).unwrap(),
+            IncomingWebhookEvent::PaymentIntentProcessing
+        );
+    }
+
+    #[test]
+    fn map_webhook_event_ignores_non_transaction_events_before_parsing_data() {
+        let mut webhook = sample_webhook_body();
+        webhook.event = "nequi_token.updated".to_string();
+        // Unlike `transaction.updated`, this event carries no `transaction` object
+        // at all: if the event check ran after parsing `data`, this would error
+        // instead of resolving to `EventNotSupported`.
+        webhook.data = serde_json::json!({});
+        assert_eq!(
+            map_webhook_event(&webhook).unwrap(),
+            IncomingWebhookEvent::EventNotSupported
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Card PSync-by-reference selection (see `select_card_transaction`)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn select_card_transaction_prefers_approved_over_pending() {
+        let transactions = vec![
+            tx("1", WompiTransactionStatus::Pending, None),
+            tx("2", WompiTransactionStatus::Approved, None),
+        ];
+        let selected = select_card_transaction(transactions).expect("must select one");
+        assert_eq!(selected.id, "2");
+    }
+
+    #[test]
+    fn select_card_transaction_falls_back_to_pending() {
+        let transactions = vec![tx("1", WompiTransactionStatus::Pending, None)];
+        let selected = select_card_transaction(transactions).expect("must select one");
+        assert_eq!(selected.id, "1");
+    }
+
+    #[test]
+    fn select_card_transaction_picks_the_newest_terminal_failure() {
+        let transactions = vec![
+            tx(
+                "1",
+                WompiTransactionStatus::Declined,
+                Some("2024-01-01T00:00:00.000Z"),
+            ),
+            tx(
+                "2",
+                WompiTransactionStatus::Declined,
+                Some("2024-01-01T00:05:00.000Z"),
+            ),
+        ];
+        let selected = select_card_transaction(transactions).expect("must select one");
+        assert_eq!(selected.id, "2");
+    }
+
+    #[test]
+    fn select_card_transaction_empty_search_returns_none() {
+        assert!(select_card_transaction(vec![]).is_none());
+    }
+
+    #[test]
+    fn card_sync_by_reference_response_maps_the_selected_transaction() {
+        let router_data = authorize_router_data(
+            authorize_request_data(
+                PaymentMethodData::Card(test_card()),
+                enums::Currency::COP,
+                100000,
+                Some(common_utils::pii::Email::from_str("buyer@example.com").unwrap()),
+                None,
+            ),
+            enums::AuthenticationType::NoThreeDs,
+            Some(packed_access_token()),
+            Some("tok_test_x".to_string()),
+            "wompi-test-ref-8",
+        );
+        let transactions = vec![tx("txn-approved", WompiTransactionStatus::Approved, None)];
+        let result = card_sync_by_reference_response(transactions, router_data, 200);
+        assert_eq!(result.status, enums::AttemptStatus::Charged);
+    }
+
+    #[test]
+    fn card_sync_by_reference_response_empty_search_stays_pending_with_no_response_id() {
+        let router_data = authorize_router_data(
+            authorize_request_data(
+                PaymentMethodData::Card(test_card()),
+                enums::Currency::COP,
+                100000,
+                Some(common_utils::pii::Email::from_str("buyer@example.com").unwrap()),
+                None,
+            ),
+            enums::AuthenticationType::NoThreeDs,
+            Some(packed_access_token()),
+            Some("tok_test_x".to_string()),
+            "wompi-test-ref-9",
+        );
+        let result = card_sync_by_reference_response(vec![], router_data, 200);
+        assert_eq!(result.status, enums::AttemptStatus::Pending);
+        match result.response.expect("empty search must not be an Err") {
+            PaymentsResponseData::TransactionResponse { resource_id, .. } => {
+                assert!(matches!(resource_id, ResponseId::NoResponseId));
+            }
+            other => panic!("expected a TransactionResponse, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Authorize / PSync request-response conversions, built through a compact
+    // local RouterData builder (mirrors the pattern in
+    // `fiservemea::cert_payloads::router_data`).
+    // ------------------------------------------------------------------
+
+    fn test_auth() -> ConnectorAuthType {
+        ConnectorAuthType::SignatureKey {
+            api_key: Secret::new("pub_test_x".to_string()),
+            key1: Secret::new("prv_test_x".to_string()),
+            api_secret: Secret::new("test_integrity_x".to_string()),
+        }
+    }
+
+    fn packed_access_token() -> AccessToken {
+        let packed = WompiPackedAcceptanceTokens {
+            acceptance_token: Secret::new("acc_test_x".to_string()),
+            accept_personal_auth: Secret::new("pat_test_x".to_string()),
+        };
+        AccessToken {
+            token: Secret::new(serde_json::to_string(&packed).unwrap()),
+            expires: 300,
+        }
+    }
+
+    fn test_card() -> hyperswitch_domain_models::payment_method_data::Card {
+        hyperswitch_domain_models::payment_method_data::Card {
+            card_number: cards::CardNumber::from_str("4242424242424242").unwrap(),
+            card_exp_month: Secret::new("12".to_string()),
+            card_exp_year: Secret::new("2030".to_string()),
+            card_cvc: Secret::new("123".to_string()),
+            card_issuer: None,
+            card_network: None,
+            card_type: None,
+            card_issuing_country: None,
+            bank_code: None,
+            nick_name: None,
+            card_holder_name: Some(Secret::new("PXSOL TEST".to_string())),
+            co_badged_card_data: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_request_data(
+        payment_method_data: PaymentMethodData,
+        currency: enums::Currency,
+        amount_minor: i64,
+        email: Option<common_utils::pii::Email>,
+        router_return_url: Option<String>,
+    ) -> PaymentsAuthorizeData {
+        PaymentsAuthorizeData {
+            payment_method_data,
+            amount: amount_minor,
+            minor_amount: MinorUnit::new(amount_minor),
+            order_tax_amount: None,
+            email,
+            customer_name: None,
+            currency,
+            confirm: true,
+            statement_descriptor_suffix: None,
+            statement_descriptor: None,
+            capture_method: Some(enums::CaptureMethod::Automatic),
+            router_return_url,
+            webhook_url: None,
+            complete_authorize_url: None,
+            setup_future_usage: None,
+            mandate_id: None,
+            off_session: None,
+            customer_acceptance: None,
+            setup_mandate_details: None,
+            browser_info: None,
+            order_details: None,
+            order_category: None,
+            session_token: None,
+            enrolled_for_3ds: false,
+            related_transaction_id: None,
+            payment_experience: None,
+            payment_method_type: None,
+            surcharge_details: None,
+            customer_id: None,
+            request_incremental_authorization: false,
+            metadata: None,
+            authentication_data: None,
+            request_extended_authorization: None,
+            split_payments: None,
+            merchant_order_reference_id: None,
+            integrity_object: None,
+            shipping_cost: None,
+            additional_payment_method_data: None,
+            merchant_account_id: None,
+            merchant_config_currency: None,
+            connector_testing_data: None,
+            order_id: None,
+            locale: None,
+            payment_channel: None,
+            enable_partial_authorization: None,
+            enable_overcapture: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_router_data(
+        request: PaymentsAuthorizeData,
+        auth_type: enums::AuthenticationType,
+        access_token: Option<AccessToken>,
+        payment_method_token: Option<String>,
+        reference: &str,
+    ) -> PaymentsAuthorizeRouterData {
+        RouterData {
+            flow: std::marker::PhantomData,
+            merchant_id: common_utils::id_type::MerchantId::try_from(std::borrow::Cow::from(
+                "wompi",
+            ))
+            .unwrap(),
+            customer_id: None,
+            connector_customer: None,
+            connector: "wompi".to_string(),
+            payment_id: reference.to_string(),
+            attempt_id: reference.to_string(),
+            tenant_id: common_utils::id_type::TenantId::try_from_string("public".to_string())
+                .unwrap(),
+            status: enums::AttemptStatus::default(),
+            payment_method: enums::PaymentMethod::Card,
+            connector_auth_type: test_auth(),
+            description: None,
+            address: hyperswitch_domain_models::payment_address::PaymentAddress::default(),
+            auth_type,
+            connector_meta_data: None,
+            connector_wallets_details: None,
+            amount_captured: None,
+            access_token,
+            session_token: None,
+            reference_id: None,
+            payment_method_token: payment_method_token.map(|token| {
+                hyperswitch_domain_models::router_data::PaymentMethodToken::Token(Secret::new(
+                    token,
+                ))
+            }),
+            recurring_mandate_payment_data: None,
+            preprocessing_id: None,
+            payment_method_balance: None,
+            connector_api_version: None,
+            request,
+            response: Err(ErrorResponse::default()),
+            connector_request_reference_id: reference.to_string(),
+            #[cfg(feature = "payouts")]
+            payout_method_data: None,
+            #[cfg(feature = "payouts")]
+            quote_id: None,
+            test_mode: Some(true),
+            connector_http_status_code: None,
+            external_latency: None,
+            apple_pay_flow: None,
+            frm_metadata: None,
+            dispute_id: None,
+            refund_id: None,
+            connector_response: None,
+            payment_method_status: None,
+            minor_amount_captured: None,
+            minor_amount_capturable: None,
+            integrity_check: Ok(()),
+            additional_merchant_data: None,
+            header_payload: None,
+            connector_mandate_request_reference_id: None,
+            l2_l3_data: None,
+            authentication_id: None,
+            psd2_sca_exemption_type: None,
+            raw_connector_response: None,
+            is_payment_id_from_merchant: None,
+        }
+    }
+
+    #[test]
+    fn authorize_rejects_non_cop_currency() {
+        let request = authorize_request_data(
+            PaymentMethodData::Card(test_card()),
+            enums::Currency::USD,
+            100000,
+            Some(common_utils::pii::Email::from_str("buyer@example.com").unwrap()),
+            None,
+        );
+        let router_data = authorize_router_data(
+            request,
+            enums::AuthenticationType::NoThreeDs,
+            Some(packed_access_token()),
+            Some("tok_test_x".to_string()),
+            "wompi-test-ref-1",
+        );
+        let amount = MinorUnit::new(100000);
+        let wompi_router_data = WompiRouterData::from((amount, &router_data));
+        let result = WompiTransactionsRequest::try_from(&wompi_router_data);
+        assert!(matches!(
+            result.unwrap_err().current_context(),
+            errors::ConnectorError::CurrencyNotSupported { .. }
+        ));
+    }
+
+    #[test]
+    fn authorize_rejects_three_ds() {
+        let request = authorize_request_data(
+            PaymentMethodData::Card(test_card()),
+            enums::Currency::COP,
+            100000,
+            Some(common_utils::pii::Email::from_str("buyer@example.com").unwrap()),
+            None,
+        );
+        let router_data = authorize_router_data(
+            request,
+            enums::AuthenticationType::ThreeDs,
+            Some(packed_access_token()),
+            Some("tok_test_x".to_string()),
+            "wompi-test-ref-2",
+        );
+        let amount = MinorUnit::new(100000);
+        let wompi_router_data = WompiRouterData::from((amount, &router_data));
+        let result = WompiTransactionsRequest::try_from(&wompi_router_data);
+        assert!(matches!(
+            result.unwrap_err().current_context(),
+            errors::ConnectorError::NotSupported { .. }
+        ));
+    }
+
+    #[test]
+    fn authorize_requires_email() {
+        let request = authorize_request_data(
+            PaymentMethodData::Card(test_card()),
+            enums::Currency::COP,
+            100000,
+            None,
+            None,
+        );
+        let router_data = authorize_router_data(
+            request,
+            enums::AuthenticationType::NoThreeDs,
+            Some(packed_access_token()),
+            Some("tok_test_x".to_string()),
+            "wompi-test-ref-3",
+        );
+        let amount = MinorUnit::new(100000);
+        let wompi_router_data = WompiRouterData::from((amount, &router_data));
+        let result = WompiTransactionsRequest::try_from(&wompi_router_data);
+        assert!(matches!(
+            result.unwrap_err().current_context(),
+            errors::ConnectorError::MissingRequiredField {
+                field_name: "email"
+            }
+        ));
+    }
+
+    #[test]
+    fn authorize_requires_access_token() {
+        let request = authorize_request_data(
+            PaymentMethodData::Card(test_card()),
+            enums::Currency::COP,
+            100000,
+            Some(common_utils::pii::Email::from_str("buyer@example.com").unwrap()),
+            None,
+        );
+        let router_data = authorize_router_data(
+            request,
+            enums::AuthenticationType::NoThreeDs,
+            None,
+            Some("tok_test_x".to_string()),
+            "wompi-test-ref-4",
+        );
+        let amount = MinorUnit::new(100000);
+        let wompi_router_data = WompiRouterData::from((amount, &router_data));
+        let result = WompiTransactionsRequest::try_from(&wompi_router_data);
+        assert!(matches!(
+            result.unwrap_err().current_context(),
+            errors::ConnectorError::FailedToObtainAuthType
+        ));
+    }
+
+    #[test]
+    fn authorize_happy_path_serializes_expected_fields() {
+        let mut request = authorize_request_data(
+            PaymentMethodData::Card(test_card()),
+            enums::Currency::COP,
+            250000,
+            Some(common_utils::pii::Email::from_str("buyer@example.com").unwrap()),
+            None,
+        );
+        request.metadata = Some(serde_json::json!({"installments": 3}));
+        let router_data = authorize_router_data(
+            request,
+            enums::AuthenticationType::NoThreeDs,
+            Some(packed_access_token()),
+            Some("tok_test_x".to_string()),
+            "wompi-test-ref-5",
+        );
+        let amount = MinorUnit::new(250000);
+        let wompi_router_data = WompiRouterData::from((amount, &router_data));
+        let connector_request = WompiTransactionsRequest::try_from(&wompi_router_data)
+            .expect("happy path must build a request");
+
+        assert!(matches!(
+            connector_request.payment_method.payment_method_type,
+            WompiPaymentMethodType::Card
+        ));
+        assert_eq!(connector_request.payment_method.installments, 3);
+        assert_eq!(connector_request.reference, "wompi-test-ref-5");
+
+        let expected_signature = build_integrity_signature(
+            "wompi-test-ref-5",
+            amount,
+            "COP",
+            &Secret::new("test_integrity_x".to_string()),
+        )
+        .unwrap();
+        assert_eq!(connector_request.signature, expected_signature);
+    }
+
+    #[test]
+    fn declined_transaction_becomes_an_error_response() {
+        let request = authorize_request_data(
+            PaymentMethodData::Card(test_card()),
+            enums::Currency::COP,
+            100000,
+            Some(common_utils::pii::Email::from_str("buyer@example.com").unwrap()),
+            None,
+        );
+        let router_data = authorize_router_data(
+            request,
+            enums::AuthenticationType::NoThreeDs,
+            Some(packed_access_token()),
+            Some("tok_test_x".to_string()),
+            "wompi-test-ref-6",
+        );
+        let transaction = WompiTransactionData {
+            id: "txn_declined_1".to_string(),
+            reference: "wompi-test-ref-6".to_string(),
+            status: WompiTransactionStatus::Declined,
+            status_message: Some("Fondos insuficientes".to_string()),
+            created_at: None,
+            finalized_at: None,
+        };
+        let result = transaction_to_router_data(transaction, router_data, 200);
+        assert_eq!(result.status, enums::AttemptStatus::Failure);
+        let error = result
+            .response
+            .expect_err("a declined transaction must be an Err");
+        assert_eq!(error.attempt_status, Some(enums::AttemptStatus::Failure));
+        assert_eq!(error.code, "DECLINED");
+        assert_eq!(error.message, "Fondos insuficientes");
+    }
+
+    #[test]
+    fn hosted_checkout_merchant_response_builds_the_redirect_form() {
+        let request = authorize_request_data(
+            PaymentMethodData::Wallet(WalletData::WompiCheckout {}),
+            enums::Currency::COP,
+            150000,
+            None,
+            Some("https://example.com/return".to_string()),
+        );
+        let router_data = authorize_router_data(
+            request,
+            enums::AuthenticationType::NoThreeDs,
+            None,
+            None,
+            "wompi-test-ref-7",
+        );
+
+        let merchant_response = WompiMerchantResponse {
+            data: WompiMerchantData {
+                active: true,
+                presigned_acceptance: WompiPresignedToken {
+                    acceptance_token: Secret::new("acc_x".to_string()),
+                },
+                presigned_personal_data_auth: WompiPresignedToken {
+                    acceptance_token: Secret::new("pat_x".to_string()),
+                },
+            },
+        };
+
+        let response_router_data = ResponseRouterData {
+            response: merchant_response,
+            data: router_data,
+            http_code: 200,
+        };
+
+        let result = PaymentsAuthorizeRouterData::try_from(response_router_data)
+            .expect("hosted checkout conversion must succeed");
+
+        assert_eq!(result.status, enums::AttemptStatus::AuthenticationPending);
+
+        match result.response.expect("must be a TransactionResponse") {
+            PaymentsResponseData::TransactionResponse {
+                redirection_data, ..
+            } => match *redirection_data {
+                Some(RedirectForm::Form {
+                    endpoint,
+                    method,
+                    form_fields,
+                }) => {
+                    assert_eq!(endpoint, WOMPI_CHECKOUT_ENDPOINT);
+                    assert_eq!(method, Method::Get);
+                    assert_eq!(
+                        form_fields.get("public-key"),
+                        Some(&"pub_test_x".to_string())
+                    );
+                    assert_eq!(
+                        form_fields.get("amount-in-cents"),
+                        Some(&"150000".to_string())
+                    );
+                    assert_eq!(
+                        form_fields.get("reference"),
+                        Some(&"wompi-test-ref-7".to_string())
+                    );
+                    let expected_signature = build_integrity_signature(
+                        "wompi-test-ref-7",
+                        MinorUnit::new(150000),
+                        "COP",
+                        &Secret::new("test_integrity_x".to_string()),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        form_fields.get("signature:integrity"),
+                        Some(&expected_signature)
+                    );
+                    assert_eq!(
+                        form_fields.get("redirect-url"),
+                        Some(&"https://example.com/return".to_string())
+                    );
+                }
+                other => panic!("expected a RedirectForm::Form, got {other:?}"),
+            },
+            other => panic!("expected a TransactionResponse, got {other:?}"),
+        }
     }
 }

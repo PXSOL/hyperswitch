@@ -1,5 +1,7 @@
-use hyperswitch_domain_models::payment_method_data::{Card, PaymentMethodData};
-use masking::Secret;
+use hyperswitch_domain_models::{
+    payment_method_data::{PaymentMethodData, WalletData},
+    router_response_types::RedirectForm,
+};
 use router::types::{self, api, storage::enums};
 use test_utils::connector_auth;
 
@@ -39,88 +41,58 @@ fn get_default_payment_info() -> Option<utils::PaymentInfo> {
     None
 }
 
-fn payment_method_details() -> Option<types::PaymentsAuthorizeData> {
-    None
-}
+// Card flows (Authorize/PSync) go through the router's own access-token fetch and
+// connector-tokenization step before ever reaching this connector, and every Wompi
+// transaction starts PENDING regardless of card validity anyway — none of which this
+// harness (which calls Authorize directly, skipping both prerequisites) can
+// reproduce. Card behavior is exercised end to end through the full router instead;
+// here we only drive what this harness genuinely can run standalone.
 
-// Cards Positive Tests
-// Creates a payment using the automatic capture flow (Non 3DS). Wompi only
-// supports automatic capture (manual/void are not part of this contract yet).
+// Hosted checkout Authorize is a self-contained GET /merchants/{public_key} lookup:
+// it needs neither an access token nor a payment method token, so this harness can
+// call it directly and get a real response back from Wompi.
 #[actix_web::test]
-async fn should_make_payment() {
+#[ignore = "needs Wompi sandbox keys in sample_auth.toml"]
+async fn should_authorize_hosted_checkout_payment() {
     let authorize_response = CONNECTOR
-        .make_payment(payment_method_details(), get_default_payment_info())
-        .await
-        .unwrap();
-    assert_eq!(authorize_response.status, enums::AttemptStatus::Charged);
-}
-
-// Synchronizes a payment using the automatic capture flow (Non 3DS).
-#[actix_web::test]
-async fn should_sync_auto_captured_payment() {
-    let authorize_response = CONNECTOR
-        .make_payment(payment_method_details(), get_default_payment_info())
-        .await
-        .unwrap();
-    assert_eq!(authorize_response.status, enums::AttemptStatus::Charged);
-    let txn_id = utils::get_connector_transaction_id(authorize_response.response);
-    assert_ne!(txn_id, None, "Empty connector transaction id");
-    let response = CONNECTOR
-        .psync_retry_till_status_matches(
-            enums::AttemptStatus::Charged,
-            Some(types::PaymentsSyncData {
-                connector_transaction_id: types::ResponseId::ConnectorTransactionId(
-                    txn_id.unwrap(),
-                ),
-                capture_method: Some(enums::CaptureMethod::Automatic),
-                ..Default::default()
-            }),
-            get_default_payment_info(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status, enums::AttemptStatus::Charged,);
-}
-
-// Cards Negative scenarios
-// Creates a payment with incorrect CVC.
-#[actix_web::test]
-async fn should_fail_payment_for_incorrect_cvc() {
-    let response = CONNECTOR
         .make_payment(
             Some(types::PaymentsAuthorizeData {
-                payment_method_data: PaymentMethodData::Card(Card {
-                    card_cvc: Secret::new("12345".to_string()),
-                    ..utils::CCardType::default().0
-                }),
+                payment_method_data: PaymentMethodData::Wallet(WalletData::WompiCheckout {}),
+                currency: enums::Currency::COP,
+                amount: 150000,
+                minor_amount: types::MinorUnit::new(150000),
+                router_return_url: Some("https://hyperswitch.io/return".to_string()),
                 ..utils::PaymentAuthorizeType::default().0
             }),
             get_default_payment_info(),
         )
         .await
         .unwrap();
-    assert!(response.response.is_err());
+
+    assert_eq!(
+        authorize_response.status,
+        enums::AttemptStatus::AuthenticationPending
+    );
+
+    match authorize_response
+        .response
+        .expect("hosted checkout must return a TransactionResponse")
+    {
+        types::PaymentsResponseData::TransactionResponse {
+            redirection_data, ..
+        } => match *redirection_data {
+            Some(RedirectForm::Form { endpoint, .. }) => {
+                assert_eq!(endpoint, "https://checkout.wompi.co/p/");
+            }
+            other => panic!("expected a RedirectForm::Form, got {other:?}"),
+        },
+        other => panic!("expected a TransactionResponse, got {other:?}"),
+    }
 }
 
-// Creates a payment with incorrect expiry month.
-#[actix_web::test]
-async fn should_fail_payment_for_invalid_exp_month() {
-    let response = CONNECTOR
-        .make_payment(
-            Some(types::PaymentsAuthorizeData {
-                payment_method_data: PaymentMethodData::Card(Card {
-                    card_exp_month: Secret::new("20".to_string()),
-                    ..utils::CCardType::default().0
-                }),
-                ..utils::PaymentAuthorizeType::default().0
-            }),
-            get_default_payment_info(),
-        )
-        .await
-        .unwrap();
-    assert!(response.response.is_err());
-}
-
+// PSync-by-id only needs the public key (no access token/pm token prerequisite), so
+// this harness can also drive it directly: a bogus connector transaction id must
+// fail the sync.
 // Captures a payment using invalid connector payment id (PSync on a
 // non-existent transaction id should fail).
 #[actix_web::test]

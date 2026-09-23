@@ -126,9 +126,9 @@ impl ConnectorCommon for Wompi {
         &self,
         auth_type: &ConnectorAuthType,
     ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
-        // Default (public-key) credential, correct for every flow except the
-        // hosted-checkout PSync search, which overrides `get_headers` itself to use
-        // the private key instead.
+        // Default (public-key) credential, correct for every flow except a PSync
+        // search by reference (see `syncs_by_reference`), which overrides
+        // `get_headers` itself to use the private key instead.
         let auth = wompi::WompiAuthType::try_from(auth_type)?;
         Ok(vec![(
             headers::AUTHORIZATION.to_string(),
@@ -141,26 +141,41 @@ impl ConnectorCommon for Wompi {
         res: Response,
         event_builder: Option<&mut ConnectorEvent>,
     ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
-        let response: wompi::WompiErrorResponse =
-            res.response
-                .parse_struct("WompiErrorResponse")
-                .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+        let response: CustomResult<wompi::WompiErrorResponse, common_utils::errors::ParsingError> =
+            res.response.parse_struct("WompiErrorResponse");
 
-        event_builder.map(|i| i.set_error_response_body(&response));
-        router_env::logger::info!(connector_response=?response);
+        match response {
+            Ok(response) => {
+                event_builder.map(|i| i.set_error_response_body(&response));
+                router_env::logger::info!(connector_response=?response);
 
-        Ok(ErrorResponse {
-            status_code: res.status_code,
-            code: response.error.error_type.clone(),
-            message: response.error.combined_reason(),
-            reason: Some(response.error.combined_reason()),
-            attempt_status: None,
-            connector_transaction_id: None,
-            network_advice_code: None,
-            network_decline_code: None,
-            network_error_message: None,
-            connector_metadata: None,
-        })
+                Ok(ErrorResponse {
+                    status_code: res.status_code,
+                    code: response.error.error_type.clone(),
+                    message: response.error.combined_reason(),
+                    reason: Some(response.error.combined_reason()),
+                    attempt_status: None,
+                    connector_transaction_id: None,
+                    network_advice_code: None,
+                    network_decline_code: None,
+                    network_error_message: None,
+                    connector_metadata: None,
+                })
+            }
+            // Not every error Wompi can return is JSON (e.g. an HTML 502 from its
+            // edge/proxy layer during an outage), so a body that fails to parse as
+            // `WompiErrorResponse` is not necessarily a bug in this connector.
+            Err(error) => {
+                event_builder.map(|event| {
+                    event.set_error(serde_json::json!({
+                        "error": res.response.escape_ascii().to_string(),
+                        "status_code": res.status_code
+                    }))
+                });
+                router_env::logger::error!(deserialization_error=?error);
+                utils::handle_json_response_deserialization_failure(res, "wompi")
+            }
+        }
     }
 }
 
@@ -174,7 +189,10 @@ impl ConnectorValidation for Wompi {
     ) -> CustomResult<(), errors::ConnectorError> {
         // A hosted-checkout (wallet) attempt syncs by `connector_request_reference_id`
         // (GET /transactions?reference=...) and has no connector_transaction_id until
-        // the buyer pays, so having one is not a precondition for PSync here.
+        // the buyer pays. A CARD attempt can also reach PSync without one (its POST
+        // /transactions timed out after Wompi accepted it), and is resolved the same
+        // way. So having a connector_transaction_id is never a precondition for PSync
+        // here (see `syncs_by_reference`).
         Ok(())
     }
 }
@@ -191,6 +209,18 @@ fn get_wompi_base_url<'a>(
         wompi::WompiEnvironment::Production => Ok(connectors.wompi.base_url.as_str()),
         wompi::WompiEnvironment::Sandbox => Ok(connectors.wompi.secondary_base_url.as_str()),
     }
+}
+
+/// True when this PSync must search `GET /transactions?reference=` instead of
+/// trusting a known connector transaction id: the hosted-checkout flow always does
+/// (it never has one until the buyer pays), and so does a CARD attempt whose POST
+/// /transactions timed out after Wompi accepted it — a retry that trusted the
+/// (missing) id would have nothing to sync, and a retry that resubmitted the same
+/// `reference` to POST /transactions again would get a 422 from Wompi, so this
+/// searches for whatever Wompi ended up creating instead.
+fn syncs_by_reference(req: &PaymentsSyncRouterData) -> bool {
+    req.payment_method == enums::PaymentMethod::Wallet
+        || req.request.get_connector_transaction_id().is_err()
 }
 
 // ============================================================================
@@ -497,7 +527,8 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
 }
 
 // ============================================================================
-// PSync — card: GET /transactions/{id} (public key) ; hosted: ALWAYS
+// PSync — card (known id): GET /transactions/{id} (public key) ; hosted, and a
+// card attempt with no known id yet (see `syncs_by_reference`): ALWAYS
 // GET /transactions?reference={connector_request_reference_id} (private key),
 // never the buyer-controllable redirect `?id=`.
 // ============================================================================
@@ -508,7 +539,7 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Wom
         req: &PaymentsSyncRouterData,
         connectors: &Connectors,
     ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
-        if req.payment_method == enums::PaymentMethod::Wallet {
+        if syncs_by_reference(req) {
             let auth = wompi::WompiAuthType::try_from(&req.connector_auth_type)?;
             Ok(vec![
                 (
@@ -536,10 +567,12 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Wom
     ) -> CustomResult<String, errors::ConnectorError> {
         let auth = wompi::WompiAuthType::try_from(&req.connector_auth_type)?;
         let base_url = get_wompi_base_url(&auth, connectors)?;
-        if req.payment_method == enums::PaymentMethod::Wallet {
+        if syncs_by_reference(req) {
             // A retry can supersede an earlier PENDING attempt with a new connector
-            // transaction id under the same reference, so this always searches by
-            // reference (private key) rather than trusting a previously-seen id.
+            // transaction id under the same reference (or, for a card, simply never
+            // produce one because the POST timed out after Wompi accepted it), so
+            // this always searches by reference (private key) rather than trusting a
+            // previously-seen id.
             Ok(format!(
                 "{base_url}/transactions?reference={}",
                 req.connector_request_reference_id
@@ -585,6 +618,21 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Wom
                 data: data.clone(),
                 http_code: res.status_code,
             })
+        } else if syncs_by_reference(data) {
+            // A CARD retried by reference must NOT apply the hosted-checkout buyer-
+            // retry window: there is no buyer retry to wait out here, POST
+            // /transactions either created the charge or it did not.
+            let response: wompi::WompiSearchResponse = res
+                .response
+                .parse_struct("WompiSearchResponse")
+                .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+            event_builder.map(|i| i.set_response_body(&response));
+            router_env::logger::info!(connector_response=?response);
+            Ok(wompi::card_sync_by_reference_response(
+                response.data,
+                data.clone(),
+                res.status_code,
+            ))
         } else {
             let response: wompi::WompiTransactionResponse = res
                 .response
@@ -689,19 +737,24 @@ impl IncomingWebhook for Wompi {
                 .body
                 .parse_struct("WompiWebhookBody")
                 .change_context(errors::ConnectorError::WebhookReferenceIdNotFound)?;
-        let transaction: wompi::WompiWebhookTransaction = serde_json::from_value(
-            webhook_body
-                .data
-                .get("transaction")
-                .cloned()
-                .ok_or(errors::ConnectorError::WebhookReferenceIdNotFound)?,
-        )
-        .change_context(errors::ConnectorError::WebhookReferenceIdNotFound)?;
-        // `connector_request_reference_id` defaults to the payment ATTEMPT id
-        // (`generate_connector_request_reference_id`, v1, config disabled by default),
-        // which is exactly what we sent Wompi as `reference`.
+        let payment_id_type = match wompi::webhook_payment_reference(&webhook_body)? {
+            // `connector_request_reference_id` defaults to the payment ATTEMPT id
+            // (`generate_connector_request_reference_id`, v1, config disabled by
+            // default), which is exactly what we sent Wompi as `reference` — but this
+            // is only trustworthy when `signature.properties` itself lists
+            // `transaction.reference`, since that is what makes it SIGNED data.
+            wompi::WompiWebhookReference::AttemptReference(reference) => {
+                api_models::payments::PaymentIdType::PaymentAttemptId(reference)
+            }
+            // `transaction.reference` is not signed in this payload but `transaction.id`
+            // is, so look the attempt up by Wompi's own id rather than trust an
+            // editable field (see `webhook_payment_reference`).
+            wompi::WompiWebhookReference::ConnectorTransactionId(id) => {
+                api_models::payments::PaymentIdType::ConnectorTransactionId(id)
+            }
+        };
         Ok(api_models::webhooks::ObjectReferenceId::PaymentId(
-            api_models::payments::PaymentIdType::PaymentAttemptId(transaction.reference),
+            payment_id_type,
         ))
     }
 
@@ -714,28 +767,7 @@ impl IncomingWebhook for Wompi {
                 .body
                 .parse_struct("WompiWebhookBody")
                 .change_context(errors::ConnectorError::WebhookEventTypeNotFound)?;
-        if webhook_body.event != "transaction.updated" {
-            // `nequi_token.updated`, `bancolombia_transfer_token.updated`, and any
-            // future event Wompi's docs warn the list "can grow" all land here.
-            return Ok(IncomingWebhookEvent::EventNotSupported);
-        }
-        let transaction: wompi::WompiWebhookTransaction = serde_json::from_value(
-            webhook_body
-                .data
-                .get("transaction")
-                .cloned()
-                .ok_or(errors::ConnectorError::WebhookEventTypeNotFound)?,
-        )
-        .change_context(errors::ConnectorError::WebhookEventTypeNotFound)?;
-        Ok(match transaction.status {
-            wompi::WompiTransactionStatus::Approved => IncomingWebhookEvent::PaymentIntentSuccess,
-            wompi::WompiTransactionStatus::Declined | wompi::WompiTransactionStatus::Error => {
-                IncomingWebhookEvent::PaymentIntentFailure
-            }
-            wompi::WompiTransactionStatus::Pending => IncomingWebhookEvent::PaymentIntentProcessing,
-            wompi::WompiTransactionStatus::Voided => IncomingWebhookEvent::PaymentIntentCancelled,
-            wompi::WompiTransactionStatus::Unknown => IncomingWebhookEvent::EventNotSupported,
-        })
+        wompi::map_webhook_event(&webhook_body)
     }
 
     fn get_webhook_resource_object(

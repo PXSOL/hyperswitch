@@ -220,6 +220,8 @@ worldpayvantiv.third_base_url = "https://services.vantivprelive.com"
 worldpayxml.base_url = "https://secure-test.worldpay.com/jsp/merchant/xml/paymentService.jsp"
 xendit.base_url = "https://api.xendit.co"
 wise.base_url = "https://api.sandbox.transferwise.tech/"
+# wompi: base_url is production and secondary_base_url is sandbox in every environment; the
+# connector picks one per request from the key prefix (pub_test_ / pub_prod_).
 wompi.base_url = "https://production.wompi.co/v1"
 wompi.secondary_base_url = "https://sandbox.wompi.co/v1"
 zen.base_url = "https://api.zen-test.com/"
@@ -694,7 +696,6 @@ wompi = { country = "CO", currency = "COP" }
 
 #tokenization configuration which describe token lifetime and payment method for specific connector
 [tokenization]
-wompi = { long_lived_token = false, payment_method = "card" }
 stripe = { long_lived_token = false, payment_method = "wallet", payment_method_type = { type = "disable_only", list = "google_pay" } }
 checkout = { long_lived_token = false, payment_method = "wallet", apple_pay_pre_decrypt_flow = "network_tokenization" }
 mollie = { long_lived_token = false, payment_method = "card" }
@@ -705,6 +706,9 @@ globalpay = { long_lived_token = false, payment_method = "card", flow = "mandate
 dwolla = { long_lived_token = true, payment_method = "bank_debit" }
 payway = { long_lived_token = false, payment_method = "card" }
 mercadopago = { long_lived_token = false, payment_method = "card" }
+# wompi: every card payment is tokenized (POST /tokens/cards) right before the charge, so no
+# `flow` filter on purpose.
+wompi = { long_lived_token = false, payment_method = "card" }
 
 [connector_customer]
 connector_list = "authorizedotnet,dwolla,facilitapay,gocardless,hyperswitch_vault,stax,stripe"
