@@ -1814,6 +1814,47 @@ mod tests {
             map_webhook_event(&webhook).unwrap(),
             IncomingWebhookEvent::PaymentIntentProcessing
         );
+
+        webhook.data["transaction"]["status"] = serde_json::json!("ERROR");
+        assert_eq!(
+            map_webhook_event(&webhook).unwrap(),
+            IncomingWebhookEvent::PaymentIntentFailure
+        );
+
+        webhook.data["transaction"]["status"] = serde_json::json!("VOIDED");
+        assert_eq!(
+            map_webhook_event(&webhook).unwrap(),
+            IncomingWebhookEvent::PaymentIntentCancelled
+        );
+
+        webhook.data["transaction"]["status"] = serde_json::json!("SOMETHING_NEW");
+        assert_eq!(
+            map_webhook_event(&webhook).unwrap(),
+            IncomingWebhookEvent::EventNotSupported
+        );
+    }
+
+    #[test]
+    fn non_json_error_body_becomes_a_structured_error() {
+        use hyperswitch_interfaces::api::ConnectorCommon;
+
+        // An HTML page from Wompi's edge (e.g. a 502 during an outage) must not
+        // surface as a deserialization failure that drops the status code.
+        let error = crate::connectors::wompi::Wompi::new()
+            .build_error_response(
+                hyperswitch_interfaces::types::Response {
+                    headers: None,
+                    response: bytes::Bytes::from_static(b"<html>502 Bad Gateway</html>"),
+                    status_code: 502,
+                },
+                None,
+            )
+            .expect("a non-JSON error body must still produce an ErrorResponse");
+        assert_eq!(error.status_code, 502);
+        assert!(error
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("502 Bad Gateway")));
     }
 
     #[test]
