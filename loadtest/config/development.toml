@@ -220,6 +220,8 @@ worldpayvantiv.third_base_url = "https://services.vantivprelive.com"
 worldpayxml.base_url = "https://secure-test.worldpay.com/jsp/merchant/xml/paymentService.jsp"
 xendit.base_url = "https://api.xendit.co"
 wise.base_url = "https://api.sandbox.transferwise.tech/"
+wompi.base_url = "https://production.wompi.co/v1"
+wompi.secondary_base_url = "https://sandbox.wompi.co/v1"
 zen.base_url = "https://api.zen-test.com/"
 zen.secondary_base_url = "https://secure.zen-test.com/"
 zsl.base_url = "https://api.sitoffalb.net/"
@@ -685,8 +687,14 @@ apple_pay = { country = "US,CA,IL,GB", currency = "ILS,USD,EUR" }
 [pm_filters.payway]
 credit = { country = "AR", currency = "ARS" }
 
+[pm_filters.wompi]
+credit = { country = "CO", currency = "COP" }
+debit = { country = "CO", currency = "COP" }
+wompi = { country = "CO", currency = "COP" }
+
 #tokenization configuration which describe token lifetime and payment method for specific connector
 [tokenization]
+wompi = { long_lived_token = false, payment_method = "card" }
 stripe = { long_lived_token = false, payment_method = "wallet", payment_method_type = { type = "disable_only", list = "google_pay" } }
 checkout = { long_lived_token = false, payment_method = "wallet", apple_pay_pre_decrypt_flow = "network_tokenization" }
 mollie = { long_lived_token = false, payment_method = "card" }

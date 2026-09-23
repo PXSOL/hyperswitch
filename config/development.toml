@@ -351,6 +351,8 @@ thunes.base_url = "https://api.limonetikqualif.com/"
 tokenio.base_url = "https://api.sandbox.token.io"
 stripe.base_url_file_upload = "https://files.stripe.com/"
 wise.base_url = "https://api.sandbox.transferwise.tech/"
+wompi.base_url = "https://production.wompi.co/v1"
+wompi.secondary_base_url = "https://sandbox.wompi.co/v1"
 worldline.base_url = "https://eu.sandbox.api-ingenico.com/"
 worldpay.base_url = "https://try.access.worldpay.com/"
 worldpayvantiv.base_url = "https://transact.vantivprelive.com/vap/communicator/online"
@@ -995,7 +997,13 @@ apple_pay = { country = "US,CA,IL,GB", currency = "ILS,USD,EUR" }
 [pm_filters.payway]
 credit = { country = "AR", currency = "ARS" }
 
+[pm_filters.wompi]
+credit = { country = "CO", currency = "COP" }
+debit = { country = "CO", currency = "COP" }
+wompi = { country = "CO", currency = "COP" }
+
 [tokenization]
+wompi = { long_lived_token = false, payment_method = "card" }
 # `flow = "mandates"` no es opcional: sin él el filtro del router acepta cualquier pago, y toda
 # venta con tarjeta se cursaría como PaymentTokenSaleTransaction en vez del PaymentCardSaleTransaction
 # con PAN que documenta el vendor, además de romper el 3DS, que la rama de token no soporta.

@@ -248,6 +248,8 @@ volt.base_url = "https://api.sandbox.volt.io/"
 wellsfargo.base_url = "https://apitest.cybersource.com/"
 wellsfargopayout.base_url = "https://api-sandbox.wellsfargo.com/"
 wise.base_url = "https://api.sandbox.transferwise.tech/"
+wompi.base_url = "https://production.wompi.co/v1"
+wompi.secondary_base_url = "https://sandbox.wompi.co/v1"
 worldline.base_url = "https://eu.sandbox.api-ingenico.com/"
 worldpay.base_url = "https://try.access.worldpay.com/"
 worldpayvantiv.base_url = "https://transact.vantivprelive.com/vap/communicator/online"
@@ -396,8 +398,14 @@ port = 3000
 host = "127.0.0.1"
 workers = 1
 
+[pm_filters.wompi]
+credit = { country = "CO", currency = "COP" }
+debit = { country = "CO", currency = "COP" }
+wompi = { country = "CO", currency = "COP" }
+
 #tokenization configuration which describe token lifetime and payment method for specific connector
 [tokenization]
+wompi = { long_lived_token = false, payment_method = "card" }
 # `flow = "mandates"` no es opcional: sin él el filtro del router acepta cualquier pago, y toda
 # venta con tarjeta se cursaría como PaymentTokenSaleTransaction en vez del PaymentCardSaleTransaction
 # con PAN que documenta el vendor, además de romper el 3DS, que la rama de token no soporta.

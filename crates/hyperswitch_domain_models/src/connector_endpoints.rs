@@ -137,6 +137,7 @@ pub struct Connectors {
     pub wellsfargo: ConnectorParams,
     pub wellsfargopayout: ConnectorParams,
     pub wise: ConnectorParams,
+    pub wompi: ConnectorParamsWithSecondaryBaseUrl,
     pub worldline: ConnectorParams,
     pub worldpay: ConnectorParams,
     pub worldpayvantiv: ConnectorParamsWithThreeUrls,
@@ -257,4 +258,3 @@ pub struct ConnectorParamsWithThreeUrls {
     /// third base url
     pub third_base_url: String,
 }
-
