@@ -130,6 +130,7 @@ pub fn validate_payment_method_type_against_payment_method(
                 | api_enums::PaymentMethodType::Paze
                 | api_enums::PaymentMethodType::RevolutPay
                 | api_enums::PaymentMethodType::MercadoPago
+                | api_enums::PaymentMethodType::Wompi
         ),
         api_enums::PaymentMethod::BankRedirect => matches!(
             payment_method_type,

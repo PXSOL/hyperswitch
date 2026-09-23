@@ -88,6 +88,7 @@ pub enum WalletType {
     MbWay,
     MercadoPago,
     MobilePay,
+    Wompi,
     WeChatPay,
     SamsungPay,
     GoPay,

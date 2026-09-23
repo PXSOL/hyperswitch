@@ -1608,6 +1608,7 @@ where
                 | WalletData::RevolutPay(_)
                 | WalletData::Mifinity(_)
                 | WalletData::MercadoPagoSdk(_)
+                | WalletData::WompiCheckout {}
                 | WalletData::MercadoPagoCheckoutPro {} => {
                     Err(errors::ConnectorError::NotImplemented(
                         utils::get_unimplemented_payment_method_error_message("nuvei"),

@@ -2892,6 +2892,7 @@ impl GetPaymentMethodType for WalletData {
             Self::MercadoPagoSdk(_) | Self::MercadoPagoCheckoutPro {} => {
                 api_enums::PaymentMethodType::MercadoPago
             }
+            Self::WompiCheckout {} => api_enums::PaymentMethodType::Wompi,
             Self::Paze(_) => api_enums::PaymentMethodType::Paze,
             Self::SamsungPay(_) => api_enums::PaymentMethodType::SamsungPay,
             Self::TwintRedirect {} => api_enums::PaymentMethodType::Twint,
@@ -3904,6 +3905,9 @@ pub enum WalletData {
     /// The wallet data for Mercado Pago Checkout Pro (hosted checkout redirect)
     #[schema(title = "MercadoPagoCheckoutPro")]
     MercadoPagoCheckoutPro {},
+    /// The wallet data for Wompi's hosted checkout redirect (Wompi Colombia)
+    #[schema(title = "WompiCheckout")]
+    WompiCheckout {},
     /// The wallet data for Paysera
     #[schema(title = "Paysera")]
     Paysera(PayseraData),
@@ -3985,6 +3989,7 @@ impl GetAddressFromPaymentMethodData for WalletData {
             | Self::PaypalSdk(_)
             | Self::MercadoPagoSdk(_)
             | Self::MercadoPagoCheckoutPro {}
+            | Self::WompiCheckout {}
             | Self::Paze(_)
             | Self::SamsungPay(_)
             | Self::TwintRedirect {}

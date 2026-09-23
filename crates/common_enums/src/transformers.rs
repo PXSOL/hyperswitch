@@ -1885,6 +1885,7 @@ impl From<PaymentMethodType> for PaymentMethod {
             PaymentMethodType::VietQr => Self::RealTimePayment,
             PaymentMethodType::Walley => Self::PayLater,
             PaymentMethodType::WeChatPay => Self::Wallet,
+            PaymentMethodType::Wompi => Self::Wallet,
             PaymentMethodType::TouchNGo => Self::Wallet,
             PaymentMethodType::Atome => Self::PayLater,
             PaymentMethodType::Boleto => Self::Voucher,
