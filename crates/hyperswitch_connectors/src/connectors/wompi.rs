@@ -29,7 +29,7 @@ use hyperswitch_domain_models::{
     },
     types::{
         PaymentsAuthorizeRouterData, PaymentsSyncRouterData, RefreshTokenRouterData,
-        TokenizationRouterData,
+        RefundSyncRouterData, RefundsRouterData, TokenizationRouterData,
     },
 };
 use hyperswitch_interfaces::{
@@ -41,7 +41,8 @@ use hyperswitch_interfaces::{
     errors,
     events::connector_api_logs::ConnectorEvent,
     types::{
-        PaymentsAuthorizeType, PaymentsSyncType, RefreshTokenType, Response, TokenizationType,
+        PaymentsAuthorizeType, PaymentsSyncType, RefreshTokenType, RefundExecuteType,
+        RefundSyncType, Response, TokenizationType,
     },
     webhooks::{IncomingWebhook, IncomingWebhookRequestDetails},
 };
@@ -52,7 +53,7 @@ use transformers as wompi;
 use crate::{
     constants::headers,
     types::ResponseRouterData,
-    utils::{self, PaymentsSyncRequestData},
+    utils::{self, PaymentsSyncRequestData, RefundsRequestData},
 };
 
 #[derive(Clone)]
@@ -66,6 +67,27 @@ impl Wompi {
         &Self {
             amount_converter: &MinorUnitForConnector,
         }
+    }
+
+    /// Headers signed with the PRIVATE key rather than the public key that
+    /// `build_headers` (via `get_auth_header`) always sends: a PSync-by-reference
+    /// search and both refund flows are merchant-to-Wompi calls that Wompi's docs
+    /// require the private key for, unlike the buyer-facing card/tokenization/
+    /// authorize calls, which use the public key.
+    fn private_key_headers(
+        &self,
+        auth: &wompi::WompiAuthType,
+    ) -> Vec<(String, masking::Maskable<String>)> {
+        vec![
+            (
+                headers::CONTENT_TYPE.to_string(),
+                self.common_get_content_type().to_string().into(),
+            ),
+            (
+                headers::AUTHORIZATION.to_string(),
+                format!("Bearer {}", auth.private_key.peek()).into_masked(),
+            ),
+        ]
     }
 }
 
@@ -541,16 +563,7 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Wom
     ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
         if syncs_by_reference(req) {
             let auth = wompi::WompiAuthType::try_from(&req.connector_auth_type)?;
-            Ok(vec![
-                (
-                    headers::CONTENT_TYPE.to_string(),
-                    self.common_get_content_type().to_string().into(),
-                ),
-                (
-                    headers::AUTHORIZATION.to_string(),
-                    format!("Bearer {}", auth.private_key.peek()).into_masked(),
-                ),
-            ])
+            Ok(self.private_key_headers(&auth))
         } else {
             self.build_headers(req, connectors)
         }
@@ -658,17 +671,173 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Wom
 }
 
 // ============================================================================
-// Capture / Void / Refunds — not implemented yet
-// (Wompi is auto-capture only; void/refunds are not wired yet)
+// Capture / Void — not implemented
+// (Wompi is auto-capture only here; no cancel/void flow is wired)
 // ============================================================================
 
 impl ConnectorIntegration<Capture, PaymentsCaptureData, PaymentsResponseData> for Wompi {}
 
 impl ConnectorIntegration<Void, PaymentsCancelData, PaymentsResponseData> for Wompi {}
 
-impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Wompi {}
+// ============================================================================
+// Refunds Execute — POST /refunds (private key, not the public key `Authorize`
+// and tokenization use)
+// ============================================================================
 
-impl ConnectorIntegration<RSync, RefundsData, RefundsResponseData> for Wompi {}
+impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Wompi {
+    fn get_headers(
+        &self,
+        req: &RefundsRouterData<Execute>,
+        _connectors: &Connectors,
+    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+        let auth = wompi::WompiAuthType::try_from(&req.connector_auth_type)?;
+        Ok(self.private_key_headers(&auth))
+    }
+
+    fn get_content_type(&self) -> &'static str {
+        self.common_get_content_type()
+    }
+
+    fn get_url(
+        &self,
+        req: &RefundsRouterData<Execute>,
+        connectors: &Connectors,
+    ) -> CustomResult<String, errors::ConnectorError> {
+        let auth = wompi::WompiAuthType::try_from(&req.connector_auth_type)?;
+        let base_url = get_wompi_base_url(&auth, connectors)?;
+        Ok(format!("{base_url}/refunds"))
+    }
+
+    fn get_request_body(
+        &self,
+        req: &RefundsRouterData<Execute>,
+        _connectors: &Connectors,
+    ) -> CustomResult<RequestContent, errors::ConnectorError> {
+        let amount = utils::convert_amount(
+            self.amount_converter,
+            req.request.minor_refund_amount,
+            req.request.currency,
+        )?;
+        let connector_router_data = wompi::WompiRouterData::from((amount, req));
+        let connector_req = wompi::WompiRefundRequest::try_from(&connector_router_data)?;
+        Ok(RequestContent::Json(Box::new(connector_req)))
+    }
+
+    fn build_request(
+        &self,
+        req: &RefundsRouterData<Execute>,
+        connectors: &Connectors,
+    ) -> CustomResult<Option<Request>, errors::ConnectorError> {
+        Ok(Some(
+            RequestBuilder::new()
+                .method(Method::Post)
+                .url(&RefundExecuteType::get_url(self, req, connectors)?)
+                .attach_default_headers()
+                .headers(RefundExecuteType::get_headers(self, req, connectors)?)
+                .set_body(RefundExecuteType::get_request_body(self, req, connectors)?)
+                .build(),
+        ))
+    }
+
+    fn handle_response(
+        &self,
+        data: &RefundsRouterData<Execute>,
+        event_builder: Option<&mut ConnectorEvent>,
+        res: Response,
+    ) -> CustomResult<RefundsRouterData<Execute>, errors::ConnectorError> {
+        let response: wompi::WompiRefundResponse = res
+            .response
+            .parse_struct("WompiRefundResponse")
+            .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+        event_builder.map(|i| i.set_response_body(&response));
+        router_env::logger::info!(connector_response=?response);
+        RouterData::try_from(ResponseRouterData {
+            response,
+            data: data.clone(),
+            http_code: res.status_code,
+        })
+    }
+
+    fn get_error_response(
+        &self,
+        res: Response,
+        event_builder: Option<&mut ConnectorEvent>,
+    ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
+        self.build_error_response(res, event_builder)
+    }
+}
+
+// ============================================================================
+// Refunds RSync — GET /refunds/{connector_refund_id} (private key)
+// ============================================================================
+
+impl ConnectorIntegration<RSync, RefundsData, RefundsResponseData> for Wompi {
+    fn get_headers(
+        &self,
+        req: &RefundSyncRouterData,
+        _connectors: &Connectors,
+    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+        let auth = wompi::WompiAuthType::try_from(&req.connector_auth_type)?;
+        Ok(self.private_key_headers(&auth))
+    }
+
+    fn get_content_type(&self) -> &'static str {
+        self.common_get_content_type()
+    }
+
+    fn get_url(
+        &self,
+        req: &RefundSyncRouterData,
+        connectors: &Connectors,
+    ) -> CustomResult<String, errors::ConnectorError> {
+        let auth = wompi::WompiAuthType::try_from(&req.connector_auth_type)?;
+        let base_url = get_wompi_base_url(&auth, connectors)?;
+        let connector_refund_id = req.request.get_connector_refund_id()?;
+        Ok(format!("{base_url}/refunds/{connector_refund_id}"))
+    }
+
+    fn build_request(
+        &self,
+        req: &RefundSyncRouterData,
+        connectors: &Connectors,
+    ) -> CustomResult<Option<Request>, errors::ConnectorError> {
+        Ok(Some(
+            RequestBuilder::new()
+                .method(Method::Get)
+                .url(&RefundSyncType::get_url(self, req, connectors)?)
+                .attach_default_headers()
+                .headers(RefundSyncType::get_headers(self, req, connectors)?)
+                .build(),
+        ))
+    }
+
+    fn handle_response(
+        &self,
+        data: &RefundSyncRouterData,
+        event_builder: Option<&mut ConnectorEvent>,
+        res: Response,
+    ) -> CustomResult<RefundSyncRouterData, errors::ConnectorError> {
+        let response: wompi::WompiRefundResponse = res
+            .response
+            .parse_struct("WompiRefundResponse")
+            .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+        event_builder.map(|i| i.set_response_body(&response));
+        router_env::logger::info!(connector_response=?response);
+        RouterData::try_from(ResponseRouterData {
+            response,
+            data: data.clone(),
+            http_code: res.status_code,
+        })
+    }
+
+    fn get_error_response(
+        &self,
+        res: Response,
+        event_builder: Option<&mut ConnectorEvent>,
+    ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
+        self.build_error_response(res, event_builder)
+    }
+}
 
 // ============================================================================
 // Incoming webhooks — transaction.updated
@@ -798,8 +967,8 @@ impl IncomingWebhook for Wompi {
 static WOMPI_SUPPORTED_PAYMENT_METHODS: LazyLock<SupportedPaymentMethods> = LazyLock::new(|| {
     let mut supported_payment_methods = SupportedPaymentMethods::new();
 
-    // Wompi is auto-capture only here (no Capture flow is implemented); refunds are
-    // not wired yet.
+    // Wompi is auto-capture only here (no Capture flow is implemented). Refunds
+    // (Execute + RSync) are wired for every payment method below.
     let supported_capture_methods = vec![
         enums::CaptureMethod::Automatic,
         enums::CaptureMethod::SequentialAutomatic,
@@ -830,7 +999,7 @@ static WOMPI_SUPPORTED_PAYMENT_METHODS: LazyLock<SupportedPaymentMethods> = Lazy
         enums::PaymentMethodType::Credit,
         PaymentMethodDetails {
             mandates: enums::FeatureStatus::NotSupported,
-            refunds: enums::FeatureStatus::NotSupported,
+            refunds: enums::FeatureStatus::Supported,
             supported_capture_methods: supported_capture_methods.clone(),
             specific_features: card_specific_features.clone(),
         },
@@ -841,7 +1010,7 @@ static WOMPI_SUPPORTED_PAYMENT_METHODS: LazyLock<SupportedPaymentMethods> = Lazy
         enums::PaymentMethodType::Debit,
         PaymentMethodDetails {
             mandates: enums::FeatureStatus::NotSupported,
-            refunds: enums::FeatureStatus::NotSupported,
+            refunds: enums::FeatureStatus::Supported,
             supported_capture_methods: supported_capture_methods.clone(),
             specific_features: card_specific_features,
         },
@@ -855,7 +1024,7 @@ static WOMPI_SUPPORTED_PAYMENT_METHODS: LazyLock<SupportedPaymentMethods> = Lazy
         enums::PaymentMethodType::Wompi,
         PaymentMethodDetails {
             mandates: enums::FeatureStatus::NotSupported,
-            refunds: enums::FeatureStatus::NotSupported,
+            refunds: enums::FeatureStatus::Supported,
             supported_capture_methods,
             specific_features: None,
         },

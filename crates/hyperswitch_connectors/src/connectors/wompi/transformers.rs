@@ -14,16 +14,23 @@ use error_stack::{report, ResultExt};
 use hyperswitch_domain_models::{
     payment_method_data::{PaymentMethodData, WalletData},
     router_data::{AccessToken, ConnectorAuthType, ErrorResponse, RouterData},
+    router_flow_types::refunds::Execute,
     router_request_types::{PaymentsAuthorizeData, ResponseId},
-    router_response_types::{PaymentsResponseData, RedirectForm},
-    types::PaymentsAuthorizeRouterData,
+    router_response_types::{PaymentsResponseData, RedirectForm, RefundsResponseData},
+    types::{PaymentsAuthorizeRouterData, RefundsRouterData},
 };
+// Only used by the refund round-trip tests below (the non-test code only ever
+// spells the flow-generic `RefundsRouterData<F>`, never the RSync-specific
+// alias or `RefundsData` directly), so these stay test-only to avoid an
+// unused-import warning in a plain (non-test) build.
+#[cfg(test)]
+use hyperswitch_domain_models::{router_request_types::RefundsData, types::RefundSyncRouterData};
 use hyperswitch_interfaces::errors;
 use masking::{ExposeInterface, PeekInterface, Secret};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    types::ResponseRouterData,
+    types::{RefundsResponseRouterData, ResponseRouterData},
     utils::{PaymentsAuthorizeRequestData, RouterData as _},
 };
 
@@ -1066,6 +1073,168 @@ impl<F, T> TryFrom<ResponseRouterData<F, WompiSearchResponse, T, PaymentsRespons
         Ok(Self {
             status,
             response,
+            ..item.data
+        })
+    }
+}
+
+// ============================================================================
+// Refunds Execute — POST /refunds ; RSync — GET /refunds/{id} (both private key,
+// see `Wompi::private_key_headers` in wompi.rs)
+// ============================================================================
+
+// Wompi rejects an `idempotency_key` longer than 64 characters; truncating our
+// own refund id (rather than rejecting an otherwise-valid refund) keeps a long
+// Hyperswitch-generated id usable instead of failing the refund outright.
+const MAX_IDEMPOTENCY_KEY_LEN: usize = 64;
+
+#[derive(Debug, Serialize)]
+pub struct WompiRefundRequest {
+    pub transaction_id: String,
+    pub amount_in_cents: MinorUnit,
+    pub idempotency_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl TryFrom<&WompiRouterData<&RefundsRouterData<Execute>>> for WompiRefundRequest {
+    type Error = error_stack::Report<errors::ConnectorError>;
+
+    fn try_from(item: &WompiRouterData<&RefundsRouterData<Execute>>) -> Result<Self, Self::Error> {
+        let router_data = item.router_data;
+
+        if router_data.request.currency != enums::Currency::COP {
+            return Err(errors::ConnectorError::CurrencyNotSupported {
+                message: router_data.request.currency.to_string(),
+                connector: "wompi",
+            }
+            .into());
+        }
+
+        let idempotency_key = router_data
+            .request
+            .refund_id
+            .chars()
+            .take(MAX_IDEMPOTENCY_KEY_LEN)
+            .collect();
+
+        Ok(Self {
+            transaction_id: router_data.request.connector_transaction_id.clone(),
+            amount_in_cents: item.amount,
+            idempotency_key,
+            reason: router_data.request.reason.clone(),
+        })
+    }
+}
+
+/// Normalizes Wompi's refund `id`, which its own docs show as either a JSON
+/// number (the wrapped/201 shape) or a string, to a plain `String`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WompiRefundId {
+    Number(i64),
+    Text(String),
+}
+
+impl From<WompiRefundId> for String {
+    fn from(id: WompiRefundId) -> Self {
+        match id {
+            WompiRefundId::Number(n) => n.to_string(),
+            WompiRefundId::Text(s) => s,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum WompiRefundStatus {
+    Approved,
+    Pending,
+    Declined,
+    Error,
+    Cancelled,
+    // Never map an unrecognized status to Success: an unknown value from Wompi
+    // must keep the refund syncable, not silently mark it paid out.
+    #[serde(other)]
+    Unknown,
+}
+
+pub(super) fn map_refund_status(status: WompiRefundStatus) -> enums::RefundStatus {
+    match status {
+        WompiRefundStatus::Approved => enums::RefundStatus::Success,
+        WompiRefundStatus::Declined | WompiRefundStatus::Error | WompiRefundStatus::Cancelled => {
+            enums::RefundStatus::Failure
+        }
+        WompiRefundStatus::Pending | WompiRefundStatus::Unknown => enums::RefundStatus::Pending,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WompiRefundObject {
+    #[serde(default)]
+    pub refund_id: Option<String>,
+    #[serde(default)]
+    pub id: Option<WompiRefundId>,
+    #[serde(default)]
+    pub v2_refund_id: Option<String>,
+    pub status: WompiRefundStatus,
+}
+
+impl WompiRefundObject {
+    /// `refund_id` first (the flat/202 shape's own field), else `id` (the
+    /// wrapped/201 shape, number or string), else `v2_refund_id` as a last
+    /// resort. Never invents an id when none of the three is present.
+    fn connector_refund_id(&self) -> Option<String> {
+        self.refund_id
+            .clone()
+            .or_else(|| self.id.clone().map(String::from))
+            .or_else(|| self.v2_refund_id.clone())
+    }
+}
+
+/// Wompi's own docs disagree on the refund response shape: one page returns an
+/// immediate `{"data": {"id": <number>, ...}}` object (HTTP 201), another a flat
+/// `{"refund_id": <string>, "status": "PENDING"}` object (HTTP 202) that settles
+/// asynchronously. Both are accepted here (wrapped checked first) rather than
+/// picking one and failing on the other against the real API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WompiRefundResponse {
+    Wrapped { data: WompiRefundObject },
+    Flat(WompiRefundObject),
+}
+
+impl WompiRefundResponse {
+    fn into_object(self) -> WompiRefundObject {
+        match self {
+            Self::Wrapped { data } => data,
+            Self::Flat(object) => object,
+        }
+    }
+}
+
+/// Shared by refund Execute and RSync: both receive the same tolerant shape
+/// and map it identically. Unlike a payment, a refund never fails to convert
+/// because of the refund's own status (DECLINED/ERROR/CANCELLED still resolve
+/// to `Ok(RefundsResponseData { refund_status: Failure, .. })`); it only fails
+/// when no id at all can be found, which would otherwise leave RSync unable to
+/// look the refund back up.
+impl<F> TryFrom<RefundsResponseRouterData<F, WompiRefundResponse>> for RefundsRouterData<F> {
+    type Error = error_stack::Report<errors::ConnectorError>;
+
+    fn try_from(
+        item: RefundsResponseRouterData<F, WompiRefundResponse>,
+    ) -> Result<Self, Self::Error> {
+        let object = item.response.into_object();
+        let connector_refund_id = object
+            .connector_refund_id()
+            .ok_or(errors::ConnectorError::ResponseDeserializationFailed)?;
+
+        Ok(Self {
+            response: Ok(RefundsResponseData {
+                connector_refund_id,
+                refund_status: map_refund_status(object.status),
+            }),
             ..item.data
         })
     }
@@ -2390,5 +2559,295 @@ mod tests {
             },
             other => panic!("expected a TransactionResponse, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Refunds — request building
+    // ------------------------------------------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    fn refund_request_data(
+        connector_transaction_id: &str,
+        currency: enums::Currency,
+        refund_id: &str,
+        minor_refund_amount: i64,
+        reason: Option<String>,
+    ) -> RefundsData {
+        RefundsData {
+            refund_id: refund_id.to_string(),
+            connector_transaction_id: connector_transaction_id.to_string(),
+            connector_refund_id: None,
+            currency,
+            payment_amount: minor_refund_amount,
+            reason,
+            webhook_url: None,
+            refund_amount: minor_refund_amount,
+            connector_metadata: None,
+            refund_connector_metadata: None,
+            browser_info: None,
+            split_refunds: None,
+            minor_payment_amount: MinorUnit::new(minor_refund_amount),
+            minor_refund_amount: MinorUnit::new(minor_refund_amount),
+            integrity_object: None,
+            refund_status: enums::RefundStatus::Pending,
+            merchant_account_id: None,
+            merchant_config_currency: None,
+            capture_method: None,
+            additional_payment_method_data: None,
+        }
+    }
+
+    fn refund_router_data<F>(request: RefundsData, reference: &str) -> RefundsRouterData<F> {
+        RouterData {
+            flow: std::marker::PhantomData,
+            merchant_id: common_utils::id_type::MerchantId::try_from(std::borrow::Cow::from(
+                "wompi",
+            ))
+            .unwrap(),
+            customer_id: None,
+            connector_customer: None,
+            connector: "wompi".to_string(),
+            payment_id: reference.to_string(),
+            attempt_id: reference.to_string(),
+            tenant_id: common_utils::id_type::TenantId::try_from_string("public".to_string())
+                .unwrap(),
+            status: enums::AttemptStatus::default(),
+            payment_method: enums::PaymentMethod::Card,
+            connector_auth_type: test_auth(),
+            description: None,
+            address: hyperswitch_domain_models::payment_address::PaymentAddress::default(),
+            auth_type: enums::AuthenticationType::NoThreeDs,
+            connector_meta_data: None,
+            connector_wallets_details: None,
+            amount_captured: None,
+            access_token: None,
+            session_token: None,
+            reference_id: None,
+            payment_method_token: None,
+            recurring_mandate_payment_data: None,
+            preprocessing_id: None,
+            payment_method_balance: None,
+            connector_api_version: None,
+            request,
+            response: Err(ErrorResponse::default()),
+            connector_request_reference_id: reference.to_string(),
+            #[cfg(feature = "payouts")]
+            payout_method_data: None,
+            #[cfg(feature = "payouts")]
+            quote_id: None,
+            test_mode: Some(true),
+            connector_http_status_code: None,
+            external_latency: None,
+            apple_pay_flow: None,
+            frm_metadata: None,
+            dispute_id: None,
+            refund_id: None,
+            connector_response: None,
+            payment_method_status: None,
+            minor_amount_captured: None,
+            minor_amount_capturable: None,
+            integrity_check: Ok(()),
+            additional_merchant_data: None,
+            header_payload: None,
+            connector_mandate_request_reference_id: None,
+            l2_l3_data: None,
+            authentication_id: None,
+            psd2_sca_exemption_type: None,
+            raw_connector_response: None,
+            is_payment_id_from_merchant: None,
+        }
+    }
+
+    #[test]
+    fn refund_request_rejects_non_cop_currency() {
+        let request =
+            refund_request_data("wompi-tx-1", enums::Currency::USD, "refund-1", 50000, None);
+        let router_data = refund_router_data(request, "wompi-refund-ref-1");
+        let amount = MinorUnit::new(50000);
+        let wompi_router_data = WompiRouterData::from((amount, &router_data));
+        let result = WompiRefundRequest::try_from(&wompi_router_data);
+        assert!(matches!(
+            result.unwrap_err().current_context(),
+            errors::ConnectorError::CurrencyNotSupported { .. }
+        ));
+    }
+
+    #[test]
+    fn refund_request_serializes_expected_fields_and_truncates_idempotency_key() {
+        let long_refund_id = "r".repeat(100);
+        let request = refund_request_data(
+            "wompi-tx-1",
+            enums::Currency::COP,
+            &long_refund_id,
+            50000,
+            Some("requested by customer".to_string()),
+        );
+        let router_data = refund_router_data(request, "wompi-refund-ref-2");
+        let amount = MinorUnit::new(50000);
+        let wompi_router_data = WompiRouterData::from((amount, &router_data));
+        let connector_req = WompiRefundRequest::try_from(&wompi_router_data)
+            .expect("a COP refund request must build");
+
+        assert_eq!(connector_req.transaction_id, "wompi-tx-1");
+        assert_eq!(connector_req.amount_in_cents, MinorUnit::new(50000));
+        assert_eq!(connector_req.idempotency_key.chars().count(), 64);
+        assert_eq!(connector_req.idempotency_key, "r".repeat(64));
+        assert_eq!(
+            connector_req.reason,
+            Some("requested by customer".to_string())
+        );
+
+        let json = serde_json::to_value(&connector_req).unwrap();
+        assert_eq!(json["transaction_id"], "wompi-tx-1");
+        assert_eq!(json["amount_in_cents"], 50000);
+        assert_eq!(json["idempotency_key"], "r".repeat(64));
+        assert_eq!(json["reason"], "requested by customer");
+    }
+
+    #[test]
+    fn refund_request_omits_reason_when_absent() {
+        let request =
+            refund_request_data("wompi-tx-1", enums::Currency::COP, "refund-3", 1000, None);
+        let router_data = refund_router_data(request, "wompi-refund-ref-3");
+        let amount = MinorUnit::new(1000);
+        let wompi_router_data = WompiRouterData::from((amount, &router_data));
+        let connector_req = WompiRefundRequest::try_from(&wompi_router_data).unwrap();
+
+        let json = serde_json::to_value(&connector_req).unwrap();
+        assert!(!json.as_object().unwrap().contains_key("reason"));
+    }
+
+    // ------------------------------------------------------------------
+    // Refunds — tolerant response parsing (both documented shapes)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn refund_response_parses_wrapped_shape_with_numeric_id() {
+        let body = serde_json::json!({
+            "data": {
+                "id": 1523,
+                "status": "APPROVED",
+                "v2_refund_id": "v2_refund_abc123",
+                "amount_in_cents": 150000,
+                "transaction_id": "1688-test",
+                "reference": "REF_001",
+                "created_at": "2024-01-15 14:30:45 UTC"
+            }
+        });
+        let response: WompiRefundResponse = serde_json::from_value(body).unwrap();
+
+        let request =
+            refund_request_data("1688-test", enums::Currency::COP, "refund-4", 150000, None);
+        let router_data = refund_router_data(request, "wompi-refund-ref-4");
+        let response_router_data = ResponseRouterData {
+            response,
+            data: router_data,
+            http_code: 201,
+        };
+        let result = RefundsRouterData::<Execute>::try_from(response_router_data)
+            .expect("a wrapped refund response must convert");
+        let refunds_response = result.response.expect("must be Ok");
+        assert_eq!(refunds_response.connector_refund_id, "1523");
+        assert_eq!(refunds_response.refund_status, enums::RefundStatus::Success);
+    }
+
+    #[test]
+    fn refund_response_parses_flat_shape_with_string_refund_id_and_pending_status() {
+        let body = serde_json::json!({
+            "refund_id": "flat_refund_abc",
+            "status": "PENDING"
+        });
+        let response: WompiRefundResponse = serde_json::from_value(body).unwrap();
+
+        let request =
+            refund_request_data("wompi-tx-5", enums::Currency::COP, "refund-5", 2000, None);
+        let router_data = refund_router_data(request, "wompi-refund-ref-5");
+        let response_router_data = ResponseRouterData {
+            response,
+            data: router_data,
+            http_code: 202,
+        };
+        let result = RefundSyncRouterData::try_from(response_router_data)
+            .expect("a flat refund response must convert");
+        let refunds_response = result.response.expect("must be Ok");
+        assert_eq!(refunds_response.connector_refund_id, "flat_refund_abc");
+        assert_eq!(refunds_response.refund_status, enums::RefundStatus::Pending);
+    }
+
+    #[test]
+    fn refund_response_accepts_a_string_id_in_the_wrapped_shape() {
+        let body = serde_json::json!({
+            "data": {
+                "id": "string_id_123",
+                "status": "DECLINED"
+            }
+        });
+        let response: WompiRefundResponse = serde_json::from_value(body).unwrap();
+        let request =
+            refund_request_data("wompi-tx-6", enums::Currency::COP, "refund-6", 3000, None);
+        let router_data = refund_router_data(request, "wompi-refund-ref-6");
+        let response_router_data = ResponseRouterData {
+            response,
+            data: router_data,
+            http_code: 201,
+        };
+        let result = RefundsRouterData::<Execute>::try_from(response_router_data)
+            .expect("a string id must convert");
+        let refunds_response = result.response.expect("must be Ok");
+        assert_eq!(refunds_response.connector_refund_id, "string_id_123");
+        assert_eq!(refunds_response.refund_status, enums::RefundStatus::Failure);
+    }
+
+    #[test]
+    fn refund_status_mapping_never_maps_unknown_to_success() {
+        assert_eq!(
+            map_refund_status(WompiRefundStatus::Approved),
+            enums::RefundStatus::Success
+        );
+        assert_eq!(
+            map_refund_status(WompiRefundStatus::Declined),
+            enums::RefundStatus::Failure
+        );
+        assert_eq!(
+            map_refund_status(WompiRefundStatus::Error),
+            enums::RefundStatus::Failure
+        );
+        assert_eq!(
+            map_refund_status(WompiRefundStatus::Cancelled),
+            enums::RefundStatus::Failure
+        );
+        assert_eq!(
+            map_refund_status(WompiRefundStatus::Pending),
+            enums::RefundStatus::Pending
+        );
+        assert_eq!(
+            map_refund_status(WompiRefundStatus::Unknown),
+            enums::RefundStatus::Pending
+        );
+    }
+
+    #[test]
+    fn refund_response_unknown_status_value_falls_back_via_serde_other() {
+        let parsed: WompiRefundStatus = serde_json::from_str("\"SOME_NEW_STATUS\"").unwrap();
+        assert_eq!(parsed, WompiRefundStatus::Unknown);
+    }
+
+    #[test]
+    fn refund_response_missing_id_becomes_a_deserialization_error() {
+        let body = serde_json::json!({ "status": "APPROVED" });
+        let response: WompiRefundResponse = serde_json::from_value(body).unwrap();
+        let request =
+            refund_request_data("wompi-tx-7", enums::Currency::COP, "refund-7", 4000, None);
+        let router_data = refund_router_data(request, "wompi-refund-ref-7");
+        let response_router_data = ResponseRouterData {
+            response,
+            data: router_data,
+            http_code: 201,
+        };
+        let result = RefundsRouterData::<Execute>::try_from(response_router_data);
+        assert!(matches!(
+            result.unwrap_err().current_context(),
+            errors::ConnectorError::ResponseDeserializationFailed
+        ));
     }
 }
