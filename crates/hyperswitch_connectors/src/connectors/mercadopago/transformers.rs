@@ -1269,7 +1269,7 @@ pub enum MercadopagoPSyncResponse {
     /// Must stay FIRST: `results` is required, so a payment body falls through,
     /// while `{"results": [], ...}` (buyer hasn't paid) matches here.
     Search(MercadopagoSearchResponse),
-    Payment(MercadopagoPaymentsResponse),
+    Payment(Box<MercadopagoPaymentsResponse>),
 }
 
 impl MercadopagoPSyncResponse {
@@ -1281,7 +1281,7 @@ impl MercadopagoPSyncResponse {
     /// needed to match `keep_waiting_for_buyer` below.
     pub(crate) fn resolved_payment(&self) -> Option<&MercadopagoPaymentsResponse> {
         match self {
-            Self::Payment(payment) => Some(payment),
+            Self::Payment(payment) => Some(payment.as_ref()),
             Self::Search(search) => search.results.first(),
         }
     }
@@ -1297,7 +1297,7 @@ impl<F, T> TryFrom<ResponseRouterData<F, MercadopagoPSyncResponse, T, PaymentsRe
     ) -> Result<Self, Self::Error> {
         match item.response {
             MercadopagoPSyncResponse::Payment(payment) => Self::try_from(ResponseRouterData {
-                response: payment,
+                response: *payment,
                 data: item.data,
                 http_code: item.http_code,
             }),

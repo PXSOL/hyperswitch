@@ -593,6 +593,7 @@ impl<F: Clone> PostUpdateTracker<F, PaymentData<F>, types::PaymentsSyncData> for
         // Reconcile only after the payment itself has been persisted above, and
         // only when there is something reported. Any failure here is logged and
         // swallowed: it must never fail the payment sync itself.
+        let mut payment_data = payment_data;
         if let Some(reported_activity) = reported_activity {
             if let Err(error) = reconcile_connector_reported_activity(
                 db,
@@ -609,6 +610,10 @@ impl<F: Clone> PostUpdateTracker<F, PaymentData<F>, types::PaymentsSyncData> for
                     "failed to reconcile connector-reported refund/dispute activity on payment sync"
                 );
             }
+            // The refunds and disputes in `payment_data` were loaded before this
+            // sync; reload them so this same response already shows what the
+            // reconciliation created or updated.
+            refresh_refunds_and_disputes(db, &mut payment_data, storage_scheme).await;
         }
 
         Ok(payment_data)
@@ -676,6 +681,41 @@ impl<F: Clone> PostUpdateTracker<F, PaymentData<F>, types::PaymentsSyncData> for
 // payment itself has already been persisted; every error here is logged and
 // swallowed by the caller rather than failing the sync.
 // ============================================================================
+
+#[cfg(feature = "v1")]
+async fn refresh_refunds_and_disputes<F: Clone + Send>(
+    state: &SessionState,
+    payment_data: &mut PaymentData<F>,
+    storage_scheme: enums::MerchantStorageScheme,
+) {
+    let db = &*state.store;
+    let payment_id = payment_data.payment_intent.payment_id.clone();
+    let merchant_id = payment_data.payment_intent.merchant_id.clone();
+
+    match db
+        .find_refund_by_payment_id_merchant_id(&payment_id, &merchant_id, storage_scheme)
+        .await
+    {
+        Ok(refunds) => payment_data.refunds = refunds,
+        Err(error) => router_env::logger::error!(
+            ?error,
+            ?payment_id,
+            "failed to reload refunds after reconciling connector-reported activity"
+        ),
+    }
+
+    match db
+        .find_disputes_by_merchant_id_payment_id(&merchant_id, &payment_id)
+        .await
+    {
+        Ok(disputes) => payment_data.disputes = disputes,
+        Err(error) => router_env::logger::error!(
+            ?error,
+            ?payment_id,
+            "failed to reload disputes after reconciling connector-reported activity"
+        ),
+    }
+}
 
 #[cfg(feature = "v1")]
 async fn reconcile_connector_reported_activity(

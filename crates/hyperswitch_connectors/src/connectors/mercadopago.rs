@@ -1014,13 +1014,29 @@ impl webhooks::IncomingWebhook for Mercadopago {
         &self,
         request: &webhooks::IncomingWebhookRequestDetails<'_>,
     ) -> CustomResult<Box<dyn masking::ErasedMaskSerialize>, errors::ConnectorError> {
-        // Try to parse as Webhooks v1 (full) or Feed v2 (resource + topic) format
-        let webhook_body: mercadopago::MercadopagoWebhookBodyEnum = request
+        // Webhooks v1 (full) or Feed v2 (resource + topic) carry a JSON body; a
+        // legacy IPN carries only `?topic=...&id=...`, so fall back to the query
+        // (as `get_webhook_object_reference_id` does) instead of rejecting it.
+        if let Ok(webhook_body) = request
             .body
-            .parse_struct("MercadopagoWebhookBodyEnum")
-            .change_context(errors::ConnectorError::WebhookResourceObjectNotFound)?;
+            .parse_struct::<mercadopago::MercadopagoWebhookBodyEnum>("MercadopagoWebhookBodyEnum")
+        {
+            return Ok(Box::new(webhook_body.to_resource_object()));
+        }
 
-        Ok(Box::new(webhook_body.to_resource_object()))
+        match (
+            extract_ipn_id_from_query(&request.query_params),
+            extract_topic_from_query(&request.query_params),
+        ) {
+            (Some(resource_id), Some(topic)) => {
+                Ok(Box::new(mercadopago::MercadopagoWebhookResourceObject {
+                    resource_id,
+                    topic,
+                    action: None,
+                }))
+            }
+            _ => Err(errors::ConnectorError::WebhookResourceObjectNotFound.into()),
+        }
     }
 }
 
@@ -1128,6 +1144,41 @@ mod tests {
             query_params: query_params.to_string(),
         };
         classify_mercadopago_webhook(&request)
+    }
+
+    #[test]
+    fn ipn_resource_object_falls_back_to_query_params() {
+        let headers = actix_web::http::header::HeaderMap::new();
+        for body in [b"".as_slice(), b"{}".as_slice()] {
+            let request = webhooks::IncomingWebhookRequestDetails {
+                method: http::Method::POST,
+                uri: "/webhooks/mercadopago".parse().expect("valid test uri"),
+                headers: &headers,
+                body,
+                query_params: "topic=payment&id=150211668619".to_string(),
+            };
+            assert!(
+                webhooks::IncomingWebhook::get_webhook_resource_object(
+                    Mercadopago::new(),
+                    &request
+                )
+                .is_ok(),
+                "an IPN (query-only) notification must not be rejected"
+            );
+        }
+
+        let request = webhooks::IncomingWebhookRequestDetails {
+            method: http::Method::POST,
+            uri: "/webhooks/mercadopago".parse().expect("valid test uri"),
+            headers: &headers,
+            body: b"{}",
+            query_params: String::new(),
+        };
+        assert!(webhooks::IncomingWebhook::get_webhook_resource_object(
+            Mercadopago::new(),
+            &request
+        )
+        .is_err());
     }
 
     #[test]
