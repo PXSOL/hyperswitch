@@ -579,6 +579,16 @@ impl Connector {
         matches!(self, Self::Adyenplatform)
     }
 
+    /// Whether a payment sync (force_sync) for this connector should also reconcile
+    /// refunds and disputes that were created outside Hyperswitch, from the same
+    /// PSync response (see `ConnectorResponseData`'s reported-activity carrier).
+    /// Mercado Pago's PSync payload always carries `refunds[]` and the chargeback
+    /// status of the payment, so a forced sync is the only signal Hyperswitch has
+    /// for activity the merchant performed directly on the Mercado Pago panel.
+    pub fn syncs_refunds_and_disputes_on_payment_sync(self) -> bool {
+        matches!(self, Self::Mercadopago)
+    }
+
     /// Validates if dummy connector can be created
     /// Dummy connectors can be created only if dummy_connector feature is enabled in the configs
     #[cfg(feature = "dummy_connector")]

@@ -7617,6 +7617,25 @@ where
                         | storage_enums::IntentStatus::RequiresCapture
                         | storage_enums::IntentStatus::PartiallyCapturedAndCapturable
                 ) && payment_data.get_force_sync().unwrap_or(false)
+                // A forced sync on an already-settled payment is otherwise never sent
+                // to the connector. Some connectors (e.g. Mercado Pago) report refunds
+                // and disputes created outside Hyperswitch only on their PSync payload,
+                // so those need one more connector call even once the intent is final.
+                || (matches!(
+                    payment_data.get_payment_intent().status,
+                    storage_enums::IntentStatus::Succeeded
+                        | storage_enums::IntentStatus::PartiallyCaptured
+                ) && payment_data.get_force_sync().unwrap_or(false)
+                    && payment_data
+                        .get_payment_attempt()
+                        .connector
+                        .as_deref()
+                        .and_then(|connector| {
+                            common_enums::connector_enums::Connector::from_str(connector).ok()
+                        })
+                        .is_some_and(
+                            common_enums::connector_enums::Connector::syncs_refunds_and_disputes_on_payment_sync,
+                        ))
         }
         "PaymentCancel" => matches!(
             payment_data.get_payment_intent().status,

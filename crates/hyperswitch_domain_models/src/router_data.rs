@@ -465,6 +465,12 @@ pub struct ConnectorResponseData {
     pub additional_payment_method_data: Option<AdditionalPaymentMethodConnectorResponse>,
     extended_authorization_response_data: Option<ExtendedAuthorizationResponseData>,
     is_overcapture_enabled: Option<primitive_wrappers::OvercaptureEnabledBool>,
+    /// Refunds and/or a dispute the connector reports on a payment-sync response for
+    /// activity that happened outside Hyperswitch (e.g. a refund issued from the
+    /// connector's own dashboard). `#[serde(default)]` so a value persisted before
+    /// this field existed still deserializes.
+    #[serde(default)]
+    reported_activity: Option<ConnectorReportedActivity>,
 }
 
 impl ConnectorResponseData {
@@ -475,8 +481,25 @@ impl ConnectorResponseData {
             additional_payment_method_data: Some(additional_payment_method_data),
             extended_authorization_response_data: None,
             is_overcapture_enabled: None,
+            reported_activity: None,
         }
     }
+
+    /// Builds a `ConnectorResponseData` carrying only reported refund/dispute
+    /// activity (see `Connector::syncs_refunds_and_disputes_on_payment_sync`).
+    /// Deliberately leaves `additional_payment_method_data` unset: the payment
+    /// response update tracker treats `None` there as "don't touch the attempt's
+    /// stored payment-method data", not as "clear it" (Diesel changeset semantics
+    /// — `payment_method_data.or(source.payment_method_data)`).
+    pub fn with_reported_activity(reported_activity: ConnectorReportedActivity) -> Self {
+        Self {
+            additional_payment_method_data: None,
+            extended_authorization_response_data: None,
+            is_overcapture_enabled: None,
+            reported_activity: Some(reported_activity),
+        }
+    }
+
     pub fn new(
         additional_payment_method_data: Option<AdditionalPaymentMethodConnectorResponse>,
         is_overcapture_enabled: Option<primitive_wrappers::OvercaptureEnabledBool>,
@@ -486,6 +509,7 @@ impl ConnectorResponseData {
             additional_payment_method_data,
             extended_authorization_response_data,
             is_overcapture_enabled,
+            reported_activity: None,
         }
     }
 
@@ -498,6 +522,50 @@ impl ConnectorResponseData {
     pub fn is_overcapture_enabled(&self) -> Option<primitive_wrappers::OvercaptureEnabledBool> {
         self.is_overcapture_enabled
     }
+
+    /// Sets the reported-activity carrier in place, leaving every other
+    /// field untouched. Used instead of replacing a whole `ConnectorResponseData`
+    /// wholesale, so an existing value (e.g. `additional_payment_method_data`
+    /// already set by an earlier step in the same flow) is never silently
+    /// dropped.
+    pub fn set_reported_activity(&mut self, reported_activity: ConnectorReportedActivity) {
+        self.reported_activity = Some(reported_activity);
+    }
+
+    pub fn get_reported_activity(&self) -> Option<&ConnectorReportedActivity> {
+        self.reported_activity.as_ref()
+    }
+}
+
+/// Refunds and/or a dispute an aggregator connector reports on a payment-sync
+/// response, for money movement the merchant performed directly on the
+/// connector's own panel rather than through Hyperswitch (e.g. Mercado Pago).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ConnectorReportedActivity {
+    pub refunds: Vec<ConnectorReportedRefund>,
+    pub dispute: Option<ConnectorReportedDispute>,
+}
+
+/// A single refund as the connector currently reports it, keyed by the
+/// connector's own refund id.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ConnectorReportedRefund {
+    pub connector_refund_id: String,
+    pub amount: MinorUnit,
+    pub status: common_enums::enums::RefundStatus,
+}
+
+/// A dispute as the connector currently reports it on the payment object.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ConnectorReportedDispute {
+    pub connector_dispute_id: String,
+    pub stage: common_enums::enums::DisputeStage,
+    pub status: common_enums::enums::DisputeStatus,
+    /// The connector's own status string, stored as-is for support/debugging.
+    pub connector_status: String,
+    pub amount: MinorUnit,
+    pub currency: common_enums::enums::Currency,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

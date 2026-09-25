@@ -1,10 +1,17 @@
 use std::collections::HashMap;
 
 use common_enums::enums;
-use common_utils::{pii::SecretSerdeValue, request::Method, types::FloatMajorUnit};
+use common_utils::{
+    pii::SecretSerdeValue,
+    request::Method,
+    types::{FloatMajorUnit, FloatMajorUnitForConnector},
+};
 use hyperswitch_domain_models::{
     payment_method_data::{PaymentMethodData, WalletData},
-    router_data::{ConnectorAuthType, ErrorResponse, RouterData},
+    router_data::{
+        ConnectorAuthType, ConnectorReportedActivity, ConnectorReportedDispute,
+        ConnectorReportedRefund, ErrorResponse, RouterData,
+    },
     router_flow_types::{
         payments::PaymentMethodToken,
         refunds::{Execute, RSync},
@@ -908,11 +915,15 @@ impl From<MercadopagoPaymentStatus> for enums::AttemptStatus {
             MercadopagoPaymentStatus::Pending | MercadopagoPaymentStatus::InProcess => {
                 Self::Pending
             }
-            MercadopagoPaymentStatus::InMediation => Self::Pending,
             MercadopagoPaymentStatus::Rejected => Self::Failure,
             MercadopagoPaymentStatus::Cancelled => Self::Voided,
-            MercadopagoPaymentStatus::Refunded => Self::AutoRefunded,
-            MercadopagoPaymentStatus::ChargedBack => Self::AutoRefunded,
+            // The money was already captured: a refund, chargeback or mediation
+            // is its own Hyperswitch record (see the payment-sync reconciliation
+            // this payment status drives), and must never regress a settled
+            // attempt back to processing/failed.
+            MercadopagoPaymentStatus::Refunded
+            | MercadopagoPaymentStatus::ChargedBack
+            | MercadopagoPaymentStatus::InMediation => Self::Charged,
         }
     }
 }
@@ -929,14 +940,176 @@ pub struct MercadopagoPaymentsResponse {
     pub date_created: Option<String>,
     #[serde(default)]
     pub date_approved: Option<String>,
+    // A newtype over f64 (deserializes transparently from the same JSON number
+    // MP sends): needed, rather than a plain f64, so `reported_dispute` below
+    // can call `FloatMajorUnitForConnector::convert_back` on it directly —
+    // `FloatMajorUnit::new` is private outside `common_utils`.
     #[serde(default)]
-    pub transaction_amount: Option<f64>,
+    pub transaction_amount: Option<FloatMajorUnit>,
     #[serde(default)]
     pub currency_id: Option<String>,
     #[serde(default)]
     pub payment_method_id: Option<String>,
     #[serde(default)]
     pub payment_type_id: Option<String>,
+    /// Refunds Mercado Pago reports directly on the payment object. Kept as
+    /// raw JSON: a malformed array (or a malformed entry in it) must never
+    /// fail parsing the payment sync response — see `reported_refunds`, which
+    /// parses each entry leniently and skips ones it cannot read.
+    #[serde(default)]
+    pub refunds: Option<Vec<serde_json::Value>>,
+}
+
+/// One entry of `MercadopagoPaymentsResponse::refunds`. Deliberately tolerant:
+/// every field is optional (except via `id`, which is required for the entry
+/// to be usable) so a single unexpected shape does not fail the whole array.
+#[derive(Debug, Clone, Deserialize)]
+struct MercadopagoPaymentRefundEntry {
+    #[serde(default, deserialize_with = "deserialize_code")]
+    id: Option<String>,
+    #[serde(default)]
+    amount: Option<FloatMajorUnit>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+impl MercadopagoPaymentRefundEntry {
+    fn into_reported_refund(self, currency: enums::Currency) -> Option<ConnectorReportedRefund> {
+        let connector_refund_id = self.id?;
+        // A missing amount must never silently become a 0-amount refund:
+        // skip the entry instead (it will simply be retried on the next
+        // sync once Mercado Pago's response is well-formed).
+        let amount = match self.amount {
+            Some(amount) => amount,
+            None => {
+                router_env::logger::warn!(
+                    connector_refund_id = %connector_refund_id,
+                    "mercadopago: skipping a reported refund with no amount"
+                );
+                return None;
+            }
+        };
+        let amount = match utils::convert_back_amount_to_minor_units(
+            &FloatMajorUnitForConnector,
+            amount,
+            currency,
+        ) {
+            Ok(amount) => amount,
+            Err(error) => {
+                router_env::logger::warn!(
+                    ?error,
+                    connector_refund_id = %connector_refund_id,
+                    "mercadopago: could not convert a reported refund's amount, skipping it"
+                );
+                return None;
+            }
+        };
+        Some(ConnectorReportedRefund {
+            connector_refund_id,
+            amount,
+            status: mercadopago_reported_refund_status(self.status.as_deref()),
+        })
+    }
+}
+
+/// Mercado Pago's own refund status vocabulary, mapped tolerantly: any status
+/// this doesn't recognize (or that is missing) is treated as still pending
+/// rather than failing the sync.
+fn mercadopago_reported_refund_status(status: Option<&str>) -> enums::RefundStatus {
+    match status {
+        Some("approved") => enums::RefundStatus::Success,
+        Some("rejected" | "cancelled") => enums::RefundStatus::Failure,
+        // "pending", "in_process", anything unrecognized, or missing.
+        _ => enums::RefundStatus::Pending,
+    }
+}
+
+/// Maps a `charged_back` payment's `status_detail` to a dispute status, per
+/// the Mercado Pago contract: `in_process` is still open, `settled` means the
+/// chargeback stuck (Hyperswitch lost the dispute), `reimbursed` means the
+/// chargeback was reverted back to the merchant (Hyperswitch won it). Any
+/// other value (or a missing one) is conservatively left open.
+fn mercadopago_reported_dispute_status(status_detail: Option<&str>) -> enums::DisputeStatus {
+    match status_detail {
+        Some("settled") => enums::DisputeStatus::DisputeLost,
+        Some("reimbursed") => enums::DisputeStatus::DisputeWon,
+        _ => enums::DisputeStatus::DisputeOpened,
+    }
+}
+
+impl MercadopagoPaymentsResponse {
+    /// Parses `refunds[]` leniently: an entry that fails to parse, or that
+    /// has no usable id, is skipped and logged rather than failing the sync.
+    fn reported_refunds(&self) -> Vec<MercadopagoPaymentRefundEntry> {
+        let mut parsed = Vec::new();
+        for raw_entry in self.refunds.iter().flatten() {
+            match serde_json::from_value::<MercadopagoPaymentRefundEntry>(raw_entry.clone()) {
+                Ok(entry) if entry.id.is_some() => parsed.push(entry),
+                Ok(_) => router_env::logger::warn!(
+                    "mercadopago: skipping a reported refund with no usable id"
+                ),
+                Err(error) => router_env::logger::warn!(
+                    ?error,
+                    "mercadopago: skipping a malformed reported refund entry"
+                ),
+            }
+        }
+        parsed
+    }
+
+    /// A `charged_back` payment has no disputed-amount field of its own: the
+    /// whole payment's `transaction_amount` is used, per the Mercado Pago
+    /// contract (a full chargeback is the only kind MP's payment object
+    /// reports).
+    fn reported_dispute(&self, currency: enums::Currency) -> Option<ConnectorReportedDispute> {
+        if self.status != MercadopagoPaymentStatus::ChargedBack {
+            return None;
+        }
+        let transaction_amount = self.transaction_amount?;
+        let amount = utils::convert_back_amount_to_minor_units(
+            &FloatMajorUnitForConnector,
+            transaction_amount,
+            currency,
+        )
+        .map_err(|error| {
+            router_env::logger::warn!(
+                ?error,
+                "mercadopago: could not convert the charged-back amount, skipping the dispute"
+            );
+        })
+        .ok()?;
+
+        Some(ConnectorReportedDispute {
+            connector_dispute_id: self.id.to_string(),
+            stage: enums::DisputeStage::Dispute,
+            status: mercadopago_reported_dispute_status(self.status_detail.as_deref()),
+            connector_status: "charged_back".to_string(),
+            amount,
+            currency,
+            reason: self.status_detail.clone(),
+        })
+    }
+
+    /// Builds the D5 carrier from this payment's `refunds[]` and (when
+    /// `charged_back`) its own chargeback status. `None` when there is
+    /// nothing to report, so the caller never attaches an empty carrier.
+    pub(crate) fn reported_activity(
+        &self,
+        currency: enums::Currency,
+    ) -> Option<ConnectorReportedActivity> {
+        let refunds: Vec<ConnectorReportedRefund> = self
+            .reported_refunds()
+            .into_iter()
+            .filter_map(|entry| entry.into_reported_refund(currency))
+            .collect();
+        let dispute = self.reported_dispute(currency);
+
+        if refunds.is_empty() && dispute.is_none() {
+            None
+        } else {
+            Some(ConnectorReportedActivity { refunds, dispute })
+        }
+    }
 }
 
 impl<F, T> TryFrom<ResponseRouterData<F, MercadopagoPaymentsResponse, T, PaymentsResponseData>>
@@ -1015,8 +1188,10 @@ pub struct MercadopagoPreferenceResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MercadopagoAuthorizeResponse {
-    /// `id: i64` + `status` — fails to parse a preference (id is a String there)
-    Payment(MercadopagoPaymentsResponse),
+    /// `id: i64` + `status` — fails to parse a preference (id is a String there).
+    /// Boxed: `MercadopagoPaymentsResponse` is large enough to trip
+    /// clippy::large_enum_variant against the much smaller `Preference` variant.
+    Payment(Box<MercadopagoPaymentsResponse>),
     /// `id: String` + `init_point` — fails to parse a payment (no init_point)
     Preference(Box<MercadopagoPreferenceResponse>),
 }
@@ -1031,7 +1206,7 @@ impl<F, T> TryFrom<ResponseRouterData<F, MercadopagoAuthorizeResponse, T, Paymen
     ) -> Result<Self, Self::Error> {
         match item.response {
             MercadopagoAuthorizeResponse::Payment(payment) => Self::try_from(ResponseRouterData {
-                response: payment,
+                response: *payment,
                 data: item.data,
                 http_code: item.http_code,
             }),
@@ -1084,6 +1259,21 @@ pub enum MercadopagoPSyncResponse {
     /// while `{"results": [], ...}` (buyer hasn't paid) matches here.
     Search(MercadopagoSearchResponse),
     Payment(MercadopagoPaymentsResponse),
+}
+
+impl MercadopagoPSyncResponse {
+    /// The payment object this sync resolved to, if any — the most recent
+    /// search result for a Checkout Pro promotion, or the payment body
+    /// itself. Used to build the D5 reported-activity carrier; a rejected or
+    /// cancelled search result naturally reports nothing (a payment that was
+    /// never captured has no refunds or chargeback), so no special-casing is
+    /// needed to match `keep_waiting_for_buyer` below.
+    pub(crate) fn resolved_payment(&self) -> Option<&MercadopagoPaymentsResponse> {
+        match self {
+            Self::Payment(payment) => Some(payment),
+            Self::Search(search) => search.results.first(),
+        }
+    }
 }
 
 impl<F, T> TryFrom<ResponseRouterData<F, MercadopagoPSyncResponse, T, PaymentsResponseData>>
@@ -1462,8 +1652,11 @@ impl MercadopagoErrorResponse {
 // Webhook Types
 // ============================================================================
 
-/// Webhooks v1 format: full JSON with action and data.id
-/// Example: {"action":"payment.created","data":{"id":"150211668619"},...}
+/// Webhooks v1 / app-level push format: full JSON body.
+/// Payment example: {"action":"payment.created","data":{"id":"150211668619"},...}
+/// Chargeback example (app-level push only, never via `notification_url`):
+/// {"type":"topic_chargebacks_wh","actions":["created"],
+///  "data":{"id":"<chargeback id>","payment_id":168355689156},...}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MercadopagoWebhookBody {
     #[serde(default)]
@@ -1477,7 +1670,17 @@ pub struct MercadopagoWebhookBody {
     #[serde(default)]
     pub user_id: Option<serde_json::Value>,
     pub api_version: Option<String>,
-    pub action: String,
+    /// Present on payment/refund notifications ("payment.updated", ...).
+    /// Absent on the dedicated chargeback push format, which uses `actions`
+    /// (plural, below) and `type` instead.
+    #[serde(default)]
+    pub action: Option<String>,
+    /// Only present on the chargeback push format. Not otherwise consumed;
+    /// kept for observability (visible via `get_webhook_resource_object`'s
+    /// masked_serialize logging is action-based, not actions-based, so this
+    /// mainly documents the wire format for future readers).
+    #[serde(default)]
+    pub actions: Option<Vec<String>>,
     pub data: MercadopagoWebhookData,
 }
 
@@ -1493,24 +1696,29 @@ pub struct MercadopagoWebhookFeedBody {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MercadopagoWebhookBodyEnum {
-    Full(MercadopagoWebhookBody),
+    // Boxed: `MercadopagoWebhookBody` is large enough to trip
+    // clippy::large_enum_variant against the much smaller `Feed` variant.
+    Full(Box<MercadopagoWebhookBody>),
     Feed(MercadopagoWebhookFeedBody),
 }
 
 impl MercadopagoWebhookBodyEnum {
-    /// Get the connector transaction ID (payment/refund/chargeback ID) from either format
-    pub fn get_resource_id(&self) -> String {
+    /// Classifies the notification into what Hyperswitch can act on: which
+    /// payment (if any) needs a re-sync, or that there is nothing to do.
+    /// Both `get_webhook_event_type` and `get_webhook_object_reference_id`
+    /// (in `mercadopago.rs`) go through this single place so the two stay
+    /// consistent with each other.
+    pub fn classify(&self) -> MercadopagoWebhookNotification {
         match self {
-            Self::Full(body) => body.data.id.clone(),
-            Self::Feed(body) => body.resource.clone(),
-        }
-    }
-
-    /// Get the webhook action/event type
-    pub fn get_action(&self) -> MercadopagoWebhookAction {
-        match self {
-            Self::Full(body) => MercadopagoWebhookAction::from(body.action.as_str()),
-            Self::Feed(body) => topic_to_action(&body.topic),
+            Self::Full(body) => body.classify(),
+            Self::Feed(body) => match body.topic.as_str() {
+                "payment" => MercadopagoWebhookNotification::Payment {
+                    payment_id: body.resource.clone(),
+                },
+                // Feed v2 never carries the payment a chargeback applies to.
+                "chargebacks" => MercadopagoWebhookNotification::ChargebackWithoutPayment,
+                _ => MercadopagoWebhookNotification::Unknown,
+            },
         }
     }
 
@@ -1523,7 +1731,7 @@ impl MercadopagoWebhookBodyEnum {
                     .webhook_type
                     .clone()
                     .unwrap_or_else(|| "payment".to_string()),
-                action: Some(body.action.clone()),
+                action: body.action.clone(),
             },
             Self::Feed(body) => MercadopagoWebhookResourceObject {
                 resource_id: body.resource.clone(),
@@ -1531,6 +1739,49 @@ impl MercadopagoWebhookBodyEnum {
                 action: None,
             },
         }
+    }
+}
+
+impl MercadopagoWebhookBody {
+    fn classify(&self) -> MercadopagoWebhookNotification {
+        // The dedicated chargeback push: no singular `action`, `type` names
+        // the topic. The chargeback id (`data.id`) is never usable as a
+        // payment id — only `data.payment_id`, when present, is.
+        if self.webhook_type.as_deref() == Some("topic_chargebacks_wh") {
+            return chargeback_notification(self.data.payment_id.as_deref());
+        }
+
+        match self.action.as_deref() {
+            Some("payment.created") | Some("payment.updated") => {
+                MercadopagoWebhookNotification::Payment {
+                    payment_id: self.data.id.clone(),
+                }
+            }
+            // Refund state is read from the payment's own PSync response
+            // (`refunds[]`, see D5/D6), never from the webhook body itself:
+            // Mercado Pago's webhook payloads carry no refund status or
+            // amount, only a resource id.
+            Some("refund.created") | Some("refund.updated") => {
+                MercadopagoWebhookNotification::Refund
+            }
+            // Not observed from Mercado Pago via `notification_url` in
+            // practice (chargebacks arrive through the `topic_chargebacks_wh`
+            // push above, or the IPN `chargebacks` topic/query below), kept
+            // for forward compatibility with the documented action names.
+            Some("chargeback.created") | Some("chargeback.updated") => {
+                chargeback_notification(self.data.payment_id.as_deref())
+            }
+            _ => MercadopagoWebhookNotification::Unknown,
+        }
+    }
+}
+
+fn chargeback_notification(payment_id: Option<&str>) -> MercadopagoWebhookNotification {
+    match payment_id {
+        Some(payment_id) => MercadopagoWebhookNotification::ChargebackWithPayment {
+            payment_id: payment_id.to_string(),
+        },
+        None => MercadopagoWebhookNotification::ChargebackWithoutPayment,
     }
 }
 
@@ -1546,79 +1797,71 @@ pub struct MercadopagoWebhookResourceObject {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MercadopagoWebhookData {
     pub id: String,
+    /// The payment a chargeback applies to. Mercado Pago sends this as either
+    /// a JSON number or a string depending on the push format, hence the
+    /// tolerant deserializer (shared with `MercadopagoErrorCause::code`).
+    #[serde(default, deserialize_with = "deserialize_code")]
+    pub payment_id: Option<String>,
 }
 
-fn topic_to_action(topic: &str) -> MercadopagoWebhookAction {
-    match topic {
-        "payment" => MercadopagoWebhookAction::PaymentUpdated,
-        "chargebacks" => MercadopagoWebhookAction::ChargebackUpdated,
-        _ => MercadopagoWebhookAction::Unknown,
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum MercadopagoWebhookAction {
-    #[serde(rename = "payment.created")]
-    PaymentCreated,
-    #[serde(rename = "payment.updated")]
-    PaymentUpdated,
-    #[serde(rename = "refund.created")]
-    RefundCreated,
-    #[serde(rename = "refund.updated")]
-    RefundUpdated,
-    #[serde(rename = "chargeback.created")]
-    ChargebackCreated,
-    #[serde(rename = "chargeback.updated")]
-    ChargebackUpdated,
-    #[serde(other)]
+/// A Mercado Pago webhook notification, normalized across all wire formats
+/// (Webhooks v1 / app-level push, Feed v2, IPN legacy) into what Hyperswitch
+/// can act on. Never carries a status: Mercado Pago webhooks only ever
+/// signal "something changed on this id", so every supported variant here
+/// just triggers a live PSync (D1) — MP's own API, called with the
+/// merchant's credentials, is the only source of truth for the actual state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MercadopagoWebhookNotification {
+    /// A payment notification: PSync `payment_id`.
+    Payment {
+        payment_id: String,
+    },
+    /// A chargeback notification that names the payment it applies to: PSync
+    /// that payment id (the sync itself reconciles the dispute record — D6).
+    ChargebackWithPayment {
+        payment_id: String,
+    },
+    /// A chargeback notification without a payment id (e.g. the IPN
+    /// `topic=chargebacks` fallback, which carries only the chargeback id):
+    /// nothing safe to sync against a chargeback id alone — never treat a
+    /// chargeback id as a payment id.
+    ChargebackWithoutPayment,
+    /// A refund notification: refund state is read from the payment's own
+    /// PSync response, never from here.
+    Refund,
     Unknown,
 }
 
-impl From<&str> for MercadopagoWebhookAction {
-    fn from(action: &str) -> Self {
-        match action {
-            "payment.created" => Self::PaymentCreated,
-            "payment.updated" => Self::PaymentUpdated,
-            "refund.created" => Self::RefundCreated,
-            "refund.updated" => Self::RefundUpdated,
-            "chargeback.created" => Self::ChargebackCreated,
-            "chargeback.updated" => Self::ChargebackUpdated,
-            _ => Self::Unknown,
+impl MercadopagoWebhookNotification {
+    /// The payment id to PSync, if this notification calls for one.
+    pub fn payment_id_to_sync(&self) -> Option<&str> {
+        match self {
+            Self::Payment { payment_id } | Self::ChargebackWithPayment { payment_id } => {
+                Some(payment_id.as_str())
+            }
+            Self::ChargebackWithoutPayment | Self::Refund | Self::Unknown => None,
         }
     }
 }
 
-impl From<MercadopagoWebhookAction> for api_models::webhooks::IncomingWebhookEvent {
-    fn from(action: MercadopagoWebhookAction) -> Self {
-        // NOTE: MercadoPago webhooks only contain the resource ID, not the actual status.
-        // The action (e.g., "payment.updated") doesn't indicate whether the payment succeeded,
-        // failed, or was cancelled. Therefore, we map to processing/pending states and rely
-        // on the sync mechanism to fetch the actual status from MercadoPago's API.
-        //
-        // For refunds, since IncomingWebhookEvent doesn't have a RefundProcessing variant,
-        // we map to EventNotSupported. Refund status is updated via periodic sync (RSync) calls.
-        match action {
-            MercadopagoWebhookAction::PaymentCreated | MercadopagoWebhookAction::PaymentUpdated => {
+impl From<&MercadopagoWebhookNotification> for api_models::webhooks::IncomingWebhookEvent {
+    fn from(notification: &MercadopagoWebhookNotification) -> Self {
+        match notification {
+            MercadopagoWebhookNotification::Payment { .. }
+            | MercadopagoWebhookNotification::ChargebackWithPayment { .. } => {
                 Self::PaymentIntentProcessing
             }
-            MercadopagoWebhookAction::RefundCreated | MercadopagoWebhookAction::RefundUpdated => {
-                // MercadoPago webhook payloads only contain the resource ID (no status).
-                // Since there is no RefundProcessing event variant, refund status changes
-                // are NOT tracked via webhooks. Refund state is updated exclusively through
-                // periodic sync (RSync) calls. EventNotSupported causes this webhook to be
-                // acknowledged and discarded without modifying refund state.
-                Self::EventNotSupported
-            }
-            MercadopagoWebhookAction::ChargebackCreated
-            | MercadopagoWebhookAction::ChargebackUpdated => Self::DisputeOpened,
-            MercadopagoWebhookAction::Unknown => Self::EventNotSupported,
+            MercadopagoWebhookNotification::ChargebackWithoutPayment
+            | MercadopagoWebhookNotification::Refund
+            | MercadopagoWebhookNotification::Unknown => Self::EventNotSupported,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use common_utils::types::MinorUnit;
+
     use super::*;
 
     const PAYMENT_JSON: &str = r#"{
@@ -1707,5 +1950,276 @@ mod tests {
         }
 
         assert_eq!(filter_public_url(None), None);
+    }
+
+    // ------------------------------------------------------------------
+    // T1: webhook body parsing / classification
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn classifies_webhooks_v1_payment_notification() {
+        let body: MercadopagoWebhookBodyEnum = serde_json::from_str(
+            r#"{"action":"payment.updated","data":{"id":"150211668619"},"type":"payment"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            body.classify(),
+            MercadopagoWebhookNotification::Payment {
+                payment_id: "150211668619".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn classifies_chargeback_push_with_payment_id_as_numeric_json() {
+        let body: MercadopagoWebhookBodyEnum = serde_json::from_str(
+            r#"{"type":"topic_chargebacks_wh","actions":["created"],
+                "data":{"id":"cb_1","payment_id":168355689156}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            body.classify(),
+            MercadopagoWebhookNotification::ChargebackWithPayment {
+                payment_id: "168355689156".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn classifies_chargeback_push_with_payment_id_as_string() {
+        let body: MercadopagoWebhookBodyEnum = serde_json::from_str(
+            r#"{"type":"topic_chargebacks_wh","actions":["created"],
+                "data":{"id":"cb_1","payment_id":"168355689156"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            body.classify(),
+            MercadopagoWebhookNotification::ChargebackWithPayment {
+                payment_id: "168355689156".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn classifies_chargeback_push_without_payment_id_as_unsupported() {
+        let body: MercadopagoWebhookBodyEnum = serde_json::from_str(
+            r#"{"type":"topic_chargebacks_wh","actions":["created"],"data":{"id":"cb_1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            body.classify(),
+            MercadopagoWebhookNotification::ChargebackWithoutPayment
+        );
+        assert_eq!(
+            api_models::webhooks::IncomingWebhookEvent::from(&body.classify()),
+            api_models::webhooks::IncomingWebhookEvent::EventNotSupported
+        );
+        // Never a payment id to sync against.
+        assert_eq!(body.classify().payment_id_to_sync(), None);
+    }
+
+    #[test]
+    fn classifies_refund_action_as_not_supported() {
+        let body: MercadopagoWebhookBodyEnum = serde_json::from_str(
+            r#"{"action":"refund.created","data":{"id":"r_1"},"type":"payment"}"#,
+        )
+        .unwrap();
+        assert_eq!(body.classify(), MercadopagoWebhookNotification::Refund);
+        assert_eq!(
+            api_models::webhooks::IncomingWebhookEvent::from(&body.classify()),
+            api_models::webhooks::IncomingWebhookEvent::EventNotSupported
+        );
+    }
+
+    #[test]
+    fn classifies_unknown_action_as_not_supported() {
+        let body: MercadopagoWebhookBodyEnum = serde_json::from_str(
+            r#"{"action":"something.else","data":{"id":"x"},"type":"payment"}"#,
+        )
+        .unwrap();
+        assert_eq!(body.classify(), MercadopagoWebhookNotification::Unknown);
+    }
+
+    #[test]
+    fn classifies_feed_v2_payment_topic() {
+        let body: MercadopagoWebhookBodyEnum =
+            serde_json::from_str(r#"{"resource":"150211668619","topic":"payment"}"#).unwrap();
+        assert_eq!(
+            body.classify(),
+            MercadopagoWebhookNotification::Payment {
+                payment_id: "150211668619".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn classifies_feed_v2_chargebacks_topic_as_unsupported() {
+        let body: MercadopagoWebhookBodyEnum =
+            serde_json::from_str(r#"{"resource":"cb_1","topic":"chargebacks"}"#).unwrap();
+        assert_eq!(
+            body.classify(),
+            MercadopagoWebhookNotification::ChargebackWithoutPayment
+        );
+    }
+
+    #[test]
+    fn payment_notification_never_carries_a_chargeback_id_as_payment_id() {
+        // Regression guard for the original bug: a chargeback notification's
+        // own id must never surface as the payment id to sync.
+        let chargeback = MercadopagoWebhookNotification::ChargebackWithoutPayment;
+        assert_eq!(chargeback.payment_id_to_sync(), None);
+    }
+
+    // ------------------------------------------------------------------
+    // T2: PSync status mapping + refunds[] / dispute carrier
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn refunded_charged_back_and_in_mediation_map_to_charged() {
+        for status in [
+            MercadopagoPaymentStatus::Refunded,
+            MercadopagoPaymentStatus::ChargedBack,
+            MercadopagoPaymentStatus::InMediation,
+        ] {
+            assert_eq!(
+                enums::AttemptStatus::from(status),
+                enums::AttemptStatus::Charged
+            );
+        }
+    }
+
+    fn payment_response_with_refunds(
+        refunds_json: &str,
+        status: &str,
+    ) -> MercadopagoPaymentsResponse {
+        serde_json::from_str(&format!(
+            r#"{{"id":168355689156,"status":"{status}","transaction_amount":1000.0,
+                "currency_id":"ARS","refunds":{refunds_json}}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn parses_refunds_and_converts_float_to_minor_units() {
+        let payment = payment_response_with_refunds(
+            r#"[{"id":1,"amount":10.5,"status":"approved"}]"#,
+            "approved",
+        );
+        let activity = payment.reported_activity(enums::Currency::ARS).unwrap();
+        assert_eq!(activity.refunds.len(), 1);
+        assert_eq!(activity.refunds[0].connector_refund_id, "1");
+        assert_eq!(activity.refunds[0].amount, MinorUnit::new(1050));
+        assert_eq!(activity.refunds[0].status, enums::RefundStatus::Success);
+    }
+
+    #[test]
+    fn parses_refund_id_as_numeric_or_string() {
+        let payment = payment_response_with_refunds(
+            r#"[{"id":1,"amount":10.0,"status":"pending"},
+                {"id":"2","amount":5.0,"status":"pending"}]"#,
+            "approved",
+        );
+        let activity = payment.reported_activity(enums::Currency::ARS).unwrap();
+        let ids: Vec<_> = activity
+            .refunds
+            .iter()
+            .map(|r| r.connector_refund_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn unknown_refund_status_is_tolerantly_mapped_to_pending() {
+        let payment = payment_response_with_refunds(
+            r#"[{"id":1,"amount":10.0,"status":"some_new_status_mp_might_add"}]"#,
+            "approved",
+        );
+        let activity = payment.reported_activity(enums::Currency::ARS).unwrap();
+        assert_eq!(activity.refunds[0].status, enums::RefundStatus::Pending);
+    }
+
+    #[test]
+    fn in_process_and_rejected_and_cancelled_refund_statuses_map_correctly() {
+        let payment = payment_response_with_refunds(
+            r#"[{"id":1,"amount":1.0,"status":"in_process"},
+                {"id":2,"amount":1.0,"status":"rejected"},
+                {"id":3,"amount":1.0,"status":"cancelled"}]"#,
+            "approved",
+        );
+        let activity = payment.reported_activity(enums::Currency::ARS).unwrap();
+        assert_eq!(activity.refunds[0].status, enums::RefundStatus::Pending);
+        assert_eq!(activity.refunds[1].status, enums::RefundStatus::Failure);
+        assert_eq!(activity.refunds[2].status, enums::RefundStatus::Failure);
+    }
+
+    #[test]
+    fn payment_without_a_refunds_field_parses_fine() {
+        // The common case: most payments carry no `refunds` at all.
+        let payment: MercadopagoPaymentsResponse =
+            serde_json::from_str(r#"{"id":1,"status":"approved","transaction_amount":100.0}"#)
+                .unwrap();
+        assert!(payment.refunds.is_none());
+        assert!(payment.reported_activity(enums::Currency::ARS).is_none());
+    }
+
+    #[test]
+    fn a_malformed_individual_refund_entry_is_skipped_not_fatal() {
+        let payment = payment_response_with_refunds(
+            r#"[{"id":1,"amount":10.0,"status":"approved"},
+                {"amount":5.0,"status":"approved"},
+                "not-an-object"]"#,
+            "approved",
+        );
+        let activity = payment.reported_activity(enums::Currency::ARS).unwrap();
+        // Only the first, well-formed entry survives.
+        assert_eq!(activity.refunds.len(), 1);
+        assert_eq!(activity.refunds[0].connector_refund_id, "1");
+    }
+
+    #[test]
+    fn a_refund_entry_without_an_amount_is_skipped_not_defaulted_to_zero() {
+        let payment =
+            payment_response_with_refunds(r#"[{"id":1,"status":"approved"}]"#, "approved");
+        assert!(payment.reported_activity(enums::Currency::ARS).is_none());
+    }
+
+    #[test]
+    fn no_reported_activity_when_nothing_to_report() {
+        let payment: MercadopagoPaymentsResponse =
+            serde_json::from_str(r#"{"id":1,"status":"approved","transaction_amount":100.0}"#)
+                .unwrap();
+        assert!(payment.reported_activity(enums::Currency::ARS).is_none());
+    }
+
+    #[test]
+    fn charged_back_status_detail_maps_to_dispute_snapshot() {
+        for (status_detail, expected) in [
+            ("in_process", enums::DisputeStatus::DisputeOpened),
+            ("settled", enums::DisputeStatus::DisputeLost),
+            ("reimbursed", enums::DisputeStatus::DisputeWon),
+            ("something_else", enums::DisputeStatus::DisputeOpened),
+        ] {
+            let payment: MercadopagoPaymentsResponse = serde_json::from_str(&format!(
+                r#"{{"id":168355689156,"status":"charged_back","status_detail":"{status_detail}",
+                    "transaction_amount":250.0}}"#
+            ))
+            .unwrap();
+            let activity = payment.reported_activity(enums::Currency::ARS).unwrap();
+            let dispute = activity
+                .dispute
+                .expect("charged_back must report a dispute");
+            assert_eq!(dispute.status, expected, "status_detail={status_detail}");
+            assert_eq!(dispute.connector_dispute_id, "168355689156");
+            assert_eq!(dispute.stage, enums::DisputeStage::Dispute);
+            assert_eq!(dispute.amount, MinorUnit::new(25000));
+        }
+    }
+
+    #[test]
+    fn in_mediation_never_creates_a_dispute() {
+        let payment: MercadopagoPaymentsResponse =
+            serde_json::from_str(r#"{"id":1,"status":"in_mediation","transaction_amount":100.0}"#)
+                .unwrap();
+        assert!(payment.reported_activity(enums::Currency::ARS).is_none());
     }
 }
