@@ -9,7 +9,10 @@ use common_enums::AuthorizationStatus;
 use common_utils::ext_traits::ValueExt;
 use common_utils::{
     ext_traits::{AsyncExt, Encode},
-    types::{keymanager::KeyManagerState, ConnectorTransactionId, MinorUnit},
+    types::{
+        keymanager::KeyManagerState, AmountConvertor, ConnectorTransactionId, MinorUnit,
+        StringMinorUnitForConnector,
+    },
 };
 use error_stack::{report, ResultExt};
 use futures::FutureExt;
@@ -26,6 +29,8 @@ use tracing_futures::Instrument;
 use super::{Operation, OperationSessionSetters, PostUpdateTracker};
 #[cfg(all(feature = "v1", feature = "dynamic_routing"))]
 use crate::core::routing::helpers as routing_helpers;
+#[cfg(feature = "v1")]
+use crate::db::StorageInterface;
 #[cfg(feature = "v2")]
 use crate::utils::OptionExt;
 use crate::{
@@ -562,7 +567,16 @@ impl<F: Clone> PostUpdateTracker<F, PaymentData<F>, types::PaymentsSyncData> for
     where
         F: 'b + Send,
     {
-        Box::pin(payment_response_update_tracker(
+        // Read before `router_data` is moved into `payment_response_update_tracker`
+        // below: some connectors (Mercado Pago) report refunds/disputes
+        // created outside Hyperswitch directly on the payment-sync response.
+        let reported_activity = router_data
+            .connector_response
+            .as_ref()
+            .and_then(|connector_response| connector_response.get_reported_activity())
+            .cloned();
+
+        let payment_data = Box::pin(payment_response_update_tracker(
             db,
             payment_data,
             router_data,
@@ -574,7 +588,35 @@ impl<F: Clone> PostUpdateTracker<F, PaymentData<F>, types::PaymentsSyncData> for
             #[cfg(all(feature = "v1", feature = "dynamic_routing"))]
             business_profile,
         ))
-        .await
+        .await?;
+
+        // Reconcile only after the payment itself has been persisted above, and
+        // only when there is something reported. Any failure here is logged and
+        // swallowed: it must never fail the payment sync itself.
+        let mut payment_data = payment_data;
+        if let Some(reported_activity) = reported_activity {
+            if let Err(error) = reconcile_connector_reported_activity(
+                db,
+                &payment_data.payment_attempt,
+                &payment_data.payment_intent,
+                storage_scheme,
+                reported_activity,
+            )
+            .await
+            {
+                router_env::logger::error!(
+                    ?error,
+                    payment_id = ?payment_data.payment_intent.payment_id,
+                    "failed to reconcile connector-reported refund/dispute activity on payment sync"
+                );
+            }
+            // The refunds and disputes in `payment_data` were loaded before this
+            // sync; reload them so this same response already shows what the
+            // reconciliation created or updated.
+            refresh_refunds_and_disputes(db, &mut payment_data, storage_scheme).await;
+        }
+
+        Ok(payment_data)
     }
 
     async fn save_pm_and_mandate<'b>(
@@ -627,6 +669,477 @@ impl<F: Clone> PostUpdateTracker<F, PaymentData<F>, types::PaymentsSyncData> for
         )
         .await?;
         Ok(())
+    }
+}
+
+// ============================================================================
+// Reconciling refunds/disputes an aggregator connector reports on a
+// payment-sync response (see `ConnectorResponseData::get_reported_activity`,
+// `hyperswitch_domain_models::connector_activity_reconciliation`'s pure
+// planning functions, and `Connector::syncs_refunds_and_disputes_on_payment_sync`).
+// Called only from the `PaymentsSyncData` `PostUpdateTracker` above, after the
+// payment itself has already been persisted; every error here is logged and
+// swallowed by the caller rather than failing the sync.
+// ============================================================================
+
+#[cfg(feature = "v1")]
+async fn refresh_refunds_and_disputes<F: Clone + Send>(
+    state: &SessionState,
+    payment_data: &mut PaymentData<F>,
+    storage_scheme: enums::MerchantStorageScheme,
+) {
+    let db = &*state.store;
+    let payment_id = payment_data.payment_intent.payment_id.clone();
+    let merchant_id = payment_data.payment_intent.merchant_id.clone();
+
+    match db
+        .find_refund_by_payment_id_merchant_id(&payment_id, &merchant_id, storage_scheme)
+        .await
+    {
+        Ok(refunds) => payment_data.refunds = refunds,
+        Err(error) => router_env::logger::error!(
+            ?error,
+            ?payment_id,
+            "failed to reload refunds after reconciling connector-reported activity"
+        ),
+    }
+
+    match db
+        .find_disputes_by_merchant_id_payment_id(&merchant_id, &payment_id)
+        .await
+    {
+        Ok(disputes) => payment_data.disputes = disputes,
+        Err(error) => router_env::logger::error!(
+            ?error,
+            ?payment_id,
+            "failed to reload disputes after reconciling connector-reported activity"
+        ),
+    }
+}
+
+#[cfg(feature = "v1")]
+async fn reconcile_connector_reported_activity(
+    state: &SessionState,
+    payment_attempt: &PaymentAttempt,
+    payment_intent: &storage::PaymentIntent,
+    storage_scheme: enums::MerchantStorageScheme,
+    reported_activity: hyperswitch_domain_models::router_data::ConnectorReportedActivity,
+) -> RouterResult<()> {
+    let merchant_id = payment_attempt.merchant_id.clone();
+    let connector = payment_attempt
+        .connector
+        .clone()
+        .ok_or(errors::ApiErrorResponse::InternalServerError)
+        .attach_printable(
+            "connector not populated on the payment attempt; cannot reconcile reported refunds/disputes",
+        )?;
+
+    // Refunds and the dispute reconcile independently: a failure reconciling
+    // refunds (or within a single reported refund, see the loop below) must
+    // never prevent the dispute from being reconciled, and vice versa. Each
+    // branch logs its own failure and never propagates it further than this
+    // function, which the caller also treats as "never fail the payment
+    // sync".
+    if !reported_activity.refunds.is_empty() {
+        let refunds_result = match payment_attempt
+            .currency
+            .ok_or(errors::ApiErrorResponse::InternalServerError)
+            .attach_printable(
+                "currency not populated on the payment attempt; cannot reconcile reported refunds",
+            ) {
+            Ok(currency) => {
+                reconcile_reported_refunds(
+                    state,
+                    &merchant_id,
+                    &connector,
+                    currency,
+                    payment_attempt,
+                    payment_intent,
+                    storage_scheme,
+                    reported_activity.refunds,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = refunds_result {
+            router_env::logger::error!(
+                ?error,
+                payment_id = ?payment_intent.payment_id,
+                "failed to reconcile connector-reported refunds"
+            );
+        }
+    }
+
+    if let Some(reported_dispute) = reported_activity.dispute {
+        if let Err(error) = reconcile_reported_dispute(
+            state,
+            &merchant_id,
+            &connector,
+            payment_attempt,
+            payment_intent,
+            reported_dispute,
+        )
+        .await
+        {
+            router_env::logger::error!(
+                ?error,
+                payment_id = ?payment_intent.payment_id,
+                "failed to reconcile connector-reported dispute"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "v1")]
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_reported_refunds(
+    state: &SessionState,
+    merchant_id: &common_utils::id_type::MerchantId,
+    connector: &str,
+    currency: enums::Currency,
+    payment_attempt: &PaymentAttempt,
+    payment_intent: &storage::PaymentIntent,
+    storage_scheme: enums::MerchantStorageScheme,
+    reported_refunds: Vec<hyperswitch_domain_models::router_data::ConnectorReportedRefund>,
+) -> RouterResult<()> {
+    use hyperswitch_domain_models::connector_activity_reconciliation::{
+        plan_refund_reconciliation, ExistingRefundView, RefundReconciliationAction,
+    };
+
+    let db = &*state.store;
+
+    let existing_refunds = db
+        .find_refund_by_payment_id_merchant_id(
+            &payment_intent.payment_id,
+            merchant_id,
+            storage_scheme,
+        )
+        .await
+        .change_context(errors::ApiErrorResponse::InternalServerError)
+        .attach_printable(
+            "failed to fetch existing refunds while reconciling connector-reported refunds",
+        )?;
+
+    let existing_views: Vec<ExistingRefundView> = existing_refunds
+        .iter()
+        .map(|refund| ExistingRefundView {
+            refund_id: refund.refund_id.clone(),
+            connector_refund_id: refund
+                .connector_refund_id
+                .as_ref()
+                .map(|id| id.get_id().clone()),
+            status: refund.refund_status,
+            amount: refund.refund_amount,
+            created_at: refund.created_at,
+        })
+        .collect();
+
+    let actions = plan_refund_reconciliation(&existing_views, &reported_refunds, connector);
+
+    // One failed action must never block the rest: log it (with enough
+    // identifiers to find the record) and move on to the next action.
+    for action in actions {
+        let result = match action {
+            RefundReconciliationAction::UpdateStatus {
+                ref refund_id,
+                status,
+            } => match existing_refunds
+                .iter()
+                .find(|refund| refund.refund_id == *refund_id)
+            {
+                Some(existing) => {
+                    apply_refund_status_update(db, existing.clone(), None, status, storage_scheme)
+                        .await
+                }
+                None => Ok(()),
+            },
+            RefundReconciliationAction::Link {
+                ref refund_id,
+                ref connector_refund_id,
+                status,
+            } => match existing_refunds
+                .iter()
+                .find(|refund| refund.refund_id == *refund_id)
+            {
+                Some(existing) => {
+                    let (stored_connector_refund_id, processor_refund_data) =
+                        ConnectorTransactionId::form_id_and_data(connector_refund_id.clone());
+                    apply_refund_status_update(
+                        db,
+                        existing.clone(),
+                        Some((stored_connector_refund_id, processor_refund_data)),
+                        status,
+                        storage_scheme,
+                    )
+                    .await
+                }
+                None => Ok(()),
+            },
+            RefundReconciliationAction::Create {
+                ref refund_id,
+                ref connector_refund_id,
+                amount,
+                status,
+            } => {
+                create_reported_refund(
+                    db,
+                    merchant_id,
+                    connector,
+                    currency,
+                    payment_attempt,
+                    payment_intent,
+                    storage_scheme,
+                    refund_id.clone(),
+                    connector_refund_id.clone(),
+                    amount,
+                    status,
+                )
+                .await
+            }
+        };
+
+        if let Err(error) = result {
+            let (refund_id, connector_refund_id) = match &action {
+                RefundReconciliationAction::UpdateStatus { refund_id, .. } => {
+                    (Some(refund_id.as_str()), None)
+                }
+                RefundReconciliationAction::Link {
+                    refund_id,
+                    connector_refund_id,
+                    ..
+                } => (Some(refund_id.as_str()), Some(connector_refund_id.as_str())),
+                RefundReconciliationAction::Create {
+                    refund_id,
+                    connector_refund_id,
+                    ..
+                } => (Some(refund_id.as_str()), Some(connector_refund_id.as_str())),
+            };
+            router_env::logger::error!(
+                ?error,
+                ?refund_id,
+                ?connector_refund_id,
+                "failed to apply a connector-reported refund reconciliation action, skipping it"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "v1")]
+async fn apply_refund_status_update(
+    db: &dyn StorageInterface,
+    existing: diesel_models::refund::Refund,
+    connector_refund_id: Option<(ConnectorTransactionId, Option<String>)>,
+    status: enums::RefundStatus,
+    storage_scheme: enums::MerchantStorageScheme,
+) -> RouterResult<()> {
+    let update = match connector_refund_id {
+        Some((connector_refund_id, processor_refund_data)) => {
+            diesel_models::refund::RefundUpdate::StatusUpdate {
+                connector_refund_id: Some(connector_refund_id),
+                sent_to_gateway: true,
+                refund_status: status,
+                updated_by: storage_scheme.to_string(),
+                processor_refund_data,
+            }
+        }
+        None => diesel_models::refund::RefundUpdate::StatusUpdate {
+            connector_refund_id: None,
+            sent_to_gateway: existing.sent_to_gateway,
+            refund_status: status,
+            updated_by: storage_scheme.to_string(),
+            processor_refund_data: existing.processor_refund_data.clone(),
+        },
+    };
+
+    db.update_refund(existing, update, storage_scheme)
+        .await
+        .change_context(errors::ApiErrorResponse::InternalServerError)
+        .attach_printable(
+            "failed to update a refund while reconciling connector-reported activity",
+        )?;
+
+    Ok(())
+}
+
+#[cfg(feature = "v1")]
+#[allow(clippy::too_many_arguments)]
+async fn create_reported_refund(
+    db: &dyn StorageInterface,
+    merchant_id: &common_utils::id_type::MerchantId,
+    connector: &str,
+    currency: enums::Currency,
+    payment_attempt: &PaymentAttempt,
+    payment_intent: &storage::PaymentIntent,
+    storage_scheme: enums::MerchantStorageScheme,
+    refund_id: String,
+    connector_refund_id: String,
+    amount: MinorUnit,
+    status: enums::RefundStatus,
+) -> RouterResult<()> {
+    let connector_transaction_id = payment_attempt
+        .connector_transaction_id
+        .clone()
+        .ok_or(errors::ApiErrorResponse::InternalServerError)
+        .attach_printable(
+            "missing connector_transaction_id on the payment attempt; cannot create a reconciled refund",
+        )?;
+    let (connector_transaction_id, processor_transaction_data) =
+        ConnectorTransactionId::form_id_and_data(connector_transaction_id);
+    let (stored_connector_refund_id, processor_refund_data) =
+        ConnectorTransactionId::form_id_and_data(connector_refund_id.clone());
+
+    let refund_new = diesel_models::refund::RefundNew {
+        refund_id: refund_id.clone(),
+        internal_reference_id: utils::generate_id(consts::ID_LENGTH, "refid"),
+        external_reference_id: Some(refund_id),
+        payment_id: payment_intent.payment_id.clone(),
+        merchant_id: merchant_id.clone(),
+        connector_transaction_id,
+        connector: connector.to_string(),
+        connector_refund_id: Some(stored_connector_refund_id),
+        refund_type: enums::RefundType::InstantRefund,
+        total_amount: payment_attempt.get_total_amount(),
+        currency,
+        refund_amount: amount,
+        refund_status: status,
+        sent_to_gateway: true,
+        metadata: None,
+        refund_arn: None,
+        created_at: common_utils::date_time::now(),
+        modified_at: common_utils::date_time::now(),
+        description: None,
+        attempt_id: payment_attempt.attempt_id.clone(),
+        refund_reason: Some(
+            "Created outside Hyperswitch; reported by the connector on payment sync".to_string(),
+        ),
+        profile_id: payment_intent.profile_id.clone(),
+        updated_by: storage_scheme.to_string(),
+        merchant_connector_id: payment_attempt.merchant_connector_id.clone(),
+        charges: None,
+        organization_id: payment_intent.organization_id.clone(),
+        split_refunds: None,
+        processor_refund_data,
+        processor_transaction_data,
+    };
+
+    match db.insert_refund(refund_new, storage_scheme).await {
+        Ok(_) => Ok(()),
+        Err(error) if error.current_context().is_db_unique_violation() => {
+            router_env::logger::info!(
+                connector_refund_id = %connector_refund_id,
+                "a refund reported by the connector was already created by a concurrent sync, skipping"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error)
+            .change_context(errors::ApiErrorResponse::InternalServerError)
+            .attach_printable("failed to insert a reconciled refund"),
+    }
+}
+
+#[cfg(feature = "v1")]
+async fn reconcile_reported_dispute(
+    state: &SessionState,
+    merchant_id: &common_utils::id_type::MerchantId,
+    connector: &str,
+    payment_attempt: &PaymentAttempt,
+    payment_intent: &storage::PaymentIntent,
+    reported: hyperswitch_domain_models::router_data::ConnectorReportedDispute,
+) -> RouterResult<()> {
+    use hyperswitch_domain_models::connector_activity_reconciliation::{
+        plan_dispute_reconciliation, DisputeReconciliationAction, ExistingDisputeView,
+    };
+
+    let db = &*state.store;
+
+    let existing = db
+        .find_by_merchant_id_payment_id_connector_dispute_id(
+            merchant_id,
+            &payment_intent.payment_id,
+            &reported.connector_dispute_id,
+        )
+        .await
+        .change_context(errors::ApiErrorResponse::InternalServerError)
+        .attach_printable(
+            "failed to look up an existing dispute while reconciling connector-reported activity",
+        )?;
+
+    let existing_view = existing.as_ref().map(|dispute| ExistingDisputeView {
+        stage: dispute.dispute_stage,
+        status: dispute.dispute_status,
+    });
+
+    match plan_dispute_reconciliation(existing_view.as_ref(), &reported) {
+        DisputeReconciliationAction::NoOp => Ok(()),
+        DisputeReconciliationAction::Update { status, stage } => {
+            if let Some(existing) = existing {
+                let update = storage::DisputeUpdate::Update {
+                    dispute_stage: stage,
+                    dispute_status: status,
+                    connector_status: reported.connector_status.clone(),
+                    connector_reason: reported.reason.clone(),
+                    connector_reason_code: None,
+                    challenge_required_by: None,
+                    connector_updated_at: None,
+                };
+                db.update_dispute(existing, update)
+                    .await
+                    .change_context(errors::ApiErrorResponse::InternalServerError)
+                    .attach_printable("failed to update a reconciled dispute")?;
+            }
+            Ok(())
+        }
+        DisputeReconciliationAction::Create => {
+            let string_minor_amount = StringMinorUnitForConnector
+                .convert(reported.amount, reported.currency)
+                .change_context(errors::ApiErrorResponse::AmountConversionFailed {
+                    amount_type: "MinorUnit",
+                })?;
+
+            let dispute_new = storage::DisputeNew {
+                dispute_id: utils::generate_id(consts::ID_LENGTH, "dp"),
+                amount: string_minor_amount,
+                currency: reported.currency.to_string(),
+                dispute_stage: reported.stage,
+                dispute_status: reported.status,
+                payment_id: payment_intent.payment_id.clone(),
+                attempt_id: payment_attempt.attempt_id.clone(),
+                merchant_id: merchant_id.clone(),
+                connector_status: reported.connector_status.clone(),
+                connector_dispute_id: reported.connector_dispute_id.clone(),
+                connector_reason: reported.reason.clone(),
+                connector_reason_code: None,
+                challenge_required_by: None,
+                connector_created_at: None,
+                connector_updated_at: None,
+                connector: connector.to_string(),
+                evidence: None,
+                profile_id: payment_intent.profile_id.clone(),
+                merchant_connector_id: payment_attempt.merchant_connector_id.clone(),
+                dispute_amount: reported.amount,
+                organization_id: payment_intent.organization_id.clone(),
+                dispute_currency: Some(reported.currency),
+            };
+
+            match db.insert_dispute(dispute_new).await {
+                Ok(_) => Ok(()),
+                Err(error) if error.current_context().is_db_unique_violation() => {
+                    router_env::logger::info!(
+                        connector_dispute_id = %reported.connector_dispute_id,
+                        "a dispute reported by the connector was already created by a concurrent sync, skipping"
+                    );
+                    Ok(())
+                }
+                Err(error) => Err(error)
+                    .change_context(errors::ApiErrorResponse::InternalServerError)
+                    .attach_printable("failed to insert a reconciled dispute"),
+            }
+        }
     }
 }
 

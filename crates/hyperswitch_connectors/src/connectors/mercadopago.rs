@@ -493,11 +493,41 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Mer
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
-        RouterData::try_from(ResponseRouterData {
+
+        // Built from the response BEFORE it is consumed by `try_from` below,
+        // using the request's own currency (`data`, concretely typed here as
+        // `PaymentsSyncRouterData`) rather than the connector's `currency_id`
+        // string.
+        let reported_activity = response
+            .resolved_payment()
+            .and_then(|payment| payment.reported_activity(data.request.currency));
+
+        let mut router_data = RouterData::try_from(ResponseRouterData {
             response,
             data: data.clone(),
             http_code: res.status_code,
-        })
+        })?;
+
+        if let Some(reported_activity) = reported_activity {
+            // Merge into an existing `connector_response` (e.g. carried over
+            // via `..item.data` from the request's `RouterData`) instead of
+            // replacing it wholesale, so any other field already set on it
+            // is never silently dropped.
+            match router_data.connector_response.as_mut() {
+                Some(connector_response) => {
+                    connector_response.set_reported_activity(reported_activity);
+                }
+                None => {
+                    router_data.connector_response = Some(
+                        hyperswitch_domain_models::router_data::ConnectorResponseData::with_reported_activity(
+                            reported_activity,
+                        ),
+                    );
+                }
+            }
+        }
+
+        Ok(router_data)
     }
 
     fn get_error_response(
@@ -872,50 +902,6 @@ impl ConnectorIntegration<RSync, RefundsData, RefundsResponseData> for Mercadopa
 // Webhooks
 // ============================================================================
 
-/// Parse the x-signature header from Mercado Pago
-/// Format: ts=1704908010,v1=618c85345248dd820d5fd456117c2ab2ef8eda45a0282ff693eac24131a5e839
-fn parse_mercadopago_signature_header(
-    headers: &actix_web::http::header::HeaderMap,
-) -> CustomResult<(String, String), errors::ConnectorError> {
-    let signature_header = headers
-        .get("x-signature")
-        .and_then(|v| v.to_str().ok())
-        .ok_or(errors::ConnectorError::WebhookSignatureNotFound)?;
-
-    let mut ts = String::new();
-    let mut v1 = String::new();
-
-    for part in signature_header.split(',') {
-        let mut kv = part.splitn(2, '=');
-        if let (Some(key), Some(value)) = (kv.next(), kv.next()) {
-            match key.trim() {
-                "ts" => ts = value.trim().to_string(),
-                "v1" => v1 = value.trim().to_string(),
-                _ => {}
-            }
-        }
-    }
-
-    if ts.is_empty() || v1.is_empty() {
-        return Err(errors::ConnectorError::WebhookSignatureNotFound.into());
-    }
-
-    Ok((ts, v1))
-}
-
-/// Extract the data.id from query params (for Webhooks v2)
-fn extract_data_id_from_query(query_params: &str) -> Option<String> {
-    for param in query_params.split('&') {
-        let mut kv = param.splitn(2, '=');
-        if let (Some(key), Some(value)) = (kv.next(), kv.next()) {
-            if key == "data.id" {
-                return Some(value.to_lowercase());
-            }
-        }
-    }
-    None
-}
-
 /// Extract the id from query params (for IPN legacy notifications)
 fn extract_ipn_id_from_query(query_params: &str) -> Option<String> {
     for param in query_params.split('&') {
@@ -942,161 +928,115 @@ fn extract_topic_from_query(query_params: &str) -> Option<String> {
     None
 }
 
-/// Convert IPN topic to webhook action
-fn ipn_topic_to_action(topic: &str) -> mercadopago::MercadopagoWebhookAction {
-    match topic {
-        "payment" => mercadopago::MercadopagoWebhookAction::PaymentUpdated,
-        "chargebacks" => mercadopago::MercadopagoWebhookAction::ChargebackUpdated,
-        _ => mercadopago::MercadopagoWebhookAction::Unknown,
+/// Classifies an incoming Mercado Pago webhook across every wire format: the
+/// body first (Webhooks v1 / app-level chargeback push, or Feed v2), falling
+/// back to the IPN legacy `topic`/`id` query params when the body doesn't
+/// parse as either. `get_webhook_event_type` and `get_webhook_object_reference_id`
+/// both go through this so they can never disagree with each other.
+fn classify_mercadopago_webhook(
+    request: &webhooks::IncomingWebhookRequestDetails<'_>,
+) -> mercadopago::MercadopagoWebhookNotification {
+    if let Ok(webhook_body) = request
+        .body
+        .parse_struct::<mercadopago::MercadopagoWebhookBodyEnum>("MercadopagoWebhookBodyEnum")
+    {
+        return webhook_body.classify();
+    }
+
+    // IPN legacy URL format: ?topic=payment&id=123456789
+    let topic = extract_topic_from_query(&request.query_params);
+    let id = extract_ipn_id_from_query(&request.query_params);
+    match (topic.as_deref(), id) {
+        (Some("payment"), Some(payment_id)) => {
+            mercadopago::MercadopagoWebhookNotification::Payment { payment_id }
+        }
+        // The IPN chargeback notification carries only the chargeback id,
+        // never the payment it applies to — never treat that id as a
+        // payment id.
+        (Some("chargebacks"), Some(_chargeback_id)) => {
+            mercadopago::MercadopagoWebhookNotification::ChargebackWithoutPayment
+        }
+        _ => mercadopago::MercadopagoWebhookNotification::Unknown,
     }
 }
 
 #[async_trait::async_trait]
 impl webhooks::IncomingWebhook for Mercadopago {
-    fn get_webhook_source_verification_algorithm(
+    /// Always `false`: Mercado Pago notifications carry only a resource id,
+    /// never a status or amount, so their state is always fetched fresh from
+    /// MP's own API using the merchant's credentials (see
+    /// `classify_mercadopago_webhook`). Returning
+    /// `true` here would make core treat the id-only webhook body itself as
+    /// a PSync response via `HandleResponse` — which the PSync parser above
+    /// cannot read (it expects the full payment object MP's API returns, not
+    /// a webhook notification). Since every notification just triggers a
+    /// live PSync regardless of its authenticity, an unverified notification
+    /// can at worst cause one extra API read against MP.
+    async fn verify_webhook_source(
         &self,
         _request: &webhooks::IncomingWebhookRequestDetails<'_>,
-    ) -> CustomResult<Box<dyn common_utils::crypto::VerifySignature + Send>, errors::ConnectorError>
-    {
-        Ok(Box::new(common_utils::crypto::HmacSha256))
-    }
-
-    fn get_webhook_source_verification_signature(
-        &self,
-        request: &webhooks::IncomingWebhookRequestDetails<'_>,
-        _connector_webhook_secrets: &api_models::webhooks::ConnectorWebhookSecrets,
-    ) -> CustomResult<Vec<u8>, errors::ConnectorError> {
-        let (_ts, v1) = parse_mercadopago_signature_header(request.headers)?;
-        hex::decode(v1).change_context(errors::ConnectorError::WebhookSignatureNotFound)
-    }
-
-    fn get_webhook_source_verification_message(
-        &self,
-        request: &webhooks::IncomingWebhookRequestDetails<'_>,
         _merchant_id: &common_utils::id_type::MerchantId,
-        _connector_webhook_secrets: &api_models::webhooks::ConnectorWebhookSecrets,
-    ) -> CustomResult<Vec<u8>, errors::ConnectorError> {
-        // Check if this is a Webhooks v2 notification (has x-signature header)
-        // IPN legacy notifications don't support signature verification
-        let (ts, _v1) = parse_mercadopago_signature_header(request.headers)?;
-
-        let x_request_id = request
-            .headers
-            .get("x-request-id")
-            .and_then(|v| v.to_str().ok())
-            .ok_or(errors::ConnectorError::WebhookSignatureNotFound)?;
-
-        // data.id / resource can come from query params or from the body
-        // Webhooks v1: data.id in body; Webhooks v2 URL: data.id in query; Feed v2: resource in body or id in query
-        let data_id = extract_data_id_from_query(&request.query_params)
-            .or_else(|| {
-                request
-                    .body
-                    .parse_struct::<mercadopago::MercadopagoWebhookBodyEnum>(
-                        "MercadopagoWebhookBodyEnum",
-                    )
-                    .ok()
-                    .map(|body| body.get_resource_id().to_lowercase())
-            })
-            .or_else(|| {
-                // Fallback for IPN/Feed v2: try to get "id" from query params
-                extract_ipn_id_from_query(&request.query_params).map(|id| id.to_lowercase())
-            })
-            .ok_or(errors::ConnectorError::WebhookSignatureNotFound)?;
-
-        // Build the manifest: id:{data.id};request-id:{x-request-id};ts:{ts};
-        let manifest = format!("id:{};request-id:{};ts:{};", data_id, x_request_id, ts);
-
-        Ok(manifest.into_bytes())
+        _connector_webhook_details: Option<common_utils::pii::SecretSerdeValue>,
+        _connector_account_details: common_utils::crypto::Encryptable<
+            masking::Secret<serde_json::Value>,
+        >,
+        _connector_name: &str,
+    ) -> CustomResult<bool, errors::ConnectorError> {
+        Ok(false)
     }
 
     fn get_webhook_object_reference_id(
         &self,
         request: &webhooks::IncomingWebhookRequestDetails<'_>,
     ) -> CustomResult<api_models::webhooks::ObjectReferenceId, errors::ConnectorError> {
-        // Try to parse as Webhooks v1 (full) or Feed v2 (resource + topic) format
-        if let Ok(webhook_body) = request
-            .body
-            .parse_struct::<mercadopago::MercadopagoWebhookBodyEnum>("MercadopagoWebhookBodyEnum")
-        {
-            let action = webhook_body.get_action();
-            let resource_id = webhook_body.get_resource_id();
-
-            return match action {
-                mercadopago::MercadopagoWebhookAction::PaymentCreated
-                | mercadopago::MercadopagoWebhookAction::PaymentUpdated
-                | mercadopago::MercadopagoWebhookAction::ChargebackCreated
-                | mercadopago::MercadopagoWebhookAction::ChargebackUpdated => {
-                    Ok(api_models::webhooks::ObjectReferenceId::PaymentId(
-                        api_models::payments::PaymentIdType::ConnectorTransactionId(resource_id),
-                    ))
-                }
-                mercadopago::MercadopagoWebhookAction::RefundCreated
-                | mercadopago::MercadopagoWebhookAction::RefundUpdated => {
-                    Ok(api_models::webhooks::ObjectReferenceId::RefundId(
-                        api_models::webhooks::RefundIdType::ConnectorRefundId(resource_id),
-                    ))
-                }
-                mercadopago::MercadopagoWebhookAction::Unknown => {
-                    Err(errors::ConnectorError::WebhookReferenceIdNotFound.into())
-                }
-            };
-        }
-
-        // Fallback: try IPN legacy format (topic and id in query params)
-        // IPN/Feed v2 URL format: ?topic=payment&id=123456789
-        let topic = extract_topic_from_query(&request.query_params);
-        let id = extract_ipn_id_from_query(&request.query_params);
-
-        match (topic.as_deref(), id) {
-            (Some("payment"), Some(payment_id)) => {
-                Ok(api_models::webhooks::ObjectReferenceId::PaymentId(
-                    api_models::payments::PaymentIdType::ConnectorTransactionId(payment_id),
-                ))
-            }
-            (Some("chargebacks"), Some(chargeback_id)) => {
-                Ok(api_models::webhooks::ObjectReferenceId::PaymentId(
-                    api_models::payments::PaymentIdType::ConnectorTransactionId(chargeback_id),
-                ))
-            }
-            _ => Err(errors::ConnectorError::WebhookReferenceIdNotFound.into()),
-        }
+        classify_mercadopago_webhook(request)
+            .payment_id_to_sync()
+            .map(|payment_id| {
+                api_models::webhooks::ObjectReferenceId::PaymentId(
+                    api_models::payments::PaymentIdType::ConnectorTransactionId(
+                        payment_id.to_string(),
+                    ),
+                )
+            })
+            .ok_or_else(|| errors::ConnectorError::WebhookReferenceIdNotFound.into())
     }
 
     fn get_webhook_event_type(
         &self,
         request: &webhooks::IncomingWebhookRequestDetails<'_>,
     ) -> CustomResult<api_models::webhooks::IncomingWebhookEvent, errors::ConnectorError> {
-        // Try to parse as Webhooks v1 (full) or Feed v2 (resource + topic) format
-        if let Ok(webhook_body) = request
-            .body
-            .parse_struct::<mercadopago::MercadopagoWebhookBodyEnum>("MercadopagoWebhookBodyEnum")
-        {
-            let action = webhook_body.get_action();
-            return Ok(api_models::webhooks::IncomingWebhookEvent::from(action));
-        }
-
-        // Fallback: try IPN legacy format (topic in query params)
-        // IPN/Feed v2 URL: ?topic=payment&id=123456789
-        if let Some(topic) = extract_topic_from_query(&request.query_params) {
-            let action = ipn_topic_to_action(&topic);
-            return Ok(api_models::webhooks::IncomingWebhookEvent::from(action));
-        }
-
-        Err(errors::ConnectorError::WebhookEventTypeNotFound.into())
+        Ok(api_models::webhooks::IncomingWebhookEvent::from(
+            &classify_mercadopago_webhook(request),
+        ))
     }
 
     fn get_webhook_resource_object(
         &self,
         request: &webhooks::IncomingWebhookRequestDetails<'_>,
     ) -> CustomResult<Box<dyn masking::ErasedMaskSerialize>, errors::ConnectorError> {
-        // Try to parse as Webhooks v1 (full) or Feed v2 (resource + topic) format
-        let webhook_body: mercadopago::MercadopagoWebhookBodyEnum = request
+        // Webhooks v1 (full) or Feed v2 (resource + topic) carry a JSON body; a
+        // legacy IPN carries only `?topic=...&id=...`, so fall back to the query
+        // (as `get_webhook_object_reference_id` does) instead of rejecting it.
+        if let Ok(webhook_body) = request
             .body
-            .parse_struct("MercadopagoWebhookBodyEnum")
-            .change_context(errors::ConnectorError::WebhookResourceObjectNotFound)?;
+            .parse_struct::<mercadopago::MercadopagoWebhookBodyEnum>("MercadopagoWebhookBodyEnum")
+        {
+            return Ok(Box::new(webhook_body.to_resource_object()));
+        }
 
-        Ok(Box::new(webhook_body.to_resource_object()))
+        match (
+            extract_ipn_id_from_query(&request.query_params),
+            extract_topic_from_query(&request.query_params),
+        ) {
+            (Some(resource_id), Some(topic)) => {
+                Ok(Box::new(mercadopago::MercadopagoWebhookResourceObject {
+                    resource_id,
+                    topic,
+                    action: None,
+                }))
+            }
+            _ => Err(errors::ConnectorError::WebhookResourceObjectNotFound.into()),
+        }
     }
 }
 
@@ -1182,5 +1122,109 @@ impl ConnectorSpecifications for Mercadopago {
 
     fn get_supported_webhook_flows(&self) -> Option<&'static [enums::EventClass]> {
         Some(&MERCADOPAGO_SUPPORTED_WEBHOOK_FLOWS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Classifies an IPN legacy notification given only its query params. An
+    /// empty body always fails to parse as `MercadopagoWebhookBodyEnum`
+    /// (neither the Full nor Feed shape matches), forcing
+    /// `classify_mercadopago_webhook` into the query-params fallback these
+    /// tests exercise.
+    fn classify_ipn(query_params: &str) -> mercadopago::MercadopagoWebhookNotification {
+        let headers = actix_web::http::header::HeaderMap::new();
+        let request = webhooks::IncomingWebhookRequestDetails {
+            method: http::Method::GET,
+            uri: "/webhooks/mercadopago".parse().expect("valid test uri"),
+            headers: &headers,
+            body: b"",
+            query_params: query_params.to_string(),
+        };
+        classify_mercadopago_webhook(&request)
+    }
+
+    #[test]
+    fn ipn_resource_object_falls_back_to_query_params() {
+        let headers = actix_web::http::header::HeaderMap::new();
+        for body in [b"".as_slice(), b"{}".as_slice()] {
+            let request = webhooks::IncomingWebhookRequestDetails {
+                method: http::Method::POST,
+                uri: "/webhooks/mercadopago".parse().expect("valid test uri"),
+                headers: &headers,
+                body,
+                query_params: "topic=payment&id=150211668619".to_string(),
+            };
+            assert!(
+                webhooks::IncomingWebhook::get_webhook_resource_object(
+                    Mercadopago::new(),
+                    &request
+                )
+                .is_ok(),
+                "an IPN (query-only) notification must not be rejected"
+            );
+        }
+
+        let request = webhooks::IncomingWebhookRequestDetails {
+            method: http::Method::POST,
+            uri: "/webhooks/mercadopago".parse().expect("valid test uri"),
+            headers: &headers,
+            body: b"{}",
+            query_params: String::new(),
+        };
+        assert!(webhooks::IncomingWebhook::get_webhook_resource_object(
+            Mercadopago::new(),
+            &request
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn ipn_payment_topic_resyncs_that_payment_id() {
+        let notification = classify_ipn("topic=payment&id=150211668619");
+        assert_eq!(
+            notification,
+            mercadopago::MercadopagoWebhookNotification::Payment {
+                payment_id: "150211668619".to_string()
+            }
+        );
+        assert_eq!(notification.payment_id_to_sync(), Some("150211668619"));
+        assert_eq!(
+            api_models::webhooks::IncomingWebhookEvent::from(&notification),
+            api_models::webhooks::IncomingWebhookEvent::PaymentIntentProcessing
+        );
+    }
+
+    #[test]
+    fn ipn_chargebacks_topic_is_not_supported_and_never_looked_up_by_id() {
+        let notification = classify_ipn("topic=chargebacks&id=cb_123");
+        assert_eq!(
+            notification,
+            mercadopago::MercadopagoWebhookNotification::ChargebackWithoutPayment
+        );
+        // The chargeback id must never be used as a payment id to sync.
+        assert_eq!(notification.payment_id_to_sync(), None);
+        assert_eq!(
+            api_models::webhooks::IncomingWebhookEvent::from(&notification),
+            api_models::webhooks::IncomingWebhookEvent::EventNotSupported
+        );
+    }
+
+    #[test]
+    fn ipn_missing_or_unknown_topic_is_not_supported() {
+        for query in ["", "topic=something_else&id=1", "id=1"] {
+            let notification = classify_ipn(query);
+            assert_eq!(
+                notification,
+                mercadopago::MercadopagoWebhookNotification::Unknown,
+                "query={query}"
+            );
+            assert_eq!(
+                api_models::webhooks::IncomingWebhookEvent::from(&notification),
+                api_models::webhooks::IncomingWebhookEvent::EventNotSupported
+            );
+        }
     }
 }

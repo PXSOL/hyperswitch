@@ -3084,6 +3084,24 @@ pub fn check_force_psync_precondition(status: storage_enums::AttemptStatus) -> b
     )
 }
 
+/// A settled attempt is normally never re-synced (see `check_force_psync_precondition`), but a
+/// connector that reports refunds and disputes created outside Hyperswitch only on its
+/// payment-sync response (`Connector::syncs_refunds_and_disputes_on_payment_sync`) needs that
+/// forced sync to surface them.
+pub fn should_force_psync_settled_attempt_for_reported_activity(
+    status: storage_enums::AttemptStatus,
+    connector: Option<&str>,
+) -> bool {
+    matches!(
+        status,
+        storage_enums::AttemptStatus::Charged | storage_enums::AttemptStatus::PartialCharged
+    ) && connector
+        .and_then(|connector| common_enums::connector_enums::Connector::from_str(connector).ok())
+        .is_some_and(
+            common_enums::connector_enums::Connector::syncs_refunds_and_disputes_on_payment_sync,
+        )
+}
+
 pub fn append_option<T, U, F, V>(func: F, option1: Option<T>, option2: Option<U>) -> Option<V>
 where
     F: FnOnce(T, U) -> V,
