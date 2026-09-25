@@ -568,7 +568,7 @@ impl<F: Clone> PostUpdateTracker<F, PaymentData<F>, types::PaymentsSyncData> for
         F: 'b + Send,
     {
         // Read before `router_data` is moved into `payment_response_update_tracker`
-        // below. D5/D6: some connectors (Mercado Pago) report refunds/disputes
+        // below: some connectors (Mercado Pago) report refunds/disputes
         // created outside Hyperswitch directly on the payment-sync response.
         let reported_activity = router_data
             .connector_response
@@ -668,7 +668,7 @@ impl<F: Clone> PostUpdateTracker<F, PaymentData<F>, types::PaymentsSyncData> for
 }
 
 // ============================================================================
-// D6: reconciling refunds/disputes an aggregator connector reports on a
+// Reconciling refunds/disputes an aggregator connector reports on a
 // payment-sync response (see `ConnectorResponseData::get_reported_activity`,
 // `hyperswitch_domain_models::connector_activity_reconciliation`'s pure
 // planning functions, and `Connector::syncs_refunds_and_disputes_on_payment_sync`).

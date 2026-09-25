@@ -119,7 +119,7 @@ pub fn deterministic_refund_id(connector_name: &str, connector_refund_id: &str) 
     }
 }
 
-/// Plans the refund side of D6 reconciliation. See the action variants for
+/// Plans the refund side of the reconciliation. See the action variants for
 /// the exact rule each one implements.
 ///
 /// A `connector_refund_id` reported more than once in the same call (the
@@ -224,7 +224,7 @@ fn is_terminal_dispute_status(status: common_enums::enums::DisputeStatus) -> boo
     )
 }
 
-/// Plans the dispute side of D6 reconciliation. `existing` must already be
+/// Plans the dispute side of the reconciliation. `existing` must already be
 /// the Hyperswitch dispute matching `reported.connector_dispute_id`, if any
 /// (the caller looks it up; this function stays DB-free).
 pub fn plan_dispute_reconciliation(

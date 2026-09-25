@@ -953,11 +953,12 @@ pub struct MercadopagoPaymentsResponse {
     #[serde(default)]
     pub payment_type_id: Option<String>,
     /// Refunds Mercado Pago reports directly on the payment object. Kept as
-    /// raw JSON: a malformed array (or a malformed entry in it) must never
-    /// fail parsing the payment sync response — see `reported_refunds`, which
-    /// parses each entry leniently and skips ones it cannot read.
+    /// raw JSON: an unexpected shape (not an array, or a malformed entry in
+    /// it) must never fail parsing the payment sync response — see
+    /// `reported_refunds`, which parses each entry leniently and skips ones it
+    /// cannot read.
     #[serde(default)]
-    pub refunds: Option<Vec<serde_json::Value>>,
+    pub refunds: Option<serde_json::Value>,
 }
 
 /// One entry of `MercadopagoPaymentsResponse::refunds`. Deliberately tolerant:
@@ -1042,7 +1043,17 @@ impl MercadopagoPaymentsResponse {
     /// has no usable id, is skipped and logged rather than failing the sync.
     fn reported_refunds(&self) -> Vec<MercadopagoPaymentRefundEntry> {
         let mut parsed = Vec::new();
-        for raw_entry in self.refunds.iter().flatten() {
+        let raw_entries: &[serde_json::Value] = match &self.refunds {
+            None | Some(serde_json::Value::Null) => &[],
+            Some(serde_json::Value::Array(entries)) => entries,
+            Some(_) => {
+                router_env::logger::warn!(
+                    "mercadopago: payment `refunds` is not an array, ignoring it"
+                );
+                &[]
+            }
+        };
+        for raw_entry in raw_entries {
             match serde_json::from_value::<MercadopagoPaymentRefundEntry>(raw_entry.clone()) {
                 Ok(entry) if entry.id.is_some() => parsed.push(entry),
                 Ok(_) => router_env::logger::warn!(
@@ -1090,7 +1101,7 @@ impl MercadopagoPaymentsResponse {
         })
     }
 
-    /// Builds the D5 carrier from this payment's `refunds[]` and (when
+    /// Builds the reported-activity carrier from this payment's `refunds[]` and (when
     /// `charged_back`) its own chargeback status. `None` when there is
     /// nothing to report, so the caller never attaches an empty carrier.
     pub(crate) fn reported_activity(
@@ -1264,7 +1275,7 @@ pub enum MercadopagoPSyncResponse {
 impl MercadopagoPSyncResponse {
     /// The payment object this sync resolved to, if any — the most recent
     /// search result for a Checkout Pro promotion, or the payment body
-    /// itself. Used to build the D5 reported-activity carrier; a rejected or
+    /// itself. Used to build the reported-activity carrier; a rejected or
     /// cancelled search result naturally reports nothing (a payment that was
     /// never captured has no refunds or chargeback), so no special-casing is
     /// needed to match `keep_waiting_for_buyer` below.
@@ -1758,7 +1769,7 @@ impl MercadopagoWebhookBody {
                 }
             }
             // Refund state is read from the payment's own PSync response
-            // (`refunds[]`, see D5/D6), never from the webhook body itself:
+            // (`refunds[]`), never from the webhook body itself:
             // Mercado Pago's webhook payloads carry no refund status or
             // amount, only a resource id.
             Some("refund.created") | Some("refund.updated") => {
@@ -1808,7 +1819,7 @@ pub struct MercadopagoWebhookData {
 /// (Webhooks v1 / app-level push, Feed v2, IPN legacy) into what Hyperswitch
 /// can act on. Never carries a status: Mercado Pago webhooks only ever
 /// signal "something changed on this id", so every supported variant here
-/// just triggers a live PSync (D1) — MP's own API, called with the
+/// just triggers a live PSync — MP's own API, called with the
 /// merchant's credentials, is the only source of truth for the actual state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MercadopagoWebhookNotification {
@@ -1817,7 +1828,7 @@ pub enum MercadopagoWebhookNotification {
         payment_id: String,
     },
     /// A chargeback notification that names the payment it applies to: PSync
-    /// that payment id (the sync itself reconciles the dispute record — D6).
+    /// that payment id (the sync itself reconciles the dispute record).
     ChargebackWithPayment {
         payment_id: String,
     },
@@ -2181,6 +2192,68 @@ mod tests {
         let payment =
             payment_response_with_refunds(r#"[{"id":1,"status":"approved"}]"#, "approved");
         assert!(payment.reported_activity(enums::Currency::ARS).is_none());
+    }
+
+    /// Shape of a real `GET /v1/payments/{id}` response (production, 2026-09-24)
+    /// for a payment refunded by Mercado Pago's buyer protection, not through
+    /// Hyperswitch. Ids and references are anonymized; field names, value types
+    /// (integer amounts and ids) and the extra refund fields are kept as seen.
+    const REAL_REFUNDED_PAYMENT_JSON: &str = r#"{
+        "id": 111111111111,
+        "status": "refunded",
+        "status_detail": "bpp_refunded",
+        "transaction_amount": 138000,
+        "transaction_amount_refunded": 138000,
+        "currency_id": "ARS",
+        "external_reference": "2000000000000000",
+        "refunds": [{
+            "id": 2222222222,
+            "payment_id": 111111111111,
+            "amount": 138000,
+            "status": "approved",
+            "refund_mode": "standard",
+            "reason": null,
+            "date_created": "2026-09-21T17:43:39.000-04:00",
+            "amount_refunded_to_payer": 138000,
+            "adjustment_amount": 0,
+            "unique_sequence_number": null,
+            "source": {"id": "1", "name": "Buyer protection", "type": "bpp"},
+            "metadata": {},
+            "labels": [],
+            "partition_details": [],
+            "additional_data": null,
+            "external_refund_id": null
+        }]
+    }"#;
+
+    #[test]
+    fn real_refunded_payment_reports_its_external_refund() {
+        let payment: MercadopagoPaymentsResponse =
+            serde_json::from_str(REAL_REFUNDED_PAYMENT_JSON).unwrap();
+        assert_eq!(
+            enums::AttemptStatus::from(payment.status.clone()),
+            enums::AttemptStatus::Charged
+        );
+        let activity = payment
+            .reported_activity(enums::Currency::ARS)
+            .expect("a refunded payment must report its refund");
+        assert!(activity.dispute.is_none());
+        assert_eq!(activity.refunds.len(), 1);
+        let refund = &activity.refunds[0];
+        assert_eq!(refund.connector_refund_id, "2222222222");
+        assert_eq!(refund.amount, MinorUnit::new(13_800_000));
+        assert_eq!(refund.status, enums::RefundStatus::Success);
+    }
+
+    #[test]
+    fn refunds_that_is_not_an_array_does_not_fail_the_sync() {
+        for refunds in [r#"{"id":1}"#, r#""unexpected""#, "null"] {
+            let payment: MercadopagoPaymentsResponse = serde_json::from_str(&format!(
+                r#"{{"id":1,"status":"approved","transaction_amount":10,"refunds":{refunds}}}"#
+            ))
+            .unwrap();
+            assert!(payment.reported_activity(enums::Currency::ARS).is_none());
+        }
     }
 
     #[test]

@@ -497,7 +497,7 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Mer
         // Built from the response BEFORE it is consumed by `try_from` below,
         // using the request's own currency (`data`, concretely typed here as
         // `PaymentsSyncRouterData`) rather than the connector's `currency_id`
-        // string (see D5/D6 in the feature design).
+        // string.
         let reported_activity = response
             .resolved_payment()
             .and_then(|payment| payment.reported_activity(data.request.currency));
@@ -965,7 +965,7 @@ impl webhooks::IncomingWebhook for Mercadopago {
     /// Always `false`: Mercado Pago notifications carry only a resource id,
     /// never a status or amount, so their state is always fetched fresh from
     /// MP's own API using the merchant's credentials (see
-    /// `classify_mercadopago_webhook` / D1 in the feature design). Returning
+    /// `classify_mercadopago_webhook`). Returning
     /// `true` here would make core treat the id-only webhook body itself as
     /// a PSync response via `HandleResponse` — which the PSync parser above
     /// cannot read (it expects the full payment object MP's API returns, not
