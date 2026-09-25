@@ -619,6 +619,13 @@ pub struct WompiTransactionData {
     pub created_at: Option<String>,
     #[serde(default)]
     pub finalized_at: Option<String>,
+    // Top-level on every transaction (e.g. "CARD", "NEQUI", "PSE",
+    // "BANCOLOMBIA_TRANSFER"); defaulted so a response shape that predates this
+    // field still parses. Carried into a Charged payment's `connector_metadata`
+    // (see `charged_connector_metadata`) so refund Execute can later decide
+    // whether this transaction is void-eligible without another Wompi call.
+    #[serde(default)]
+    pub payment_method_type: Option<String>,
 }
 
 /// Shared by card Authorize and card PSync: both receive the same
@@ -640,6 +647,33 @@ impl<F, T> TryFrom<ResponseRouterData<F, WompiTransactionResponse, T, PaymentsRe
     }
 }
 
+/// What a Charged payment remembers about how it was paid, carried on
+/// `PaymentsResponseData::TransactionResponse.connector_metadata` and handed
+/// back unchanged as `RefundsData.connector_metadata` when a refund is later
+/// requested (Hyperswitch persists `connector_metadata` on the payment
+/// attempt for exactly this round trip). `refund_via_void` reads it back to
+/// decide whether a refund can go through Wompi's void endpoint instead of
+/// the (settled-only) refunds API. Never populated for a non-charged outcome:
+/// a payment that never settled can't be refunded either way.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WompiPaymentMetadata {
+    pub payment_method_type: Option<String>,
+    pub finalized_at: Option<String>,
+}
+
+/// Builds the `connector_metadata` for a Charged transaction. Effectively
+/// infallible (a two-`Option<String>`-field struct always serializes), but
+/// returns `Option` rather than panicking on the off chance it doesn't: a
+/// missing metadata blob just means a later refund falls back to the V2
+/// refunds API instead of void, never a hard failure of the payment itself.
+fn charged_connector_metadata(transaction: &WompiTransactionData) -> Option<serde_json::Value> {
+    serde_json::to_value(WompiPaymentMetadata {
+        payment_method_type: transaction.payment_method_type.clone(),
+        finalized_at: transaction.finalized_at.clone(),
+    })
+    .ok()
+}
+
 /// Builds the RouterData outcome for one Wompi transaction: Charged/Pending/
 /// Voided become a `TransactionResponse`, DECLINED/ERROR become an `Err`
 /// carrying the connector's own reason so it is never lost even though Wompi
@@ -652,6 +686,9 @@ pub(super) fn transaction_to_router_data<F, T>(
     http_code: u16,
 ) -> RouterData<F, T, PaymentsResponseData> {
     let status = map_wompi_status(transaction.status);
+    let connector_metadata = matches!(status, enums::AttemptStatus::Charged)
+        .then(|| charged_connector_metadata(&transaction))
+        .flatten();
     let response = if matches!(status, enums::AttemptStatus::Failure) {
         Err(ErrorResponse {
             status_code: http_code,
@@ -673,7 +710,7 @@ pub(super) fn transaction_to_router_data<F, T>(
             resource_id: ResponseId::ConnectorTransactionId(transaction.id),
             redirection_data: Box::new(None),
             mandate_reference: Box::new(None),
-            connector_metadata: None,
+            connector_metadata,
             network_txn_id: None,
             connector_response_reference_id: Some(transaction.reference),
             incremental_authorization_allowed: None,
@@ -843,6 +880,7 @@ pub(super) fn select_hosted_transaction(
         return HostedSyncOutcome::Charged {
             id: approved.id.clone(),
             reference: approved.reference.clone(),
+            connector_metadata: charged_connector_metadata(approved),
         };
     }
 
@@ -981,6 +1019,7 @@ pub(super) enum HostedSyncOutcome {
     Charged {
         id: String,
         reference: String,
+        connector_metadata: Option<serde_json::Value>,
     },
     Voided {
         id: String,
@@ -1008,13 +1047,17 @@ impl<F, T> TryFrom<ResponseRouterData<F, WompiSearchResponse, T, PaymentsRespons
         let outcome = select_hosted_transaction(item.response.data, now);
 
         let (status, response) = match outcome {
-            HostedSyncOutcome::Charged { id, reference } => (
+            HostedSyncOutcome::Charged {
+                id,
+                reference,
+                connector_metadata,
+            } => (
                 enums::AttemptStatus::Charged,
                 Ok(PaymentsResponseData::TransactionResponse {
                     resource_id: ResponseId::ConnectorTransactionId(id),
                     redirection_data: Box::new(None),
                     mandate_reference: Box::new(None),
-                    connector_metadata: None,
+                    connector_metadata,
                     network_txn_id: None,
                     connector_response_reference_id: Some(reference),
                     incremental_authorization_allowed: None,
@@ -1241,6 +1284,191 @@ impl<F> TryFrom<RefundsResponseRouterData<F, WompiRefundResponse>> for RefundsRo
 }
 
 // ============================================================================
+// Refunds Execute — void routing: production evidence (2026-09-25) showed a
+// same-day `POST /refunds` on a card transaction rejected with 422
+// `TRANSACTION_NOT_SETTLED` ("La transacción no está aprobada"): Wompi only
+// refunds a SETTLED transaction, and a card/RBM transaction settles roughly
+// 24h after it is charged. `POST /transactions/{id}/void` (private key, no
+// body) succeeds the same day instead, so a same-day full refund of a CARD
+// transaction goes through void; everything else (partial, non-card, or a
+// transaction old enough to plausibly have settled) still goes through the
+// V2 refunds API unchanged.
+// ============================================================================
+
+/// True when this refund should hit `POST /transactions/{id}/void` instead of
+/// `POST /refunds`: the payment's remembered `connector_metadata` (see
+/// `charged_connector_metadata`) parses, its `payment_method_type` is
+/// exactly `"CARD"` (void has no equivalent for PSE/Nequi/etc.), the full
+/// payment amount is being refunded (void has no partial-amount mode), and
+/// `finalized_at` falls on the same Colombia calendar day as `now`.
+///
+/// The day boundary is only an approximation of Wompi's real settlement
+/// cutoff (observed as roughly 24h, not published as an exact instant): a
+/// void attempted just after the true cutoff simply fails with Wompi's own
+/// "not approved"/"not settled" message and can be retried as a plain refund
+/// once the transaction has actually settled. Missing/unparsable metadata or
+/// timestamp is treated as "not void-eligible" (`false`), which always falls
+/// back to the V2 refund path rather than risking a wrong guess.
+///
+/// Colombia never observes DST, so a fixed UTC-5 offset is correct for every
+/// date in every year — unlike an IANA zone lookup, it needs no timezone
+/// database and can never silently drift when one goes stale.
+pub(super) fn refund_via_void(
+    connector_metadata: Option<&serde_json::Value>,
+    refund_amount: MinorUnit,
+    payment_amount: MinorUnit,
+    now: time::OffsetDateTime,
+) -> bool {
+    if refund_amount != payment_amount {
+        return false;
+    }
+
+    let metadata = match connector_metadata
+        .and_then(|value| serde_json::from_value::<WompiPaymentMetadata>(value.clone()).ok())
+    {
+        Some(metadata) => metadata,
+        None => return false,
+    };
+
+    if metadata.payment_method_type.as_deref() != Some("CARD") {
+        return false;
+    }
+
+    let finalized_at = match parse_timestamp(metadata.finalized_at.as_deref()) {
+        Some(finalized_at) => finalized_at,
+        None => return false,
+    };
+
+    let colombia_offset = match time::UtcOffset::from_hms(-5, 0, 0) {
+        Ok(offset) => offset,
+        // Unreachable in practice: -5:00:00 is always a valid fixed offset.
+        // Never treat a broken offset as "same day" by falling through.
+        Err(_) => return false,
+    };
+
+    finalized_at.to_offset(colombia_offset).date() == now.to_offset(colombia_offset).date()
+}
+
+/// The connector refund id Wompi's void endpoint mints is not a refund id at
+/// all (void has no refund object), so it is prefixed with this marker to
+/// tell RSync which API to ask: strip it (see `strip_void_refund_id`) and
+/// this is the original transaction id, straight back to `GET
+/// /transactions/{id}`; anything without the prefix is an ordinary Wompi
+/// refund id and goes to `GET /refunds/{id}` unchanged.
+pub(super) const VOID_REFUND_ID_PREFIX: &str = "void_";
+
+/// Returns the transaction id RSync should ask about when `connector_refund_id`
+/// was minted by `refund_via_void` (i.e. it carries the `void_` prefix), else
+/// `None` for an ordinary Wompi refund id.
+pub(super) fn strip_void_refund_id(connector_refund_id: &str) -> Option<&str> {
+    connector_refund_id.strip_prefix(VOID_REFUND_ID_PREFIX)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WompiVoidTransaction {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WompiVoidData {
+    pub status: WompiRefundStatus,
+    pub status_message: Option<String>,
+    pub transaction: WompiVoidTransaction,
+}
+
+/// `POST /transactions/{id}/void`'s response shape: `data.status` is the
+/// VOID's own status (not the embedded transaction's — that still reads
+/// APPROVED at response time, and only turns VOIDED itself moments later, per
+/// the production evidence this connector was built against), reusing
+/// `WompiRefundStatus` since Wompi's void statuses are the same vocabulary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WompiVoidResponse {
+    pub data: WompiVoidData,
+}
+
+/// Converts a void response into the same `RefundsResponseData` shape a
+/// normal refund would produce, so refund Execute never has to special-case
+/// which API answered. `connector_refund_id` carries the `void_` prefix (see
+/// `strip_void_refund_id`) so RSync later knows to ask the transaction, not
+/// the (nonexistent) refund object.
+impl<F> TryFrom<RefundsResponseRouterData<F, WompiVoidResponse>> for RefundsRouterData<F> {
+    type Error = error_stack::Report<errors::ConnectorError>;
+
+    fn try_from(
+        item: RefundsResponseRouterData<F, WompiVoidResponse>,
+    ) -> Result<Self, Self::Error> {
+        let void = item.response.data;
+        Ok(Self {
+            response: Ok(RefundsResponseData {
+                connector_refund_id: format!("{VOID_REFUND_ID_PREFIX}{}", void.transaction.id),
+                refund_status: map_refund_status(void.status),
+            }),
+            ..item.data
+        })
+    }
+}
+
+/// Whether a refund Execute body came from the void endpoint: only a void
+/// response carries `data.transaction.id`. Deciding by the body (not by
+/// re-evaluating the clock-dependent void decision after the round trip) keeps
+/// the parser aligned with whichever API actually answered.
+pub(super) fn is_void_response(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("data")?.get("transaction")?.get("id").cloned())
+        .is_some()
+}
+
+/// Maps the ORIGINAL transaction's status (from `GET /transactions/{id}`,
+/// asked instead of `GET /refunds/{id}` for a void-routed refund — see
+/// `strip_void_refund_id`) to a refund status: VOIDED is the void having
+/// actually applied; APPROVED means it has not (yet) applied, or never will,
+/// so this stays syncable rather than reporting a premature success;
+/// PENDING/Unknown are the transaction's own not-yet-resolved states, kept
+/// syncable for the same reason; DECLINED/ERROR are Wompi-side failures of
+/// the original charge and can never turn into a successful void.
+pub(super) fn map_void_status_to_refund_status(
+    status: WompiTransactionStatus,
+) -> enums::RefundStatus {
+    match status {
+        WompiTransactionStatus::Voided => enums::RefundStatus::Success,
+        WompiTransactionStatus::Approved
+        | WompiTransactionStatus::Pending
+        | WompiTransactionStatus::Unknown => enums::RefundStatus::Pending,
+        WompiTransactionStatus::Declined | WompiTransactionStatus::Error => {
+            enums::RefundStatus::Failure
+        }
+    }
+}
+
+/// RSync for a void-routed refund: the `connector_refund_id` on the request is
+/// preserved unchanged (still `void_`-prefixed) so a later RSync call keeps
+/// routing to this same branch.
+impl<F> TryFrom<RefundsResponseRouterData<F, WompiTransactionResponse>> for RefundsRouterData<F> {
+    type Error = error_stack::Report<errors::ConnectorError>;
+
+    fn try_from(
+        item: RefundsResponseRouterData<F, WompiTransactionResponse>,
+    ) -> Result<Self, Self::Error> {
+        let transaction = item.response.data;
+        let connector_refund_id = item
+            .data
+            .request
+            .connector_refund_id
+            .clone()
+            .ok_or(errors::ConnectorError::ResponseDeserializationFailed)?;
+
+        Ok(Self {
+            response: Ok(RefundsResponseData {
+                connector_refund_id,
+                refund_status: map_void_status_to_refund_status(transaction.status),
+            }),
+            ..item.data
+        })
+    }
+}
+
+// ============================================================================
 // Errors
 // ============================================================================
 
@@ -1404,7 +1632,13 @@ pub(super) fn map_webhook_event(
             IncomingWebhookEvent::PaymentIntentFailure
         }
         WompiTransactionStatus::Pending => IncomingWebhookEvent::PaymentIntentProcessing,
-        WompiTransactionStatus::Voided => IncomingWebhookEvent::PaymentIntentCancelled,
+        // A VOIDED transaction here is never a merchant-initiated cancellation:
+        // this connector only ever voids a transaction itself, as the same-day
+        // half of its own refund flow (see `refund_via_void`), and refund RSync
+        // already tracks that outcome. Mapping VOIDED to
+        // `PaymentIntentCancelled` would flip an already succeeded-and-refunded
+        // payment to cancelled when this webhook arrives.
+        WompiTransactionStatus::Voided => IncomingWebhookEvent::EventNotSupported,
         WompiTransactionStatus::Unknown => IncomingWebhookEvent::EventNotSupported,
     })
 }
@@ -1687,6 +1921,7 @@ mod tests {
             status_message: Some("declined by issuer".to_string()),
             created_at: finalized_at.map(|s| s.to_string()),
             finalized_at: finalized_at.map(|s| s.to_string()),
+            payment_method_type: None,
         }
     }
 
@@ -1714,8 +1949,35 @@ mod tests {
             HostedSyncOutcome::Charged {
                 id: "2".to_string(),
                 reference: "REF-1".to_string(),
+                connector_metadata: Some(serde_json::json!({
+                    "payment_method_type": null,
+                    "finalized_at": null
+                })),
             }
         );
+    }
+
+    #[test]
+    fn hosted_charged_transaction_carries_payment_metadata() {
+        let mut approved = tx("h-1", WompiTransactionStatus::Approved, None);
+        approved.payment_method_type = Some("CARD".to_string());
+        approved.finalized_at = Some("2026-09-25T15:00:00Z".to_string());
+
+        let outcome = select_hosted_transaction(vec![approved], now());
+        match outcome {
+            HostedSyncOutcome::Charged {
+                connector_metadata, ..
+            } => {
+                assert_eq!(
+                    connector_metadata,
+                    Some(serde_json::json!({
+                        "payment_method_type": "CARD",
+                        "finalized_at": "2026-09-25T15:00:00Z"
+                    }))
+                );
+            }
+            other => panic!("expected Charged, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1990,10 +2252,14 @@ mod tests {
             IncomingWebhookEvent::PaymentIntentFailure
         );
 
+        // A VOIDED transaction is never a merchant-initiated cancellation here:
+        // this connector only ever voids as the same-day half of its own
+        // refund flow, and refund RSync (not this webhook) tracks that
+        // outcome — see `refund_via_void`.
         webhook.data["transaction"]["status"] = serde_json::json!("VOIDED");
         assert_eq!(
             map_webhook_event(&webhook).unwrap(),
-            IncomingWebhookEvent::PaymentIntentCancelled
+            IncomingWebhookEvent::EventNotSupported
         );
 
         webhook.data["transaction"]["status"] = serde_json::json!("SOMETHING_NEW");
@@ -2465,6 +2731,7 @@ mod tests {
             status_message: Some("Fondos insuficientes".to_string()),
             created_at: None,
             finalized_at: None,
+            payment_method_type: None,
         };
         let result = transaction_to_router_data(transaction, router_data, 200);
         assert_eq!(result.status, enums::AttemptStatus::Failure);
@@ -2849,5 +3116,337 @@ mod tests {
             result.unwrap_err().current_context(),
             errors::ConnectorError::ResponseDeserializationFailed
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // `payment_method_type` parsing and Charged connector_metadata
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn transaction_data_parses_payment_method_type_when_present() {
+        let data: WompiTransactionData = serde_json::from_value(serde_json::json!({
+            "id": "txn-1",
+            "reference": "ref-1",
+            "status": "APPROVED",
+            "status_message": null,
+            "payment_method_type": "CARD"
+        }))
+        .unwrap();
+        assert_eq!(data.payment_method_type, Some("CARD".to_string()));
+    }
+
+    #[test]
+    fn transaction_data_defaults_payment_method_type_when_absent() {
+        let data: WompiTransactionData = serde_json::from_value(serde_json::json!({
+            "id": "txn-1",
+            "reference": "ref-1",
+            "status": "APPROVED",
+            "status_message": null
+        }))
+        .unwrap();
+        assert_eq!(data.payment_method_type, None);
+    }
+
+    #[test]
+    fn charged_card_transaction_carries_payment_metadata() {
+        let request = authorize_request_data(
+            PaymentMethodData::Card(test_card()),
+            enums::Currency::COP,
+            100000,
+            Some(common_utils::pii::Email::from_str("buyer@example.com").unwrap()),
+            None,
+        );
+        let router_data = authorize_router_data(
+            request,
+            enums::AuthenticationType::NoThreeDs,
+            Some(packed_access_token()),
+            Some("tok_test_x".to_string()),
+            "wompi-test-ref-10",
+        );
+        let transaction = WompiTransactionData {
+            id: "txn_charged_1".to_string(),
+            reference: "wompi-test-ref-10".to_string(),
+            status: WompiTransactionStatus::Approved,
+            status_message: None,
+            created_at: None,
+            finalized_at: Some("2026-09-25T15:00:00Z".to_string()),
+            payment_method_type: Some("CARD".to_string()),
+        };
+        let result = transaction_to_router_data(transaction, router_data, 200);
+        assert_eq!(result.status, enums::AttemptStatus::Charged);
+        match result.response.expect("charged must be Ok") {
+            PaymentsResponseData::TransactionResponse {
+                connector_metadata, ..
+            } => {
+                assert_eq!(
+                    connector_metadata,
+                    Some(serde_json::json!({
+                        "payment_method_type": "CARD",
+                        "finalized_at": "2026-09-25T15:00:00Z"
+                    }))
+                );
+            }
+            other => panic!("expected a TransactionResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_charged_transaction_carries_no_connector_metadata() {
+        let request = authorize_request_data(
+            PaymentMethodData::Card(test_card()),
+            enums::Currency::COP,
+            100000,
+            Some(common_utils::pii::Email::from_str("buyer@example.com").unwrap()),
+            None,
+        );
+        let router_data = authorize_router_data(
+            request,
+            enums::AuthenticationType::NoThreeDs,
+            Some(packed_access_token()),
+            Some("tok_test_x".to_string()),
+            "wompi-test-ref-11",
+        );
+        let transaction = WompiTransactionData {
+            id: "txn_pending_1".to_string(),
+            reference: "wompi-test-ref-11".to_string(),
+            status: WompiTransactionStatus::Pending,
+            status_message: None,
+            created_at: None,
+            finalized_at: None,
+            payment_method_type: Some("CARD".to_string()),
+        };
+        let result = transaction_to_router_data(transaction, router_data, 200);
+        match result.response.expect("pending must be Ok") {
+            PaymentsResponseData::TransactionResponse {
+                connector_metadata, ..
+            } => assert_eq!(connector_metadata, None),
+            other => panic!("expected a TransactionResponse, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Refund routing: void vs V2 refund (see `refund_via_void`)
+    // ------------------------------------------------------------------
+
+    fn card_metadata(finalized_at: &str) -> serde_json::Value {
+        serde_json::json!({ "payment_method_type": "CARD", "finalized_at": finalized_at })
+    }
+
+    fn parse_rfc3339(value: &str) -> time::OffsetDateTime {
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).unwrap()
+    }
+
+    #[test]
+    fn refund_via_void_true_for_full_card_refund_same_colombia_day() {
+        let metadata = card_metadata("2026-09-25T15:00:00Z"); // 10:00 Colombia
+        let now = parse_rfc3339("2026-09-25T20:00:00Z"); // 15:00 Colombia, same day
+        assert!(refund_via_void(
+            Some(&metadata),
+            MinorUnit::new(100000),
+            MinorUnit::new(100000),
+            now,
+        ));
+    }
+
+    #[test]
+    fn refund_via_void_false_for_partial_refund() {
+        let metadata = card_metadata("2026-09-25T15:00:00Z");
+        let now = parse_rfc3339("2026-09-25T20:00:00Z");
+        assert!(!refund_via_void(
+            Some(&metadata),
+            MinorUnit::new(50000),
+            MinorUnit::new(100000),
+            now,
+        ));
+    }
+
+    #[test]
+    fn refund_via_void_false_for_non_card_payment_method() {
+        let metadata = serde_json::json!({
+            "payment_method_type": "NEQUI",
+            "finalized_at": "2026-09-25T15:00:00Z"
+        });
+        let now = parse_rfc3339("2026-09-25T20:00:00Z");
+        assert!(!refund_via_void(
+            Some(&metadata),
+            MinorUnit::new(100000),
+            MinorUnit::new(100000),
+            now,
+        ));
+    }
+
+    #[test]
+    fn refund_via_void_false_when_finalized_yesterday_in_colombia() {
+        let metadata = card_metadata("2026-09-24T15:00:00Z"); // 10:00 Colombia on the 24th
+        let now = parse_rfc3339("2026-09-25T20:00:00Z"); // 15:00 Colombia on the 25th
+        assert!(!refund_via_void(
+            Some(&metadata),
+            MinorUnit::new(100000),
+            MinorUnit::new(100000),
+            now,
+        ));
+    }
+
+    #[test]
+    fn refund_via_void_false_across_a_colombia_midnight_boundary() {
+        // finalized_at 23:30 Colombia on the 24th = 04:30Z on the 25th; now
+        // 00:10 Colombia on the 25th = 05:10Z, also on the 25th. A naive
+        // UTC-date comparison would call this "same day" (both 25th in UTC)
+        // and wrongly return true; the correct Colombia-shifted comparison
+        // sees the 24th vs the 25th and returns false.
+        let metadata = card_metadata("2026-09-25T04:30:00Z");
+        let now = parse_rfc3339("2026-09-25T05:10:00Z");
+        assert!(!refund_via_void(
+            Some(&metadata),
+            MinorUnit::new(100000),
+            MinorUnit::new(100000),
+            now,
+        ));
+    }
+
+    #[test]
+    fn refund_via_void_true_when_utc_date_differs_from_colombia_date() {
+        // finalized_at 02:00Z = 21:00 on the 25th in Colombia; now 03:00Z =
+        // 22:00 on the 25th in Colombia: same Colombia day, so true, even
+        // though the raw UTC dates alone (both the 26th) tell a different
+        // story than the Colombia-shifted comparison this function performs.
+        let metadata = card_metadata("2026-09-26T02:00:00Z");
+        let now = parse_rfc3339("2026-09-26T03:00:00Z");
+        assert!(refund_via_void(
+            Some(&metadata),
+            MinorUnit::new(100000),
+            MinorUnit::new(100000),
+            now,
+        ));
+    }
+
+    #[test]
+    fn refund_via_void_false_for_missing_metadata() {
+        let now = parse_rfc3339("2026-09-25T20:00:00Z");
+        assert!(!refund_via_void(
+            None,
+            MinorUnit::new(100000),
+            MinorUnit::new(100000),
+            now,
+        ));
+    }
+
+    #[test]
+    fn refund_via_void_false_for_unparsable_metadata() {
+        let metadata = serde_json::json!("not an object");
+        let now = parse_rfc3339("2026-09-25T20:00:00Z");
+        assert!(!refund_via_void(
+            Some(&metadata),
+            MinorUnit::new(100000),
+            MinorUnit::new(100000),
+            now,
+        ));
+    }
+
+    #[test]
+    fn refund_via_void_false_when_finalized_at_is_missing() {
+        let metadata = serde_json::json!({ "payment_method_type": "CARD", "finalized_at": null });
+        let now = parse_rfc3339("2026-09-25T20:00:00Z");
+        assert!(!refund_via_void(
+            Some(&metadata),
+            MinorUnit::new(100000),
+            MinorUnit::new(100000),
+            now,
+        ));
+    }
+
+    // ------------------------------------------------------------------
+    // Void response parsing (refund Execute's void-routed path)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn void_response_parses_the_trimmed_production_shape() {
+        // Trimmed 201 shape observed in production (2026-09-25): `data.status`
+        // is the VOID's own status; the embedded transaction still reads
+        // APPROVED at response time (see `WompiVoidResponse`'s doc comment).
+        let body = serde_json::json!({
+            "data": {
+                "status": "APPROVED",
+                "status_message": null,
+                "transaction": {
+                    "id": "144941-1790368341-22002"
+                }
+            },
+            "meta": {}
+        });
+        let response: WompiVoidResponse = serde_json::from_value(body).unwrap();
+
+        let request = refund_request_data(
+            "144941-1790368341-22002",
+            enums::Currency::COP,
+            "refund-void-1",
+            100000,
+            None,
+        );
+        let router_data = refund_router_data(request, "wompi-refund-void-ref-1");
+        let response_router_data = ResponseRouterData {
+            response,
+            data: router_data,
+            http_code: 201,
+        };
+        let result = RefundsRouterData::<Execute>::try_from(response_router_data)
+            .expect("a void response must convert");
+        let refunds_response = result.response.expect("must be Ok");
+        assert_eq!(refunds_response.refund_status, enums::RefundStatus::Success);
+        assert_eq!(
+            refunds_response.connector_refund_id,
+            "void_144941-1790368341-22002"
+        );
+    }
+
+    #[test]
+    fn void_response_is_recognized_by_its_body_not_the_clock() {
+        let void = br#"{"data":{"status":"APPROVED","status_message":null,"transaction":{"id":"144941-1790368341-22002"}},"meta":{}}"#;
+        assert!(is_void_response(void));
+        assert!(!is_void_response(
+            br#"{"refund_id":"COa7Bk9m1","status":"PENDING"}"#
+        ));
+        assert!(!is_void_response(
+            br#"{"data":{"id":1523,"status":"APPROVED"}}"#
+        ));
+        assert!(!is_void_response(b"<html>502</html>"));
+    }
+
+    // ------------------------------------------------------------------
+    // RSync void status mapping (see `map_void_status_to_refund_status`)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn void_status_mapping_covers_every_transaction_status() {
+        assert_eq!(
+            map_void_status_to_refund_status(WompiTransactionStatus::Voided),
+            enums::RefundStatus::Success
+        );
+        assert_eq!(
+            map_void_status_to_refund_status(WompiTransactionStatus::Approved),
+            enums::RefundStatus::Pending
+        );
+        assert_eq!(
+            map_void_status_to_refund_status(WompiTransactionStatus::Pending),
+            enums::RefundStatus::Pending
+        );
+        assert_eq!(
+            map_void_status_to_refund_status(WompiTransactionStatus::Unknown),
+            enums::RefundStatus::Pending
+        );
+        assert_eq!(
+            map_void_status_to_refund_status(WompiTransactionStatus::Declined),
+            enums::RefundStatus::Failure
+        );
+        assert_eq!(
+            map_void_status_to_refund_status(WompiTransactionStatus::Error),
+            enums::RefundStatus::Failure
+        );
+    }
+
+    #[test]
+    fn strip_void_refund_id_recognizes_only_the_void_prefix() {
+        assert_eq!(strip_void_refund_id("void_abc-123"), Some("abc-123"));
+        assert_eq!(strip_void_refund_id("plain-refund-id"), None);
     }
 }

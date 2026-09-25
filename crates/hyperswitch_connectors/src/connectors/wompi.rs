@@ -245,6 +245,19 @@ fn syncs_by_reference(req: &PaymentsSyncRouterData) -> bool {
         || req.request.get_connector_transaction_id().is_err()
 }
 
+/// Whether this refund Execute request goes through Wompi's void endpoint
+/// instead of `POST /refunds` (see `wompi::refund_via_void`). It reads the
+/// clock, so `build_request` evaluates it once for both the URL and the body,
+/// and `handle_response` tells the two APIs apart by the body instead.
+fn refund_via_void_route(req: &RefundsRouterData<Execute>) -> bool {
+    wompi::refund_via_void(
+        req.request.connector_metadata.as_ref(),
+        req.request.minor_refund_amount,
+        req.request.minor_payment_amount,
+        time::OffsetDateTime::now_utc(),
+    )
+}
+
 // ============================================================================
 // Session — not implemented
 // ============================================================================
@@ -705,7 +718,14 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Wompi {
     ) -> CustomResult<String, errors::ConnectorError> {
         let auth = wompi::WompiAuthType::try_from(&req.connector_auth_type)?;
         let base_url = get_wompi_base_url(&auth, connectors)?;
-        Ok(format!("{base_url}/refunds"))
+        if refund_via_void_route(req) {
+            Ok(format!(
+                "{base_url}/transactions/{}/void",
+                req.request.connector_transaction_id
+            ))
+        } else {
+            Ok(format!("{base_url}/refunds"))
+        }
     }
 
     fn get_request_body(
@@ -728,13 +748,31 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Wompi {
         req: &RefundsRouterData<Execute>,
         connectors: &Connectors,
     ) -> CustomResult<Option<Request>, errors::ConnectorError> {
+        // The void endpoint takes no body at all (a total void is implicit),
+        // unlike POST /refunds, which always carries one.
+        let via_void = refund_via_void_route(req);
+        let body = if via_void {
+            None
+        } else {
+            Some(RefundExecuteType::get_request_body(self, req, connectors)?)
+        };
+        let auth = wompi::WompiAuthType::try_from(&req.connector_auth_type)?;
+        let base_url = get_wompi_base_url(&auth, connectors)?;
+        let url = if via_void {
+            format!(
+                "{base_url}/transactions/{}/void",
+                req.request.connector_transaction_id
+            )
+        } else {
+            format!("{base_url}/refunds")
+        };
         Ok(Some(
             RequestBuilder::new()
                 .method(Method::Post)
-                .url(&RefundExecuteType::get_url(self, req, connectors)?)
+                .url(&url)
                 .attach_default_headers()
                 .headers(RefundExecuteType::get_headers(self, req, connectors)?)
-                .set_body(RefundExecuteType::get_request_body(self, req, connectors)?)
+                .set_optional_body(body)
                 .build(),
         ))
     }
@@ -745,17 +783,31 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Wompi {
         event_builder: Option<&mut ConnectorEvent>,
         res: Response,
     ) -> CustomResult<RefundsRouterData<Execute>, errors::ConnectorError> {
-        let response: wompi::WompiRefundResponse = res
-            .response
-            .parse_struct("WompiRefundResponse")
-            .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
-        event_builder.map(|i| i.set_response_body(&response));
-        router_env::logger::info!(connector_response=?response);
-        RouterData::try_from(ResponseRouterData {
-            response,
-            data: data.clone(),
-            http_code: res.status_code,
-        })
+        if wompi::is_void_response(&res.response) {
+            let response: wompi::WompiVoidResponse = res
+                .response
+                .parse_struct("WompiVoidResponse")
+                .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+            event_builder.map(|i| i.set_response_body(&response));
+            router_env::logger::info!(connector_response=?response);
+            RouterData::try_from(ResponseRouterData {
+                response,
+                data: data.clone(),
+                http_code: res.status_code,
+            })
+        } else {
+            let response: wompi::WompiRefundResponse = res
+                .response
+                .parse_struct("WompiRefundResponse")
+                .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+            event_builder.map(|i| i.set_response_body(&response));
+            router_env::logger::info!(connector_response=?response);
+            RouterData::try_from(ResponseRouterData {
+                response,
+                data: data.clone(),
+                http_code: res.status_code,
+            })
+        }
     }
 
     fn get_error_response(
@@ -793,7 +845,13 @@ impl ConnectorIntegration<RSync, RefundsData, RefundsResponseData> for Wompi {
         let auth = wompi::WompiAuthType::try_from(&req.connector_auth_type)?;
         let base_url = get_wompi_base_url(&auth, connectors)?;
         let connector_refund_id = req.request.get_connector_refund_id()?;
-        Ok(format!("{base_url}/refunds/{connector_refund_id}"))
+        // A refund minted by the void route (see `refund_via_void`) has no
+        // matching Wompi refund object: ask the ORIGINAL transaction instead.
+        if let Some(transaction_id) = wompi::strip_void_refund_id(&connector_refund_id) {
+            Ok(format!("{base_url}/transactions/{transaction_id}"))
+        } else {
+            Ok(format!("{base_url}/refunds/{connector_refund_id}"))
+        }
     }
 
     fn build_request(
@@ -817,17 +875,32 @@ impl ConnectorIntegration<RSync, RefundsData, RefundsResponseData> for Wompi {
         event_builder: Option<&mut ConnectorEvent>,
         res: Response,
     ) -> CustomResult<RefundSyncRouterData, errors::ConnectorError> {
-        let response: wompi::WompiRefundResponse = res
-            .response
-            .parse_struct("WompiRefundResponse")
-            .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
-        event_builder.map(|i| i.set_response_body(&response));
-        router_env::logger::info!(connector_response=?response);
-        RouterData::try_from(ResponseRouterData {
-            response,
-            data: data.clone(),
-            http_code: res.status_code,
-        })
+        let connector_refund_id = data.request.get_connector_refund_id()?;
+        if wompi::strip_void_refund_id(&connector_refund_id).is_some() {
+            let response: wompi::WompiTransactionResponse = res
+                .response
+                .parse_struct("WompiTransactionResponse")
+                .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+            event_builder.map(|i| i.set_response_body(&response));
+            router_env::logger::info!(connector_response=?response);
+            RouterData::try_from(ResponseRouterData {
+                response,
+                data: data.clone(),
+                http_code: res.status_code,
+            })
+        } else {
+            let response: wompi::WompiRefundResponse = res
+                .response
+                .parse_struct("WompiRefundResponse")
+                .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+            event_builder.map(|i| i.set_response_body(&response));
+            router_env::logger::info!(connector_response=?response);
+            RouterData::try_from(ResponseRouterData {
+                response,
+                data: data.clone(),
+                http_code: res.status_code,
+            })
+        }
     }
 
     fn get_error_response(
