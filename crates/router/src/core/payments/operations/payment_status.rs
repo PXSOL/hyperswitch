@@ -522,7 +522,11 @@ async fn get_tracker_for_sync<
         force_sync: Some(
             request.force_sync
                 && (helpers::check_force_psync_precondition(payment_attempt.status)
-                    || contains_encoded_data),
+                    || contains_encoded_data
+                    || helpers::should_force_psync_settled_attempt_for_reported_activity(
+                        payment_attempt.status,
+                        payment_attempt.connector.as_deref(),
+                    )),
         ),
         all_keys_required: request.all_keys_required,
         payment_attempt,
