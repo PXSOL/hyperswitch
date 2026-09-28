@@ -14,17 +14,18 @@ use error_stack::{report, ResultExt};
 use hyperswitch_domain_models::{
     payment_method_data::{PaymentMethodData, WalletData},
     router_data::{AccessToken, ConnectorAuthType, ErrorResponse, RouterData},
-    router_flow_types::refunds::Execute,
     router_request_types::{PaymentsAuthorizeData, ResponseId},
     router_response_types::{PaymentsResponseData, RedirectForm, RefundsResponseData},
     types::{PaymentsAuthorizeRouterData, RefundsRouterData},
 };
 // Only used by the refund round-trip tests below (the non-test code only ever
-// spells the flow-generic `RefundsRouterData<F>`, never `RefundsData`
-// directly), so this stays test-only to avoid an unused-import warning in a
-// plain (non-test) build.
+// spells the flow-generic `RefundsRouterData<F>`, never `RefundsData` or the
+// `Execute` flow directly), so these stay test-only to avoid unused-import
+// warnings in a plain (non-test) build.
 #[cfg(test)]
-use hyperswitch_domain_models::router_request_types::RefundsData;
+use hyperswitch_domain_models::{
+    router_flow_types::refunds::Execute, router_request_types::RefundsData,
+};
 use hyperswitch_interfaces::errors;
 use masking::{ExposeInterface, PeekInterface, Secret};
 use serde::{Deserialize, Serialize};
@@ -1260,6 +1261,12 @@ pub struct WompiVoidResponse {
 /// Converts a void response into `RefundsResponseData`. `connector_refund_id`
 /// carries the `void_` prefix (see `strip_void_refund_id`) so RSync later
 /// knows to ask the transaction, not a (nonexistent) refund object.
+///
+/// A rejected void still answers 201: once the network can no longer void
+/// the charge (production, 2026-09-28, three days after the charge) Wompi
+/// returns `data.status: ERROR` with `status_message: "Original no
+/// Encontrado"`. That becomes an `ErrorResponse` carrying Wompi's message, so
+/// the failed refund tells the merchant why instead of failing silently.
 impl<F> TryFrom<RefundsResponseRouterData<F, WompiVoidResponse>> for RefundsRouterData<F> {
     type Error = error_stack::Report<errors::ConnectorError>;
 
@@ -1267,11 +1274,31 @@ impl<F> TryFrom<RefundsResponseRouterData<F, WompiVoidResponse>> for RefundsRout
         item: RefundsResponseRouterData<F, WompiVoidResponse>,
     ) -> Result<Self, Self::Error> {
         let void = item.response.data;
-        Ok(Self {
-            response: Ok(RefundsResponseData {
+        let refund_status = map_refund_status(void.status);
+        let response = if refund_status == enums::RefundStatus::Failure {
+            Err(ErrorResponse {
+                status_code: item.http_code,
+                code: format!("{:?}", void.status).to_uppercase(),
+                message: void
+                    .status_message
+                    .clone()
+                    .unwrap_or_else(|| "Void rejected by Wompi".to_string()),
+                reason: void.status_message,
+                attempt_status: None,
+                connector_transaction_id: Some(void.transaction.id),
+                network_advice_code: None,
+                network_decline_code: None,
+                network_error_message: None,
+                connector_metadata: None,
+            })
+        } else {
+            Ok(RefundsResponseData {
                 connector_refund_id: format!("{VOID_REFUND_ID_PREFIX}{}", void.transaction.id),
-                refund_status: map_refund_status(void.status),
-            }),
+                refund_status,
+            })
+        };
+        Ok(Self {
+            response,
             ..item.data
         })
     }
@@ -3077,6 +3104,45 @@ mod tests {
             refunds_response.connector_refund_id,
             "void_144941-1790368341-22002"
         );
+    }
+
+    #[test]
+    fn rejected_void_becomes_an_error_with_wompi_message() {
+        // Production (2026-09-28): voiding a card charge three days later is
+        // answered 201 with the void itself in ERROR.
+        let body = serde_json::json!({
+            "data": {
+                "status": "ERROR",
+                "status_message": "Original no Encontrado",
+                "transaction": {
+                    "id": "144941-1790379525-64907"
+                }
+            }
+        });
+        let response: WompiVoidResponse = serde_json::from_value(body).unwrap();
+
+        let request = refund_request_data(
+            "144941-1790379525-64907",
+            enums::Currency::COP,
+            "refund-void-late",
+            150000,
+            None,
+        );
+        let router_data = refund_router_data(request, "wompi-refund-void-late");
+        let response_router_data = ResponseRouterData {
+            response,
+            data: router_data,
+            http_code: 201,
+        };
+        let result = RefundsRouterData::<Execute>::try_from(response_router_data)
+            .expect("a void response must convert");
+        let error = result
+            .response
+            .expect_err("a rejected void must be an error");
+        assert_eq!(error.code, "ERROR");
+        assert_eq!(error.message, "Original no Encontrado");
+        assert_eq!(error.reason.as_deref(), Some("Original no Encontrado"));
+        assert_eq!(error.status_code, 201);
     }
 
     // ------------------------------------------------------------------
