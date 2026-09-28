@@ -148,9 +148,10 @@ impl ConnectorCommon for Wompi {
         &self,
         auth_type: &ConnectorAuthType,
     ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
-        // Default (public-key) credential, correct for every flow except a PSync
-        // search by reference (see `syncs_by_reference`), which overrides
-        // `get_headers` itself to use the private key instead.
+        // Default (public-key) credential, for the calls Wompi documents with the
+        // public key (merchant lookup, card tokenization, transaction creation).
+        // Every server-side read of a transaction or refund overrides `get_headers`
+        // with the private key instead (see the PSync impl for why).
         let auth = wompi::WompiAuthType::try_from(auth_type)?;
         Ok(vec![(
             headers::AUTHORIZATION.to_string(),
@@ -562,24 +563,24 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
 }
 
 // ============================================================================
-// PSync — card (known id): GET /transactions/{id} (public key) ; hosted, and a
-// card attempt with no known id yet (see `syncs_by_reference`): ALWAYS
-// GET /transactions?reference={connector_request_reference_id} (private key),
-// never the buyer-controllable redirect `?id=`.
+// PSync — card (known id): GET /transactions/{id} ; hosted, and a card attempt
+// with no known id yet (see `syncs_by_reference`): ALWAYS
+// GET /transactions?reference={connector_request_reference_id}, never the
+// buyer-controllable redirect `?id=`. Both with the private key.
 // ============================================================================
 
 impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Wompi {
     fn get_headers(
         &self,
         req: &PaymentsSyncRouterData,
-        connectors: &Connectors,
+        _connectors: &Connectors,
     ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
-        if syncs_by_reference(req) {
-            let auth = wompi::WompiAuthType::try_from(&req.connector_auth_type)?;
-            Ok(self.private_key_headers(&auth))
-        } else {
-            self.build_headers(req, connectors)
-        }
+        // Private key for both shapes: in production `GET /transactions/{id}` with
+        // the public key answers 404 once a transaction is a few days old (seen on
+        // transactions it had returned the same day), while the private key keeps
+        // returning them.
+        let auth = wompi::WompiAuthType::try_from(&req.connector_auth_type)?;
+        Ok(self.private_key_headers(&auth))
     }
 
     fn get_content_type(&self) -> &'static str {
