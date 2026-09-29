@@ -1206,16 +1206,33 @@ pub(super) fn build_browser_info_collection_page(complete_authorize_url: &str) -
     )
 }
 
+/// Official card-network marks (doc §11.4: Mastercard's card-network policy requires showing
+/// its "ID Check" mark whenever `three_ds_auth` is received and when the challenge finishes;
+/// shown here alongside Visa's "Secure" mark for the same duration). Both are real SVG files the
+/// user supplied, stripped only of their XML prolog / attribution comments and fixed pixel
+/// width/height (kept as `viewBox` so CSS sizes them instead) — the drawing itself is untouched.
+/// Neither file contains an `id` attribute or a `<script>` element, so embedding them verbatim as
+/// sibling markup cannot collide with anything else on the page or execute anything of its own.
+///
+/// Embedded via `include_str!` (a compile-time file read) and inserted as a `format!` ARGUMENT
+/// rather than written into the surrounding page's `r#"..."#` template source: several SVG
+/// attributes are quoted hex colors like `fill="#F3F3F3"`, whose `"#` would otherwise
+/// prematurely close that raw-string literal if the markup were pasted into the template text
+/// itself. As a format argument it is only ever substituted at runtime, so it is never re-lexed
+/// as Rust source and that concern does not apply.
+const MASTERCARD_ID_CHECK_SVG: &str = include_str!("assets/mastercard_id_check.svg");
+const VISA_SECURE_SVG: &str = include_str!("assets/visa_secure.svg");
+
 /// Self-authored page B: the wait between creating the 3DS transaction and its resolution.
 /// Doc §11.2/§11.4: no server push — the browser itself polls `GET /transactions/{id}` (PUBLIC
 /// key; CORS-open with the Authorization header allowed, verified live 2026-09-29) until
 /// `current_step`/`current_step_status` or the top-level `status` settles, decoding and
 /// rendering `three_ds_method_data` (HTML-entity-escaped by Wompi) inside an iframe `srcdoc`
-/// (never `src`) once a `CHALLENGE`/`PENDING` step appears, per §11.4. Mastercard's card-network
-/// policy requires showing its "ID Check" mark alongside Visa's "Secure" mark on this page; no
-/// official logo asset URL could be confirmed on Wompi's public CDN (`public-assets.wompi.com`)
-/// or docs during this work, so both are rendered as text labels rather than risking a fake
-/// logo — see the connector work report for what was tried.
+/// (never `src`) once a `CHALLENGE`/`PENDING` step appears, per §11.4. The Mastercard ID
+/// Check / Visa Secure marks (`MASTERCARD_ID_CHECK_SVG`/`VISA_SECURE_SVG` above) sit above the
+/// polling status text, outside the `wompiChallengeContainer` that toggles for the challenge
+/// iframe, so they are visible from the moment this page loads and stay visible through and
+/// after the challenge, satisfying Mastercard's policy without any extra JS to manage.
 ///
 /// Once resolved (or after the 5-minute timeout mirroring Wompi's own recommended ceiling), it
 /// navigates the TOP window back to `complete_authorize_url` with the `done` marker so the
@@ -1245,10 +1262,17 @@ pub(super) fn build_challenge_page(
 
     Ok(format!(
         r#"<!doctype html>
-<html><head><meta charset="utf-8"><title>Confirming your payment</title></head>
+<html><head><meta charset="utf-8"><title>Confirming your payment</title>
+<style>
+  .wompiMark {{ display: inline-block; vertical-align: middle; }}
+  .wompiMark + .wompiMark {{ margin-left: 16px; }}
+  .wompiMark svg {{ display: block; height: 36px; width: auto; }}
+</style>
+</head>
 <body style="font-family:Arial,Helvetica,sans-serif;text-align:center;padding:24px;">
 <div style="margin-bottom:12px;">
-  <strong>Mastercard ID Check</strong> &nbsp;|&nbsp; <strong>Visa Secure</strong>
+  <span class="wompiMark" role="img" aria-label="Mastercard ID Check">{MASTERCARD_ID_CHECK_SVG}</span>
+  <span class="wompiMark" role="img" aria-label="Visa Secure">{VISA_SECURE_SVG}</span>
 </div>
 <p>Confirming your payment (transaction {transaction_id_html})&hellip;</p>
 <div id="wompiChallengeContainer" style="display:none;">
@@ -4328,6 +4352,47 @@ mod tests {
         assert!(page.contains("Visa Secure"));
         assert!(!page.contains("prv_"));
         assert!(!page.contains("tok_test"));
+    }
+
+    #[test]
+    fn challenge_page_embeds_both_official_marks_with_no_text_label_fallback() {
+        let page = build_challenge_page(
+            "txn-abc-123",
+            "pub_test_public_key",
+            WOMPI_PUBLIC_SANDBOX_HOST,
+            "https://hyperswitch.example.com/payments/redirect/pay_1/merchant_1/wompi",
+        )
+        .unwrap();
+        // The actual SVG drawings are embedded (not just accessible-name text): a
+        // distinctive fill color from each mark's own artwork.
+        assert!(
+            page.contains("fill=\"#EB001B\""),
+            "mastercard mark drawing missing"
+        );
+        assert!(
+            page.contains("fill=\"#1434CB\""),
+            "visa mark drawing missing"
+        );
+        assert!(page.contains("<svg"));
+        assert!(page.contains(r#"role="img""#));
+        assert!(page.contains(r#"aria-label="Mastercard ID Check""#));
+        assert!(page.contains(r#"aria-label="Visa Secure""#));
+        // No plain-text fallback label in place of the marks.
+        assert!(!page.contains("<strong>Mastercard ID Check</strong>"));
+        assert!(!page.contains("<strong>Visa Secure</strong>"));
+        // Neither source file carries an `id` attribute or a script of its own (the page's
+        // own polling `<script>` is a separate, expected element).
+        assert!(!MASTERCARD_ID_CHECK_SVG.contains("<script"));
+        assert!(!VISA_SECURE_SVG.contains("<script"));
+        assert!(!MASTERCARD_ID_CHECK_SVG.contains("id=\""));
+        assert!(!VISA_SECURE_SVG.contains("id=\""));
+        // Marks sit outside (before) the toggled challenge container, so they render from
+        // page load and stay visible once the challenge iframe is shown.
+        let marks_pos = page.find("wompiMark").expect("marks must be present");
+        let container_pos = page
+            .find("wompiChallengeContainer")
+            .expect("challenge container must be present");
+        assert!(marks_pos < container_pos);
     }
 
     #[test]
