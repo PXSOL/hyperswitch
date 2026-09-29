@@ -13,7 +13,10 @@ use common_utils::{
 use error_stack::{report, ResultExt};
 use hyperswitch_domain_models::{
     payment_method_data::{PaymentMethodData, WalletData},
-    router_data::{AccessToken, ConnectorAuthType, ErrorResponse, RouterData},
+    router_data::{
+        AccessToken, ConnectorAuthType, ConnectorReportedActivity, ConnectorReportedRefund,
+        ConnectorResponseData, ErrorResponse, RouterData,
+    },
     router_request_types::{CompleteAuthorizeRedirectResponse, PaymentsAuthorizeData, ResponseId},
     router_response_types::{PaymentsResponseData, RedirectForm, RefundsResponseData},
     types::{PaymentsAuthorizeRouterData, PaymentsCompleteAuthorizeRouterData, RefundsRouterData},
@@ -634,6 +637,106 @@ pub struct WompiTransactionData {
     // whether this transaction is void-eligible without another Wompi call.
     #[serde(default)]
     pub payment_method_type: Option<String>,
+    // Present on every transaction Wompi returns; defaulted so a payload that
+    // omits it still parses. Only read to size a void made outside Hyperswitch
+    // (see `reclassify_external_void`).
+    #[serde(default)]
+    pub amount_in_cents: Option<i64>,
+}
+
+/// A Wompi void has no partial mode (see the refunds section below): a payment
+/// that Hyperswitch recorded as Charged and that Wompi now reports VOIDED was
+/// reversed in full by someone other than this connector's refund flow (the
+/// merchant in the Wompi dashboard, or Wompi support). Hyperswitch must keep
+/// showing that payment as succeeded and record the reversal as a refund, like
+/// any other refund, instead of flipping the payment to cancelled.
+///
+/// So when the attempt is already Charged/PartialCharged and `transactions`
+/// holds no live APPROVED transaction, the matching VOIDED transaction is
+/// rewritten to APPROVED (the caller then builds the ordinary Charged outcome,
+/// with its usual `connector_metadata`) and the reversal is returned as a
+/// reported `void_<transaction id>` refund: the very id this connector mints when
+/// Hyperswitch voids by itself, so the reconciliation links or dedupes the two
+/// instead of creating a second refund. Anything else (attempt not settled, no
+/// VOIDED transaction to attribute) returns `None` and leaves `transactions`
+/// untouched, which keeps the previous VOIDED -> Voided behavior.
+pub(super) fn reclassify_external_void(
+    transactions: &mut [WompiTransactionData],
+    attempt_status: enums::AttemptStatus,
+    attempt_connector_transaction_id: Option<&str>,
+    payment_amount: MinorUnit,
+) -> Option<ConnectorReportedActivity> {
+    if !matches!(
+        attempt_status,
+        enums::AttemptStatus::Charged | enums::AttemptStatus::PartialCharged
+    ) || transactions
+        .iter()
+        .any(|t| t.status == WompiTransactionStatus::Approved)
+    {
+        return None;
+    }
+
+    let voided = transactions.iter_mut().find(|t| {
+        t.status == WompiTransactionStatus::Voided
+            && !matches!(attempt_connector_transaction_id, Some(id) if id != t.id)
+    })?;
+    voided.status = WompiTransactionStatus::Approved;
+
+    Some(ConnectorReportedActivity {
+        refunds: vec![ConnectorReportedRefund {
+            connector_refund_id: format!("{VOID_REFUND_ID_PREFIX}{}", voided.id),
+            amount: voided
+                .amount_in_cents
+                .map(MinorUnit::new)
+                .unwrap_or(payment_amount),
+            status: enums::RefundStatus::Success,
+        }],
+        dispute: None,
+    })
+}
+
+/// Attaches `activity` to `router_data.connector_response`, merging into an
+/// existing one instead of replacing it (same as Mercado Pago's PSync).
+pub(super) fn attach_reported_activity<F, T>(
+    router_data: &mut RouterData<F, T, PaymentsResponseData>,
+    activity: ConnectorReportedActivity,
+) {
+    match router_data.connector_response.as_mut() {
+        Some(connector_response) => connector_response.set_reported_activity(activity),
+        None => {
+            router_data.connector_response =
+                Some(ConnectorResponseData::with_reported_activity(activity));
+        }
+    }
+}
+
+/// PSync outcome for a set of transactions (a card lookup by id or by
+/// reference, a hosted-checkout search, or a webhook's single transaction): the
+/// ordinary outcome that `build` derives from them, plus a reported refund when
+/// they contain an external void of a Charged attempt (see
+/// `reclassify_external_void`, which runs first so `build` sees it as APPROVED).
+pub(super) fn sync_with_external_void<F, T>(
+    mut transactions: Vec<WompiTransactionData>,
+    data: RouterData<F, T, PaymentsResponseData>,
+    attempt_connector_transaction_id: Option<&str>,
+    payment_amount: MinorUnit,
+    build: impl FnOnce(
+        Vec<WompiTransactionData>,
+        RouterData<F, T, PaymentsResponseData>,
+    )
+        -> CustomResult<RouterData<F, T, PaymentsResponseData>, errors::ConnectorError>,
+) -> CustomResult<RouterData<F, T, PaymentsResponseData>, errors::ConnectorError> {
+    let activity = reclassify_external_void(
+        &mut transactions,
+        data.status,
+        attempt_connector_transaction_id,
+        payment_amount,
+    );
+    let mut router_data = build(transactions, data)?;
+    if let Some(activity) = activity {
+        attach_reported_activity(&mut router_data, activity);
+    }
+    Ok(router_data)
 }
 
 /// Shared by card Authorize and card PSync: both receive the same
@@ -2272,13 +2375,17 @@ pub(super) fn map_webhook_event(
             IncomingWebhookEvent::PaymentIntentFailure
         }
         WompiTransactionStatus::Pending => IncomingWebhookEvent::PaymentIntentProcessing,
-        // A VOIDED transaction here is never a merchant-initiated cancellation:
-        // this connector only ever voids a transaction itself, as its own
-        // refund flow (see `validate_void_refund`), and refund RSync already
-        // tracks that outcome. Mapping VOIDED to
-        // `PaymentIntentCancelled` would flip an already succeeded-and-refunded
-        // payment to cancelled when this webhook arrives.
-        WompiTransactionStatus::Voided => IncomingWebhookEvent::EventNotSupported,
+        // A VOIDED transaction is a reversal made in the Wompi dashboard (or by
+        // Wompi support) or the settling of a void this connector requested; either
+        // way the webhook only needs to reach the payments flow so it re-syncs the
+        // payment. This event type does not decide the payment's outcome: the sync
+        // derives it from Wompi's transaction and the attempt (a VOIDED transaction
+        // on a Charged attempt stays succeeded and becomes a `void_<id>` refund, see
+        // `reclassify_external_void`), and the outgoing webhook's event type comes
+        // from the resulting payment status. `PaymentIntentCancelled` is only the
+        // closest routing label; unlike `PaymentIntentSuccess` it triggers no
+        // mandate update.
+        WompiTransactionStatus::Voided => IncomingWebhookEvent::PaymentIntentCancelled,
         WompiTransactionStatus::Unknown => IncomingWebhookEvent::EventNotSupported,
     })
 }
@@ -2562,6 +2669,7 @@ mod tests {
             created_at: finalized_at.map(|s| s.to_string()),
             finalized_at: finalized_at.map(|s| s.to_string()),
             payment_method_type: None,
+            amount_in_cents: None,
         }
     }
 
@@ -2892,14 +3000,12 @@ mod tests {
             IncomingWebhookEvent::PaymentIntentFailure
         );
 
-        // A VOIDED transaction is never a merchant-initiated cancellation here:
-        // this connector only ever voids as its own refund flow, and refund
-        // RSync (not this webhook) tracks that outcome — see
-        // `validate_void_refund`.
+        // VOIDED must reach the payments flow (it re-syncs the payment; a void of a
+        // Charged payment is reported as a refund there, not a cancellation).
         webhook.data["transaction"]["status"] = serde_json::json!("VOIDED");
         assert_eq!(
             map_webhook_event(&webhook).unwrap(),
-            IncomingWebhookEvent::EventNotSupported
+            IncomingWebhookEvent::PaymentIntentCancelled
         );
 
         webhook.data["transaction"]["status"] = serde_json::json!("SOMETHING_NEW");
@@ -3033,6 +3139,233 @@ mod tests {
             }
             other => panic!("expected a TransactionResponse, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // External void of a Charged payment (see `reclassify_external_void`)
+    // ------------------------------------------------------------------
+
+    fn voided_tx(id: &str, amount_in_cents: Option<i64>) -> WompiTransactionData {
+        WompiTransactionData {
+            amount_in_cents,
+            payment_method_type: Some("CARD".to_string()),
+            ..tx(id, WompiTransactionStatus::Voided, None)
+        }
+    }
+
+    #[test]
+    fn external_void_of_a_charged_attempt_is_reported_as_a_succeeded_void_refund() {
+        for attempt_status in [
+            enums::AttemptStatus::Charged,
+            enums::AttemptStatus::PartialCharged,
+        ] {
+            let mut transactions = vec![voided_tx("txn-1", Some(4490000))];
+            let activity = reclassify_external_void(
+                &mut transactions,
+                attempt_status,
+                Some("txn-1"),
+                MinorUnit::new(1),
+            )
+            .expect("a voided transaction on a settled attempt must be reported");
+
+            assert_eq!(transactions[0].status, WompiTransactionStatus::Approved);
+            assert!(activity.dispute.is_none());
+            assert_eq!(activity.refunds.len(), 1);
+            assert_eq!(activity.refunds[0].connector_refund_id, "void_txn-1");
+            assert_eq!(activity.refunds[0].amount, MinorUnit::new(4490000));
+            assert_eq!(activity.refunds[0].status, enums::RefundStatus::Success);
+            // The id must round-trip through the RSync prefix handling.
+            assert_eq!(
+                strip_void_refund_id(&activity.refunds[0].connector_refund_id),
+                Some("txn-1")
+            );
+        }
+    }
+
+    #[test]
+    fn external_void_falls_back_to_the_payment_amount_when_the_transaction_has_none() {
+        let mut transactions = vec![voided_tx("txn-1", None)];
+        let activity = reclassify_external_void(
+            &mut transactions,
+            enums::AttemptStatus::Charged,
+            None,
+            MinorUnit::new(250000),
+        )
+        .expect("must be reported");
+        assert_eq!(activity.refunds[0].amount, MinorUnit::new(250000));
+    }
+
+    #[test]
+    fn voided_transaction_on_an_unsettled_attempt_keeps_the_voided_outcome() {
+        for attempt_status in [
+            enums::AttemptStatus::Pending,
+            enums::AttemptStatus::AuthenticationPending,
+            enums::AttemptStatus::Voided,
+            enums::AttemptStatus::Failure,
+        ] {
+            let mut transactions = vec![voided_tx("txn-1", Some(100))];
+            assert!(reclassify_external_void(
+                &mut transactions,
+                attempt_status,
+                Some("txn-1"),
+                MinorUnit::new(100),
+            )
+            .is_none());
+            assert_eq!(transactions[0].status, WompiTransactionStatus::Voided);
+        }
+    }
+
+    #[test]
+    fn external_void_needs_the_voided_transaction_to_be_the_attempts_own() {
+        let mut transactions = vec![voided_tx("other-txn", Some(100))];
+        assert!(reclassify_external_void(
+            &mut transactions,
+            enums::AttemptStatus::Charged,
+            Some("txn-1"),
+            MinorUnit::new(100),
+        )
+        .is_none());
+        assert_eq!(transactions[0].status, WompiTransactionStatus::Voided);
+    }
+
+    #[test]
+    fn a_live_approved_transaction_is_never_reported_as_voided() {
+        let mut transactions = vec![
+            voided_tx("txn-old", Some(100)),
+            tx("txn-live", WompiTransactionStatus::Approved, None),
+        ];
+        assert!(reclassify_external_void(
+            &mut transactions,
+            enums::AttemptStatus::Charged,
+            None,
+            MinorUnit::new(100),
+        )
+        .is_none());
+    }
+
+    fn charged_sync_router_data(
+        status: enums::AttemptStatus,
+    ) -> RouterData<
+        hyperswitch_domain_models::router_flow_types::payments::Authorize,
+        PaymentsAuthorizeData,
+        PaymentsResponseData,
+    > {
+        let mut router_data = authorize_router_data(
+            authorize_request_data(
+                PaymentMethodData::Card(test_card()),
+                enums::Currency::COP,
+                100000,
+                Some(common_utils::pii::Email::from_str("buyer@example.com").unwrap()),
+                None,
+            ),
+            enums::AuthenticationType::NoThreeDs,
+            Some(packed_access_token()),
+            Some("tok_test_x".to_string()),
+            "wompi-test-ref-void",
+        );
+        router_data.status = status;
+        router_data
+    }
+
+    #[test]
+    fn sync_of_an_externally_voided_charged_payment_stays_charged_with_a_reported_refund() {
+        let result = sync_with_external_void(
+            vec![voided_tx("txn-1", Some(100000))],
+            charged_sync_router_data(enums::AttemptStatus::Charged),
+            Some("txn-1"),
+            MinorUnit::new(100000),
+            |transactions, data| Ok(card_sync_by_reference_response(transactions, data, 200)),
+        )
+        .expect("sync must succeed");
+
+        assert_eq!(result.status, enums::AttemptStatus::Charged);
+        match result.response.expect("must not be an Err") {
+            PaymentsResponseData::TransactionResponse {
+                resource_id,
+                connector_metadata,
+                connector_response_reference_id,
+                ..
+            } => {
+                assert!(matches!(
+                    resource_id,
+                    ResponseId::ConnectorTransactionId(ref id) if id == "txn-1"
+                ));
+                assert_eq!(connector_response_reference_id.as_deref(), Some("REF-1"));
+                // The Charged path's metadata (refund Execute reads it back) is kept.
+                assert_eq!(
+                    connector_metadata.and_then(|m| m.get("payment_method_type").cloned()),
+                    Some(serde_json::json!("CARD"))
+                );
+            }
+            other => panic!("expected a TransactionResponse, got {other:?}"),
+        }
+        let reported = result
+            .connector_response
+            .as_ref()
+            .and_then(|response| response.get_reported_activity())
+            .expect("the void must be attached as reported activity");
+        assert_eq!(reported.refunds[0].connector_refund_id, "void_txn-1");
+    }
+
+    #[test]
+    fn sync_of_a_voided_transaction_on_a_pending_payment_is_still_voided() {
+        let result = sync_with_external_void(
+            vec![voided_tx("txn-1", Some(100000))],
+            charged_sync_router_data(enums::AttemptStatus::Pending),
+            None,
+            MinorUnit::new(100000),
+            |transactions, data| Ok(card_sync_by_reference_response(transactions, data, 200)),
+        )
+        .expect("sync must succeed");
+
+        assert_eq!(result.status, enums::AttemptStatus::Voided);
+        assert!(result.connector_response.is_none());
+    }
+
+    #[test]
+    fn sync_of_an_externally_voided_hosted_payment_is_reported_through_the_search_selection() {
+        let mut router_data = charged_sync_router_data(enums::AttemptStatus::Charged);
+        router_data.connector_response = None;
+        let result = sync_with_external_void(
+            vec![
+                tx("txn-declined", WompiTransactionStatus::Declined, None),
+                voided_tx("txn-1", Some(100000)),
+            ],
+            router_data,
+            Some("txn-1"),
+            MinorUnit::new(100000),
+            |transactions, data| {
+                RouterData::try_from(ResponseRouterData {
+                    response: WompiSearchResponse { data: transactions },
+                    data,
+                    http_code: 200,
+                })
+            },
+        )
+        .expect("sync must succeed");
+
+        assert_eq!(result.status, enums::AttemptStatus::Charged);
+        assert!(result
+            .connector_response
+            .as_ref()
+            .and_then(|response| response.get_reported_activity())
+            .is_some());
+    }
+
+    #[test]
+    fn transaction_data_parses_a_webhook_transaction_without_optional_fields() {
+        // A webhook's transaction may omit finalized_at / payment_method_type /
+        // amount_in_cents; it must still parse as a PSync resource.
+        let parsed: WompiTransactionResponse = serde_json::from_value(serde_json::json!({
+            "data": {
+                "id": "txn-1",
+                "reference": "attempt-1",
+                "status": "VOIDED"
+            }
+        }))
+        .expect("minimal VOIDED webhook transaction must parse");
+        assert_eq!(parsed.data.status, WompiTransactionStatus::Voided);
+        assert!(parsed.data.amount_in_cents.is_none());
     }
 
     // ------------------------------------------------------------------
@@ -3366,6 +3699,7 @@ mod tests {
             created_at: None,
             finalized_at: None,
             payment_method_type: None,
+            amount_in_cents: None,
         };
         let result = transaction_to_router_data(transaction, router_data, 200);
         assert_eq!(result.status, enums::AttemptStatus::Failure);
@@ -3650,6 +3984,7 @@ mod tests {
             created_at: None,
             finalized_at: Some("2026-09-25T15:00:00Z".to_string()),
             payment_method_type: Some("CARD".to_string()),
+            amount_in_cents: None,
         };
         let result = transaction_to_router_data(transaction, router_data, 200);
         assert_eq!(result.status, enums::AttemptStatus::Charged);
@@ -3693,6 +4028,7 @@ mod tests {
             created_at: None,
             finalized_at: None,
             payment_method_type: Some("CARD".to_string()),
+            amount_in_cents: None,
         };
         let result = transaction_to_router_data(transaction, router_data, 200);
         match result.response.expect("pending must be Ok") {
@@ -4169,6 +4505,7 @@ mod tests {
             created_at: None,
             finalized_at: None,
             payment_method_type: Some("CARD".to_string()),
+            amount_in_cents: None,
         };
 
         let result = three_ds_create_response(
@@ -4213,6 +4550,7 @@ mod tests {
             created_at: None,
             finalized_at: Some("2026-01-01T00:00:00Z".to_string()),
             payment_method_type: Some("CARD".to_string()),
+            amount_in_cents: None,
         };
 
         let result = three_ds_create_response(
@@ -4421,6 +4759,7 @@ mod tests {
             created_at: None,
             finalized_at: Some("2026-01-01T00:00:00Z".to_string()),
             payment_method_type: Some("CARD".to_string()),
+            amount_in_cents: None,
         }
     }
 

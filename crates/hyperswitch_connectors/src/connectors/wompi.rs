@@ -800,6 +800,12 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Wom
         event_builder: Option<&mut ConnectorEvent>,
         res: Response,
     ) -> CustomResult<PaymentsSyncRouterData, errors::ConnectorError> {
+        // Every branch also runs the transactions through the external-void check:
+        // a VOIDED transaction on an attempt that is already Charged is a reversal
+        // made outside Hyperswitch, reported as a refund instead of a cancellation.
+        let attempt_connector_transaction_id = data.request.get_connector_transaction_id().ok();
+        let attempt_connector_transaction_id = attempt_connector_transaction_id.as_deref();
+        let http_code = res.status_code;
         if data.payment_method == enums::PaymentMethod::Wallet {
             let response: wompi::WompiSearchResponse = res
                 .response
@@ -807,11 +813,19 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Wom
                 .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
             event_builder.map(|i| i.set_response_body(&response));
             router_env::logger::info!(connector_response=?response);
-            RouterData::try_from(ResponseRouterData {
-                response,
-                data: data.clone(),
-                http_code: res.status_code,
-            })
+            wompi::sync_with_external_void(
+                response.data,
+                data.clone(),
+                attempt_connector_transaction_id,
+                data.request.amount,
+                |transactions, data| {
+                    RouterData::try_from(ResponseRouterData {
+                        response: wompi::WompiSearchResponse { data: transactions },
+                        data,
+                        http_code,
+                    })
+                },
+            )
         } else if syncs_by_reference(data) {
             // A CARD retried by reference must NOT apply the hosted-checkout buyer-
             // retry window: there is no buyer retry to wait out here, POST
@@ -822,11 +836,19 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Wom
                 .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
             event_builder.map(|i| i.set_response_body(&response));
             router_env::logger::info!(connector_response=?response);
-            Ok(wompi::card_sync_by_reference_response(
+            wompi::sync_with_external_void(
                 response.data,
                 data.clone(),
-                res.status_code,
-            ))
+                attempt_connector_transaction_id,
+                data.request.amount,
+                |transactions, data| {
+                    Ok(wompi::card_sync_by_reference_response(
+                        transactions,
+                        data,
+                        http_code,
+                    ))
+                },
+            )
         } else {
             let response: wompi::WompiTransactionResponse = res
                 .response
@@ -834,11 +856,21 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Wom
                 .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
             event_builder.map(|i| i.set_response_body(&response));
             router_env::logger::info!(connector_response=?response);
-            RouterData::try_from(ResponseRouterData {
-                response,
-                data: data.clone(),
-                http_code: res.status_code,
-            })
+            wompi::sync_with_external_void(
+                vec![response.data],
+                data.clone(),
+                attempt_connector_transaction_id,
+                data.request.amount,
+                |transactions, data| {
+                    transactions
+                        .into_iter()
+                        .next()
+                        .map(|transaction| {
+                            wompi::transaction_to_router_data(transaction, data, http_code)
+                        })
+                        .ok_or_else(|| errors::ConnectorError::ResponseHandlingFailed.into())
+                },
+            )
         }
     }
 
