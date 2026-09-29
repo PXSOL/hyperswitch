@@ -125,6 +125,7 @@ mod worldpayvantiv;
 // mod wellsfargopayout;
 #[cfg(feature = "payouts")]
 mod wise;
+mod wompi;
 mod worldline;
 mod worldpay;
 mod worldpayxml;

@@ -434,6 +434,7 @@ impl TryFrom<&PaymentMethodData> for SalePaymentMethod {
                 | WalletData::Mifinity(_)
                 | WalletData::RevolutPay(_)
                 | WalletData::MercadoPagoSdk(_)
+                | WalletData::WompiCheckout {}
                 | WalletData::MercadoPagoCheckoutPro {} => {
                     Err(errors::ConnectorError::NotSupported {
                         message: "Wallet".to_string(),

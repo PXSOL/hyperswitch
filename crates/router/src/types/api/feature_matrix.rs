@@ -313,6 +313,9 @@ impl FeatureMatrixConnectorData {
                     connector::Stripebilling::new(),
                 ))),
                 enums::Connector::Wise => Ok(ConnectorEnum::Old(Box::new(connector::Wise::new()))),
+                enums::Connector::Wompi => {
+                    Ok(ConnectorEnum::Old(Box::new(connector::Wompi::new())))
+                }
                 enums::Connector::Worldline => {
                     Ok(ConnectorEnum::Old(Box::new(&connector::Worldline)))
                 }

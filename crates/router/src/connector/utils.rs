@@ -2576,6 +2576,7 @@ pub enum PaymentMethodDataType {
     PaypalSdk,
     MercadoPagoSdk,
     MercadoPagoCheckoutPro,
+    WompiCheckout,
     Paze,
     SamsungPay,
     TwintRedirect,
@@ -2714,6 +2715,7 @@ impl From<domain::payments::PaymentMethodData> for PaymentMethodDataType {
                 domain::payments::WalletData::MercadoPagoCheckoutPro {} => {
                     Self::MercadoPagoCheckoutPro
                 }
+                domain::payments::WalletData::WompiCheckout {} => Self::WompiCheckout,
                 domain::payments::WalletData::Paze(_) => Self::Paze,
                 domain::payments::WalletData::SamsungPay(_) => Self::SamsungPay,
                 domain::payments::WalletData::TwintRedirect {} => Self::TwintRedirect,

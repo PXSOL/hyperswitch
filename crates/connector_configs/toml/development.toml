@@ -6854,3 +6854,29 @@ api_key = "API Key"
   payment_method_type = "mercado_pago"
 [mercadopago.connector_auth.HeaderKey]
 api_key="Access Token"
+
+[wompi]
+[[wompi.credit]]
+  payment_method_type = "Mastercard"
+[[wompi.credit]]
+  payment_method_type = "Visa"
+[[wompi.credit]]
+  payment_method_type = "AmericanExpress"
+[[wompi.credit]]
+  payment_method_type = "DinersClub"
+[[wompi.debit]]
+  payment_method_type = "Mastercard"
+[[wompi.debit]]
+  payment_method_type = "Visa"
+[[wompi.debit]]
+  payment_method_type = "AmericanExpress"
+[[wompi.debit]]
+  payment_method_type = "DinersClub"
+[[wompi.wallet]]
+  payment_method_type = "wompi"
+[wompi.connector_auth.SignatureKey]
+api_key="Public Key"
+key1="Private Key"
+api_secret="Integrity Secret"
+[wompi.connector_webhook_details]
+merchant_secret="Events Secret"

@@ -168,6 +168,7 @@ pub enum RoutableConnectors {
     Wellsfargo,
     // Wellsfargopayout,
     Wise,
+    Wompi,
     Worldline,
     Worldpay,
     Worldpayvantiv,
@@ -347,6 +348,7 @@ pub enum Connector {
     Wellsfargo,
     // Wellsfargopayout,
     Wise,
+    Wompi,
     Worldline,
     Worldpay,
     Worldpayvantiv,
@@ -410,6 +412,7 @@ impl Connector {
                 | (Self::Itaubank, _)
                 | (Self::Facilitapay, _)
                 | (Self::Dwolla, _)
+                | (Self::Wompi, PaymentMethod::Card | PaymentMethod::Wallet)
         )
     }
     pub fn requires_order_creation_before_payment(self, payment_method: PaymentMethod) -> bool {
@@ -532,6 +535,7 @@ impl Connector {
             | Self::Wellsfargo
             // | Self::Wellsfargopayout
             | Self::Wise
+            | Self::Wompi
             | Self::Worldline
             | Self::Worldpay
             | Self::Worldpayvantiv
@@ -724,6 +728,7 @@ impl From<RoutableConnectors> for Connector {
             RoutableConnectors::Volt => Self::Volt,
             RoutableConnectors::Wellsfargo => Self::Wellsfargo,
             RoutableConnectors::Wise => Self::Wise,
+            RoutableConnectors::Wompi => Self::Wompi,
             RoutableConnectors::Worldline => Self::Worldline,
             RoutableConnectors::Worldpay => Self::Worldpay,
             RoutableConnectors::Worldpayvantiv => Self::Worldpayvantiv,
@@ -859,6 +864,7 @@ impl TryFrom<Connector> for RoutableConnectors {
             Connector::Volt => Ok(Self::Volt),
             Connector::Wellsfargo => Ok(Self::Wellsfargo),
             Connector::Wise => Ok(Self::Wise),
+            Connector::Wompi => Ok(Self::Wompi),
             Connector::Worldline => Ok(Self::Worldline),
             Connector::Worldpay => Ok(Self::Worldpay),
             Connector::Worldpayvantiv => Ok(Self::Worldpayvantiv),

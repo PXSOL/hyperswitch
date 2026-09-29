@@ -510,6 +510,10 @@ impl ConnectorAuthTypeAndMetadataValidation<'_> {
                 wise::transformers::WiseAuthType::try_from(self.auth_type)?;
                 Ok(())
             }
+            api_enums::Connector::Wompi => {
+                wompi::transformers::WompiAuthType::try_from(self.auth_type)?;
+                Ok(())
+            }
             api_enums::Connector::Worldline => {
                 worldline::transformers::WorldlineAuthType::try_from(self.auth_type)?;
                 Ok(())

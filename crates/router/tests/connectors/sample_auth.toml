@@ -372,3 +372,8 @@ api_key="EOrder Token"
 [peachpayments]
 api_key="API Key"
 key1="Tenant ID"
+
+[wompi]
+api_key="pub_test_sample_public_key"
+key1="prv_test_sample_private_key"
+api_secret="test_integrity_sample_secret"

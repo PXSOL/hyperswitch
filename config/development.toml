@@ -351,6 +351,10 @@ thunes.base_url = "https://api.limonetikqualif.com/"
 tokenio.base_url = "https://api.sandbox.token.io"
 stripe.base_url_file_upload = "https://files.stripe.com/"
 wise.base_url = "https://api.sandbox.transferwise.tech/"
+# wompi: base_url is production and secondary_base_url is sandbox in every environment; the
+# connector picks one per request from the key prefix (pub_test_ / pub_prod_).
+wompi.base_url = "https://production.wompi.co/v1"
+wompi.secondary_base_url = "https://sandbox.wompi.co/v1"
 worldline.base_url = "https://eu.sandbox.api-ingenico.com/"
 worldpay.base_url = "https://try.access.worldpay.com/"
 worldpayvantiv.base_url = "https://transact.vantivprelive.com/vap/communicator/online"
@@ -995,6 +999,11 @@ apple_pay = { country = "US,CA,IL,GB", currency = "ILS,USD,EUR" }
 [pm_filters.payway]
 credit = { country = "AR", currency = "ARS" }
 
+[pm_filters.wompi]
+credit = { country = "CO", currency = "COP" }
+debit = { country = "CO", currency = "COP" }
+wompi = { country = "CO", currency = "COP" }
+
 [tokenization]
 # `flow = "mandates"` no es opcional: sin él el filtro del router acepta cualquier pago, y toda
 # venta con tarjeta se cursaría como PaymentTokenSaleTransaction en vez del PaymentCardSaleTransaction
@@ -1014,6 +1023,9 @@ dwolla = { long_lived_token = true, payment_method = "bank_debit" }
 globalpay = { long_lived_token = false, payment_method = "card", flow = "mandates" }
 payway = { long_lived_token = false, payment_method = "card" }
 mercadopago = { long_lived_token = false, payment_method = "card" }
+# wompi: every card payment is tokenized (POST /tokens/cards) right before the charge, so no
+# `flow` filter on purpose.
+wompi = { long_lived_token = false, payment_method = "card" }
 
 [temp_locker_enable_config]
 stripe = { payment_method = "bank_transfer" }
