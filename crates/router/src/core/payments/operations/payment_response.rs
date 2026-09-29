@@ -597,6 +597,7 @@ impl<F: Clone> PostUpdateTracker<F, PaymentData<F>, types::PaymentsSyncData> for
         if let Some(reported_activity) = reported_activity {
             if let Err(error) = reconcile_connector_reported_activity(
                 db,
+                key_store,
                 &payment_data.payment_attempt,
                 &payment_data.payment_intent,
                 storage_scheme,
@@ -720,6 +721,7 @@ async fn refresh_refunds_and_disputes<F: Clone + Send>(
 #[cfg(feature = "v1")]
 async fn reconcile_connector_reported_activity(
     state: &SessionState,
+    key_store: &domain::MerchantKeyStore,
     payment_attempt: &PaymentAttempt,
     payment_intent: &storage::PaymentIntent,
     storage_scheme: enums::MerchantStorageScheme,
@@ -740,6 +742,12 @@ async fn reconcile_connector_reported_activity(
     // branch logs its own failure and never propagates it further than this
     // function, which the caller also treats as "never fail the payment
     // sync".
+    //
+    // What they insert or move to a new status is collected here and pushed to
+    // the merchant's outgoing webhooks at the end, once both are done.
+    let mut changed_refunds = Vec::new();
+    let mut changed_dispute = None;
+
     if !reported_activity.refunds.is_empty() {
         let refunds_result = match payment_attempt
             .currency
@@ -762,17 +770,18 @@ async fn reconcile_connector_reported_activity(
             }
             Err(error) => Err(error),
         };
-        if let Err(error) = refunds_result {
-            router_env::logger::error!(
+        match refunds_result {
+            Ok(refunds) => changed_refunds = refunds,
+            Err(error) => router_env::logger::error!(
                 ?error,
                 payment_id = ?payment_intent.payment_id,
                 "failed to reconcile connector-reported refunds"
-            );
+            ),
         }
     }
 
     if let Some(reported_dispute) = reported_activity.dispute {
-        if let Err(error) = reconcile_reported_dispute(
+        match reconcile_reported_dispute(
             state,
             &merchant_id,
             &connector,
@@ -782,15 +791,142 @@ async fn reconcile_connector_reported_activity(
         )
         .await
         {
-            router_env::logger::error!(
+            Ok(dispute) => changed_dispute = dispute,
+            Err(error) => router_env::logger::error!(
                 ?error,
                 payment_id = ?payment_intent.payment_id,
                 "failed to reconcile connector-reported dispute"
+            ),
+        }
+    }
+
+    trigger_reconciled_activity_webhooks(
+        state,
+        key_store,
+        payment_attempt,
+        changed_refunds,
+        changed_dispute,
+    )
+    .await;
+
+    Ok(())
+}
+
+/// Pushes to the merchant's outgoing webhooks the refunds and the dispute a
+/// reconciliation just inserted or moved to a new status, the same events the
+/// refund and dispute APIs emit (a refund respects the profile's
+/// `refund_statuses_enabled`). Nothing here may fail the payment sync: every
+/// error is logged and dropped. An unchanged refund or dispute never reaches
+/// this function, and the events' idempotent ids (`<object id>_<event type>`)
+/// make a repeated call harmless.
+#[cfg(feature = "v1")]
+async fn trigger_reconciled_activity_webhooks(
+    state: &SessionState,
+    key_store: &domain::MerchantKeyStore,
+    payment_attempt: &PaymentAttempt,
+    refunds: Vec<diesel_models::refund::Refund>,
+    dispute: Option<diesel_models::dispute::Dispute>,
+) {
+    if refunds.is_empty() && dispute.is_none() {
+        return;
+    }
+
+    let merchant_account = match state
+        .store
+        .find_merchant_account_by_merchant_id(
+            &state.into(),
+            &payment_attempt.merchant_id,
+            key_store,
+        )
+        .await
+    {
+        Ok(merchant_account) => merchant_account,
+        Err(error) => {
+            router_env::logger::error!(
+                ?error,
+                payment_id = ?payment_attempt.payment_id,
+                "failed to load the merchant account; skipping outgoing webhooks for connector-reported activity"
+            );
+            return;
+        }
+    };
+    let merchant_context = domain::MerchantContext::NormalMerchant(Box::new(domain::Context(
+        merchant_account,
+        key_store.clone(),
+    )));
+
+    for refund in &refunds {
+        if let Err(error) = utils::trigger_refund_outgoing_webhook(
+            state,
+            &merchant_context,
+            refund,
+            payment_attempt.profile_id.clone(),
+        )
+        .await
+        {
+            router_env::logger::warn!(
+                ?error,
+                refund_id = %refund.refund_id,
+                "failed to trigger the outgoing webhook for a connector-reported refund"
             );
         }
     }
 
-    Ok(())
+    if let Some(dispute) = dispute {
+        if let Err(error) = trigger_dispute_outgoing_webhook(
+            state,
+            merchant_context,
+            &payment_attempt.profile_id,
+            dispute,
+        )
+        .await
+        {
+            router_env::logger::warn!(
+                ?error,
+                "failed to trigger the outgoing webhook for a connector-reported dispute"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "v1")]
+async fn trigger_dispute_outgoing_webhook(
+    state: &SessionState,
+    merchant_context: domain::MerchantContext,
+    profile_id: &common_utils::id_type::ProfileId,
+    dispute: diesel_models::dispute::Dispute,
+) -> RouterResult<()> {
+    let business_profile = state
+        .store
+        .find_business_profile_by_profile_id(
+            &state.into(),
+            merchant_context.get_merchant_key_store(),
+            profile_id,
+        )
+        .await
+        .to_not_found_response(errors::ApiErrorResponse::ProfileNotFound {
+            id: profile_id.get_string_repr().to_owned(),
+        })?;
+
+    let event_type: enums::EventType = dispute.dispute_status.into();
+    let created_at = dispute.created_at;
+    let dispute_id = dispute.dispute_id.clone();
+    let dispute_response = api_models::disputes::DisputeResponse::foreign_from(dispute);
+
+    Box::pin(
+        crate::core::webhooks::create_event_and_trigger_outgoing_webhook(
+            state.clone(),
+            merchant_context,
+            business_profile,
+            event_type,
+            enums::EventClass::Disputes,
+            dispute_id,
+            enums::EventObjectType::DisputeDetails,
+            types::api::OutgoingWebhookContent::DisputeDetails(Box::new(dispute_response)),
+            Some(created_at),
+        ),
+    )
+    .await
 }
 
 #[cfg(feature = "v1")]
@@ -804,7 +940,7 @@ async fn reconcile_reported_refunds(
     payment_intent: &storage::PaymentIntent,
     storage_scheme: enums::MerchantStorageScheme,
     reported_refunds: Vec<hyperswitch_domain_models::router_data::ConnectorReportedRefund>,
-) -> RouterResult<()> {
+) -> RouterResult<Vec<diesel_models::refund::Refund>> {
     use hyperswitch_domain_models::connector_activity_reconciliation::{
         plan_refund_reconciliation, ExistingRefundView, RefundReconciliationAction,
     };
@@ -839,6 +975,10 @@ async fn reconcile_reported_refunds(
 
     let actions = plan_refund_reconciliation(&existing_views, &reported_refunds, connector);
 
+    // The refunds an action inserted or moved to a new status, for the caller to
+    // announce through the outgoing webhooks.
+    let mut changed_refunds = Vec::new();
+
     // One failed action must never block the rest: log it (with enough
     // identifiers to find the record) and move on to the next action.
     for action in actions {
@@ -854,7 +994,7 @@ async fn reconcile_reported_refunds(
                     apply_refund_status_update(db, existing.clone(), None, status, storage_scheme)
                         .await
                 }
-                None => Ok(()),
+                None => Ok(None),
             },
             RefundReconciliationAction::Link {
                 ref refund_id,
@@ -876,7 +1016,7 @@ async fn reconcile_reported_refunds(
                     )
                     .await
                 }
-                None => Ok(()),
+                None => Ok(None),
             },
             RefundReconciliationAction::Create {
                 ref refund_id,
@@ -901,32 +1041,36 @@ async fn reconcile_reported_refunds(
             }
         };
 
-        if let Err(error) = result {
-            let (refund_id, connector_refund_id) = match &action {
-                RefundReconciliationAction::UpdateStatus { refund_id, .. } => {
-                    (Some(refund_id.as_str()), None)
-                }
-                RefundReconciliationAction::Link {
-                    refund_id,
-                    connector_refund_id,
-                    ..
-                } => (Some(refund_id.as_str()), Some(connector_refund_id.as_str())),
-                RefundReconciliationAction::Create {
-                    refund_id,
-                    connector_refund_id,
-                    ..
-                } => (Some(refund_id.as_str()), Some(connector_refund_id.as_str())),
-            };
-            router_env::logger::error!(
+        match result {
+            Ok(Some(refund)) => changed_refunds.push(refund),
+            Ok(None) => {}
+            Err(error) => {
+                let (refund_id, connector_refund_id) = match &action {
+                    RefundReconciliationAction::UpdateStatus { refund_id, .. } => {
+                        (Some(refund_id.as_str()), None)
+                    }
+                    RefundReconciliationAction::Link {
+                        refund_id,
+                        connector_refund_id,
+                        ..
+                    } => (Some(refund_id.as_str()), Some(connector_refund_id.as_str())),
+                    RefundReconciliationAction::Create {
+                        refund_id,
+                        connector_refund_id,
+                        ..
+                    } => (Some(refund_id.as_str()), Some(connector_refund_id.as_str())),
+                };
+                router_env::logger::error!(
                 ?error,
                 ?refund_id,
                 ?connector_refund_id,
                 "failed to apply a connector-reported refund reconciliation action, skipping it"
             );
+            }
         }
     }
 
-    Ok(())
+    Ok(changed_refunds)
 }
 
 #[cfg(feature = "v1")]
@@ -936,7 +1080,8 @@ async fn apply_refund_status_update(
     connector_refund_id: Option<(ConnectorTransactionId, Option<String>)>,
     status: enums::RefundStatus,
     storage_scheme: enums::MerchantStorageScheme,
-) -> RouterResult<()> {
+) -> RouterResult<Option<diesel_models::refund::Refund>> {
+    let status_changed = existing.refund_status != status;
     let update = match connector_refund_id {
         Some((connector_refund_id, processor_refund_data)) => {
             diesel_models::refund::RefundUpdate::StatusUpdate {
@@ -956,14 +1101,16 @@ async fn apply_refund_status_update(
         },
     };
 
-    db.update_refund(existing, update, storage_scheme)
+    let updated = db
+        .update_refund(existing, update, storage_scheme)
         .await
         .change_context(errors::ApiErrorResponse::InternalServerError)
         .attach_printable(
             "failed to update a refund while reconciling connector-reported activity",
         )?;
 
-    Ok(())
+    // Linking a refund without moving its status is not worth an event.
+    Ok(status_changed.then_some(updated))
 }
 
 #[cfg(feature = "v1")]
@@ -980,7 +1127,7 @@ async fn create_reported_refund(
     connector_refund_id: String,
     amount: MinorUnit,
     status: enums::RefundStatus,
-) -> RouterResult<()> {
+) -> RouterResult<Option<diesel_models::refund::Refund>> {
     let connector_transaction_id = payment_attempt
         .connector_transaction_id
         .clone()
@@ -1028,13 +1175,13 @@ async fn create_reported_refund(
     };
 
     match db.insert_refund(refund_new, storage_scheme).await {
-        Ok(_) => Ok(()),
+        Ok(refund) => Ok(Some(refund)),
         Err(error) if error.current_context().is_db_unique_violation() => {
             router_env::logger::info!(
                 connector_refund_id = %connector_refund_id,
                 "a refund reported by the connector was already created by a concurrent sync, skipping"
             );
-            Ok(())
+            Ok(None)
         }
         Err(error) => Err(error)
             .change_context(errors::ApiErrorResponse::InternalServerError)
@@ -1050,7 +1197,7 @@ async fn reconcile_reported_dispute(
     payment_attempt: &PaymentAttempt,
     payment_intent: &storage::PaymentIntent,
     reported: hyperswitch_domain_models::router_data::ConnectorReportedDispute,
-) -> RouterResult<()> {
+) -> RouterResult<Option<diesel_models::dispute::Dispute>> {
     use hyperswitch_domain_models::connector_activity_reconciliation::{
         plan_dispute_reconciliation, DisputeReconciliationAction, ExistingDisputeView,
     };
@@ -1075,7 +1222,7 @@ async fn reconcile_reported_dispute(
     });
 
     match plan_dispute_reconciliation(existing_view.as_ref(), &reported) {
-        DisputeReconciliationAction::NoOp => Ok(()),
+        DisputeReconciliationAction::NoOp => Ok(None),
         DisputeReconciliationAction::Update { status, stage } => {
             if let Some(existing) = existing {
                 let update = storage::DisputeUpdate::Update {
@@ -1087,12 +1234,14 @@ async fn reconcile_reported_dispute(
                     challenge_required_by: None,
                     connector_updated_at: None,
                 };
-                db.update_dispute(existing, update)
+                let updated = db
+                    .update_dispute(existing, update)
                     .await
                     .change_context(errors::ApiErrorResponse::InternalServerError)
                     .attach_printable("failed to update a reconciled dispute")?;
+                return Ok(Some(updated));
             }
-            Ok(())
+            Ok(None)
         }
         DisputeReconciliationAction::Create => {
             let string_minor_amount = StringMinorUnitForConnector
@@ -1127,13 +1276,13 @@ async fn reconcile_reported_dispute(
             };
 
             match db.insert_dispute(dispute_new).await {
-                Ok(_) => Ok(()),
+                Ok(dispute) => Ok(Some(dispute)),
                 Err(error) if error.current_context().is_db_unique_violation() => {
                     router_env::logger::info!(
                         connector_dispute_id = %reported.connector_dispute_id,
                         "a dispute reported by the connector was already created by a concurrent sync, skipping"
                     );
-                    Ok(())
+                    Ok(None)
                 }
                 Err(error) => Err(error)
                     .change_context(errors::ApiErrorResponse::InternalServerError)
