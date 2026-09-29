@@ -589,8 +589,10 @@ impl Connector {
     /// Mercado Pago's PSync payload always carries `refunds[]` and the chargeback
     /// status of the payment, so a forced sync is the only signal Hyperswitch has
     /// for activity the merchant performed directly on the Mercado Pago panel.
+    /// Wompi reports a void made in its dashboard only as the transaction turning
+    /// VOIDED, which a forced sync turns into a reported refund.
     pub fn syncs_refunds_and_disputes_on_payment_sync(self) -> bool {
-        matches!(self, Self::Mercadopago)
+        matches!(self, Self::Mercadopago | Self::Wompi)
     }
 
     /// Validates if dummy connector can be created
