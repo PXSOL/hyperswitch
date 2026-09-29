@@ -6,7 +6,7 @@ use common_enums::enums;
 use common_utils::{
     crypto::{GenerateDigest, Sha256},
     errors::CustomResult,
-    ext_traits::ByteSliceExt,
+    ext_traits::{ByteSliceExt, ValueExt},
     request::Method,
     types::MinorUnit,
 };
@@ -14,17 +14,18 @@ use error_stack::{report, ResultExt};
 use hyperswitch_domain_models::{
     payment_method_data::{PaymentMethodData, WalletData},
     router_data::{AccessToken, ConnectorAuthType, ErrorResponse, RouterData},
-    router_request_types::{PaymentsAuthorizeData, ResponseId},
+    router_request_types::{CompleteAuthorizeRedirectResponse, PaymentsAuthorizeData, ResponseId},
     router_response_types::{PaymentsResponseData, RedirectForm, RefundsResponseData},
-    types::{PaymentsAuthorizeRouterData, RefundsRouterData},
+    types::{PaymentsAuthorizeRouterData, PaymentsCompleteAuthorizeRouterData, RefundsRouterData},
 };
-// Only used by the refund round-trip tests below (the non-test code only ever
-// spells the flow-generic `RefundsRouterData<F>`, never `RefundsData` or the
-// `Execute` flow directly), so these stay test-only to avoid unused-import
-// warnings in a plain (non-test) build.
+// Only used by the tests below (the non-test code only ever spells the flow-generic
+// `RefundsRouterData<F>`/`PaymentsCompleteAuthorizeRouterData`, never `RefundsData`, `Execute`
+// or `CompleteAuthorizeData` directly), so these stay test-only to avoid unused-import warnings
+// in a plain (non-test) build.
 #[cfg(test)]
 use hyperswitch_domain_models::{
-    router_flow_types::refunds::Execute, router_request_types::RefundsData,
+    router_flow_types::refunds::Execute,
+    router_request_types::{CompleteAuthorizeData, RefundsData},
 };
 use hyperswitch_interfaces::errors;
 use masking::{ExposeInterface, PeekInterface, Secret};
@@ -486,6 +487,11 @@ pub struct WompiCustomerData {
     pub full_name: Secret<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phone_number: Option<Secret<String>>,
+    // Only present on the deferred 3DS `POST /transactions` (CompleteAuthorize hit 1, see
+    // `build_three_ds_transaction_request`); absent (and never serialized) for every
+    // `no_three_ds` request, keeping that wire format byte-for-byte unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_info: Option<WompiBrowserInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -502,6 +508,10 @@ pub struct WompiTransactionsRequest {
     pub customer_data: Option<WompiCustomerData>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ip: Option<Secret<String, common_utils::pii::IpAddress>>,
+    // 3DS v2 (doc §11.1). `Some(true)` only for the deferred CompleteAuthorize hit 1 request;
+    // omitted (never `Some(false)`) for `no_three_ds`, which never sets this field at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_three_ds: Option<bool>,
 }
 
 impl TryFrom<&WompiRouterData<&PaymentsAuthorizeRouterData>> for WompiTransactionsRequest {
@@ -531,16 +541,11 @@ impl TryFrom<&WompiRouterData<&PaymentsAuthorizeRouterData>> for WompiTransactio
             .into());
         }
 
-        // Card 3DS (`is_three_ds`) is not implemented yet. Charging a `three_ds`
-        // request without authentication would silently drop the liability shift
-        // the caller asked for, so it is rejected instead of downgraded.
-        if router_data.auth_type == enums::AuthenticationType::ThreeDs {
-            return Err(errors::ConnectorError::NotSupported {
-                message: "3DS card payments".to_string(),
-                connector: "wompi",
-            }
-            .into());
-        }
+        // Card 3DS (`is_three_ds`) never reaches this constructor: Authorize routes a
+        // `ThreeDs` card through the merchant-lookup GET branch instead (see
+        // `is_card_three_ds` in wompi.rs), and the deferred `POST /transactions` it
+        // eventually makes goes through `build_three_ds_transaction_request`, not here.
+        debug_assert_eq!(router_data.auth_type, enums::AuthenticationType::NoThreeDs);
 
         let access_token = router_data
             .access_token
@@ -582,6 +587,7 @@ impl TryFrom<&WompiRouterData<&PaymentsAuthorizeRouterData>> for WompiTransactio
         let customer_data = full_name.map(|full_name| WompiCustomerData {
             full_name,
             phone_number,
+            browser_info: None,
         });
 
         let ip = router_data.request.get_ip_address_as_optional();
@@ -601,6 +607,7 @@ impl TryFrom<&WompiRouterData<&PaymentsAuthorizeRouterData>> for WompiTransactio
             accept_personal_auth: packed.accept_personal_auth,
             customer_data,
             ip,
+            is_three_ds: None,
         })
     }
 }
@@ -834,6 +841,730 @@ impl
             ..item.data
         })
     }
+}
+
+// ============================================================================
+// Card 3DS v2 (doc §11) — deferred `POST /transactions`
+//
+// Wompi's 3DS is one-shot: `browser_info` must already be in the SAME request that creates
+// the transaction (§11.1), but Hyperswitch only has browser data once the browser is back at
+// `complete_authorize_url`. So Authorize never calls Wompi for a `ThreeDs` card: it stashes
+// everything the deferred call needs in `connector_metadata` and returns a self-authored page
+// that collects `browser_info` and posts it back. From there:
+//   - CompleteAuthorize hit 1 (page A's post): makes the one `POST /transactions`.
+//   - CompleteAuthorize hit 2 (page B's `done` navigation): reads the transaction back
+//     authoritatively with the PRIVATE key, exactly like PSync.
+// Both hits share the SAME `ConnectorIntegration<CompleteAuthorize, ...>` impl (wompi.rs),
+// routed by `determine_complete_authorize_stage` below — never by the `wompi3ds` marker alone,
+// which is only a hint for what to do once a transaction already exists (see that function).
+// ============================================================================
+
+/// Marker hung off `complete_authorize_url`'s query string (page B's `done` navigation) or
+/// posted alongside the browser fields (page A's form): a plain server-observed fact about
+/// which of the two pages called back, never an authentication attestation. `determine_
+/// complete_authorize_stage` only consults it to decide what to do with an ALREADY-created
+/// transaction; whether to create one at all is decided from `connector_meta` alone.
+const THREE_DS_MARKER_PARAM: &str = "wompi3ds";
+const THREE_DS_MARKER_BROWSER: &str = "browser";
+const THREE_DS_MARKER_DONE: &str = "done";
+
+/// Doc §11.2: no push, no separate resolution endpoint — every step is `GET
+/// /transactions/{id}`, polled every 2-3s with a 5-minute recommended ceiling. Page B mirrors
+/// both.
+const THREE_DS_POLL_INTERVAL_MS: u64 = 2_500;
+const THREE_DS_POLL_TIMEOUT_MS: u64 = 300_000;
+
+/// Generous but bounded: long enough for a verbose real `user_agent`, short enough that a
+/// malicious/broken client can't smuggle megabytes through a `browser_info` field.
+const MAX_BROWSER_FIELD_LEN: usize = 512;
+
+/// Wompi's real public API hosts (doc §2), matching what `connectors.toml` holds in a correctly
+/// configured deployment. Page B's JS polls Wompi DIRECTLY from the cardholder's browser (never
+/// through this backend), so it must always target Wompi's actual host — never whatever
+/// `connectors.wompi.base_url` happens to be configured to for THIS backend's own outgoing
+/// calls (e.g. a mock host in a test/dev setup). That is why this is a separate literal rather
+/// than a reuse of `get_wompi_base_url`, which `handle_response` has no `Connectors` config to
+/// call anyway.
+const WOMPI_PUBLIC_SANDBOX_HOST: &str = "https://sandbox.wompi.co/v1";
+const WOMPI_PUBLIC_PRODUCTION_HOST: &str = "https://production.wompi.co/v1";
+
+pub(super) fn public_polling_host(
+    auth: &WompiAuthType,
+) -> CustomResult<&'static str, errors::ConnectorError> {
+    match resolve_environment(auth)? {
+        WompiEnvironment::Sandbox => Ok(WOMPI_PUBLIC_SANDBOX_HOST),
+        WompiEnvironment::Production => Ok(WOMPI_PUBLIC_PRODUCTION_HOST),
+    }
+}
+
+/// `true` only for a card being authenticated with 3DS: this is the one condition under which
+/// Authorize takes the merchant-lookup GET branch (like hosted checkout) instead of the direct
+/// `POST /transactions`.
+pub fn is_card_three_ds(
+    payment_method_data: &PaymentMethodData,
+    auth_type: enums::AuthenticationType,
+) -> bool {
+    matches!(payment_method_data, PaymentMethodData::Card(_))
+        && auth_type == enums::AuthenticationType::ThreeDs
+}
+
+/// Wompi's 3DS v2 `browser_info` object (doc §11.1): six plain strings, each the direct
+/// `.toString()` of a `window`/`navigator` value. Sourced live from page A's own JS
+/// (`build_browser_info_collection_page`), never from Hyperswitch's generic `BrowserInformation`
+/// — that type's units/shape don't match Wompi's string-only contract, and this connector's own
+/// live test script deliberately never sends it for a 3DS payment (see `wompi_tests/live.sh`'s
+/// `card3ds` subcommand).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WompiBrowserInfo {
+    pub browser_color_depth: String,
+    pub browser_screen_height: String,
+    pub browser_screen_width: String,
+    pub browser_language: String,
+    pub browser_user_agent: String,
+    pub browser_tz: String,
+}
+
+/// Everything the deferred `POST /transactions` (CompleteAuthorize hit 1) needs that
+/// `CompleteAuthorizeData` cannot carry itself: it has no billing address and no payment method
+/// token field at all. Resolved once, at Authorize time, using the same billing/card-holder
+/// fallback chain the non-3DS path already uses (see `build_card_three_ds_authorize_response`).
+///
+/// `card_token` and the customer fields are `Secret` so an accidental `Debug`/log of this
+/// struct — or of the `connector_metadata` value it round-trips through — never prints them.
+/// This is also the ONLY place the card token is ever stored outside Wompi's own tokenization
+/// response, and it stops existing the moment hit 1 succeeds: `three_ds_create_response`
+/// replaces this whole stash with `WompiThreeDsChallengeStash`, which does not have the field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WompiThreeDsBrowserInfoStash {
+    pub card_token: Secret<String>,
+    pub customer_email: common_utils::pii::Email,
+    pub full_name: Secret<String>,
+    pub phone_number: Secret<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip: Option<Secret<String, common_utils::pii::IpAddress>>,
+}
+
+/// What replaces the stash above the instant hit 1 creates the Wompi transaction: just the id,
+/// so a later CompleteAuthorize call (a duplicate hit 1, or the real hit 2) can find it again.
+/// Deliberately nothing else — the card token and customer data have already done their one job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WompiThreeDsChallengeStash {
+    pub wompi_transaction_id: String,
+}
+
+/// `connector_metadata` across the whole deferred 3DS round trip. The `three_ds_stage` tag
+/// doubles as the on-the-wire stage marker and the discriminant `determine_complete_authorize_
+/// stage` switches on: which variant is stashed is the actual idempotency guard (never the
+/// `wompi3ds` marker alone — a browser can resubmit page A, or replay a stale `done` link).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "three_ds_stage", rename_all = "snake_case")]
+pub enum WompiThreeDsStash {
+    BrowserInfo(WompiThreeDsBrowserInfoStash),
+    Challenge(WompiThreeDsChallengeStash),
+}
+
+/// What CompleteAuthorize must do with THIS call, decided purely from what is already stashed
+/// in `connector_meta` (see `determine_complete_authorize_stage`): `Create` still needs to make
+/// the one-shot `POST /transactions`; `Poll` already has a transaction and only ever reads it
+/// back with `GET /transactions/{id}`.
+#[derive(Debug)]
+pub(super) enum WompiCompleteAuthorizeStage {
+    Create(Box<WompiThreeDsBrowserInfoStash>),
+    Poll {
+        wompi_transaction_id: String,
+        /// `true` when this call should re-render the challenge/poll page if the transaction is
+        /// still `PENDING` (a duplicate hit 1 — page A resubmitted while a transaction already
+        /// exists, e.g. a refresh or a network retry). `false` for the real hit 2 (page B's own
+        /// `done` navigation): there, a still-`PENDING` transaction means page B's own 5-minute
+        /// client-side timeout fired, and the outcome must be reported as-is (`Pending`, no more
+        /// redirect) rather than looping the browser back into another challenge page.
+        keep_polling: bool,
+    },
+}
+
+/// Routes a CompleteAuthorize call from `connector_meta` alone (the marker only breaks the tie
+/// once a transaction already exists — see `WompiCompleteAuthorizeStage::Poll::keep_polling`).
+/// A payment that reaches CompleteAuthorize without ANY 3DS stash was never put into the
+/// deferred flow by Authorize, which is a connector/router invariant violation, not a
+/// resolvable runtime state, so it fails closed with `NoConnectorMetaData`.
+pub(super) fn determine_complete_authorize_stage(
+    req: &PaymentsCompleteAuthorizeRouterData,
+) -> CustomResult<WompiCompleteAuthorizeStage, errors::ConnectorError> {
+    let stash: WompiThreeDsStash = req
+        .request
+        .connector_meta
+        .clone()
+        .ok_or(errors::ConnectorError::NoConnectorMetaData)?
+        .parse_value("WompiThreeDsStash")
+        .change_context(errors::ConnectorError::NoConnectorMetaData)?;
+
+    Ok(match stash {
+        WompiThreeDsStash::BrowserInfo(stash) => {
+            WompiCompleteAuthorizeStage::Create(Box::new(stash))
+        }
+        WompiThreeDsStash::Challenge(challenge) => WompiCompleteAuthorizeStage::Poll {
+            wompi_transaction_id: challenge.wompi_transaction_id,
+            keep_polling: wompi_three_ds_marker(req.request.redirect_response.as_ref()).as_deref()
+                == Some(THREE_DS_MARKER_BROWSER),
+        },
+    })
+}
+
+/// Reads the `wompi3ds` marker from either channel the browser can carry it on: page B
+/// navigates with it in the query string (`redirect_response.params`); page A posts it as a
+/// plain form field alongside the browser values (`redirect_response.payload`, a JSON object —
+/// `payments_complete_authorize_redirect` decodes the form body into one).
+fn wompi_three_ds_marker(
+    redirect_response: Option<&CompleteAuthorizeRedirectResponse>,
+) -> Option<String> {
+    let redirect_response = redirect_response?;
+    if let Some(params) = redirect_response.params.as_ref() {
+        for (key, val) in url::form_urlencoded::parse(params.peek().as_bytes()) {
+            if key.eq_ignore_ascii_case(THREE_DS_MARKER_PARAM) {
+                return Some(val.into_owned());
+            }
+        }
+    }
+    if let Some(payload) = redirect_response.payload.as_ref() {
+        if let Some(value) = payload
+            .peek()
+            .as_object()
+            .and_then(|object| object.get(THREE_DS_MARKER_PARAM))
+            .and_then(|value| value.as_str())
+        {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn extract_browser_field(
+    payload: &serde_json::Map<String, serde_json::Value>,
+    field_name: &'static str,
+) -> CustomResult<String, errors::ConnectorError> {
+    let value = payload
+        .get(field_name)
+        .and_then(|value| value.as_str())
+        .ok_or(errors::ConnectorError::MissingRequiredField { field_name })?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > MAX_BROWSER_FIELD_LEN {
+        return Err(errors::ConnectorError::InvalidDataFormat { field_name }.into());
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Reads and validates the six `browser_info` fields (doc §11.1) out of page A's posted form
+/// body. Every field is required (Wompi documents all six as mandatory strings) and bounded in
+/// length; nothing is defaulted; a missing or oversized field fails clearly rather than
+/// forwarding a malformed value to Wompi.
+pub(super) fn parse_browser_info_payload(
+    redirect_response: Option<&CompleteAuthorizeRedirectResponse>,
+) -> CustomResult<WompiBrowserInfo, errors::ConnectorError> {
+    let payload = redirect_response
+        .and_then(|redirect_response| redirect_response.payload.as_ref())
+        .and_then(|payload| payload.peek().as_object().cloned())
+        .ok_or(errors::ConnectorError::MissingRequiredField {
+            field_name: "redirect_response.payload",
+        })?;
+
+    Ok(WompiBrowserInfo {
+        browser_color_depth: extract_browser_field(&payload, "browser_color_depth")?,
+        browser_screen_height: extract_browser_field(&payload, "browser_screen_height")?,
+        browser_screen_width: extract_browser_field(&payload, "browser_screen_width")?,
+        browser_language: extract_browser_field(&payload, "browser_language")?,
+        browser_user_agent: extract_browser_field(&payload, "browser_user_agent")?,
+        browser_tz: extract_browser_field(&payload, "browser_tz")?,
+    })
+}
+
+/// Builds the deferred hit-1 `POST /transactions`: same acceptance-token/signature/installment
+/// machinery as the non-3DS path (`WompiTransactionsRequest::try_from`), but sourced from the
+/// stash and the freshly-posted `browser_info` instead of `PaymentsAuthorizeData`/billing —
+/// `CompleteAuthorizeData` has neither. `installments`/`amount`/`currency`/`reference` are
+/// re-read live from `req` rather than stashed: they come from the same `payment_intent`/
+/// `payment_attempt` fields Authorize itself would have read, so re-reading them here is exactly
+/// as correct and keeps the stash to only what is genuinely nowhere else.
+pub(super) fn build_three_ds_transaction_request(
+    req: &PaymentsCompleteAuthorizeRouterData,
+    stash: &WompiThreeDsBrowserInfoStash,
+    browser_info: WompiBrowserInfo,
+) -> CustomResult<WompiTransactionsRequest, errors::ConnectorError> {
+    if req.request.currency != enums::Currency::COP {
+        return Err(errors::ConnectorError::CurrencyNotSupported {
+            message: req.request.currency.to_string(),
+            connector: "wompi",
+        }
+        .into());
+    }
+
+    let installments = extract_installments(req.request.metadata.as_ref())?;
+    let reference = req.connector_request_reference_id.clone();
+    let amount_in_cents = req.request.minor_amount;
+    let integrity_secret = WompiAuthType::try_from(&req.connector_auth_type)?.integrity_secret;
+    let signature =
+        build_integrity_signature(&reference, amount_in_cents, "COP", &integrity_secret)?;
+
+    let access_token = req
+        .access_token
+        .as_ref()
+        .ok_or(errors::ConnectorError::FailedToObtainAuthType)?;
+    let packed = unpack_access_token(access_token)?;
+
+    Ok(WompiTransactionsRequest {
+        amount_in_cents,
+        currency: "COP".to_string(),
+        signature,
+        customer_email: stash.customer_email.clone(),
+        reference,
+        payment_method: WompiCardPaymentMethod {
+            payment_method_type: WompiPaymentMethodType::Card,
+            token: stash.card_token.clone(),
+            installments,
+        },
+        acceptance_token: packed.acceptance_token,
+        accept_personal_auth: packed.accept_personal_auth,
+        customer_data: Some(WompiCustomerData {
+            full_name: stash.full_name.clone(),
+            phone_number: Some(stash.phone_number.clone()),
+            browser_info: Some(browser_info),
+        }),
+        ip: stash.ip.clone(),
+        is_three_ds: Some(true),
+    })
+}
+
+/// Escapes a value for interpolation into HTML text/attribute content (page A/B are built with
+/// plain `format!`, not a templating engine, so every interpolated value goes through this).
+fn escape_html(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+/// Escapes a value for a double-quoted JavaScript string literal inside an inline `<script>`.
+/// `<` is escaped to its unicode form so nothing inside the value can close the surrounding tag.
+fn escape_js_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '<' => escaped.push_str("\\u003C"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\u{2028}' => escaped.push_str("\\u2028"),
+            '\u{2029}' => escaped.push_str("\\u2029"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+/// Self-authored page A: returned directly from Authorize for a `ThreeDs` card, with NO call to
+/// Wompi at all. Collects the six `browser_info` values (doc §11.1) via JS and posts them as a
+/// plain HTML form — so they land in `redirect_response.payload`, never `.params` — to
+/// `complete_authorize_url` with the `browser` marker. Carries no secret: the card token,
+/// acceptance tokens and customer data the deferred call needs all live server-side in
+/// `connector_metadata`, never on this page.
+pub(super) fn build_browser_info_collection_page(complete_authorize_url: &str) -> String {
+    let action = escape_html(complete_authorize_url);
+    format!(
+        r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Verifying your card</title></head>
+<body style="font-family:Arial,Helvetica,sans-serif;text-align:center;padding:40px;">
+<p>Verifying your card, please wait&hellip;</p>
+<form id="wompiThreeDsBrowserInfoForm" method="POST" action="{action}">
+<input type="hidden" name="{THREE_DS_MARKER_PARAM}" value="{THREE_DS_MARKER_BROWSER}">
+<input type="hidden" name="browser_color_depth" id="wompiColorDepth">
+<input type="hidden" name="browser_screen_height" id="wompiScreenHeight">
+<input type="hidden" name="browser_screen_width" id="wompiScreenWidth">
+<input type="hidden" name="browser_language" id="wompiLanguage">
+<input type="hidden" name="browser_user_agent" id="wompiUserAgent">
+<input type="hidden" name="browser_tz" id="wompiTz">
+</form>
+<script type="text/javascript">
+(function () {{
+  document.getElementById('wompiColorDepth').value = String(window.screen.colorDepth);
+  document.getElementById('wompiScreenHeight').value = String(window.screen.height);
+  document.getElementById('wompiScreenWidth').value = String(window.screen.width);
+  document.getElementById('wompiLanguage').value = String(window.navigator.language || '');
+  document.getElementById('wompiUserAgent').value = String(window.navigator.userAgent || '');
+  document.getElementById('wompiTz').value = String(new Date().getTimezoneOffset());
+  document.getElementById('wompiThreeDsBrowserInfoForm').submit();
+}})();
+</script>
+</body></html>"#
+    )
+}
+
+/// Self-authored page B: the wait between creating the 3DS transaction and its resolution.
+/// Doc §11.2/§11.4: no server push — the browser itself polls `GET /transactions/{id}` (PUBLIC
+/// key; CORS-open with the Authorization header allowed, verified live 2026-09-29) until
+/// `current_step`/`current_step_status` or the top-level `status` settles, decoding and
+/// rendering `three_ds_method_data` (HTML-entity-escaped by Wompi) inside an iframe `srcdoc`
+/// (never `src`) once a `CHALLENGE`/`PENDING` step appears, per §11.4. Mastercard's card-network
+/// policy requires showing its "ID Check" mark alongside Visa's "Secure" mark on this page; no
+/// official logo asset URL could be confirmed on Wompi's public CDN (`public-assets.wompi.com`)
+/// or docs during this work, so both are rendered as text labels rather than risking a fake
+/// logo — see the connector work report for what was tried.
+///
+/// Once resolved (or after the 5-minute timeout mirroring Wompi's own recommended ceiling), it
+/// navigates the TOP window back to `complete_authorize_url` with the `done` marker so the
+/// authoritative PRIVATE-key check can run server-side. This page's own read of `status` is
+/// NEVER trusted for the payment outcome, only for when to stop polling and hand off.
+pub(super) fn build_challenge_page(
+    wompi_transaction_id: &str,
+    public_key: &str,
+    polling_host: &str,
+    complete_authorize_url: &str,
+) -> CustomResult<String, errors::ConnectorError> {
+    let mut done_url = url::Url::parse(complete_authorize_url).change_context(
+        errors::ConnectorError::InvalidDataFormat {
+            field_name: "complete_authorize_url",
+        },
+    )?;
+    done_url
+        .query_pairs_mut()
+        .append_pair(THREE_DS_MARKER_PARAM, THREE_DS_MARKER_DONE);
+
+    let poll_url_js = escape_js_string(&format!(
+        "{polling_host}/transactions/{wompi_transaction_id}"
+    ));
+    let public_key_js = escape_js_string(public_key);
+    let done_url_js = escape_js_string(done_url.as_str());
+    let transaction_id_html = escape_html(wompi_transaction_id);
+
+    Ok(format!(
+        r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Confirming your payment</title></head>
+<body style="font-family:Arial,Helvetica,sans-serif;text-align:center;padding:24px;">
+<div style="margin-bottom:12px;">
+  <strong>Mastercard ID Check</strong> &nbsp;|&nbsp; <strong>Visa Secure</strong>
+</div>
+<p>Confirming your payment (transaction {transaction_id_html})&hellip;</p>
+<div id="wompiChallengeContainer" style="display:none;">
+  <iframe id="wompiChallengeFrame" style="width:100%;min-height:500px;border:0;" title="3-D Secure challenge"></iframe>
+</div>
+<script type="text/javascript">
+(function () {{
+  var pollUrl = "{poll_url_js}";
+  var publicKey = "{public_key_js}";
+  var doneUrl = "{done_url_js}";
+  var pollIntervalMs = {THREE_DS_POLL_INTERVAL_MS};
+  var timeoutMs = {THREE_DS_POLL_TIMEOUT_MS};
+  var startedAt = Date.now();
+  var navigated = false;
+  var renderedChallenge = false;
+
+  function decodeHtmlEntities(escaped) {{
+    var parser = new DOMParser();
+    return parser.parseFromString('<!doctype html><body>' + escaped, 'text/html').body.textContent;
+  }}
+
+  function navigateDone() {{
+    if (navigated) {{ return; }}
+    navigated = true;
+    (window.top || window).location.replace(doneUrl);
+  }}
+
+  function renderChallenge(methodData) {{
+    if (renderedChallenge || !methodData) {{ return; }}
+    renderedChallenge = true;
+    document.getElementById('wompiChallengeContainer').style.display = 'block';
+    document.getElementById('wompiChallengeFrame').srcdoc = decodeHtmlEntities(methodData);
+  }}
+
+  function poll() {{
+    if (navigated) {{ return; }}
+    if (Date.now() - startedAt > timeoutMs) {{
+      navigateDone();
+      return;
+    }}
+    fetch(pollUrl, {{ headers: {{ 'Authorization': 'Bearer ' + publicKey }} }})
+      .then(function (response) {{ return response.json(); }})
+      .then(function (body) {{
+        var data = body && body.data;
+        var status = data && data.status;
+        var threeDsAuth = data && data.payment_method && data.payment_method.extra
+          && data.payment_method.extra.three_ds_auth;
+        if (threeDsAuth && threeDsAuth.current_step === 'CHALLENGE'
+          && threeDsAuth.current_step_status === 'PENDING' && threeDsAuth.three_ds_method_data) {{
+          renderChallenge(threeDsAuth.three_ds_method_data);
+        }}
+        if (status && status !== 'PENDING') {{
+          navigateDone();
+          return;
+        }}
+        window.setTimeout(poll, pollIntervalMs);
+      }})
+      .catch(function () {{
+        window.setTimeout(poll, pollIntervalMs);
+      }});
+  }}
+
+  poll();
+}})();
+</script>
+</body></html>"#
+    ))
+}
+
+/// Maps the one-shot `POST /transactions` response (hit 1's create): a terminal outcome
+/// (frictionless APPROVED, or an immediate DECLINED/ERROR) finalizes right away through the
+/// shared `transaction_to_router_data`. Anything still PENDING renders the challenge/poll page
+/// and replaces `connector_metadata` with just the transaction id — the card token, email, full
+/// name and phone that lived there only long enough to build this one request are gone the
+/// moment it succeeds.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn three_ds_create_response<F, T>(
+    transaction: WompiTransactionData,
+    data: RouterData<F, T, PaymentsResponseData>,
+    http_code: u16,
+    public_key: &str,
+    polling_host: &str,
+    complete_authorize_url: &str,
+) -> CustomResult<RouterData<F, T, PaymentsResponseData>, errors::ConnectorError> {
+    let status = map_wompi_status(transaction.status);
+    if matches!(
+        status,
+        enums::AttemptStatus::Charged
+            | enums::AttemptStatus::Failure
+            | enums::AttemptStatus::Voided
+    ) {
+        return Ok(transaction_to_router_data(transaction, data, http_code));
+    }
+
+    let challenge_stash = WompiThreeDsStash::Challenge(WompiThreeDsChallengeStash {
+        wompi_transaction_id: transaction.id.clone(),
+    });
+    let connector_metadata = serde_json::to_value(&challenge_stash)
+        .change_context(errors::ConnectorError::ResponseHandlingFailed)?;
+    let page = build_challenge_page(
+        &transaction.id,
+        public_key,
+        polling_host,
+        complete_authorize_url,
+    )?;
+
+    Ok(RouterData {
+        status: enums::AttemptStatus::AuthenticationPending,
+        response: Ok(PaymentsResponseData::TransactionResponse {
+            resource_id: ResponseId::ConnectorTransactionId(transaction.id),
+            redirection_data: Box::new(Some(RedirectForm::Html { html_data: page })),
+            mandate_reference: Box::new(None),
+            connector_metadata: Some(connector_metadata),
+            network_txn_id: None,
+            connector_response_reference_id: Some(transaction.reference),
+            incremental_authorization_allowed: None,
+            charges: None,
+        }),
+        ..data
+    })
+}
+
+/// Maps a `GET /transactions/{id}` read for the `Poll` stage. Hit 2 (`keep_polling: false`)
+/// always finalizes through this: a still-PENDING transaction there is page B's own client-side
+/// timeout, and `transaction_to_router_data` already yields plain `Pending` with no redirect for
+/// that case, so the router simply sends the browser to `return_url` and a later PSync resolves
+/// it. A duplicate hit 1 (`keep_polling: true`) instead re-renders the challenge page when the
+/// transaction is still PENDING, so the browser keeps polling instead of being sent away
+/// mid-challenge; a terminal transaction finalizes exactly the same way regardless of
+/// `keep_polling`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn three_ds_poll_response<F, T>(
+    transaction: WompiTransactionData,
+    data: RouterData<F, T, PaymentsResponseData>,
+    http_code: u16,
+    keep_polling: bool,
+    public_key: &str,
+    polling_host: &str,
+    complete_authorize_url: &str,
+) -> CustomResult<RouterData<F, T, PaymentsResponseData>, errors::ConnectorError> {
+    let status = map_wompi_status(transaction.status);
+    if !keep_polling || status != enums::AttemptStatus::Pending {
+        return Ok(transaction_to_router_data(transaction, data, http_code));
+    }
+
+    let page = build_challenge_page(
+        &transaction.id,
+        public_key,
+        polling_host,
+        complete_authorize_url,
+    )?;
+    let challenge_stash = WompiThreeDsStash::Challenge(WompiThreeDsChallengeStash {
+        wompi_transaction_id: transaction.id.clone(),
+    });
+    let connector_metadata = serde_json::to_value(&challenge_stash)
+        .change_context(errors::ConnectorError::ResponseHandlingFailed)?;
+
+    Ok(RouterData {
+        status: enums::AttemptStatus::AuthenticationPending,
+        response: Ok(PaymentsResponseData::TransactionResponse {
+            resource_id: ResponseId::ConnectorTransactionId(transaction.id),
+            redirection_data: Box::new(Some(RedirectForm::Html { html_data: page })),
+            mandate_reference: Box::new(None),
+            connector_metadata: Some(connector_metadata),
+            network_txn_id: None,
+            connector_response_reference_id: Some(transaction.reference),
+            incremental_authorization_allowed: None,
+            charges: None,
+        }),
+        ..data
+    })
+}
+
+/// `true` when a `POST /transactions` 422 is Wompi rejecting a `reference` that was already used
+/// (doc §5: "La referencia ya ha sido usada") — the one condition under which hit 1 must NOT be
+/// treated as a real failure: something (our own retry after a dropped response, a client
+/// double-submit that raced ahead of `connector_meta` being persisted) already created the real
+/// transaction under this same reference. Deferring to `Pending` (no connector transaction id)
+/// resolves it exactly the way `syncs_by_reference` already resolves a card Authorize that timed
+/// out after Wompi accepted it: the next PSync finds it by reference instead.
+pub(super) fn is_duplicate_reference_error(error: &ErrorResponse) -> bool {
+    error.status_code == 422 && error.message.to_lowercase().contains("reference")
+}
+
+/// Builds Wompi's `customer_data.phone_number` for the direct `POST /transactions` call: unlike
+/// the hosted-checkout form (which keeps `customer-data:phone-number` and `-prefix` apart), the
+/// direct API's field bakes the country code into one string with no separator or leading `+`
+/// (doc §7.2 PSE example: `"573145678901"`) — different from both
+/// `get_optional_billing_phone_number()` (bare local number) and `get_billing_phone_number()`
+/// (leading `+`, via `get_number_with_country_code`). Prefers the billing phone (api2's contract
+/// for a 3DS card payment always sends `billing.phone.{number,country_code}`), falling back to
+/// the shipping phone when the billing address has none.
+pub(super) fn build_customer_data_phone_number(
+    router_data: &PaymentsAuthorizeRouterData,
+) -> Option<Secret<String>> {
+    let billing_phone = router_data
+        .address
+        .get_payment_method_billing()
+        .and_then(|billing| billing.clone().phone);
+    let shipping_phone = router_data
+        .address
+        .get_shipping()
+        .and_then(|shipping| shipping.clone().phone);
+
+    for phone in [billing_phone, shipping_phone].into_iter().flatten() {
+        if let Some(number) = phone.number {
+            let country_code = phone
+                .country_code
+                .as_deref()
+                .map(|cc| cc.trim_start_matches('+'))
+                .unwrap_or_default();
+            return Some(Secret::new(format!("{country_code}{}", number.expose())));
+        }
+    }
+    None
+}
+
+/// Builds page A instead of ever calling Wompi from Authorize (see the module-level 3DS doc
+/// comment for why): validates the merchant is active (this GET is the same
+/// `WompiMerchantResponse` hosted checkout already uses) and stashes everything the deferred
+/// `POST /transactions` needs. `full_name` prefers the billing name, falling back to the card
+/// holder name; `phone_number` prefers the billing phone (with country code, see
+/// `build_customer_data_phone_number`), falling back to the shipping phone. Wompi requires both
+/// for 3DS (doc §11.1), so either missing fails clearly instead of silently omitting the field.
+pub(super) fn build_card_three_ds_authorize_response(
+    item: ResponseRouterData<
+        hyperswitch_domain_models::router_flow_types::payments::Authorize,
+        WompiMerchantResponse,
+        PaymentsAuthorizeData,
+        PaymentsResponseData,
+    >,
+) -> Result<PaymentsAuthorizeRouterData, error_stack::Report<errors::ConnectorError>> {
+    if !item.response.data.active {
+        return Err(report!(errors::ConnectorError::InvalidConnectorConfig {
+            config: "Wompi merchant is not active for this public key"
+        }));
+    }
+    if item.data.request.currency != enums::Currency::COP {
+        return Err(errors::ConnectorError::CurrencyNotSupported {
+            message: item.data.request.currency.to_string(),
+            connector: "wompi",
+        }
+        .into());
+    }
+
+    let card_token = match item.data.payment_method_token.clone() {
+        Some(hyperswitch_domain_models::router_data::PaymentMethodToken::Token(token)) => token,
+        _ => {
+            return Err(errors::ConnectorError::MissingRequiredField {
+                field_name: "payment_method_token",
+            }
+            .into())
+        }
+    };
+
+    let customer_email = item
+        .data
+        .request
+        .get_optional_email()
+        .or_else(|| item.data.get_optional_billing_email())
+        .ok_or(errors::ConnectorError::MissingRequiredField {
+            field_name: "email",
+        })?;
+
+    let card_holder_name = match &item.data.request.payment_method_data {
+        PaymentMethodData::Card(card) => card.card_holder_name.clone(),
+        _ => None,
+    };
+    let full_name = item
+        .data
+        .get_optional_billing_full_name()
+        .or(card_holder_name)
+        .ok_or(errors::ConnectorError::MissingRequiredField {
+            field_name: "billing.address.first_name",
+        })?;
+
+    let phone_number = build_customer_data_phone_number(&item.data).ok_or(
+        errors::ConnectorError::MissingRequiredField {
+            field_name: "billing.phone.number",
+        },
+    )?;
+
+    let ip = item.data.request.get_ip_address_as_optional();
+
+    let stash = WompiThreeDsStash::BrowserInfo(WompiThreeDsBrowserInfoStash {
+        card_token,
+        customer_email,
+        full_name,
+        phone_number,
+        ip,
+    });
+    let connector_metadata = serde_json::to_value(&stash)
+        .change_context(errors::ConnectorError::RequestEncodingFailed)?;
+
+    let complete_authorize_url = item.data.request.complete_authorize_url.clone().ok_or(
+        errors::ConnectorError::MissingRequiredField {
+            field_name: "complete_authorize_url",
+        },
+    )?;
+    let page = build_browser_info_collection_page(&complete_authorize_url);
+    let reference = item.data.connector_request_reference_id.clone();
+
+    Ok(PaymentsAuthorizeRouterData {
+        status: enums::AttemptStatus::AuthenticationPending,
+        response: Ok(PaymentsResponseData::TransactionResponse {
+            resource_id: ResponseId::NoResponseId,
+            redirection_data: Box::new(Some(RedirectForm::Html { html_data: page })),
+            mandate_reference: Box::new(None),
+            connector_metadata: Some(connector_metadata),
+            network_txn_id: None,
+            connector_response_reference_id: Some(reference),
+            incremental_authorization_allowed: None,
+            charges: None,
+        }),
+        ..item.data
+    })
 }
 
 // ============================================================================
@@ -2477,28 +3208,22 @@ mod tests {
         ));
     }
 
+    // A 3DS card now takes the merchant-lookup GET branch (see `is_card_three_ds` and its
+    // callers in wompi.rs), never `WompiTransactionsRequest::try_from`: this replaces the old
+    // `authorize_rejects_three_ds` gate test with a routing test for that branch instead.
     #[test]
-    fn authorize_rejects_three_ds() {
-        let request = authorize_request_data(
-            PaymentMethodData::Card(test_card()),
-            enums::Currency::COP,
-            100000,
-            Some(common_utils::pii::Email::from_str("buyer@example.com").unwrap()),
-            None,
-        );
-        let router_data = authorize_router_data(
-            request,
+    fn is_card_three_ds_routes_only_a_3ds_card() {
+        assert!(is_card_three_ds(
+            &PaymentMethodData::Card(test_card()),
             enums::AuthenticationType::ThreeDs,
-            Some(packed_access_token()),
-            Some("tok_test_x".to_string()),
-            "wompi-test-ref-2",
-        );
-        let amount = MinorUnit::new(100000);
-        let wompi_router_data = WompiRouterData::from((amount, &router_data));
-        let result = WompiTransactionsRequest::try_from(&wompi_router_data);
-        assert!(matches!(
-            result.unwrap_err().current_context(),
-            errors::ConnectorError::NotSupported { .. }
+        ));
+        assert!(!is_card_three_ds(
+            &PaymentMethodData::Card(test_card()),
+            enums::AuthenticationType::NoThreeDs,
+        ));
+        assert!(!is_card_three_ds(
+            &PaymentMethodData::Wallet(WalletData::WompiCheckout {}),
+            enums::AuthenticationType::ThreeDs,
         ));
     }
 
@@ -3181,5 +3906,623 @@ mod tests {
     fn strip_void_refund_id_recognizes_only_the_void_prefix() {
         assert_eq!(strip_void_refund_id("void_abc-123"), Some("abc-123"));
         assert_eq!(strip_void_refund_id("plain-refund-id"), None);
+    }
+
+    // ------------------------------------------------------------------
+    // Card 3DS v2 — helpers to build a `PaymentsCompleteAuthorizeRouterData`
+    // ------------------------------------------------------------------
+
+    fn browser_info_stash() -> WompiThreeDsBrowserInfoStash {
+        WompiThreeDsBrowserInfoStash {
+            card_token: Secret::new("tok_test_3ds".to_string()),
+            customer_email: common_utils::pii::Email::from_str("buyer@example.com").unwrap(),
+            full_name: Secret::new("PXSOL TEST".to_string()),
+            phone_number: Secret::new("573001234567".to_string()),
+            ip: None,
+        }
+    }
+
+    fn sample_browser_info_payload() -> serde_json::Value {
+        serde_json::json!({
+            THREE_DS_MARKER_PARAM: THREE_DS_MARKER_BROWSER,
+            "browser_color_depth": "24",
+            "browser_screen_height": "1050",
+            "browser_screen_width": "1680",
+            "browser_language": "en-US",
+            "browser_user_agent": "Mozilla/5.0 (test)",
+            "browser_tz": "-300",
+        })
+    }
+
+    fn redirect_response_with_payload(
+        payload: serde_json::Value,
+    ) -> CompleteAuthorizeRedirectResponse {
+        CompleteAuthorizeRedirectResponse {
+            params: None,
+            payload: Some(payload.into()),
+        }
+    }
+
+    fn redirect_response_with_marker(marker: &str) -> CompleteAuthorizeRedirectResponse {
+        CompleteAuthorizeRedirectResponse {
+            params: Some(Secret::new(format!("{THREE_DS_MARKER_PARAM}={marker}"))),
+            payload: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn complete_authorize_router_data(
+        connector_meta: Option<serde_json::Value>,
+        redirect_response: Option<CompleteAuthorizeRedirectResponse>,
+        access_token: Option<AccessToken>,
+        reference: &str,
+    ) -> PaymentsCompleteAuthorizeRouterData {
+        let request = CompleteAuthorizeData {
+            payment_method_data: None,
+            amount: 100000,
+            email: None,
+            currency: enums::Currency::COP,
+            confirm: true,
+            statement_descriptor_suffix: None,
+            capture_method: Some(enums::CaptureMethod::Automatic),
+            setup_future_usage: None,
+            mandate_id: None,
+            off_session: None,
+            setup_mandate_details: None,
+            redirect_response,
+            browser_info: None,
+            connector_transaction_id: None,
+            connector_meta,
+            complete_authorize_url: Some(
+                "https://hyperswitch.example.com/payments/redirect/pay_1/merchant_1/wompi"
+                    .to_string(),
+            ),
+            metadata: None,
+            customer_acceptance: None,
+            minor_amount: MinorUnit::new(100000),
+            merchant_account_id: None,
+            merchant_config_currency: None,
+            threeds_method_comp_ind: None,
+        };
+
+        RouterData {
+            flow: std::marker::PhantomData,
+            merchant_id: common_utils::id_type::MerchantId::try_from(std::borrow::Cow::from(
+                "wompi",
+            ))
+            .unwrap(),
+            customer_id: None,
+            connector_customer: None,
+            connector: "wompi".to_string(),
+            payment_id: reference.to_string(),
+            attempt_id: reference.to_string(),
+            tenant_id: common_utils::id_type::TenantId::try_from_string("public".to_string())
+                .unwrap(),
+            status: enums::AttemptStatus::AuthenticationPending,
+            payment_method: enums::PaymentMethod::Card,
+            connector_auth_type: test_auth(),
+            description: None,
+            address: hyperswitch_domain_models::payment_address::PaymentAddress::default(),
+            auth_type: enums::AuthenticationType::ThreeDs,
+            connector_meta_data: None,
+            connector_wallets_details: None,
+            amount_captured: None,
+            access_token,
+            session_token: None,
+            reference_id: None,
+            payment_method_token: None,
+            recurring_mandate_payment_data: None,
+            preprocessing_id: None,
+            payment_method_balance: None,
+            connector_api_version: None,
+            request,
+            response: Err(ErrorResponse::default()),
+            connector_request_reference_id: reference.to_string(),
+            #[cfg(feature = "payouts")]
+            payout_method_data: None,
+            #[cfg(feature = "payouts")]
+            quote_id: None,
+            test_mode: Some(true),
+            connector_http_status_code: None,
+            external_latency: None,
+            apple_pay_flow: None,
+            frm_metadata: None,
+            dispute_id: None,
+            refund_id: None,
+            connector_response: None,
+            payment_method_status: None,
+            minor_amount_captured: None,
+            minor_amount_capturable: None,
+            integrity_check: Ok(()),
+            additional_merchant_data: None,
+            header_payload: None,
+            connector_mandate_request_reference_id: None,
+            l2_l3_data: None,
+            authentication_id: None,
+            psd2_sca_exemption_type: None,
+            raw_connector_response: None,
+            is_payment_id_from_merchant: None,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // `parse_browser_info_payload` — validation
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn browser_info_payload_parses_all_six_fields() {
+        let redirect_response = redirect_response_with_payload(sample_browser_info_payload());
+        let browser_info = parse_browser_info_payload(Some(&redirect_response)).unwrap();
+        assert_eq!(browser_info.browser_color_depth, "24");
+        assert_eq!(browser_info.browser_screen_height, "1050");
+        assert_eq!(browser_info.browser_screen_width, "1680");
+        assert_eq!(browser_info.browser_language, "en-US");
+        assert_eq!(browser_info.browser_user_agent, "Mozilla/5.0 (test)");
+        assert_eq!(browser_info.browser_tz, "-300");
+    }
+
+    #[test]
+    fn browser_info_payload_fails_clearly_when_a_field_is_missing() {
+        let mut payload = sample_browser_info_payload();
+        payload.as_object_mut().unwrap().remove("browser_tz");
+        let redirect_response = redirect_response_with_payload(payload);
+        let result = parse_browser_info_payload(Some(&redirect_response));
+        assert!(matches!(
+            result.unwrap_err().current_context(),
+            errors::ConnectorError::MissingRequiredField {
+                field_name: "browser_tz"
+            }
+        ));
+    }
+
+    #[test]
+    fn browser_info_payload_rejects_an_oversized_field() {
+        let mut payload = sample_browser_info_payload();
+        payload["browser_user_agent"] = serde_json::json!("x".repeat(MAX_BROWSER_FIELD_LEN + 1));
+        let redirect_response = redirect_response_with_payload(payload);
+        let result = parse_browser_info_payload(Some(&redirect_response));
+        assert!(matches!(
+            result.unwrap_err().current_context(),
+            errors::ConnectorError::InvalidDataFormat {
+                field_name: "browser_user_agent"
+            }
+        ));
+    }
+
+    // ------------------------------------------------------------------
+    // `build_three_ds_transaction_request` — is_three_ds, customer_data, browser_info
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn three_ds_transaction_request_carries_the_expected_fields() {
+        let stash = browser_info_stash();
+        let router_data = complete_authorize_router_data(
+            Some(serde_json::to_value(WompiThreeDsStash::BrowserInfo(stash.clone())).unwrap()),
+            Some(redirect_response_with_payload(sample_browser_info_payload())),
+            Some(packed_access_token()),
+            "wompi-3ds-ref-1",
+        );
+        let browser_info =
+            parse_browser_info_payload(router_data.request.redirect_response.as_ref()).unwrap();
+        let connector_req =
+            build_three_ds_transaction_request(&router_data, &stash, browser_info).unwrap();
+
+        assert_eq!(connector_req.is_three_ds, Some(true));
+        let customer_data = connector_req
+            .customer_data
+            .expect("customer_data must be set");
+        assert_eq!(customer_data.full_name.peek(), "PXSOL TEST");
+        assert_eq!(
+            customer_data.phone_number.as_ref().unwrap().peek(),
+            "573001234567"
+        );
+        let browser_info = customer_data
+            .browser_info
+            .expect("browser_info must be set");
+        assert_eq!(browser_info.browser_color_depth, "24");
+        assert_eq!(browser_info.browser_tz, "-300");
+        assert_eq!(connector_req.reference, "wompi-3ds-ref-1");
+    }
+
+    // ------------------------------------------------------------------
+    // `connector_metadata` stash + token removal
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn create_response_drops_the_card_token_once_pending() {
+        let stash = browser_info_stash();
+        let router_data = complete_authorize_router_data(
+            Some(serde_json::to_value(WompiThreeDsStash::BrowserInfo(stash)).unwrap()),
+            Some(redirect_response_with_payload(sample_browser_info_payload())),
+            Some(packed_access_token()),
+            "wompi-3ds-ref-2",
+        );
+        let transaction = WompiTransactionData {
+            id: "txn-pending-1".to_string(),
+            reference: "wompi-3ds-ref-2".to_string(),
+            status: WompiTransactionStatus::Pending,
+            status_message: None,
+            created_at: None,
+            finalized_at: None,
+            payment_method_type: Some("CARD".to_string()),
+        };
+
+        let result = three_ds_create_response(
+            transaction,
+            router_data,
+            200,
+            "pub_test_x",
+            WOMPI_PUBLIC_SANDBOX_HOST,
+            "https://hyperswitch.example.com/payments/redirect/pay_1/merchant_1/wompi",
+        )
+        .unwrap();
+
+        assert_eq!(result.status, enums::AttemptStatus::AuthenticationPending);
+        let metadata = match result.response.as_ref().unwrap() {
+            PaymentsResponseData::TransactionResponse {
+                connector_metadata, ..
+            } => connector_metadata.clone().expect("metadata must be set"),
+            _ => panic!("expected a TransactionResponse"),
+        };
+        let metadata_str = metadata.to_string();
+        assert!(!metadata_str.contains("tok_test_3ds"));
+        assert!(!metadata_str.contains("PXSOL TEST"));
+        let stash: WompiThreeDsStash = metadata.parse_value("WompiThreeDsStash").unwrap();
+        assert!(matches!(stash, WompiThreeDsStash::Challenge(_)));
+    }
+
+    #[test]
+    fn create_response_finalizes_immediately_on_a_frictionless_approval() {
+        let router_data = complete_authorize_router_data(
+            Some(
+                serde_json::to_value(WompiThreeDsStash::BrowserInfo(browser_info_stash())).unwrap(),
+            ),
+            Some(redirect_response_with_payload(sample_browser_info_payload())),
+            Some(packed_access_token()),
+            "wompi-3ds-ref-3",
+        );
+        let transaction = WompiTransactionData {
+            id: "txn-approved-1".to_string(),
+            reference: "wompi-3ds-ref-3".to_string(),
+            status: WompiTransactionStatus::Approved,
+            status_message: None,
+            created_at: None,
+            finalized_at: Some("2026-01-01T00:00:00Z".to_string()),
+            payment_method_type: Some("CARD".to_string()),
+        };
+
+        let result = three_ds_create_response(
+            transaction,
+            router_data,
+            200,
+            "pub_test_x",
+            WOMPI_PUBLIC_SANDBOX_HOST,
+            "https://hyperswitch.example.com/payments/redirect/pay_1/merchant_1/wompi",
+        )
+        .unwrap();
+
+        assert_eq!(result.status, enums::AttemptStatus::Charged);
+    }
+
+    // ------------------------------------------------------------------
+    // Stage routing (browser vs done markers, double submit)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn stage_is_create_when_only_browser_info_is_stashed() {
+        let router_data = complete_authorize_router_data(
+            Some(
+                serde_json::to_value(WompiThreeDsStash::BrowserInfo(browser_info_stash())).unwrap(),
+            ),
+            Some(redirect_response_with_payload(sample_browser_info_payload())),
+            Some(packed_access_token()),
+            "wompi-3ds-ref-4",
+        );
+        assert!(matches!(
+            determine_complete_authorize_stage(&router_data).unwrap(),
+            WompiCompleteAuthorizeStage::Create(_)
+        ));
+    }
+
+    #[test]
+    fn stage_keeps_polling_on_a_duplicate_hit_one() {
+        let router_data = complete_authorize_router_data(
+            Some(
+                serde_json::to_value(WompiThreeDsStash::Challenge(WompiThreeDsChallengeStash {
+                    wompi_transaction_id: "txn-1".to_string(),
+                }))
+                .unwrap(),
+            ),
+            Some(redirect_response_with_payload(sample_browser_info_payload())),
+            Some(packed_access_token()),
+            "wompi-3ds-ref-5",
+        );
+        match determine_complete_authorize_stage(&router_data).unwrap() {
+            WompiCompleteAuthorizeStage::Poll {
+                wompi_transaction_id,
+                keep_polling,
+            } => {
+                assert_eq!(wompi_transaction_id, "txn-1");
+                assert!(keep_polling);
+            }
+            WompiCompleteAuthorizeStage::Create(_) => panic!("expected Poll"),
+        }
+    }
+
+    #[test]
+    fn stage_stops_polling_on_the_done_marker() {
+        let router_data = complete_authorize_router_data(
+            Some(
+                serde_json::to_value(WompiThreeDsStash::Challenge(WompiThreeDsChallengeStash {
+                    wompi_transaction_id: "txn-1".to_string(),
+                }))
+                .unwrap(),
+            ),
+            Some(redirect_response_with_marker(THREE_DS_MARKER_DONE)),
+            Some(packed_access_token()),
+            "wompi-3ds-ref-6",
+        );
+        match determine_complete_authorize_stage(&router_data).unwrap() {
+            WompiCompleteAuthorizeStage::Poll { keep_polling, .. } => assert!(!keep_polling),
+            WompiCompleteAuthorizeStage::Create(_) => panic!("expected Poll"),
+        }
+    }
+
+    #[test]
+    fn stage_fails_closed_with_no_stash_at_all() {
+        let router_data = complete_authorize_router_data(
+            None,
+            Some(redirect_response_with_marker(THREE_DS_MARKER_DONE)),
+            Some(packed_access_token()),
+            "wompi-3ds-ref-7",
+        );
+        assert!(matches!(
+            determine_complete_authorize_stage(&router_data)
+                .unwrap_err()
+                .current_context(),
+            errors::ConnectorError::NoConnectorMetaData
+        ));
+    }
+
+    // ------------------------------------------------------------------
+    // Page A / B rendering: contains expected pieces, no secrets, escaping
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn browser_info_page_contains_the_action_and_marker_and_no_secret() {
+        let page = build_browser_info_collection_page(
+            "https://hyperswitch.example.com/payments/redirect/pay_1/merchant_1/wompi",
+        );
+        assert!(page
+            .contains("https://hyperswitch.example.com/payments/redirect/pay_1/merchant_1/wompi"));
+        assert!(page.contains(THREE_DS_MARKER_PARAM));
+        assert!(page.contains(THREE_DS_MARKER_BROWSER));
+        assert!(page.contains("browser_color_depth"));
+        assert!(!page.contains("tok_test"));
+        assert!(!page.contains("acceptance_token"));
+    }
+
+    #[test]
+    fn browser_info_page_escapes_the_action_url() {
+        let page = build_browser_info_collection_page(
+            "https://example.com/redirect?x=\"><script>alert(1)</script>",
+        );
+        assert!(!page.contains("\"><script>alert(1)</script>"));
+        assert!(page.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn challenge_page_contains_transaction_id_and_public_key_and_no_secret() {
+        let page = build_challenge_page(
+            "txn-abc-123",
+            "pub_test_public_key",
+            WOMPI_PUBLIC_SANDBOX_HOST,
+            "https://hyperswitch.example.com/payments/redirect/pay_1/merchant_1/wompi",
+        )
+        .unwrap();
+        assert!(page.contains("txn-abc-123"));
+        assert!(page.contains("pub_test_public_key"));
+        assert!(page.contains(WOMPI_PUBLIC_SANDBOX_HOST));
+        assert!(page.contains(THREE_DS_MARKER_DONE));
+        assert!(page.contains("Mastercard ID Check"));
+        assert!(page.contains("Visa Secure"));
+        assert!(!page.contains("prv_"));
+        assert!(!page.contains("tok_test"));
+    }
+
+    #[test]
+    fn challenge_page_escapes_js_string_values() {
+        let page = build_challenge_page(
+            "txn-abc-123",
+            "pub_test_x\"; alert(1); //",
+            WOMPI_PUBLIC_SANDBOX_HOST,
+            "https://hyperswitch.example.com/payments/redirect/pay_1/merchant_1/wompi",
+        )
+        .unwrap();
+        assert!(!page.contains("pub_test_x\"; alert(1); //"));
+        assert!(page.contains("\\\""));
+    }
+
+    // ------------------------------------------------------------------
+    // Status mapping on hit 2 (APPROVED/DECLINED/PENDING)
+    // ------------------------------------------------------------------
+
+    fn poll_transaction(status: WompiTransactionStatus) -> WompiTransactionData {
+        WompiTransactionData {
+            id: "txn-poll-1".to_string(),
+            reference: "wompi-3ds-ref-8".to_string(),
+            status,
+            status_message: Some("declined by issuer".to_string()),
+            created_at: None,
+            finalized_at: Some("2026-01-01T00:00:00Z".to_string()),
+            payment_method_type: Some("CARD".to_string()),
+        }
+    }
+
+    fn poll_router_data(reference: &str) -> PaymentsCompleteAuthorizeRouterData {
+        complete_authorize_router_data(
+            Some(
+                serde_json::to_value(WompiThreeDsStash::Challenge(WompiThreeDsChallengeStash {
+                    wompi_transaction_id: "txn-poll-1".to_string(),
+                }))
+                .unwrap(),
+            ),
+            Some(redirect_response_with_marker(THREE_DS_MARKER_DONE)),
+            Some(packed_access_token()),
+            reference,
+        )
+    }
+
+    #[test]
+    fn hit_two_maps_approved_to_charged() {
+        let result = three_ds_poll_response(
+            poll_transaction(WompiTransactionStatus::Approved),
+            poll_router_data("wompi-3ds-ref-8"),
+            200,
+            false,
+            "pub_test_x",
+            WOMPI_PUBLIC_SANDBOX_HOST,
+            "https://hyperswitch.example.com/payments/redirect/pay_1/merchant_1/wompi",
+        )
+        .unwrap();
+        assert_eq!(result.status, enums::AttemptStatus::Charged);
+    }
+
+    #[test]
+    fn hit_two_maps_declined_to_failure() {
+        let result = three_ds_poll_response(
+            poll_transaction(WompiTransactionStatus::Declined),
+            poll_router_data("wompi-3ds-ref-8"),
+            200,
+            false,
+            "pub_test_x",
+            WOMPI_PUBLIC_SANDBOX_HOST,
+            "https://hyperswitch.example.com/payments/redirect/pay_1/merchant_1/wompi",
+        )
+        .unwrap();
+        assert_eq!(result.status, enums::AttemptStatus::Failure);
+        assert!(result.response.is_err());
+    }
+
+    #[test]
+    fn hit_two_maps_still_pending_to_pending_without_a_redirect() {
+        let result = three_ds_poll_response(
+            poll_transaction(WompiTransactionStatus::Pending),
+            poll_router_data("wompi-3ds-ref-8"),
+            200,
+            false,
+            "pub_test_x",
+            WOMPI_PUBLIC_SANDBOX_HOST,
+            "https://hyperswitch.example.com/payments/redirect/pay_1/merchant_1/wompi",
+        )
+        .unwrap();
+        assert_eq!(result.status, enums::AttemptStatus::Pending);
+        match result.response.as_ref().unwrap() {
+            PaymentsResponseData::TransactionResponse {
+                redirection_data, ..
+            } => assert!(redirection_data.is_none()),
+            _ => panic!("expected a TransactionResponse"),
+        }
+    }
+
+    #[test]
+    fn duplicate_hit_one_rerenders_the_challenge_page_while_still_pending() {
+        let result = three_ds_poll_response(
+            poll_transaction(WompiTransactionStatus::Pending),
+            poll_router_data("wompi-3ds-ref-8"),
+            200,
+            true,
+            "pub_test_x",
+            WOMPI_PUBLIC_SANDBOX_HOST,
+            "https://hyperswitch.example.com/payments/redirect/pay_1/merchant_1/wompi",
+        )
+        .unwrap();
+        assert_eq!(result.status, enums::AttemptStatus::AuthenticationPending);
+        match result.response.as_ref().unwrap() {
+            PaymentsResponseData::TransactionResponse {
+                redirection_data, ..
+            } => assert!(redirection_data.is_some()),
+            _ => panic!("expected a TransactionResponse"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 422 duplicate-reference detection
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn duplicate_reference_error_is_recognized() {
+        let error = ErrorResponse {
+            status_code: 422,
+            code: "INPUT_VALIDATION_ERROR".to_string(),
+            message: "reference: La referencia ya ha sido usada".to_string(),
+            reason: None,
+            attempt_status: None,
+            connector_transaction_id: None,
+            network_advice_code: None,
+            network_decline_code: None,
+            network_error_message: None,
+            connector_metadata: None,
+        };
+        assert!(is_duplicate_reference_error(&error));
+    }
+
+    #[test]
+    fn other_422_errors_are_not_treated_as_duplicate_reference() {
+        let error = ErrorResponse {
+            status_code: 422,
+            code: "INPUT_VALIDATION_ERROR".to_string(),
+            message: "amount_in_cents: must be a positive integer".to_string(),
+            reason: None,
+            attempt_status: None,
+            connector_transaction_id: None,
+            network_advice_code: None,
+            network_decline_code: None,
+            network_error_message: None,
+            connector_metadata: None,
+        };
+        assert!(!is_duplicate_reference_error(&error));
+    }
+
+    // ------------------------------------------------------------------
+    // `build_customer_data_phone_number` — country code baked in, no leading `+`
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn phone_number_bakes_in_the_country_code_without_a_plus() {
+        let router_data = authorize_router_data(
+            authorize_request_data(
+                PaymentMethodData::Card(test_card()),
+                enums::Currency::COP,
+                100000,
+                Some(common_utils::pii::Email::from_str("buyer@example.com").unwrap()),
+                None,
+            ),
+            enums::AuthenticationType::ThreeDs,
+            Some(packed_access_token()),
+            Some("tok_test_x".to_string()),
+            "wompi-3ds-ref-9",
+        );
+        let mut router_data = router_data;
+        router_data.address = hyperswitch_domain_models::payment_address::PaymentAddress::new(
+            None,
+            None,
+            Some(hyperswitch_domain_models::address::Address {
+                address: Some(hyperswitch_domain_models::address::AddressDetails {
+                    first_name: Some(Secret::new("PXSOL".to_string())),
+                    last_name: Some(Secret::new("TEST".to_string())),
+                    ..Default::default()
+                }),
+                phone: Some(hyperswitch_domain_models::address::PhoneDetails {
+                    number: Some(Secret::new("3001234567".to_string())),
+                    country_code: Some("+57".to_string()),
+                }),
+                email: None,
+            }),
+            None,
+        );
+
+        let phone_number = build_customer_data_phone_number(&router_data).unwrap();
+        assert_eq!(phone_number.peek(), "573001234567");
     }
 }

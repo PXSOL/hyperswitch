@@ -1269,7 +1269,6 @@ default_imp_for_complete_authorize!(
     connectors::Tsys,
     connectors::UnifiedAuthenticationService,
     connectors::Wise,
-    connectors::Wompi,
     connectors::Wellsfargo,
     connectors::Wellsfargopayout,
     connectors::Worldline,

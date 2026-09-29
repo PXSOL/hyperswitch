@@ -15,21 +15,24 @@ use hyperswitch_domain_models::{
     router_data::{AccessToken, ConnectorAuthType, ErrorResponse, RouterData},
     router_flow_types::{
         access_token_auth::AccessTokenAuth,
-        payments::{Authorize, Capture, PSync, PaymentMethodToken, Session, SetupMandate, Void},
+        payments::{
+            Authorize, Capture, CompleteAuthorize, PSync, PaymentMethodToken, Session,
+            SetupMandate, Void,
+        },
         refunds::{Execute, RSync},
     },
     router_request_types::{
-        AccessTokenRequestData, PaymentMethodTokenizationData, PaymentsAuthorizeData,
-        PaymentsCancelData, PaymentsCaptureData, PaymentsSessionData, PaymentsSyncData,
-        RefundsData, SetupMandateRequestData,
+        AccessTokenRequestData, CompleteAuthorizeData, PaymentMethodTokenizationData,
+        PaymentsAuthorizeData, PaymentsCancelData, PaymentsCaptureData, PaymentsSessionData,
+        PaymentsSyncData, RefundsData, SetupMandateRequestData,
     },
     router_response_types::{
         ConnectorInfo, PaymentMethodDetails, PaymentsResponseData, RefundsResponseData,
         SupportedPaymentMethods, SupportedPaymentMethodsExt,
     },
     types::{
-        PaymentsAuthorizeRouterData, PaymentsSyncRouterData, RefreshTokenRouterData,
-        RefundSyncRouterData, RefundsRouterData, TokenizationRouterData,
+        PaymentsAuthorizeRouterData, PaymentsCompleteAuthorizeRouterData, PaymentsSyncRouterData,
+        RefreshTokenRouterData, RefundSyncRouterData, RefundsRouterData, TokenizationRouterData,
     },
 };
 use hyperswitch_interfaces::{
@@ -41,8 +44,8 @@ use hyperswitch_interfaces::{
     errors,
     events::connector_api_logs::ConnectorEvent,
     types::{
-        PaymentsAuthorizeType, PaymentsSyncType, RefreshTokenType, RefundExecuteType,
-        RefundSyncType, Response, TokenizationType,
+        PaymentsAuthorizeType, PaymentsCompleteAuthorizeType, PaymentsSyncType, RefreshTokenType,
+        RefundExecuteType, RefundSyncType, Response, TokenizationType,
     },
     webhooks::{IncomingWebhook, IncomingWebhookRequestDetails},
 };
@@ -96,6 +99,7 @@ impl api::PaymentSession for Wompi {}
 impl api::ConnectorAccessToken for Wompi {}
 impl api::MandateSetup for Wompi {}
 impl api::PaymentAuthorize for Wompi {}
+impl api::PaymentsCompleteAuthorize for Wompi {}
 impl api::PaymentSync for Wompi {}
 impl api::PaymentCapture for Wompi {}
 impl api::PaymentVoid for Wompi {}
@@ -454,7 +458,9 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
     ) -> CustomResult<String, errors::ConnectorError> {
         let auth = wompi::WompiAuthType::try_from(&req.connector_auth_type)?;
         let base_url = get_wompi_base_url(&auth, connectors)?;
-        if wompi::is_hosted_checkout(&req.request.payment_method_data) {
+        if wompi::is_hosted_checkout(&req.request.payment_method_data)
+            || wompi::is_card_three_ds(&req.request.payment_method_data, req.auth_type)
+        {
             Ok(format!("{base_url}/merchants/{}", auth.public_key.peek()))
         } else {
             Ok(format!("{base_url}/transactions"))
@@ -467,7 +473,7 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         _connectors: &Connectors,
     ) -> CustomResult<RequestContent, errors::ConnectorError> {
         match &req.request.payment_method_data {
-            PaymentMethodData::Card(_) => {
+            PaymentMethodData::Card(_) if req.auth_type == enums::AuthenticationType::NoThreeDs => {
                 let amount = utils::convert_amount(
                     self.amount_converter,
                     req.request.minor_amount,
@@ -478,8 +484,9 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
                     wompi::WompiTransactionsRequest::try_from(&connector_router_data)?;
                 Ok(RequestContent::Json(Box::new(connector_req)))
             }
-            // The hosted-checkout branch is a GET (see `build_request`): this body is
-            // never sent, but every flow must return something for the trait.
+            // A card being authenticated with 3DS takes the merchant-lookup GET branch
+            // below (see `build_request`), just like hosted checkout: this body is never
+            // sent for either, but every flow must return something for the trait.
             _ => Ok(RequestContent::Json(Box::new(serde_json::json!({})))),
         }
     }
@@ -489,7 +496,9 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         req: &PaymentsAuthorizeRouterData,
         connectors: &Connectors,
     ) -> CustomResult<Option<Request>, errors::ConnectorError> {
-        let method = if wompi::is_hosted_checkout(&req.request.payment_method_data) {
+        let method = if wompi::is_hosted_checkout(&req.request.payment_method_data)
+            || wompi::is_card_three_ds(&req.request.payment_method_data, req.auth_type)
+        {
             Method::Get
         } else {
             Method::Post
@@ -525,6 +534,18 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
                 data: data.clone(),
                 http_code: res.status_code,
             })
+        } else if wompi::is_card_three_ds(&data.request.payment_method_data, data.auth_type) {
+            let response: wompi::WompiMerchantResponse = res
+                .response
+                .parse_struct("WompiMerchantResponse")
+                .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+            event_builder.map(|i| i.set_response_body(&response));
+            router_env::logger::info!(connector_response=?response);
+            wompi::build_card_three_ds_authorize_response(ResponseRouterData {
+                response,
+                data: data.clone(),
+                http_code: res.status_code,
+            })
         } else {
             let response: wompi::WompiTransactionResponse = res
                 .response
@@ -546,6 +567,165 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         event_builder: Option<&mut ConnectorEvent>,
     ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
         self.build_error_response(res, event_builder)
+    }
+}
+
+// ============================================================================
+// CompleteAuthorize — card 3DS v2, deferred one-shot `POST /transactions`
+//
+// Two physical round-trips reuse this SAME flow, distinguished by what is already stashed in
+// `connector_meta` (never by the `wompi3ds` marker alone — see
+// `wompi::determine_complete_authorize_stage`):
+//   - `Create`: page A (browser info) has just posted back for the first time. Builds the
+//     one-shot `POST /transactions` with `is_three_ds` and the stashed card token/customer
+//     data; the card token never survives past this call.
+//   - `Poll`: a transaction already exists (the real hit 2 from page B's `done` navigation, or
+//     page A double-submitting while one already exists). Reads it back with the PRIVATE key,
+//     exactly like PSync.
+// ============================================================================
+
+impl ConnectorIntegration<CompleteAuthorize, CompleteAuthorizeData, PaymentsResponseData>
+    for Wompi
+{
+    fn get_headers(
+        &self,
+        req: &PaymentsCompleteAuthorizeRouterData,
+        connectors: &Connectors,
+    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+        match wompi::determine_complete_authorize_stage(req)? {
+            wompi::WompiCompleteAuthorizeStage::Create(_) => self.build_headers(req, connectors),
+            wompi::WompiCompleteAuthorizeStage::Poll { .. } => {
+                let auth = wompi::WompiAuthType::try_from(&req.connector_auth_type)?;
+                Ok(self.private_key_headers(&auth))
+            }
+        }
+    }
+
+    fn get_content_type(&self) -> &'static str {
+        self.common_get_content_type()
+    }
+
+    fn get_url(
+        &self,
+        req: &PaymentsCompleteAuthorizeRouterData,
+        connectors: &Connectors,
+    ) -> CustomResult<String, errors::ConnectorError> {
+        let auth = wompi::WompiAuthType::try_from(&req.connector_auth_type)?;
+        let base_url = get_wompi_base_url(&auth, connectors)?;
+        match wompi::determine_complete_authorize_stage(req)? {
+            wompi::WompiCompleteAuthorizeStage::Create(_) => Ok(format!("{base_url}/transactions")),
+            wompi::WompiCompleteAuthorizeStage::Poll {
+                wompi_transaction_id,
+                ..
+            } => Ok(format!("{base_url}/transactions/{wompi_transaction_id}")),
+        }
+    }
+
+    fn get_request_body(
+        &self,
+        req: &PaymentsCompleteAuthorizeRouterData,
+        _connectors: &Connectors,
+    ) -> CustomResult<RequestContent, errors::ConnectorError> {
+        match wompi::determine_complete_authorize_stage(req)? {
+            wompi::WompiCompleteAuthorizeStage::Create(stash) => {
+                let browser_info =
+                    wompi::parse_browser_info_payload(req.request.redirect_response.as_ref())?;
+                let connector_req =
+                    wompi::build_three_ds_transaction_request(req, &stash, browser_info)?;
+                Ok(RequestContent::Json(Box::new(connector_req)))
+            }
+            // `Poll` is a GET (see `build_request`): this body is never sent.
+            wompi::WompiCompleteAuthorizeStage::Poll { .. } => {
+                Ok(RequestContent::Json(Box::new(serde_json::json!({}))))
+            }
+        }
+    }
+
+    fn build_request(
+        &self,
+        req: &PaymentsCompleteAuthorizeRouterData,
+        connectors: &Connectors,
+    ) -> CustomResult<Option<Request>, errors::ConnectorError> {
+        let method = match wompi::determine_complete_authorize_stage(req)? {
+            wompi::WompiCompleteAuthorizeStage::Create(_) => Method::Post,
+            wompi::WompiCompleteAuthorizeStage::Poll { .. } => Method::Get,
+        };
+        let mut builder = RequestBuilder::new()
+            .method(method)
+            .url(&PaymentsCompleteAuthorizeType::get_url(
+                self, req, connectors,
+            )?)
+            .attach_default_headers()
+            .headers(PaymentsCompleteAuthorizeType::get_headers(
+                self, req, connectors,
+            )?);
+        if method == Method::Post {
+            builder = builder.set_body(PaymentsCompleteAuthorizeType::get_request_body(
+                self, req, connectors,
+            )?);
+        }
+        Ok(Some(builder.build()))
+    }
+
+    fn handle_response(
+        &self,
+        data: &PaymentsCompleteAuthorizeRouterData,
+        event_builder: Option<&mut ConnectorEvent>,
+        res: Response,
+    ) -> CustomResult<PaymentsCompleteAuthorizeRouterData, errors::ConnectorError> {
+        let stage = wompi::determine_complete_authorize_stage(data)?;
+        let response: wompi::WompiTransactionResponse = res
+            .response
+            .parse_struct("WompiTransactionResponse")
+            .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+        event_builder.map(|i| i.set_response_body(&response));
+        router_env::logger::info!(connector_response=?response);
+
+        let auth = wompi::WompiAuthType::try_from(&data.connector_auth_type)?;
+        let public_key = auth.public_key.peek().clone();
+        let polling_host = wompi::public_polling_host(&auth)?;
+        let complete_authorize_url = data.request.complete_authorize_url.clone().ok_or(
+            errors::ConnectorError::MissingRequiredField {
+                field_name: "complete_authorize_url",
+            },
+        )?;
+
+        match stage {
+            wompi::WompiCompleteAuthorizeStage::Create(_) => wompi::three_ds_create_response(
+                response.data,
+                data.clone(),
+                res.status_code,
+                &public_key,
+                polling_host,
+                &complete_authorize_url,
+            ),
+            wompi::WompiCompleteAuthorizeStage::Poll { keep_polling, .. } => {
+                wompi::three_ds_poll_response(
+                    response.data,
+                    data.clone(),
+                    res.status_code,
+                    keep_polling,
+                    &public_key,
+                    polling_host,
+                    &complete_authorize_url,
+                )
+            }
+        }
+    }
+
+    fn get_error_response(
+        &self,
+        res: Response,
+        event_builder: Option<&mut ConnectorEvent>,
+    ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
+        let mut error = self.build_error_response(res, event_builder)?;
+        if wompi::is_duplicate_reference_error(&error) {
+            router_env::logger::info!(
+                "wompi: duplicate 3DS transaction reference (422); deferring to PSync search-by-reference"
+            );
+            error.attempt_status = Some(enums::AttemptStatus::Pending);
+        }
+        Ok(error)
     }
 }
 
@@ -1000,7 +1180,9 @@ static WOMPI_SUPPORTED_PAYMENT_METHODS: LazyLock<SupportedPaymentMethods> = Lazy
     let card_specific_features = Some(
         api_models::feature_matrix::PaymentMethodSpecificFeatures::Card(
             api_models::feature_matrix::CardSpecificFeatures {
-                three_ds: enums::FeatureStatus::NotSupported,
+                // Direct card 3DS v2 (doc §11): deferred one-shot `POST /transactions`,
+                // implemented via the CompleteAuthorize flow (see wompi/transformers.rs).
+                three_ds: enums::FeatureStatus::Supported,
                 no_three_ds: enums::FeatureStatus::Supported,
                 supported_card_networks,
             },
