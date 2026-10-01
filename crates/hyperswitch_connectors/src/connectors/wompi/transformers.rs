@@ -684,6 +684,7 @@ pub(super) fn reclassify_external_void(
 
     Some(ConnectorReportedActivity {
         refunds: vec![ConnectorReportedRefund {
+            amount_is_remaining_balance: false,
             connector_refund_id: format!("{VOID_REFUND_ID_PREFIX}{}", voided.id),
             amount: voided
                 .amount_in_cents

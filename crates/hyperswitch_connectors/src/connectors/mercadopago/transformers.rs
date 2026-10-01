@@ -1006,6 +1006,7 @@ impl MercadopagoPaymentRefundEntry {
             }
         };
         Some(ConnectorReportedRefund {
+            amount_is_remaining_balance: false,
             connector_refund_id,
             amount,
             status: mercadopago_reported_refund_status(self.status.as_deref()),

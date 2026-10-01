@@ -1,8 +1,14 @@
 use common_enums::enums;
-use common_utils::{pii::SecretSerdeValue, types::StringMinorUnit};
+use common_utils::{
+    pii::SecretSerdeValue,
+    types::{MinorUnit, StringMinorUnit},
+};
 use hyperswitch_domain_models::{
     payment_method_data::PaymentMethodData,
-    router_data::{ConnectorAuthType, RouterData},
+    router_data::{
+        ConnectorAuthType, ConnectorReportedActivity, ConnectorReportedRefund,
+        ConnectorResponseData, ErrorResponse, RouterData,
+    },
     router_flow_types::{
         payments,
         refunds::{Execute, RSync},
@@ -306,32 +312,190 @@ impl TryFrom<&ConnectorAuthType> for PaywayAuthType {
         }
     }
 }
-// PaymentsResponse
-//TODO: Append the remaining status flags
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum PaywayPaymentStatus {
-    Succeeded,
-    Failed,
-    #[default]
-    Processing,
+// Payment status, as reported by `GET /payments/{id}` (and the authorize response).
+//
+// The OpenAPI document lists lowercase statuses (approved, rejected, pre_approved, pending,
+// cancelled, refunded) while the functional documentation names the states in upper case
+// (PROCESS, PREAPPROVED, APPROVED, ACCREDITED, ANNULLED, ANNULMENT_APPROVED, REFUNDED,
+// REFUNDED_APPROVED, APPROVED_WITH_REFUND, REJECTED, REVIEW). The real casing has not been
+// verified live, so both vocabularies are accepted, case-insensitively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaywayStatus {
+    Approved,
+    PreApproved,
+    Pending,
+    Rejected,
+    /// Voided before settlement (annulment) or cancelled.
+    Annulled,
+    /// Fully refunded after settlement.
+    Refunded,
+    /// Partially refunded; the API does not say how much.
+    PartiallyRefunded,
+    Unknown,
 }
 
-impl From<PaywayPaymentStatus> for common_enums::AttemptStatus {
-    fn from(item: PaywayPaymentStatus) -> Self {
-        match item {
-            PaywayPaymentStatus::Succeeded => Self::Charged,
-            PaywayPaymentStatus::Failed => Self::Failure,
-            PaywayPaymentStatus::Processing => Self::Authorizing,
+impl PaywayStatus {
+    pub fn parse(status: Option<&str>) -> Self {
+        let normalized = status
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', ' '], "_");
+        match normalized.as_str() {
+            "approved" | "accredited" => Self::Approved,
+            "pre_approved" | "preapproved" => Self::PreApproved,
+            "pending" | "process" | "processing" | "review" => Self::Pending,
+            "rejected" => Self::Rejected,
+            "annulled" | "annulment_approved" | "cancelled" | "canceled" => Self::Annulled,
+            "refunded" | "refunded_approved" => Self::Refunded,
+            "approved_with_refund" => Self::PartiallyRefunded,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Attempt status of an attempt that is NOT settled yet.
+    ///
+    /// Consistent with the authorize mapping (approved is Charged, a rejection is a
+    /// failure). A refunded payment, total or partial, maps to `Charged`: the money was
+    /// taken and the refund is reported separately. An unknown status keeps the current one.
+    fn attempt_status(self, current: enums::AttemptStatus) -> enums::AttemptStatus {
+        match self {
+            Self::Approved | Self::Refunded | Self::PartiallyRefunded => {
+                enums::AttemptStatus::Charged
+            }
+            Self::PreApproved => enums::AttemptStatus::Authorized,
+            Self::Pending => enums::AttemptStatus::Pending,
+            Self::Rejected => enums::AttemptStatus::Failure,
+            Self::Annulled => enums::AttemptStatus::Voided,
+            Self::Unknown => current,
         }
     }
 }
 
-//TODO: Fill the struct with respective fields
+/// `GET /payments/{payment_id}`. Everything is optional and unknown fields and statuses are
+/// tolerated: a payment sync must never fail to parse because of a field it does not use.
 #[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct PaywayPaymentsResponse {
-    status: PaywayPaymentStatus,
-    id: String,
+    /// Integer in the API, which is what the authorize response stored as the
+    /// `connector_transaction_id`.
+    id: serde_json::Value,
+    site_transaction_id: Option<String>,
+    status: Option<String>,
+    status_details: Option<serde_json::Value>,
+    amount: Option<i64>,
+    currency: Option<String>,
+}
+
+/// Prefix of the id of the refund that stands for an annulled payment.
+const ANNULMENT_REFUND_ID_PREFIX: &str = "annulment_";
+/// Prefix of the id of the refund that stands for a fully refunded payment.
+const REFUND_REFUND_ID_PREFIX: &str = "refund_";
+
+pub fn is_settled_attempt(status: enums::AttemptStatus) -> bool {
+    matches!(
+        status,
+        enums::AttemptStatus::Charged | enums::AttemptStatus::PartialCharged
+    )
+}
+
+impl PaywayPaymentsResponse {
+    fn payment_id(&self) -> Option<String> {
+        match &self.id {
+            serde_json::Value::Number(number) => Some(number.to_string()),
+            serde_json::Value::String(id) if !id.trim().is_empty() => Some(id.trim().to_string()),
+            _ => None,
+        }
+    }
+
+    pub fn payway_status(&self) -> PaywayStatus {
+        PaywayStatus::parse(self.status.as_deref())
+    }
+
+    /// Error of a rejected payment, built like the one of a declined authorize (402).
+    fn rejection(&self, http_code: u16) -> ErrorResponse {
+        let error = self
+            .status_details
+            .as_ref()
+            .and_then(|details| details.get("error"));
+        let error_type = error
+            .and_then(|error| error.get("type"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("payment_error");
+        let reason = error.and_then(|error| error.get("reason"));
+        let reason_id = reason
+            .and_then(|reason| reason.get("id"))
+            .and_then(|value| value.as_i64())
+            .map(|id| id.to_string())
+            .unwrap_or_default();
+        let reason_description = reason
+            .and_then(|reason| reason.get("description"))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let message = if reason_description.is_empty() {
+            error_type.to_string()
+        } else {
+            format!("{error_type}: {reason_description}")
+        };
+        ErrorResponse {
+            status_code: http_code,
+            code: format!("PD_{reason_id}"),
+            message: message.clone(),
+            reason: Some("payment_declined".to_string()),
+            attempt_status: Some(enums::AttemptStatus::Failure),
+            connector_transaction_id: self.payment_id(),
+            network_advice_code: None,
+            network_decline_code: Some(reason_id),
+            network_error_message: Some(if reason_description.is_empty() {
+                message
+            } else {
+                reason_description
+            }),
+            connector_metadata: None,
+        }
+    }
+
+    /// Refund the sync of a SETTLED attempt reports when the payment was annulled or refunded
+    /// in full outside Hyperswitch (Payway panel).
+    ///
+    /// Payway exposes neither a refund id nor an amount, so the refund is a "balance" one: its
+    /// amount is computed by the reconciliation (the refundable total minus the refunds
+    /// Hyperswitch already has) and `amount` here is only the payment amount for reference,
+    /// ignored because of `amount_is_remaining_balance`. The id is deterministic per payment
+    /// and kind, which makes repeated syncs idempotent. A partial refund
+    /// (`approved_with_refund`) carries no amount, so it is logged and not reported.
+    pub fn reported_activity(
+        &self,
+        attempt_status: enums::AttemptStatus,
+    ) -> Option<ConnectorReportedActivity> {
+        if !is_settled_attempt(attempt_status) {
+            return None;
+        }
+        let prefix = match self.payway_status() {
+            PaywayStatus::Annulled => ANNULMENT_REFUND_ID_PREFIX,
+            PaywayStatus::Refunded => REFUND_REFUND_ID_PREFIX,
+            PaywayStatus::PartiallyRefunded => {
+                router_env::logger::warn!(
+                    payment_id = ?self.payment_id(),
+                    "payway: payment partially refunded outside Hyperswitch; the API does not \
+                     expose the amount, so it is not reported"
+                );
+                return None;
+            }
+            _ => return None,
+        };
+        let payment_id = self.payment_id()?;
+        Some(ConnectorReportedActivity {
+            refunds: vec![ConnectorReportedRefund {
+                connector_refund_id: format!("{prefix}{payment_id}"),
+                amount: MinorUnit::new(self.amount.unwrap_or_default()),
+                status: enums::RefundStatus::Success,
+                amount_is_remaining_balance: true,
+            }],
+            dispute: None,
+        })
+    }
 }
 
 impl<F, T> TryFrom<ResponseRouterData<F, PaywayPaymentsResponse, T, PaymentsResponseData>>
@@ -341,21 +505,76 @@ impl<F, T> TryFrom<ResponseRouterData<F, PaywayPaymentsResponse, T, PaymentsResp
     fn try_from(
         item: ResponseRouterData<F, PaywayPaymentsResponse, T, PaymentsResponseData>,
     ) -> Result<Self, Self::Error> {
-        Ok(Self {
-            status: common_enums::AttemptStatus::from(item.response.status),
-            response: Ok(PaymentsResponseData::TransactionResponse {
-                resource_id: ResponseId::ConnectorTransactionId(item.response.id),
+        let payway_status = item.response.payway_status();
+        let status = payway_status.attempt_status(item.data.status);
+        let response = if payway_status == PaywayStatus::Rejected {
+            Err(item.response.rejection(item.http_code))
+        } else {
+            Ok(PaymentsResponseData::TransactionResponse {
+                resource_id: item
+                    .response
+                    .payment_id()
+                    .map(ResponseId::ConnectorTransactionId)
+                    .unwrap_or(ResponseId::NoResponseId),
                 redirection_data: Box::new(None),
                 mandate_reference: Box::new(None),
                 connector_metadata: None,
                 network_txn_id: None,
-                connector_response_reference_id: None,
+                connector_response_reference_id: item.response.site_transaction_id.clone(),
                 incremental_authorization_allowed: None,
                 charges: None,
-            }),
+            })
+        };
+        Ok(Self {
+            status,
+            response,
             ..item.data
         })
     }
+}
+
+/// Closes the payment sync of an attempt: attaches the reported refund and keeps a settled
+/// attempt from moving to a weaker status.
+///
+/// A `Charged` or `PartialCharged` attempt is never downgraded by a sync (annulled, rejected,
+/// pending, unknown...): the current status is kept, and a failure response of such a sync is
+/// replaced by a successful one with the same id so the router does not mark a real charge as
+/// failed. The annulment or refund still reaches the reconciliation as a reported refund.
+pub fn finish_payment_sync<F, T>(
+    mut router_data: RouterData<F, T, PaymentsResponseData>,
+    attempt_status: enums::AttemptStatus,
+    attempt_connector_transaction_id: &ResponseId,
+    activity: Option<ConnectorReportedActivity>,
+) -> RouterData<F, T, PaymentsResponseData> {
+    if is_settled_attempt(attempt_status) && !is_settled_attempt(router_data.status) {
+        router_env::logger::warn!(
+            reported_status = ?router_data.status,
+            "payway: weaker status reported for a charged attempt; keeping the current one"
+        );
+        router_data.status = attempt_status;
+    }
+    if is_settled_attempt(attempt_status) && router_data.response.is_err() {
+        router_data.response = Ok(PaymentsResponseData::TransactionResponse {
+            resource_id: attempt_connector_transaction_id.clone(),
+            redirection_data: Box::new(None),
+            mandate_reference: Box::new(None),
+            connector_metadata: None,
+            network_txn_id: None,
+            connector_response_reference_id: None,
+            incremental_authorization_allowed: None,
+            charges: None,
+        });
+    }
+    if let Some(activity) = activity {
+        match router_data.connector_response.as_mut() {
+            Some(connector_response) => connector_response.set_reported_activity(activity),
+            None => {
+                router_data.connector_response =
+                    Some(ConnectorResponseData::with_reported_activity(activity));
+            }
+        }
+    }
+    router_data
 }
 
 #[derive(Default, Debug, Serialize)]

@@ -551,8 +551,18 @@ pub struct ConnectorReportedActivity {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConnectorReportedRefund {
     pub connector_refund_id: String,
+    /// The refunded amount. Ignored when `amount_is_remaining_balance` is set.
     pub amount: MinorUnit,
     pub status: common_enums::enums::RefundStatus,
+    /// Set by connectors that only report that the payment was voided or refunded in
+    /// full, without a refund id or amount (e.g. Payway). The refund then stands for
+    /// "everything not refunded yet": the reconciliation computes its amount as the
+    /// refundable total of the payment minus the refunds Hyperswitch already has, and
+    /// reports nothing when they already cover it. `connector_refund_id` must be
+    /// deterministic per payment so repeated syncs dedupe. Defaults to `false`, the
+    /// meaning every other connector relies on.
+    #[serde(default)]
+    pub amount_is_remaining_balance: bool,
 }
 
 /// A dispute as the connector currently reports it on the payment object.

@@ -942,7 +942,7 @@ async fn reconcile_reported_refunds(
     reported_refunds: Vec<hyperswitch_domain_models::router_data::ConnectorReportedRefund>,
 ) -> RouterResult<Vec<diesel_models::refund::Refund>> {
     use hyperswitch_domain_models::connector_activity_reconciliation::{
-        plan_refund_reconciliation, ExistingRefundView, RefundReconciliationAction,
+        plan_refund_reconciliation_for_payment, ExistingRefundView, RefundReconciliationAction,
     };
 
     let db = &*state.store;
@@ -973,7 +973,18 @@ async fn reconcile_reported_refunds(
         })
         .collect();
 
-    let actions = plan_refund_reconciliation(&existing_views, &reported_refunds, connector);
+    // Total a balance refund (connector says "voided / refunded in full", no amount) is
+    // measured against: the same figure a refund without an explicit amount uses.
+    let refundable_total = payment_intent
+        .amount_captured
+        .unwrap_or_else(|| payment_attempt.get_total_amount());
+
+    let actions = plan_refund_reconciliation_for_payment(
+        &existing_views,
+        &reported_refunds,
+        connector,
+        Some(refundable_total),
+    );
 
     // The refunds an action inserted or moved to a new status, for the caller to
     // announce through the outgoing webhooks.
