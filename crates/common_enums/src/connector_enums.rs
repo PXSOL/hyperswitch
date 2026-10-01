@@ -591,10 +591,12 @@ impl Connector {
     /// for activity the merchant performed directly on the Mercado Pago panel.
     /// Wompi reports a void made in its dashboard only as the transaction turning
     /// VOIDED, which a forced sync turns into a reported refund.
+    /// Fiserv lists every transaction of the order (SALE, VOID, RETURN), so a forced
+    /// sync of a settled attempt reports the voids and returns made on its dashboard.
     /// Payway only reports that a payment was annulled or refunded in full (no refund id or
     /// amount), which a forced sync of a settled attempt turns into one balance refund.
     pub fn syncs_refunds_and_disputes_on_payment_sync(self) -> bool {
-        matches!(self, Self::Mercadopago | Self::Wompi | Self::Payway)
+        matches!(self, Self::Mercadopago | Self::Wompi | Self::Fiservemea | Self::Payway)
     }
 
     /// Validates if dummy connector can be created
