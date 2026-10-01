@@ -4369,16 +4369,14 @@ pub struct WebhookEventData {
 }
 
 impl WebhookEventTypeBody {
-    /// A refund made on a charge (`charge.refunded`, or the update of a refund object) whose
-    /// parent payment intent is known. Such an event is only a signal that the refunds of the
-    /// payment changed: it is routed to a sync of the parent payment, which reads them from
-    /// Stripe (see `Stripe::get_webhook_event_type`). Without the parent intent there is
-    /// nothing to sync and the refund keeps the refund-id routing.
-    pub fn is_refund_on_known_payment(&self) -> bool {
-        matches!(
-            self.event_type,
-            WebhookEventType::ChargeRefunded | WebhookEventType::ChargeRefundUpdated
-        ) && self.event_data.event_object.payment_intent.is_some()
+    /// A `charge.refunded` event whose parent payment intent is known. Such an event is only a
+    /// signal that the refunds of the payment changed: it is routed to a sync of the parent
+    /// payment, which reads them from Stripe (see `Stripe::get_webhook_event_type`). Without
+    /// the parent intent there is nothing to sync. `charge.refund.updated` is not included: it
+    /// keeps the refund-id routing, which updates a known refund directly.
+    pub fn is_charge_refunded_on_known_payment(&self) -> bool {
+        matches!(self.event_type, WebhookEventType::ChargeRefunded)
+            && self.event_data.event_object.payment_intent.is_some()
     }
 }
 
@@ -5207,8 +5205,8 @@ mod external_refund_sync_tests {
     }
 
     /// A payment intent as `GET /v1/payment_intents/{id}?expand[]=latest_charge...` returns it.
-    fn payment_intent(status: &str, latest_charge: Value) -> PaymentIntentSyncResponse {
-        serde_json::from_value(json!({
+    fn payment_intent_json(status: &str, latest_charge: Value) -> Value {
+        json!({
             "id": PI_ID,
             "object": "payment_intent",
             "amount": 10000,
@@ -5218,8 +5216,11 @@ mod external_refund_sync_tests {
             "created": 1_700_000_000,
             "metadata": {},
             "latest_charge": latest_charge
-        }))
-        .unwrap()
+        })
+    }
+
+    fn payment_intent(status: &str, latest_charge: Value) -> PaymentIntentSyncResponse {
+        serde_json::from_value(payment_intent_json(status, latest_charge)).unwrap()
     }
 
     fn refund(id: &str, amount: i64, status: &str) -> Value {
@@ -5535,5 +5536,66 @@ mod external_refund_sync_tests {
     fn stripe_syncs_refunds_on_payment_sync() {
         assert!(common_enums::connector_enums::Connector::Stripe
             .syncs_refunds_and_disputes_on_payment_sync());
+    }
+
+    /// The real payment sync of the connector: parse, map, integrity object and reported
+    /// refunds, as the router runs it.
+    fn connector_sync(
+        attempt_status: AttemptStatus,
+        body: Value,
+    ) -> RouterData<PSync, PaymentsSyncData, PaymentsResponseData> {
+        use hyperswitch_interfaces::{api::ConnectorIntegration, types::Response};
+
+        let mut data = router_data::<PSync, PaymentsSyncData, PaymentsResponseData>(sync_request());
+        data.status = attempt_status;
+        ConnectorIntegration::<PSync, PaymentsSyncData, PaymentsResponseData>::handle_response(
+            crate::connectors::Stripe::new(),
+            &data,
+            None,
+            Response {
+                headers: None,
+                response: bytes::Bytes::from(body.to_string()),
+                status_code: 200,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_connector_sync_reports_a_dashboard_refund_of_a_charged_payment() {
+        let data = connector_sync(
+            AttemptStatus::Charged,
+            payment_intent_json(
+                "succeeded",
+                charge_with(vec![refund("re_3PxyzDashboard", 2500, "succeeded")], false),
+            ),
+        );
+        assert_eq!(data.status, AttemptStatus::Charged);
+        assert!(data.request.integrity_object.is_some());
+        let activity = data
+            .connector_response
+            .as_ref()
+            .and_then(|response| response.get_reported_activity())
+            .expect("the refund must be reported");
+        assert_eq!(activity.refunds.len(), 1);
+        assert_eq!(activity.refunds[0].connector_refund_id, "re_3PxyzDashboard");
+        assert_eq!(activity.refunds[0].amount, MinorUnit::new(2500));
+        assert_eq!(activity.refunds[0].status, enums::RefundStatus::Success);
+
+        // A weaker status reported for the charged attempt keeps the attempt status.
+        let weaker = connector_sync(
+            AttemptStatus::Charged,
+            payment_intent_json(
+                "canceled",
+                charge_with(vec![refund("re_3PxyzDashboard", 2500, "succeeded")], false),
+            ),
+        );
+        assert_eq!(weaker.status, AttemptStatus::Charged);
+        assert!(weaker.response.is_ok());
+        assert!(weaker
+            .connector_response
+            .as_ref()
+            .and_then(|response| response.get_reported_activity())
+            .is_some());
     }
 }

@@ -2209,10 +2209,10 @@ fn payment_intent_sync_url(base_url: &str, payment_intent_id: &str) -> String {
 
 /// Signature check that never succeeds.
 ///
-/// Used for the refund events that are routed to a sync of the parent payment. When the
-/// signature verifies, core consumes the webhook body as if it were the payment sync
-/// response, but the body of these events is a charge or a refund, not a payment intent, and
-/// it carries no refund list. Reporting the webhook as unverified makes core run a live
+/// Used for the `charge.refunded` events that are routed to a sync of the parent payment. When
+/// the signature verifies, core consumes the webhook body as if it were the payment sync
+/// response, but the body of these events is a charge, not a payment intent, and it carries
+/// no refund list. Reporting the webhook as unverified makes core run a live
 /// payment sync against Stripe instead, and that sync is the source of truth: the event only
 /// tells that something changed, so an unauthenticated one can at worst cause one extra read
 /// with the merchant's own credentials (same rule as Mercado Pago).
@@ -2265,7 +2265,7 @@ impl IncomingWebhook for Stripe {
         let resyncs_parent_payment = request
             .body
             .parse_struct::<stripe::WebhookEventTypeBody>("WebhookEventTypeBody")
-            .is_ok_and(|details| details.is_refund_on_known_payment());
+            .is_ok_and(|details| details.is_charge_refunded_on_known_payment());
         if resyncs_parent_payment {
             return Ok(Box::new(UnverifiedWebhook));
         }
@@ -2376,23 +2376,6 @@ impl IncomingWebhook for Stripe {
                     ),
                 )
             }
-            // A refund of a known payment intent is a signal to sync that payment (see
-            // `get_webhook_event_type`), whether or not Hyperswitch created the refund: the
-            // sync reports every refund of the charge, and the reconciliation matches the
-            // ones Hyperswitch already has by `connector_refund_id`.
-            stripe::WebhookEventObjectType::Refund
-                if details.event_data.event_object.payment_intent.is_some() =>
-            {
-                api_models::webhooks::ObjectReferenceId::PaymentId(
-                    api_models::payments::PaymentIdType::ConnectorTransactionId(
-                        details
-                            .event_data
-                            .event_object
-                            .payment_intent
-                            .ok_or(ConnectorError::WebhookReferenceIdNotFound)?,
-                    ),
-                )
-            }
             stripe::WebhookEventObjectType::Refund => {
                 match details
                     .event_data
@@ -2468,16 +2451,19 @@ impl IncomingWebhook for Stripe {
                     IncomingWebhookEvent::EventNotSupported
                 }
             }
-            // Refunds of a known payment are routed to a sync of that payment, which reads the
-            // refunds of the charge from Stripe: it creates the refunds made outside
+            // `charge.refunded` of a known payment is routed to a sync of that payment, which
+            // reads the refunds of the charge from Stripe: it creates the refunds made outside
             // Hyperswitch (Stripe dashboard) and updates the ones Hyperswitch already has.
             // `PaymentIntentProcessing` is only a routing label for the payments webhook flow,
             // it does not decide any outcome: the sync derives everything from Stripe and the
             // attempt, and the outgoing webhook comes from the resulting payment status.
             // Unlike `PaymentIntentSuccess` it triggers no mandate update.
+            //
+            // `charge.refund.updated` keeps the refund-id routing below on purpose: it updates
+            // a refund Hyperswitch knows directly, whereas a payment sync only sees the first
+            // page of `latest_charge.refunds` and would never update one beyond it.
             stripe::WebhookEventType::ChargeRefunded
-            | stripe::WebhookEventType::ChargeRefundUpdated
-                if details.is_refund_on_known_payment() =>
+                if details.is_charge_refunded_on_known_payment() =>
             {
                 IncomingWebhookEvent::PaymentIntentProcessing
             }
@@ -3523,36 +3509,46 @@ mod external_refund_tests {
     }
 
     #[test]
-    fn charge_refund_updated_with_a_payment_intent_syncs_the_parent_payment() {
-        for status in ["succeeded", "pending", "failed", "requires_action"] {
-            let body = event("charge.refund.updated", refund_object(true, status));
-            assert_eq!(
-                event_type_of(&body),
-                IncomingWebhookEvent::PaymentIntentProcessing,
-                "{status}"
+    fn charge_refund_updated_keeps_the_refund_id_routing_with_or_without_a_payment_intent() {
+        // A refund beyond the first page of `latest_charge.refunds` would never be updated
+        // through a payment sync, so the event updates the known refund directly.
+        for with_payment_intent in [false, true] {
+            let body = event(
+                "charge.refund.updated",
+                refund_object(with_payment_intent, "succeeded"),
             );
-            assert_syncs_parent_payment(reference_of(&body));
+            assert_eq!(event_type_of(&body), IncomingWebhookEvent::RefundSuccess);
+            match reference_of(&body) {
+                ObjectReferenceId::RefundId(RefundIdType::ConnectorRefundId(id)) => {
+                    assert_eq!(id, "re_3PxyzDashboard")
+                }
+                other => panic!("expected the refund id, got {other:?}"),
+            }
+            assert!(matches!(
+                api_models::webhooks::WebhookFlow::from(event_type_of(&body)),
+                api_models::webhooks::WebhookFlow::Refund
+            ));
+            let failed = event(
+                "charge.refund.updated",
+                refund_object(with_payment_intent, "failed"),
+            );
+            assert_eq!(event_type_of(&failed), IncomingWebhookEvent::RefundFailure);
+            for status in ["pending", "requires_action"] {
+                let other = event(
+                    "charge.refund.updated",
+                    refund_object(with_payment_intent, status),
+                );
+                assert_eq!(
+                    event_type_of(&other),
+                    IncomingWebhookEvent::EventNotSupported,
+                    "{status}"
+                );
+            }
         }
     }
 
     #[test]
-    fn refunds_without_a_payment_intent_keep_their_previous_routing() {
-        let body = event("charge.refund.updated", refund_object(false, "succeeded"));
-        assert_eq!(event_type_of(&body), IncomingWebhookEvent::RefundSuccess);
-        match reference_of(&body) {
-            ObjectReferenceId::RefundId(RefundIdType::ConnectorRefundId(id)) => {
-                assert_eq!(id, "re_3PxyzDashboard")
-            }
-            other => panic!("expected the refund id, got {other:?}"),
-        }
-        let failed = event("charge.refund.updated", refund_object(false, "failed"));
-        assert_eq!(event_type_of(&failed), IncomingWebhookEvent::RefundFailure);
-        let pending = event("charge.refund.updated", refund_object(false, "pending"));
-        assert_eq!(
-            event_type_of(&pending),
-            IncomingWebhookEvent::EventNotSupported
-        );
-        // A `charge.refunded` of a charge without intent has nothing to sync.
+    fn a_charge_refunded_without_a_payment_intent_has_nothing_to_sync() {
         let charge = event("charge.refunded", charge_object(false));
         assert_eq!(
             event_type_of(&charge),
@@ -3607,9 +3603,9 @@ mod external_refund_tests {
 
     #[test]
     fn only_the_parent_payment_sync_events_skip_the_signature_check() {
-        // A valid HMAC signs the message: the regular events verify, the routed refund events
-        // never do, so core runs a live payment sync instead of consuming the webhook body as
-        // a payment sync response.
+        // A valid HMAC signs the message: the regular events verify, `charge.refunded` of a
+        // known payment never does, so core runs a live payment sync instead of consuming the
+        // webhook body as a payment sync response.
         let secret = b"whsec_test";
         let message = b"1700000000.body";
         let signature = crypto::HmacSha256.sign_message(secret, message).unwrap();
@@ -3631,10 +3627,13 @@ mod external_refund_tests {
             "charge.refund.updated",
             refund_object(false, "succeeded")
         )));
-        assert!(!verifies(event("charge.refunded", charge_object(true))));
-        assert!(!verifies(event(
+        // `charge.refund.updated` keeps the HMAC verification, with or without the intent.
+        assert!(verifies(event(
             "charge.refund.updated",
             refund_object(true, "succeeded")
         )));
+        assert!(!verifies(event("charge.refunded", charge_object(true))));
+        // Without a payment intent there is nothing to sync, so it verifies as usual.
+        assert!(verifies(event("charge.refunded", charge_object(false))));
     }
 }

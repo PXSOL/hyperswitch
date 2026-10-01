@@ -18,7 +18,7 @@ use hyperswitch_domain_models::{
     types,
     types::{PaymentsAuthorizeRouterData, RefundsRouterData},
 };
-use hyperswitch_interfaces::errors;
+use hyperswitch_interfaces::{consts, errors};
 use masking::{PeekInterface, Secret};
 use serde::{Deserialize, Serialize};
 
@@ -374,6 +374,10 @@ impl PaywayStatus {
 
 /// `GET /payments/{payment_id}`. Everything is optional and unknown fields and statuses are
 /// tolerated: a payment sync must never fail to parse because of a field it does not use.
+///
+/// Only what the sync uses is typed. `status_details` also carries issuer data (authorization
+/// code, ticket, address validation) that must not reach the logs or the connector events, so
+/// only its `error` sub-object is kept.
 #[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct PaywayPaymentsResponse {
@@ -382,9 +386,86 @@ pub struct PaywayPaymentsResponse {
     id: serde_json::Value,
     site_transaction_id: Option<String>,
     status: Option<String>,
-    status_details: Option<serde_json::Value>,
+    #[serde(deserialize_with = "lenient")]
+    status_details: Option<PaywayStatusDetails>,
+    #[serde(deserialize_with = "lenient_amount")]
     amount: Option<i64>,
     currency: Option<String>,
+}
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PaywayStatusDetails {
+    #[serde(deserialize_with = "lenient")]
+    error: Option<PaywayStatusError>,
+}
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PaywayStatusError {
+    #[serde(rename = "type")]
+    error_type: Option<String>,
+    #[serde(deserialize_with = "lenient")]
+    reason: Option<PaywayErrorReason>,
+}
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PaywayErrorReason {
+    #[serde(deserialize_with = "lenient_amount")]
+    id: Option<i64>,
+    description: Option<String>,
+}
+
+/// Deserializes `T`, or `None` when the value is null or has a shape `T` does not accept, so a
+/// field the sync only reads for a message can never fail the whole response.
+fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
+
+/// Integer, float (rounded to the nearest unit) or numeric string; anything else is `None`.
+// The only `as` casts are on a float that was checked to be finite and inside the `i64` range.
+#[allow(clippy::as_conversions)]
+fn lenient_amount<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let float_to_integer = |float: f64| {
+        (float.is_finite() && float.abs() < i64::MAX as f64).then(|| float.round() as i64)
+    };
+    Ok(match value {
+        Some(serde_json::Value::Number(number)) => number
+            .as_i64()
+            .or_else(|| number.as_f64().and_then(float_to_integer)),
+        Some(serde_json::Value::String(text)) => {
+            let text = text.trim();
+            text.parse::<i64>()
+                .ok()
+                .or_else(|| text.parse::<f64>().ok().and_then(float_to_integer))
+        }
+        _ => None,
+    })
+}
+
+/// Prefix of the error code of a declined payment (`PD_<reason id>`), shared by the declined
+/// authorize (402) and the rejected payment sync.
+pub const DECLINED_CODE_PREFIX: &str = "PD_";
+/// `reason` of the error of a declined payment.
+pub const DECLINED_REASON: &str = "payment_declined";
+
+/// Error code of a declined payment: `PD_<reason id>`, or the standard "no error code" when
+/// Payway gave no reason id.
+pub fn declined_error_code(reason_id: Option<&str>) -> String {
+    match reason_id.filter(|id| !id.is_empty()) {
+        Some(id) => format!("{DECLINED_CODE_PREFIX}{id}"),
+        None => consts::NO_ERROR_CODE.to_string(),
+    }
 }
 
 /// Prefix of the id of the refund that stands for an annulled payment.
@@ -413,26 +494,19 @@ impl PaywayPaymentsResponse {
     }
 
     /// Error of a rejected payment, built like the one of a declined authorize (402).
-    fn rejection(&self, http_code: u16) -> ErrorResponse {
+    pub(super) fn rejection(&self, http_code: u16) -> ErrorResponse {
         let error = self
             .status_details
             .as_ref()
-            .and_then(|details| details.get("error"));
+            .and_then(|details| details.error.as_ref());
         let error_type = error
-            .and_then(|error| error.get("type"))
-            .and_then(|value| value.as_str())
+            .and_then(|error| error.error_type.as_deref())
             .unwrap_or("payment_error");
-        let reason = error.and_then(|error| error.get("reason"));
-        let reason_id = reason
-            .and_then(|reason| reason.get("id"))
-            .and_then(|value| value.as_i64())
-            .map(|id| id.to_string())
-            .unwrap_or_default();
+        let reason = error.and_then(|error| error.reason.as_ref());
+        let reason_id = reason.and_then(|reason| reason.id).map(|id| id.to_string());
         let reason_description = reason
-            .and_then(|reason| reason.get("description"))
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .to_string();
+            .and_then(|reason| reason.description.clone())
+            .unwrap_or_default();
         let message = if reason_description.is_empty() {
             error_type.to_string()
         } else {
@@ -440,13 +514,13 @@ impl PaywayPaymentsResponse {
         };
         ErrorResponse {
             status_code: http_code,
-            code: format!("PD_{reason_id}"),
+            code: declined_error_code(reason_id.as_deref()),
             message: message.clone(),
-            reason: Some("payment_declined".to_string()),
+            reason: Some(DECLINED_REASON.to_string()),
             attempt_status: Some(enums::AttemptStatus::Failure),
             connector_transaction_id: self.payment_id(),
             network_advice_code: None,
-            network_decline_code: Some(reason_id),
+            network_decline_code: reason_id,
             network_error_message: Some(if reason_description.is_empty() {
                 message
             } else {
@@ -456,8 +530,13 @@ impl PaywayPaymentsResponse {
         }
     }
 
-    /// Refund the sync of a SETTLED attempt reports when the payment was annulled or refunded
-    /// in full outside Hyperswitch (Payway panel).
+    /// Refund the sync reports when the payment was annulled or refunded in full outside
+    /// Hyperswitch (Payway panel).
+    ///
+    /// It depends on the status the sync RESULTS in (`resulting_status`), not on the one the
+    /// attempt had before: an attempt that was not settled yet but this sync moves to `Charged`
+    /// (a refunded payment maps to `Charged`) reports its refund right away, while an annulled
+    /// payment of a non-settled attempt becomes `Voided` and reports nothing.
     ///
     /// Payway exposes neither a refund id nor an amount, so the refund is a "balance" one: its
     /// amount is computed by the reconciliation (the refundable total minus the refunds
@@ -467,9 +546,9 @@ impl PaywayPaymentsResponse {
     /// (`approved_with_refund`) carries no amount, so it is logged and not reported.
     pub fn reported_activity(
         &self,
-        attempt_status: enums::AttemptStatus,
+        resulting_status: enums::AttemptStatus,
     ) -> Option<ConnectorReportedActivity> {
-        if !is_settled_attempt(attempt_status) {
+        if !is_settled_attempt(resulting_status) {
             return None;
         }
         let prefix = match self.payway_status() {
@@ -533,21 +612,26 @@ impl<F, T> TryFrom<ResponseRouterData<F, PaywayPaymentsResponse, T, PaymentsResp
     }
 }
 
-/// Closes the payment sync of an attempt: attaches the reported refund and keeps a settled
-/// attempt from moving to a weaker status.
+/// Closes the payment sync of an attempt: keeps a settled attempt from moving to a weaker
+/// status and attaches the refund the sync reports.
 ///
 /// A `Charged` or `PartialCharged` attempt is never downgraded by a sync (annulled, rejected,
 /// pending, unknown...): the current status is kept, and a failure response of such a sync is
 /// replaced by a successful one with the same id so the router does not mark a real charge as
-/// failed. The annulment or refund still reaches the reconciliation as a reported refund.
+/// failed. The annulment or refund still reaches the reconciliation as a reported refund,
+/// decided on the status the sync ends up with.
 pub fn finish_payment_sync<F, T>(
     mut router_data: RouterData<F, T, PaymentsResponseData>,
     attempt_status: enums::AttemptStatus,
     attempt_connector_transaction_id: &ResponseId,
-    activity: Option<ConnectorReportedActivity>,
+    response: &PaywayPaymentsResponse,
 ) -> RouterData<F, T, PaymentsResponseData> {
     if is_settled_attempt(attempt_status) && !is_settled_attempt(router_data.status) {
         router_env::logger::warn!(
+            payment_id = ?response
+                .payment_id()
+                .or_else(|| attempt_connector_transaction_id.get_connector_transaction_id().ok()),
+            payway_status = ?response.status,
             reported_status = ?router_data.status,
             "payway: weaker status reported for a charged attempt; keeping the current one"
         );
@@ -565,7 +649,7 @@ pub fn finish_payment_sync<F, T>(
             charges: None,
         });
     }
-    if let Some(activity) = activity {
+    if let Some(activity) = response.reported_activity(router_data.status) {
         match router_data.connector_response.as_mut() {
             Some(connector_response) => connector_response.set_reported_activity(activity),
             None => {

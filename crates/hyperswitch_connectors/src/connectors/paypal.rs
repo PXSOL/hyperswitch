@@ -2127,6 +2127,11 @@ impl IncomingWebhook for Paypal {
                 // `seller_transaction_id` is the capture id, while Hyperswitch stores the order id
                 // as the connector transaction id, so it never finds the payment. The invoice
                 // number is the order's `invoice_id`, i.e. the attempt reference Hyperswitch sent.
+                //
+                // Assumption: that reference is the default one, the attempt id. A merchant
+                // with `payment_id_as_connector_request_id` sends the payment id instead, which
+                // does not resolve as an attempt id and ends in the webhook error path. Orders
+                // created outside Hyperswitch never matched a payment through either id.
                 let payment_id = match transaction.invoice_number.clone() {
                     Some(invoice_number) => {
                         api_models::payments::PaymentIdType::PaymentAttemptId(invoice_number)

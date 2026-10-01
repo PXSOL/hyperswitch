@@ -82,6 +82,24 @@ impl Payway {
     fn x_source() -> &'static str {
         "eyJzZXJ2aWNlIjoiU0RLLVBIUCIsImdyb3VwZXIiOiIiLCJkZXZlbG9wZXIiOiIifQ=="
     }
+
+    /// Headers of every call authenticated with the private (secret) key: payments, payment
+    /// sync and refunds. The public key only tokenizes cards.
+    fn private_key_headers(
+        &self,
+        auth_type: &ConnectorAuthType,
+    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+        let auth = payway::PaywayAuthType::try_from(auth_type)
+            .change_context(errors::ConnectorError::FailedToObtainAuthType)?;
+        Ok(vec![
+            (
+                headers::CONTENT_TYPE.to_string(),
+                self.common_get_content_type().to_string().into(),
+            ),
+            ("apikey".to_string(), auth.secret_key.expose().into_masked()),
+            ("X-Source".to_string(), Self::x_source().to_string().into()),
+        ])
+    }
 }
 
 impl api::Payment for Payway {}
@@ -434,13 +452,13 @@ impl ConnectorCommon for Payway {
 
                 return Ok(ErrorResponse {
                     status_code: res.status_code,
-                    code: format!("PD_{}", reason_id),
+                    code: payway::declined_error_code(Some(&reason_id)),
                     message: message.clone(),
-                    reason: Some("payment_declined".to_string()),
+                    reason: Some(payway::DECLINED_REASON.to_string()),
                     attempt_status: Some(AttemptStatus::Failure),
                     connector_transaction_id: external_transaction_id,
                     network_advice_code: None,
-                    network_decline_code: Some(reason_id),
+                    network_decline_code: Some(reason_id).filter(|id| !id.is_empty()),
                     network_error_message: Some(if reason_desc.is_empty() {
                         message
                     } else {
@@ -524,16 +542,7 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         req: &PaymentsAuthorizeRouterData,
         _connectors: &Connectors,
     ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
-        let auth = payway::PaywayAuthType::try_from(&req.connector_auth_type)
-            .change_context(errors::ConnectorError::FailedToObtainAuthType)?;
-        Ok(vec![
-            (
-                headers::CONTENT_TYPE.to_string(),
-                self.common_get_content_type().to_string().into(),
-            ),
-            ("apikey".to_string(), auth.secret_key.expose().into_masked()),
-            ("X-Source".to_string(), Self::x_source().to_string().into()),
-        ])
+        self.private_key_headers(&req.connector_auth_type)
     }
 
     fn get_content_type(&self) -> &'static str {
@@ -623,18 +632,7 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Pay
         req: &PaymentsSyncRouterData,
         _connectors: &Connectors,
     ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
-        // Same key as authorize and refunds: the private (secret) key. The public one only
-        // tokenizes cards.
-        let auth = payway::PaywayAuthType::try_from(&req.connector_auth_type)
-            .change_context(errors::ConnectorError::FailedToObtainAuthType)?;
-        Ok(vec![
-            (
-                headers::CONTENT_TYPE.to_string(),
-                self.common_get_content_type().to_string().into(),
-            ),
-            ("apikey".to_string(), auth.secret_key.expose().into_masked()),
-            ("X-Source".to_string(), Self::x_source().to_string().into()),
-        ])
+        self.private_key_headers(&req.connector_auth_type)
     }
 
     fn get_content_type(&self) -> &'static str {
@@ -682,12 +680,8 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Pay
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
 
-        // Built before the response is consumed. Only a settled attempt reports activity:
-        // an annulment or refund made outside Hyperswitch (Payway panel).
-        let reported_activity = response.reported_activity(data.status);
-
         let router_data = RouterData::try_from(ResponseRouterData {
-            response,
+            response: response.clone(),
             data: data.clone(),
             http_code: res.status_code,
         })?;
@@ -695,7 +689,7 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Pay
             router_data,
             data.status,
             &data.request.connector_transaction_id,
-            reported_activity,
+            &response,
         ))
     }
 
@@ -798,18 +792,7 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Payway 
         req: &RefundsRouterData<Execute>,
         _connectors: &Connectors,
     ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
-        let auth = payway::PaywayAuthType::try_from(&req.connector_auth_type)
-            .change_context(errors::ConnectorError::FailedToObtainAuthType)?;
-        Ok(vec![
-            (
-                headers::CONTENT_TYPE.to_string(),
-                types::RefundExecuteType::get_content_type(self)
-                    .to_string()
-                    .into(),
-            ),
-            ("apikey".to_string(), auth.secret_key.expose().into_masked()),
-            ("X-Source".to_string(), Self::x_source().to_string().into()),
-        ])
+        self.private_key_headers(&req.connector_auth_type)
     }
 
     fn get_content_type(&self) -> &'static str {
@@ -1049,11 +1032,13 @@ mod payment_sync_tests {
     use std::marker::PhantomData;
 
     use common_enums::AttemptStatus;
+    use common_utils::types::MinorUnit;
     use hyperswitch_domain_models::{
         payment_address::PaymentAddress,
         router_data::ConnectorReportedActivity,
         router_request_types::{ResponseId, SyncRequestType},
     };
+    use hyperswitch_interfaces::consts;
     use masking::Secret;
     use serde_json::json;
 
@@ -1158,7 +1143,6 @@ mod payment_sync_tests {
         Result<Option<String>, String>,
         Option<ConnectorReportedActivity>,
     ) {
-        let activity = response.reported_activity(attempt_status);
         let data = sync_router_data(attempt_status);
         let router_data = RouterData::try_from(ResponseRouterData {
             response: response.clone(),
@@ -1167,7 +1151,7 @@ mod payment_sync_tests {
         })
         .unwrap();
         let attempt_id = ResponseId::ConnectorTransactionId("15403386".to_string());
-        let router_data = finish_payment_sync(router_data, attempt_status, &attempt_id, activity);
+        let router_data = finish_payment_sync(router_data, attempt_status, &attempt_id, response);
         let id = match &router_data.response {
             Ok(PaymentsResponseData::TransactionResponse { resource_id, .. }) => {
                 Ok(resource_id.get_connector_transaction_id().ok())
@@ -1190,8 +1174,36 @@ mod payment_sync_tests {
         );
     }
 
+    /// Name and plain value of every header, in order.
+    fn plain(headers: Vec<(String, masking::Maskable<String>)>) -> Vec<(String, String)> {
+        headers
+            .into_iter()
+            .map(|(name, value)| (name, value.into_inner()))
+            .collect()
+    }
+
+    fn private_key_header_set() -> Vec<(String, String)> {
+        vec![
+            ("Content-Type".to_string(), "application/json".to_string()),
+            ("apikey".to_string(), "private_key".to_string()),
+            ("X-Source".to_string(), Payway::x_source().to_string()),
+        ]
+    }
+
     #[test]
-    fn payment_sync_authenticates_with_the_private_key_like_authorize_and_refunds() {
+    fn private_key_headers_are_content_type_private_apikey_and_source() {
+        let auth = sync_router_data(AttemptStatus::Pending).connector_auth_type;
+        let headers = Payway::new().private_key_headers(&auth).unwrap();
+        // The private key is masked, never exposed by the request logs.
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == "apikey" && value.is_masked()));
+        assert_eq!(plain(headers), private_key_header_set());
+    }
+
+    #[test]
+    fn payment_sync_sends_the_same_headers_as_authorize_and_refunds() {
+        // Authorize and refund get_headers are one-line calls to the same helper.
         let headers =
             ConnectorIntegration::<PSync, PaymentsSyncData, PaymentsResponseData>::get_headers(
                 Payway::new(),
@@ -1199,12 +1211,7 @@ mod payment_sync_tests {
                 &Connectors::default(),
             )
             .unwrap();
-        let apikey = headers
-            .iter()
-            .find(|(name, _)| name == "apikey")
-            .map(|(_, value)| value.clone().into_inner())
-            .expect("apikey header");
-        assert_eq!(apikey, "private_key");
+        assert_eq!(plain(headers), private_key_header_set());
     }
 
     #[test]
@@ -1287,9 +1294,8 @@ mod payment_sync_tests {
         }
         // Money was taken: a refunded payment of an attempt not marked settled is Charged.
         for status in ["refunded", "REFUNDED_APPROVED", "approved_with_refund"] {
-            let (status_after, _, activity) = sync(&with_status(status), AttemptStatus::Pending);
+            let (status_after, _, _) = sync(&with_status(status), AttemptStatus::Pending);
             assert_eq!(status_after, AttemptStatus::Charged, "{status}");
-            assert!(activity.is_none(), "{status}");
         }
     }
 
@@ -1407,5 +1413,188 @@ mod payment_sync_tests {
         let response = parse(json!({"id": "15403386", "status": "annulled"}));
         let (_, _, activity) = sync(&response, AttemptStatus::Charged);
         assert_eq!(only_refund(activity).0, "annulment_15403386");
+    }
+
+    #[test]
+    fn the_response_keeps_no_issuer_data_of_status_details() {
+        let response = parse(json!({
+            "id": 15403386,
+            "status": "approved",
+            "status_details": {
+                "ticket": "1560",
+                "card_authorization_code": "180644",
+                "address_validation_code": "VTE0011",
+                "error": null
+            }
+        }));
+        let kept = format!("{response:?} {}", serde_json::to_string(&response).unwrap());
+        for secret in ["1560", "180644", "VTE0011", "card_authorization_code"] {
+            assert!(!kept.contains(secret), "{secret} leaked: {kept}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_status_details_never_fails_the_response() {
+        for details in [
+            json!("oops"),
+            json!(7),
+            json!({"error": "oops"}),
+            json!({"error": {"reason": 5}}),
+        ] {
+            let response = parse(json!({"id": 1, "status": "rejected", "status_details": details}));
+            let (status, id, _) = sync(&response, AttemptStatus::Pending);
+            assert_eq!(status, AttemptStatus::Failure);
+            assert_eq!(id, Err(consts::NO_ERROR_CODE.to_string()));
+        }
+    }
+
+    #[test]
+    fn the_amount_is_read_leniently() {
+        let amount = |value: serde_json::Value| {
+            let response = parse(json!({"id": 1, "status": "approved", "amount": value}));
+            // A bad amount never fails the sync.
+            assert_eq!(
+                sync(&response, AttemptStatus::Pending).0,
+                AttemptStatus::Charged
+            );
+        };
+        let reported = |value: serde_json::Value| {
+            let response = parse(json!({"id": 1, "status": "refunded", "amount": value}));
+            response
+                .reported_activity(AttemptStatus::Charged)
+                .unwrap()
+                .refunds[0]
+                .amount
+        };
+        amount(json!(12050));
+        assert_eq!(reported(json!(12050)), MinorUnit::new(12050));
+        assert_eq!(reported(json!(12050.0)), MinorUnit::new(12050));
+        assert_eq!(reported(json!(120.5)), MinorUnit::new(121));
+        assert_eq!(reported(json!("12050")), MinorUnit::new(12050));
+        assert_eq!(reported(json!(" 12050.00 ")), MinorUnit::new(12050));
+        for bad in [
+            json!("abc"),
+            json!(null),
+            json!({"x": 1}),
+            json!([1]),
+            json!(true),
+            json!(""),
+        ] {
+            assert_eq!(reported(bad.clone()), MinorUnit::new(0), "{bad}");
+            amount(bad);
+        }
+    }
+
+    #[test]
+    fn a_rejection_without_reason_id_uses_the_standard_no_error_code() {
+        let response = parse(json!({
+            "id": 15403386,
+            "status": "rejected",
+            "status_details": {"error": {"type": "invalid_card", "reason": {"description": "COD.} MONTO"}}}
+        }));
+        let error = response.rejection(200);
+        assert_eq!(error.code, consts::NO_ERROR_CODE);
+        assert_eq!(error.network_decline_code, None);
+        assert_eq!(error.reason.as_deref(), Some(payway::DECLINED_REASON));
+        assert_eq!(error.message, "invalid_card: COD.} MONTO");
+
+        let with_id = parse(json!({
+            "id": 15403386,
+            "status": "rejected",
+            "status_details": {"error": {"reason": {"id": 3}}}
+        }))
+        .rejection(200);
+        assert_eq!(with_id.code, "PD_3");
+        assert_eq!(with_id.network_decline_code.as_deref(), Some("3"));
+        assert_eq!(with_id.message, "payment_error");
+    }
+
+    #[test]
+    fn the_declined_authorize_and_the_rejected_sync_share_the_code_format() {
+        assert_eq!(payway::declined_error_code(Some("3")), "PD_3");
+        assert_eq!(payway::declined_error_code(Some("-1")), "PD_-1");
+        assert_eq!(payway::declined_error_code(Some("")), consts::NO_ERROR_CODE);
+        assert_eq!(payway::declined_error_code(None), consts::NO_ERROR_CODE);
+    }
+
+    #[test]
+    fn a_refund_made_before_the_first_sync_is_reported_when_the_sync_charges_the_attempt() {
+        for attempt_status in [
+            AttemptStatus::Pending,
+            AttemptStatus::Authorizing,
+            AttemptStatus::Authorized,
+        ] {
+            for (status, id) in [
+                ("refunded", "refund_15403386"),
+                ("REFUNDED_APPROVED", "refund_15403386"),
+            ] {
+                let (after, _, activity) = sync(&with_status(status), attempt_status);
+                assert_eq!(after, AttemptStatus::Charged, "{status}");
+                assert_eq!(only_refund(activity), (id.to_string(), true), "{status}");
+            }
+            // Partial refund: Charged, logged, nothing to report.
+            let (after, _, activity) = sync(&with_status("approved_with_refund"), attempt_status);
+            assert_eq!(after, AttemptStatus::Charged);
+            assert!(activity.is_none());
+            // Annulled: the payment never settled, so it is Voided with no refund.
+            let (after, _, activity) = sync(&with_status("annulled"), attempt_status);
+            assert_eq!(after, AttemptStatus::Voided);
+            assert!(activity.is_none());
+            // Approved or still pending: nothing to report.
+            for status in ["approved", "pending", "rejected"] {
+                assert!(
+                    sync(&with_status(status), attempt_status).2.is_none(),
+                    "{status}"
+                );
+            }
+        }
+    }
+
+    fn handle_sync_response(
+        attempt_status: AttemptStatus,
+        body: serde_json::Value,
+    ) -> PaymentsSyncRouterData {
+        ConnectorIntegration::<PSync, PaymentsSyncData, PaymentsResponseData>::handle_response(
+            Payway::new(),
+            &sync_router_data(attempt_status),
+            None,
+            Response {
+                headers: None,
+                response: bytes::Bytes::from(body.to_string()),
+                status_code: 200,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_connector_reports_the_refund_of_a_charged_payment_and_keeps_its_status() {
+        let data = handle_sync_response(
+            AttemptStatus::Charged,
+            json!({"id": 15403386, "status": "ANNULMENT_APPROVED", "amount": "12050",
+                   "status_details": {"ticket": "1560", "error": null}}),
+        );
+        assert_eq!(data.status, AttemptStatus::Charged);
+        assert!(matches!(
+            &data.response,
+            Ok(PaymentsResponseData::TransactionResponse { resource_id, .. })
+                if resource_id.get_connector_transaction_id().ok().as_deref() == Some("15403386")
+        ));
+        let activity = data
+            .connector_response
+            .as_ref()
+            .and_then(|response| response.get_reported_activity().cloned());
+        assert_eq!(
+            only_refund(activity),
+            ("annulment_15403386".to_string(), true)
+        );
+
+        // Approved: nothing to report.
+        let data = handle_sync_response(
+            AttemptStatus::Charged,
+            json!({"id": 15403386, "status": "approved"}),
+        );
+        assert_eq!(data.status, AttemptStatus::Charged);
+        assert!(data.connector_response.is_none());
     }
 }

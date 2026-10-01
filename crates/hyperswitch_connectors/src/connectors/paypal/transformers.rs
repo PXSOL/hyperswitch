@@ -3299,6 +3299,11 @@ pub struct DisputeTransaction {
     pub seller_transaction_id: String,
     /// The purchase unit's `invoice_id`, which Hyperswitch sets to the attempt's
     /// `connector_request_reference_id` when it creates the order.
+    ///
+    /// The dispute webhook resolves it as a `PaymentAttemptId`, which assumes the default
+    /// request reference (the attempt id): with `payment_id_as_connector_request_id` it
+    /// would not resolve and the webhook falls into the error path. Orders created outside
+    /// Hyperswitch never matched a payment anyway.
     #[serde(default)]
     pub invoice_number: Option<String>,
 }

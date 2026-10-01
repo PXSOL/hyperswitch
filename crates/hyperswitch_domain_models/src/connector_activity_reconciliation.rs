@@ -135,6 +135,13 @@ pub fn plan_refund_reconciliation(
 
 /// Whether an existing refund already took money out of the payment (or is about
 /// to): the ones that count against the refundable total of a balance refund.
+///
+/// A `Pending` or `ManualReview` refund of Hyperswitch counts as taken on purpose: the
+/// outcome is unknown, so reporting the balance as well could refund the same money
+/// twice. The consequence is that such a refund BLOCKS the balance refund until it
+/// resolves: while it is `Pending` the balance refund is a no-op, and it stays `Pending`
+/// until its own refund sync (RSync) resolves it. If it ends in `Failure` it stops
+/// counting and the next payment sync reports the balance again.
 fn is_counted_against_balance(status: common_enums::enums::RefundStatus) -> bool {
     matches!(
         status,
@@ -154,6 +161,11 @@ fn is_counted_against_balance(status: common_enums::enums::RefundStatus) -> bool
 /// existing ones plus those this same plan creates). Nothing remaining means
 /// Hyperswitch's own refunds already cover it: no action. Without a
 /// `payment_total` a balance refund cannot be computed and is skipped.
+///
+/// The `amount` of a balance refund is ignored: it is always recomputed as above, so a
+/// connector may leave it at any value (Payway sends the payment amount for reference).
+/// A Pending/ManualReview refund of Hyperswitch counts against the balance (see
+/// `is_counted_against_balance`), so it blocks the balance refund until it resolves.
 pub fn plan_refund_reconciliation_for_payment(
     existing_refunds: &[ExistingRefundView],
     reported_refunds: &[ConnectorReportedRefund],
