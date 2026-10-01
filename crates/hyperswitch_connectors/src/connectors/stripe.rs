@@ -742,13 +742,7 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Str
                 "v1/setup_intents",
                 x,
             )),
-            Ok(x) => Ok(format!(
-                "{}{}/{}{}",
-                self.base_url(connectors),
-                "v1/payment_intents",
-                x,
-                "?expand[0]=latest_charge" //updated payment_id(if present) reside inside latest_charge field
-            )),
+            Ok(x) => Ok(payment_intent_sync_url(self.base_url(connectors), &x)),
             x => x.change_context(ConnectorError::MissingConnectorTransactionID),
         }
     }
@@ -809,6 +803,11 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Str
                 event_builder.map(|i| i.set_response_body(&response));
                 router_env::logger::info!(connector_response=?response);
 
+                // Built from the response BEFORE it is consumed by `try_from` below. The
+                // charge refunds come with the `latest_charge.refunds` expansion of the sync
+                // URL and include the refunds made outside Hyperswitch (Stripe dashboard).
+                let reported_activity = response.reported_activity();
+
                 let new_router_data = RouterData::try_from(ResponseRouterData {
                     response,
                     data: data.clone(),
@@ -816,7 +815,12 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Str
                 });
                 new_router_data.map(|mut router_data| {
                     router_data.request.integrity_object = Some(response_integrity_object);
-                    router_data
+                    stripe::finish_payment_intent_sync(
+                        router_data,
+                        data.status,
+                        &data.request.connector_transaction_id,
+                        reported_activity,
+                    )
                 })
             }
             Err(err) => Err(err).change_context(ConnectorError::MissingConnectorTransactionID),
@@ -2193,6 +2197,38 @@ impl ConnectorIntegration<Evidence, SubmitEvidenceRequestData, SubmitEvidenceRes
     }
 }
 
+/// URL of the payment intent sync. `latest_charge` is expanded for the updated payment id and
+/// the payment method details; `latest_charge.refunds` is expanded too because since API
+/// version 2022-11-15 a charge no longer lists its refunds by default, and they are how a
+/// refund made outside Hyperswitch (Stripe dashboard) is discovered.
+fn payment_intent_sync_url(base_url: &str, payment_intent_id: &str) -> String {
+    format!(
+        "{base_url}v1/payment_intents/{payment_intent_id}?expand[0]=latest_charge&expand[1]=latest_charge.refunds"
+    )
+}
+
+/// Signature check that never succeeds.
+///
+/// Used for the refund events that are routed to a sync of the parent payment. When the
+/// signature verifies, core consumes the webhook body as if it were the payment sync
+/// response, but the body of these events is a charge or a refund, not a payment intent, and
+/// it carries no refund list. Reporting the webhook as unverified makes core run a live
+/// payment sync against Stripe instead, and that sync is the source of truth: the event only
+/// tells that something changed, so an unauthenticated one can at worst cause one extra read
+/// with the merchant's own credentials (same rule as Mercado Pago).
+struct UnverifiedWebhook;
+
+impl crypto::VerifySignature for UnverifiedWebhook {
+    fn verify_signature(
+        &self,
+        _secret: &[u8],
+        _signature: &[u8],
+        _msg: &[u8],
+    ) -> CustomResult<bool, common_utils::errors::CryptoError> {
+        Ok(false)
+    }
+}
+
 fn get_signature_elements_from_header(
     headers: &actix_web::http::header::HeaderMap,
 ) -> CustomResult<HashMap<String, Vec<u8>>, ConnectorError> {
@@ -2224,8 +2260,15 @@ fn get_signature_elements_from_header(
 impl IncomingWebhook for Stripe {
     fn get_webhook_source_verification_algorithm(
         &self,
-        _request: &IncomingWebhookRequestDetails<'_>,
+        request: &IncomingWebhookRequestDetails<'_>,
     ) -> CustomResult<Box<dyn crypto::VerifySignature + Send>, ConnectorError> {
+        let resyncs_parent_payment = request
+            .body
+            .parse_struct::<stripe::WebhookEventTypeBody>("WebhookEventTypeBody")
+            .is_ok_and(|details| details.is_refund_on_known_payment());
+        if resyncs_parent_payment {
+            return Ok(Box::new(UnverifiedWebhook));
+        }
         Ok(Box::new(crypto::HmacSha256))
     }
 
@@ -2333,6 +2376,23 @@ impl IncomingWebhook for Stripe {
                     ),
                 )
             }
+            // A refund of a known payment intent is a signal to sync that payment (see
+            // `get_webhook_event_type`), whether or not Hyperswitch created the refund: the
+            // sync reports every refund of the charge, and the reconciliation matches the
+            // ones Hyperswitch already has by `connector_refund_id`.
+            stripe::WebhookEventObjectType::Refund
+                if details.event_data.event_object.payment_intent.is_some() =>
+            {
+                api_models::webhooks::ObjectReferenceId::PaymentId(
+                    api_models::payments::PaymentIdType::ConnectorTransactionId(
+                        details
+                            .event_data
+                            .event_object
+                            .payment_intent
+                            .ok_or(ConnectorError::WebhookReferenceIdNotFound)?,
+                    ),
+                )
+            }
             stripe::WebhookEventObjectType::Refund => {
                 match details
                     .event_data
@@ -2407,6 +2467,19 @@ impl IncomingWebhook for Stripe {
                 } else {
                     IncomingWebhookEvent::EventNotSupported
                 }
+            }
+            // Refunds of a known payment are routed to a sync of that payment, which reads the
+            // refunds of the charge from Stripe: it creates the refunds made outside
+            // Hyperswitch (Stripe dashboard) and updates the ones Hyperswitch already has.
+            // `PaymentIntentProcessing` is only a routing label for the payments webhook flow,
+            // it does not decide any outcome: the sync derives everything from Stripe and the
+            // attempt, and the outgoing webhook comes from the resulting payment status.
+            // Unlike `PaymentIntentSuccess` it triggers no mandate update.
+            stripe::WebhookEventType::ChargeRefunded
+            | stripe::WebhookEventType::ChargeRefundUpdated
+                if details.is_refund_on_known_payment() =>
+            {
+                IncomingWebhookEvent::PaymentIntentProcessing
             }
             stripe::WebhookEventType::ChargeRefundUpdated => details
                 .event_data
@@ -3300,5 +3373,268 @@ impl ConnectorSpecifications for Stripe {
 
     fn get_supported_webhook_flows(&self) -> Option<&'static [common_enums::EventClass]> {
         Some(&STRIPE_SUPPORTED_WEBHOOK_FLOWS)
+    }
+}
+
+#[cfg(test)]
+mod external_refund_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
+
+    use api_models::{
+        payments::PaymentIdType,
+        webhooks::{ObjectReferenceId, RefundIdType},
+    };
+    use common_utils::crypto::SignMessage;
+    use hyperswitch_interfaces::webhooks::IncomingWebhook;
+    use serde_json::json;
+
+    use super::*;
+
+    const PI_ID: &str = "pi_3PxyzABCDEF";
+
+    fn event(event_type: &str, object: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "id": "evt_1Pxyz",
+            "object": "event",
+            "api_version": "2022-11-15",
+            "created": 1_700_000_200,
+            "type": event_type,
+            "data": {"object": object}
+        }))
+        .unwrap()
+    }
+
+    fn charge_object(with_payment_intent: bool) -> serde_json::Value {
+        let mut charge = json!({
+            "id": "ch_3Pxyz",
+            "object": "charge",
+            "amount": 10000,
+            "amount_captured": 10000,
+            "amount_refunded": 2500,
+            "currency": "usd",
+            "created": 1_700_000_000,
+            "metadata": {},
+            "refunded": false,
+            "status": "succeeded"
+        });
+        if with_payment_intent {
+            charge["payment_intent"] = json!(PI_ID);
+        }
+        charge
+    }
+
+    fn refund_object(with_payment_intent: bool, status: &str) -> serde_json::Value {
+        let mut refund = json!({
+            "id": "re_3PxyzDashboard",
+            "object": "refund",
+            "amount": 2500,
+            "charge": "ch_3Pxyz",
+            "created": 1_700_000_100,
+            "currency": "usd",
+            "metadata": {},
+            "status": status
+        });
+        if with_payment_intent {
+            refund["payment_intent"] = json!(PI_ID);
+        }
+        refund
+    }
+
+    fn dispute_object() -> serde_json::Value {
+        json!({
+            "id": "dp_1Pxyz",
+            "object": "dispute",
+            "amount": 10000,
+            "charge": "ch_3Pxyz",
+            "created": 1_700_000_000,
+            "currency": "usd",
+            "payment_intent": PI_ID,
+            "reason": "fraudulent",
+            "status": "needs_response",
+            "evidence_details": {"due_by": 1_700_900_000}
+        })
+    }
+
+    fn with_request<T>(
+        body: &[u8],
+        check: impl FnOnce(&IncomingWebhookRequestDetails<'_>) -> T,
+    ) -> T {
+        let headers = actix_web::http::header::HeaderMap::new();
+        let request = IncomingWebhookRequestDetails {
+            method: actix_web::http::Method::POST,
+            uri: "/webhooks/stripe".parse().expect("valid test uri"),
+            headers: &headers,
+            body,
+            query_params: String::new(),
+        };
+        check(&request)
+    }
+
+    fn event_type_of(body: &[u8]) -> IncomingWebhookEvent {
+        with_request(body, |request| {
+            Stripe::new().get_webhook_event_type(request).unwrap()
+        })
+    }
+
+    fn reference_of(body: &[u8]) -> ObjectReferenceId {
+        with_request(body, |request| {
+            Stripe::new()
+                .get_webhook_object_reference_id(request)
+                .unwrap()
+        })
+    }
+
+    fn assert_syncs_parent_payment(reference: ObjectReferenceId) {
+        match reference {
+            ObjectReferenceId::PaymentId(PaymentIdType::ConnectorTransactionId(id)) => {
+                assert_eq!(id, PI_ID)
+            }
+            other => panic!("expected the parent payment intent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn payment_intent_sync_url_expands_the_charge_and_its_refunds() {
+        let url = payment_intent_sync_url("https://api.stripe.com/", PI_ID);
+        assert_eq!(
+            url,
+            "https://api.stripe.com/v1/payment_intents/pi_3PxyzABCDEF?expand[0]=latest_charge&expand[1]=latest_charge.refunds"
+        );
+    }
+
+    #[test]
+    fn charge_refunded_syncs_the_parent_payment() {
+        let body = event("charge.refunded", charge_object(true));
+        assert_eq!(
+            event_type_of(&body),
+            IncomingWebhookEvent::PaymentIntentProcessing
+        );
+        assert_syncs_parent_payment(reference_of(&body));
+        // The event must land in the payments flow.
+        assert!(matches!(
+            api_models::webhooks::WebhookFlow::from(event_type_of(&body)),
+            api_models::webhooks::WebhookFlow::Payment
+        ));
+    }
+
+    #[test]
+    fn charge_refund_updated_with_a_payment_intent_syncs_the_parent_payment() {
+        for status in ["succeeded", "pending", "failed", "requires_action"] {
+            let body = event("charge.refund.updated", refund_object(true, status));
+            assert_eq!(
+                event_type_of(&body),
+                IncomingWebhookEvent::PaymentIntentProcessing,
+                "{status}"
+            );
+            assert_syncs_parent_payment(reference_of(&body));
+        }
+    }
+
+    #[test]
+    fn refunds_without_a_payment_intent_keep_their_previous_routing() {
+        let body = event("charge.refund.updated", refund_object(false, "succeeded"));
+        assert_eq!(event_type_of(&body), IncomingWebhookEvent::RefundSuccess);
+        match reference_of(&body) {
+            ObjectReferenceId::RefundId(RefundIdType::ConnectorRefundId(id)) => {
+                assert_eq!(id, "re_3PxyzDashboard")
+            }
+            other => panic!("expected the refund id, got {other:?}"),
+        }
+        let failed = event("charge.refund.updated", refund_object(false, "failed"));
+        assert_eq!(event_type_of(&failed), IncomingWebhookEvent::RefundFailure);
+        let pending = event("charge.refund.updated", refund_object(false, "pending"));
+        assert_eq!(
+            event_type_of(&pending),
+            IncomingWebhookEvent::EventNotSupported
+        );
+        // A `charge.refunded` of a charge without intent has nothing to sync.
+        let charge = event("charge.refunded", charge_object(false));
+        assert_eq!(
+            event_type_of(&charge),
+            IncomingWebhookEvent::EventNotSupported
+        );
+    }
+
+    #[test]
+    fn dispute_events_keep_their_mapping() {
+        for (event_type, expected) in [
+            (
+                "charge.dispute.created",
+                IncomingWebhookEvent::DisputeOpened,
+            ),
+            (
+                "charge.dispute.closed",
+                IncomingWebhookEvent::DisputeCancelled,
+            ),
+            (
+                "charge.dispute.funds_withdrawn",
+                IncomingWebhookEvent::DisputeLost,
+            ),
+            (
+                "charge.dispute.funds_reinstated",
+                IncomingWebhookEvent::DisputeWon,
+            ),
+        ] {
+            let body = event(event_type, dispute_object());
+            assert_eq!(event_type_of(&body), expected, "{event_type}");
+            assert_syncs_parent_payment(reference_of(&body));
+        }
+    }
+
+    #[test]
+    fn payment_intent_events_keep_their_mapping() {
+        let payment_intent = json!({
+            "id": PI_ID,
+            "object": "payment_intent",
+            "amount": 10000,
+            "currency": "usd",
+            "created": 1_700_000_000,
+            "metadata": {},
+            "status": "succeeded"
+        });
+        let body = event("payment_intent.succeeded", payment_intent);
+        assert_eq!(
+            event_type_of(&body),
+            IncomingWebhookEvent::PaymentIntentSuccess
+        );
+        assert_syncs_parent_payment(reference_of(&body));
+    }
+
+    #[test]
+    fn only_the_parent_payment_sync_events_skip_the_signature_check() {
+        // A valid HMAC signs the message: the regular events verify, the routed refund events
+        // never do, so core runs a live payment sync instead of consuming the webhook body as
+        // a payment sync response.
+        let secret = b"whsec_test";
+        let message = b"1700000000.body";
+        let signature = crypto::HmacSha256.sign_message(secret, message).unwrap();
+        let verifies = |body: Vec<u8>| {
+            with_request(&body, |request| {
+                Stripe::new()
+                    .get_webhook_source_verification_algorithm(request)
+                    .unwrap()
+                    .verify_signature(secret, &signature, message)
+                    .unwrap()
+            })
+        };
+        assert!(verifies(event(
+            "payment_intent.succeeded",
+            charge_object(true)
+        )));
+        assert!(verifies(event("charge.dispute.created", dispute_object())));
+        assert!(verifies(event(
+            "charge.refund.updated",
+            refund_object(false, "succeeded")
+        )));
+        assert!(!verifies(event("charge.refunded", charge_object(true))));
+        assert!(!verifies(event(
+            "charge.refund.updated",
+            refund_object(true, "succeeded")
+        )));
     }
 }

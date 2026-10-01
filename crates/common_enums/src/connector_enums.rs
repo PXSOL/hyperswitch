@@ -593,10 +593,19 @@ impl Connector {
     /// VOIDED, which a forced sync turns into a reported refund.
     /// Fiserv lists every transaction of the order (SALE, VOID, RETURN), so a forced
     /// sync of a settled attempt reports the voids and returns made on its dashboard.
+    /// Stripe lists a charge's refunds when the payment intent sync expands
+    /// `latest_charge.refunds`, which covers refunds made on the Stripe dashboard.
     /// Payway only reports that a payment was annulled or refunded in full (no refund id or
     /// amount), which a forced sync of a settled attempt turns into one balance refund.
     pub fn syncs_refunds_and_disputes_on_payment_sync(self) -> bool {
-        matches!(self, Self::Mercadopago | Self::Wompi | Self::Fiservemea | Self::Payway)
+        matches!(
+            self,
+            Self::Mercadopago
+                | Self::Wompi
+                | Self::Fiservemea
+                | Self::Stripe
+                | Self::Payway
+        )
     }
 
     /// Validates if dummy connector can be created
