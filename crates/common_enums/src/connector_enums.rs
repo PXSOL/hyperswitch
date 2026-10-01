@@ -595,6 +595,8 @@ impl Connector {
     /// sync of a settled attempt reports the voids and returns made on its dashboard.
     /// Stripe lists a charge's refunds when the payment intent sync expands
     /// `latest_charge.refunds`, which covers refunds made on the Stripe dashboard.
+    /// PayPal lists the refunds of an order on `GET v2/checkout/orders/{id}`, which a forced
+    /// sync of a settled attempt reads, so refunds made on the PayPal dashboard are reported.
     /// Payway only reports that a payment was annulled or refunded in full (no refund id or
     /// amount), which a forced sync of a settled attempt turns into one balance refund.
     pub fn syncs_refunds_and_disputes_on_payment_sync(self) -> bool {
@@ -604,6 +606,7 @@ impl Connector {
                 | Self::Wompi
                 | Self::Fiservemea
                 | Self::Stripe
+                | Self::Paypal
                 | Self::Payway
         )
     }
