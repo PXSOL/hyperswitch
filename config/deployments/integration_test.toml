@@ -873,6 +873,7 @@ mollie = { long_lived_token = false, payment_method = "card" }
 payme = { long_lived_token = false, payment_method = "card" }
 square = { long_lived_token = false, payment_method = "card" }
 stax = { long_lived_token = true, payment_method = "card,bank_debit" }
+# stripe_checkout is a hosted redirect (Stripe Checkout): there is nothing to tokenize
 stripe = { long_lived_token = false, payment_method = "wallet", payment_method_type = { list = "google_pay,stripe_checkout", type = "disable_only" } }
 billwerk = {long_lived_token = false, payment_method = "card"}
 globalpay = { long_lived_token = false, payment_method = "card", flow = "mandates" }

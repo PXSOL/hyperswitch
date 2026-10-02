@@ -822,6 +822,13 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Str
                     .parse_struct("StripeCheckoutSessionResponse")
                     .change_context(ConnectorError::ResponseDeserializationFailed)?;
 
+                let response_integrity_object = response
+                    .amount_and_currency()
+                    .map(|(amount, currency)| {
+                        get_sync_integrity_object(self.amount_converter, amount, currency)
+                    })
+                    .transpose()?;
+
                 event_builder.map(|i| i.set_response_body(&response));
                 router_env::logger::info!(connector_response=?response);
 
@@ -829,6 +836,10 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Str
                     response,
                     data: data.clone(),
                     http_code: res.status_code,
+                })
+                .map(|mut router_data: PaymentsSyncRouterData| {
+                    router_data.request.integrity_object = response_integrity_object;
+                    router_data
                 })
             }
             Ok(x) if x.starts_with("set") => {

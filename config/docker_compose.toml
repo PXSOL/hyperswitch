@@ -411,6 +411,7 @@ wompi = { country = "CO", currency = "COP" }
 # venta con tarjeta se cursaría como PaymentTokenSaleTransaction en vez del PaymentCardSaleTransaction
 # con PAN que documenta el vendor, además de romper el 3DS, que la rama de token no soporta.
 fiservemea = { long_lived_token = false, payment_method = "card", flow = "mandates" }
+# stripe_checkout is a hosted redirect (Stripe Checkout): there is nothing to tokenize
 stripe = { long_lived_token = false, payment_method = "wallet", payment_method_type = { type = "disable_only", list = "google_pay,stripe_checkout" } }
 checkout = { long_lived_token = false, payment_method = "wallet", apple_pay_pre_decrypt_flow = "network_tokenization" }
 mollie = { long_lived_token = false, payment_method = "card" }

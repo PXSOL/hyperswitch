@@ -2165,10 +2165,12 @@ async fn payment_response_update_tracker<F: Clone, T: types::Capturable>(
                         let connector_name = router_data.connector.to_string();
                         let flow_name = core_utils::get_flow_name::<F>()?;
                         // A void the connector refused for a payment still waiting for the
-                        // customer (e.g. a Stripe Checkout session the buyer has just paid)
-                        // keeps it waiting: the next sync, not this error, decides.
+                        // customer (a Stripe Checkout session the buyer has just paid) keeps
+                        // it waiting: the next sync, not this error, decides.
                         let keep_waiting = flow_name == "Void"
-                            && router_data.status == enums::AttemptStatus::AuthenticationPending;
+                            && router_data.status == enums::AttemptStatus::AuthenticationPending
+                            && payment_data.payment_attempt.payment_method_type
+                                == Some(enums::PaymentMethodType::StripeCheckout);
                         let option_gsm = payments_helpers::get_gsm_record(
                             state,
                             Some(err.code.clone()),

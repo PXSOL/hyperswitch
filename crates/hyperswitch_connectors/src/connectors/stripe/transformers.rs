@@ -4978,6 +4978,19 @@ pub struct StripeCheckoutSessionResponse {
     pub currency: Option<String>,
 }
 
+impl StripeCheckoutSessionResponse {
+    /// Amount and currency to check against the request: the expanded PaymentIntent's when
+    /// present (what the PaymentIntent sync checks), else the session's own total.
+    pub fn amount_and_currency(&self) -> Option<(MinorUnit, String)> {
+        match &self.payment_intent {
+            Some(StripeCheckoutPaymentIntent::Object(payment_intent)) => {
+                Some((payment_intent.amount, payment_intent.currency.clone()))
+            }
+            _ => self.amount_total.zip(self.currency.clone()),
+        }
+    }
+}
+
 /// Response of expiring a Checkout Session (the void of an unpaid session).
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -5040,7 +5053,7 @@ fn checkout_session_error(
     }
 }
 
-fn checkout_session_pending_response(
+fn checkout_session_transaction_response(
     session: &StripeCheckoutSessionResponse,
     resource_id: ResponseId,
     redirection_data: Option<RedirectForm>,
@@ -5063,6 +5076,8 @@ fn checkout_session_pending_response(
 /// - `complete`: the PaymentIntent (expanded on PSync) decides, through the existing
 ///   PaymentIntent mapping, and its `pi_…` id replaces the session id.
 /// - `expired`: terminal failure, the buyer can no longer pay.
+///
+/// An unknown session status (the serde catch-all) is treated like `open`.
 impl<F, T> TryFrom<ResponseRouterData<F, StripeCheckoutSessionResponse, T, PaymentsResponseData>>
     for RouterData<F, T, PaymentsResponseData>
 where
@@ -5082,7 +5097,7 @@ where
         match session.status {
             StripeCheckoutSessionStatus::Open | StripeCheckoutSessionStatus::Unknown => {
                 let redirection_data = session.url.as_deref().map(build_checkout_redirect_form);
-                let response = checkout_session_pending_response(
+                let response = checkout_session_transaction_response(
                     &session,
                     ResponseId::ConnectorTransactionId(session.id.clone()),
                     redirection_data,
@@ -5104,7 +5119,7 @@ where
                 // The PaymentIntent was not expanded: promote its id and let the next sync
                 // (now a PaymentIntent sync) report the real status.
                 Some(StripeCheckoutPaymentIntent::Id(payment_intent_id)) => {
-                    let response = checkout_session_pending_response(
+                    let response = checkout_session_transaction_response(
                         &session,
                         ResponseId::ConnectorTransactionId(payment_intent_id),
                         None,
@@ -5116,7 +5131,7 @@ where
                     })
                 }
                 None => {
-                    let response = checkout_session_pending_response(
+                    let response = checkout_session_transaction_response(
                         &session,
                         ResponseId::ConnectorTransactionId(session.id.clone()),
                         None,
@@ -5158,7 +5173,7 @@ impl<F, T>
     ) -> Result<Self, Self::Error> {
         let session = item.response.0;
         if session.status == StripeCheckoutSessionStatus::Expired {
-            let response = checkout_session_pending_response(
+            let response = checkout_session_transaction_response(
                 &session,
                 ResponseId::ConnectorTransactionId(session.id.clone()),
                 None,
@@ -5679,6 +5694,56 @@ mod test_stripe_checkout {
         })
         .unwrap();
         assert_eq!(voided.status, AttemptStatus::Voided);
+    }
+
+    #[test]
+    fn integrity_amount_prefers_the_payment_intent_then_the_session_total() {
+        let with_intent: StripeCheckoutSessionResponse =
+            serde_json::from_value(session_json("complete", payment_intent_json("succeeded")))
+                .unwrap();
+        assert_eq!(
+            with_intent.amount_and_currency(),
+            Some((MinorUnit::new(12345), "usd".to_string()))
+        );
+
+        let mut value = session_json("complete", serde_json::json!("pi_3Abc"));
+        value["amount_total"] = serde_json::json!(999);
+        let without: StripeCheckoutSessionResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            without.amount_and_currency(),
+            Some((MinorUnit::new(999), "usd".to_string()))
+        );
+
+        let mut value = session_json("open", serde_json::Value::Null);
+        value["amount_total"] = serde_json::Value::Null;
+        let none: StripeCheckoutSessionResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(none.amount_and_currency(), None);
+    }
+
+    #[test]
+    fn void_of_a_session_that_is_not_expired_fails() {
+        let response: StripeCheckoutSessionVoidResponse =
+            serde_json::from_value(session_json("complete", serde_json::json!("pi_3Abc"))).unwrap();
+        let data = authorize_router_data(
+            authorize_request_data(
+                PaymentMethodData::Wallet(WalletData::StripeCheckout {}),
+                enums::Currency::USD,
+                12345,
+                None,
+                None,
+            ),
+            "attempt_123",
+        );
+        let result = PaymentsAuthorizeRouterData::try_from(ResponseRouterData {
+            response,
+            data,
+            http_code: 200,
+        })
+        .unwrap();
+        assert_eq!(result.status, AttemptStatus::VoidFailed);
+        let error = result.response.unwrap_err();
+        assert_eq!(error.code, "checkout_session_not_expired");
+        assert_eq!(error.attempt_status, Some(AttemptStatus::VoidFailed));
     }
 
     #[test]
