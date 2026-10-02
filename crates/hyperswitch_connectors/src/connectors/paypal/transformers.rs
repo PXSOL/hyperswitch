@@ -1102,6 +1102,7 @@ impl TryFrom<&PaypalRouterData<&PaymentsAuthorizeRouterData>> for PaypalPayments
                 | WalletData::Paze(_)
                 | WalletData::MercadoPagoSdk(_)
                 | WalletData::WompiCheckout {}
+                | WalletData::StripeCheckout {}
                 | WalletData::MercadoPagoCheckoutPro {} => {
                     Err(errors::ConnectorError::NotImplemented(
                         utils::get_unimplemented_payment_method_error_message("Paypal"),
@@ -1279,7 +1280,8 @@ impl TryFrom<&PaypalRouterData<&PaymentsAuthorizeRouterData>> for PaypalPayments
                     | enums::PaymentMethodType::RevolutPay
                     | enums::PaymentMethodType::Breadpay
                     | enums::PaymentMethodType::MercadoPago
-                    | enums::PaymentMethodType::Wompi => {
+                    | enums::PaymentMethodType::Wompi
+                    | enums::PaymentMethodType::StripeCheckout => {
                         Err(errors::ConnectorError::NotImplemented(
                             utils::get_unimplemented_payment_method_error_message("paypal"),
                         ))

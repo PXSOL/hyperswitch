@@ -54,6 +54,7 @@ impl From<enums::WalletType> for global_enums::PaymentMethodType {
             enums::WalletType::MercadoPago => Self::MercadoPago,
             enums::WalletType::MobilePay => Self::MobilePay,
             enums::WalletType::Wompi => Self::Wompi,
+            enums::WalletType::StripeCheckout => Self::StripeCheckout,
             enums::WalletType::WeChatPay => Self::WeChatPay,
             enums::WalletType::SamsungPay => Self::SamsungPay,
             enums::WalletType::GoPay => Self::GoPay,
