@@ -4796,7 +4796,8 @@ pub const CHECKOUT_SESSION_ID_PREFIX: &str = "cs_";
 pub const CHECKOUT_SESSION_OBJECT: &str = "checkout.session";
 
 /// Stripe requires `expires_at` to be between 30 minutes and 24 hours after creation; 35
-/// minutes leaves room for the request latency and outlives the 25-minute auto-cancel.
+/// minutes leaves room for the request latency. The platform's pending-payment cron waits
+/// longer than this before reconciling and cancelling, so that last check is definitive.
 const CHECKOUT_SESSION_TTL_SECS: i64 = 35 * 60;
 
 /// Stripe caps `product_data.name` at 250 characters.
