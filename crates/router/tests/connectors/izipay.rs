@@ -84,6 +84,11 @@ async fn should_authorize_hosted_checkout_payment() {
                 amount: 199,
                 minor_amount: types::MinorUnit::new(199),
                 router_return_url: Some("https://hyperswitch.io/return".to_string()),
+                // Izipay's hosted page does not submit a payment without the buyer document.
+                metadata: Some(serde_json::json!({
+                    "buyer_document_type": "DNI",
+                    "buyer_document_number": "12345678",
+                })),
                 ..utils::PaymentAuthorizeType::default().0
             }),
             get_default_payment_info(),

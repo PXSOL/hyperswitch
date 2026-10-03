@@ -1760,9 +1760,24 @@ impl TryFrom<PaymentsSyncResponseRouterData<IzipayPaymentsSyncResponse>>
             data,
             http_code,
         } = item;
+        // The payment mode decides how the body is read, not the body shape: an order Search
+        // body without `response` also deserializes as the link variant.
+        let is_payment_link = is_payment_link_meta(data.request.connector_meta.as_ref());
         match response {
+            IzipayPaymentsSyncResponse::Link(response) if is_payment_link => {
+                Self::try_from(ResponseRouterData {
+                    response,
+                    data,
+                    http_code,
+                })
+            }
             IzipayPaymentsSyncResponse::Link(response) => Self::try_from(ResponseRouterData {
-                response,
+                response: IzipaySearchResponse {
+                    code: response.code,
+                    message: response.message,
+                    message_user: response.message_user,
+                    response: None,
+                },
                 data,
                 http_code,
             }),
@@ -1797,6 +1812,35 @@ pub(crate) fn link_sync_response(
     now: OffsetDateTime,
 ) -> CustomResult<PaymentsSyncRouterData, errors::ConnectorError> {
     let payment_link_id = link_payment_id(&item.data)?;
+
+    // A search Izipay did not answer with `00` says nothing about the link: the attempt keeps
+    // its status (explicitly, because the router marks a 2xx sync error without one as
+    // failed), so a transient error after the expiration never closes a paid link.
+    if item.response.code != SUCCESS_CODE {
+        let message = item
+            .response
+            .message_user
+            .clone()
+            .or_else(|| item.response.message.clone())
+            .filter(|message| !message.is_empty())
+            .unwrap_or_else(|| "Izipay could not search the payment link transactions".to_string());
+        return Ok(RouterData {
+            response: Err(ErrorResponse {
+                status_code: item.http_code,
+                code: item.response.code.clone(),
+                message,
+                reason: item.response.message.clone(),
+                attempt_status: Some(item.data.status),
+                connector_transaction_id: Some(payment_link_id),
+                network_advice_code: None,
+                network_decline_code: None,
+                network_error_message: None,
+                connector_metadata: None,
+            }),
+            ..item.data
+        });
+    }
+
     let previous = item.data.request.connector_meta.as_ref();
     let transactions: &[IzipayLinkTransaction] = item
         .response
@@ -2625,13 +2669,24 @@ mod tests {
     }
 
     #[test]
-    fn transaction_id_is_numeric_and_unique_enough() {
-        let first = new_transaction_id();
-        let second = new_transaction_id();
-        assert!(first.chars().all(|c| c.is_ascii_digit()));
-        assert!((17..=40).contains(&first.len()));
-        // Same millisecond is possible, the random suffix then differs almost always.
-        assert!(first.len() == second.len());
+    fn transaction_id_is_the_unix_millis_plus_a_four_digit_random_suffix() {
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let id = new_transaction_id();
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        assert!(id.chars().all(|c| c.is_ascii_digit()));
+        // Izipay accepts 5 to 40 characters; the suffix keeps two ids of the same millisecond
+        // apart with probability 9999/10000, which is not asserted (it would be flaky).
+        assert!((5..=40).contains(&id.len()));
+        let (millis, suffix) = id.split_at(id.len() - 4);
+        let millis: u128 = millis.parse().unwrap();
+        assert!((before..=after).contains(&millis));
+        assert_eq!(suffix.len(), 4);
     }
 
     #[test]
@@ -4542,6 +4597,53 @@ mod tests {
             }
             other => panic!("expected a TransactionResponse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_failed_link_search_after_the_expiration_keeps_the_attempt_status() {
+        // Izipay did not answer the search with 00: it says nothing about the link, so even
+        // after the expiration the payment is neither closed nor marked failed by the router.
+        let result = link_sync(
+            serde_json::json!({"code": "T01", "message": "Demasiadas solicitudes"}),
+            Some(link_meta()),
+            at("2026-10-05T05:00:01Z"),
+        );
+        assert_eq!(result.status, enums::AttemptStatus::AuthenticationPending);
+        let error = result.response.unwrap_err();
+        assert_eq!(error.code, "T01");
+        assert_eq!(
+            error.attempt_status,
+            Some(enums::AttemptStatus::AuthenticationPending)
+        );
+        assert_eq!(error.connector_transaction_id.as_deref(), Some(LINK_ID));
+    }
+
+    #[test]
+    fn a_checkout_sync_body_without_orders_is_read_as_an_order_search() {
+        // `{"code": ...}` alone also deserializes as the link variant; a checkout payment must
+        // still be read with the order rules (a non-00 code fails, MC keeps the status).
+        let declined: IzipayPaymentsSyncResponse =
+            serde_json::from_str(r#"{"code":"05","message":"Operación Denegada"}"#).unwrap();
+        let result = PaymentsSyncRouterData::try_from(ResponseRouterData {
+            response: declined,
+            data: sync_router_data(None),
+            http_code: 200,
+        })
+        .unwrap();
+        assert_eq!(result.status, enums::AttemptStatus::Failure);
+        assert_eq!(result.response.unwrap_err().code, "05");
+
+        let not_found: IzipayPaymentsSyncResponse =
+            serde_json::from_str(r#"{"code":"MC","message":"Transacción Invalido"}"#).unwrap();
+        let data = sync_router_data(None);
+        let status_before = data.status;
+        let result = PaymentsSyncRouterData::try_from(ResponseRouterData {
+            response: not_found,
+            data,
+            http_code: 200,
+        })
+        .unwrap();
+        assert_eq!(result.status, status_before);
     }
 
     #[test]
