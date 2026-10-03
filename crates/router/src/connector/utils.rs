@@ -2577,6 +2577,8 @@ pub enum PaymentMethodDataType {
     MercadoPagoSdk,
     MercadoPagoCheckoutPro,
     WompiCheckout,
+    IzipayCheckout,
+    IzipayPaymentLink,
     Paze,
     SamsungPay,
     TwintRedirect,
@@ -2716,6 +2718,8 @@ impl From<domain::payments::PaymentMethodData> for PaymentMethodDataType {
                     Self::MercadoPagoCheckoutPro
                 }
                 domain::payments::WalletData::WompiCheckout {} => Self::WompiCheckout,
+                domain::payments::WalletData::IzipayCheckout {} => Self::IzipayCheckout,
+                domain::payments::WalletData::IzipayPaymentLink {} => Self::IzipayPaymentLink,
                 domain::payments::WalletData::Paze(_) => Self::Paze,
                 domain::payments::WalletData::SamsungPay(_) => Self::SamsungPay,
                 domain::payments::WalletData::TwintRedirect {} => Self::TwintRedirect,

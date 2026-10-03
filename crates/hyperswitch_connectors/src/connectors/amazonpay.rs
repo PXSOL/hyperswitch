@@ -395,6 +395,8 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
                 | WalletDataPaymentMethod::Mifinity(_)
                 | WalletDataPaymentMethod::MercadoPagoSdk(_)
                 | WalletDataPaymentMethod::WompiCheckout {}
+                | WalletDataPaymentMethod::IzipayCheckout {}
+                | WalletDataPaymentMethod::IzipayPaymentLink {}
                 | WalletDataPaymentMethod::MercadoPagoCheckoutPro {} => {
                     Err(errors::ConnectorError::NotImplemented(
                         utils::get_unimplemented_payment_method_error_message("amazonpay"),

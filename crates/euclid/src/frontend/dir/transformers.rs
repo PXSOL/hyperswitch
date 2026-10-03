@@ -81,6 +81,7 @@ impl IntoDirValue for (global_enums::PaymentMethodType, global_enums::PaymentMet
             global_enums::PaymentMethodType::MercadoPago => Ok(dirval!(WalletType = MercadoPago)),
             global_enums::PaymentMethodType::MobilePay => Ok(dirval!(WalletType = MobilePay)),
             global_enums::PaymentMethodType::Wompi => Ok(dirval!(WalletType = Wompi)),
+            global_enums::PaymentMethodType::Izipay => Ok(dirval!(WalletType = Izipay)),
             global_enums::PaymentMethodType::Cashapp => Ok(dirval!(WalletType = Cashapp)),
             global_enums::PaymentMethodType::Multibanco => {
                 Ok(dirval!(BankTransferType = Multibanco))

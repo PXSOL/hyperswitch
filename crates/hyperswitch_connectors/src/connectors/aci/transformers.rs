@@ -202,6 +202,8 @@ impl TryFrom<(&WalletData, &PaymentsAuthorizeRouterData)> for PaymentDetails {
             | WalletData::RevolutPay(_)
             | WalletData::MercadoPagoSdk(_)
             | WalletData::WompiCheckout {}
+            | WalletData::IzipayCheckout {}
+            | WalletData::IzipayPaymentLink {}
             | WalletData::MercadoPagoCheckoutPro {} => Err(
                 errors::ConnectorError::NotImplemented("Payment method".to_string()),
             )?,
