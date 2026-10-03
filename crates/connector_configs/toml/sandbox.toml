@@ -6863,3 +6863,32 @@ key1="Private Key"
 api_secret="Integrity Secret"
 [wompi.connector_webhook_details]
 merchant_secret="Events Secret"
+
+[izipay]
+[[izipay.wallet]]
+  payment_method_type = "izipay"
+[izipay.connector_auth.MultiAuthKey]
+api_key="Izipay API key (Clave API nuevo botón de pagos)"
+key1="Merchant code"
+api_secret="Hash key (Clave Hash)"
+key2="Izipay public RSA key"
+[izipay.metadata.ruc]
+name="ruc"
+label="Merchant RUC (required for refunds)"
+placeholder="Enter the 11-digit RUC"
+required=false
+type="Text"
+
+[izipay.metadata.terms_and_conditions_url]
+name="terms_and_conditions_url"
+label="Terms and conditions URL (required for payment links)"
+placeholder="https://www.example.com/terms"
+required=false
+type="Text"
+
+[izipay.metadata.payment_link_pay_methods]
+name="payment_link_pay_methods"
+label="Payment link pay methods (comma list of CARD, QR, YAPE_CODE, PAGO_PUSH; default CARD)"
+placeholder="CARD,QR"
+required=false
+type="Text"

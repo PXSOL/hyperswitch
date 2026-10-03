@@ -305,6 +305,10 @@ impl ConnectorAuthTypeAndMetadataValidation<'_> {
                 itaubank::transformers::ItaubankAuthType::try_from(self.auth_type)?;
                 Ok(())
             }
+            api_enums::Connector::Izipay => {
+                izipay::transformers::IzipayAuthType::try_from(self.auth_type)?;
+                Ok(())
+            }
             api_enums::Connector::Jpmorgan => {
                 jpmorgan::transformers::JpmorganAuthType::try_from(self.auth_type)?;
                 Ok(())

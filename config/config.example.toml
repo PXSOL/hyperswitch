@@ -326,6 +326,10 @@ wise.base_url = "https://api.sandbox.transferwise.tech/"
 # connector picks one per request from the key prefix (pub_test_ / pub_prod_).
 wompi.base_url = "https://production.wompi.co/v1"
 wompi.secondary_base_url = "https://sandbox.wompi.co/v1"
+# izipay: base_url is production and secondary_base_url is sandbox in every environment; the
+# connector picks one per request from the MCA test_mode flag.
+izipay.base_url = "https://api-pw.izipay.pe"
+izipay.secondary_base_url = "https://sandbox-api-pw.izipay.pe"
 worldline.base_url = "https://eu.sandbox.api-ingenico.com/"
 worldpay.base_url = "https://try.access.worldpay.com/"
 worldpayvantiv.base_url = "https://transact.vantivprelive.com/vap/communicator/online"
@@ -483,6 +487,9 @@ force_cookies = true                 # Whether to use only cookies for JWT extra
 credit = { country = "CO", currency = "COP" }
 debit = { country = "CO", currency = "COP" }
 wompi = { country = "CO", currency = "COP" }
+
+[pm_filters.izipay]
+izipay = { currency = "PEN,USD" }
 
 #tokenization configuration which describe token lifetime and payment method for specific connector
 [tokenization]

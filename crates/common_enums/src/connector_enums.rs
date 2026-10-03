@@ -110,6 +110,7 @@ pub enum RoutableConnectors {
     Iatapay,
     Inespay,
     Itaubank,
+    Izipay,
     Jpmorgan,
     Klarna,
     Mercadopago,
@@ -289,6 +290,7 @@ pub enum Connector {
     Inespay,
     Iatapay,
     Itaubank,
+    Izipay,
     Jpmorgan,
     Juspaythreedsserver,
     Klarna,
@@ -410,6 +412,7 @@ impl Connector {
                 | (Self::Iatapay, _)
                 | (Self::Volt, _)
                 | (Self::Itaubank, _)
+                | (Self::Izipay, PaymentMethod::Wallet)
                 | (Self::Facilitapay, _)
                 | (Self::Dwolla, _)
                 | (Self::Wompi, PaymentMethod::Card | PaymentMethod::Wallet)
@@ -488,6 +491,7 @@ impl Connector {
             | Self::Iatapay
 			| Self::Inespay
             | Self::Itaubank
+            | Self::Izipay
             | Self::Jpmorgan
             | Self::Juspaythreedsserver
             | Self::Klarna
@@ -682,6 +686,7 @@ impl From<RoutableConnectors> for Connector {
             RoutableConnectors::Helcim => Self::Helcim,
             RoutableConnectors::Iatapay => Self::Iatapay,
             RoutableConnectors::Itaubank => Self::Itaubank,
+            RoutableConnectors::Izipay => Self::Izipay,
             RoutableConnectors::Jpmorgan => Self::Jpmorgan,
             RoutableConnectors::Klarna => Self::Klarna,
             RoutableConnectors::Mercadopago => Self::Mercadopago,
@@ -820,6 +825,7 @@ impl TryFrom<Connector> for RoutableConnectors {
             Connector::Helcim => Ok(Self::Helcim),
             Connector::Iatapay => Ok(Self::Iatapay),
             Connector::Itaubank => Ok(Self::Itaubank),
+            Connector::Izipay => Ok(Self::Izipay),
             Connector::Jpmorgan => Ok(Self::Jpmorgan),
             Connector::Klarna => Ok(Self::Klarna),
             Connector::Mercadopago => Ok(Self::Mercadopago),

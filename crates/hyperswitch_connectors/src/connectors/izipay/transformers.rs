@@ -1,0 +1,2339 @@
+use std::collections::HashMap;
+
+use api_models::webhooks::IncomingWebhookEvent;
+use base64::Engine;
+use common_enums::enums;
+use common_utils::{
+    crypto::{HmacSha256, VerifySignature},
+    errors::CustomResult,
+    request::Method,
+    types::StringMajorUnit,
+};
+use error_stack::{report, ResultExt};
+use hyperswitch_domain_models::{
+    payment_method_data::{PaymentMethodData, WalletData},
+    router_data::{AccessToken, ConnectorAuthType, ErrorResponse, RouterData},
+    router_flow_types::refunds::{Execute, RSync},
+    router_request_types::ResponseId,
+    router_response_types::{PaymentsResponseData, RedirectForm, RefundsResponseData},
+    types::{
+        PaymentsAuthorizeRouterData, PaymentsSyncRouterData, RefreshTokenRouterData,
+        RefundsRouterData,
+    },
+};
+use hyperswitch_interfaces::errors;
+use masking::{PeekInterface, Secret};
+use rand::Rng;
+use serde::{Deserialize, Serialize};
+use time::{Date, Duration, Month, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset};
+
+use crate::{
+    types::{PaymentsSyncResponseRouterData, RefundsResponseRouterData, ResponseRouterData},
+    utils::{get_unimplemented_payment_method_error_message, RouterData as _},
+};
+
+/// Izipay Web SDK, sandbox. The environment is chosen per request from the MCA `test_mode`.
+pub const SANDBOX_SDK_URL: &str = "https://sandbox-checkout.izipay.pe/payments/v1/js/index.js";
+/// Izipay Web SDK, production.
+pub const PRODUCTION_SDK_URL: &str = "https://checkout.izipay.pe/payments/v1/js/index.js";
+
+/// Izipay session tokens are bound to one operation, so the access token cached by the router
+/// is only ever useful for the request that asked for it. The router subtracts 15 seconds from
+/// the TTL we report (`REDUCE_ACCESS_TOKEN_EXPIRY_TIME`), so 16 caches the token for about one
+/// second. A longer cache would hand an ECOMMERCE token to a refund of the same MCA (or the
+/// other way around), which Izipay rejects.
+const ACCESS_TOKEN_EXPIRES_SECONDS: i64 = 16;
+
+const IZIPAY_CONNECTOR_NAME: &str = "Izipay";
+const ORDER_NUMBER_LENGTH: usize = 15;
+/// Number of distinct order numbers: 36^15.
+const ORDER_NUMBER_MODULUS: u128 = 36u128.pow(15);
+const SUCCESS_CODE: &str = "00";
+const ORDER_AUTHORIZED: &str = "Autorizado";
+const ORDER_DENIED: &str = "Denegado";
+const ORDER_VOIDED: &str = "Anulado";
+
+pub struct IzipayRouterData<T> {
+    pub amount: StringMajorUnit,
+    pub router_data: T,
+}
+
+impl<T> From<(StringMajorUnit, T)> for IzipayRouterData<T> {
+    fn from((amount, router_data): (StringMajorUnit, T)) -> Self {
+        Self {
+            amount,
+            router_data,
+        }
+    }
+}
+
+// ============================================================================
+// Auth and environment
+// ============================================================================
+
+pub struct IzipayAuthType {
+    /// "Clave API nuevo botón": only used to generate session tokens.
+    pub api_key: Secret<String>,
+    pub merchant_code: String,
+    /// "Clave Hash": signs the notifications and the signed payloads.
+    pub hash_key: Secret<String>,
+    /// "Clave pública Izipay" (RSA): `LoadForm.keyRSA` of the Web SDK.
+    pub rsa_key: Secret<String>,
+}
+
+impl TryFrom<&ConnectorAuthType> for IzipayAuthType {
+    type Error = error_stack::Report<errors::ConnectorError>;
+
+    fn try_from(auth_type: &ConnectorAuthType) -> Result<Self, Self::Error> {
+        match auth_type {
+            ConnectorAuthType::MultiAuthKey {
+                api_key,
+                key1,
+                api_secret,
+                key2,
+            } => Ok(Self {
+                api_key: api_key.clone(),
+                merchant_code: key1.peek().trim().to_string(),
+                hash_key: api_secret.clone(),
+                rsa_key: key2.clone(),
+            }),
+            _ => Err(errors::ConnectorError::FailedToObtainAuthType.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IzipayEnvironment {
+    Sandbox,
+    Production,
+}
+
+impl IzipayEnvironment {
+    /// An unset `test_mode` means production: a production account that never set the flag
+    /// must never be routed to the sandbox, where an approved payment never settles.
+    pub fn from_test_mode(test_mode: Option<bool>) -> Self {
+        if test_mode.unwrap_or(false) {
+            Self::Sandbox
+        } else {
+            Self::Production
+        }
+    }
+
+    pub fn sdk_url(self) -> &'static str {
+        match self {
+            Self::Sandbox => SANDBOX_SDK_URL,
+            Self::Production => PRODUCTION_SDK_URL,
+        }
+    }
+}
+
+// ============================================================================
+// Identifiers
+// ============================================================================
+
+/// Order number sent to Izipay (5-15 characters): 15 characters `[0-9A-Z]` that are the base36
+/// form of a SHA-256 of the attempt id, so that it is deterministic (PSync and refunds can
+/// recompute it) and unique per attempt without storing anything.
+pub fn order_number_from_attempt_id(attempt_id: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, attempt_id.as_bytes());
+    let mut value = digest
+        .as_ref()
+        .iter()
+        .take(16)
+        .fold(0u128, |acc, byte| (acc << 8) | u128::from(*byte))
+        % ORDER_NUMBER_MODULUS;
+
+    let mut digits = Vec::with_capacity(ORDER_NUMBER_LENGTH);
+    for _ in 0..ORDER_NUMBER_LENGTH {
+        let digit = u32::try_from(value % 36)
+            .ok()
+            .and_then(|digit| char::from_digit(digit, 36))
+            .unwrap_or('0');
+        digits.push(digit.to_ascii_uppercase());
+        value /= 36;
+    }
+    digits.iter().rev().collect()
+}
+
+/// Correlation id of one Token/Generate call: `{unix_ms}{4 random digits}`.
+pub fn new_transaction_id() -> String {
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default();
+    let suffix: u16 = rand::thread_rng().gen_range(0..10_000);
+    format!("{unix_ms}{suffix:04}")
+}
+
+/// `dateTimeTransaction` of the SDK order: 16 digits, unix milliseconds times 1000.
+fn current_date_time_transaction() -> String {
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default();
+    format!("{}", unix_ms * 1000)
+}
+
+// ============================================================================
+// Session tokens (Token/Generate) and the access token that packs them
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IzipayTokenKind {
+    #[serde(rename = "ECOMMERCE")]
+    Ecommerce,
+    #[serde(rename = "REFUND")]
+    Refund,
+}
+
+impl IzipayTokenKind {
+    fn request_source(self) -> &'static str {
+        match self {
+            Self::Ecommerce => "ECOMMERCE",
+            Self::Refund => "REFUND",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayTokenRequest {
+    request_source: &'static str,
+    merchant_code: String,
+    order_number: String,
+    public_key: Secret<String>,
+    amount: String,
+}
+
+impl IzipayTokenRequest {
+    /// Session token bound to one order and amount, used by the Web SDK (`LoadForm`).
+    fn for_order(auth: &IzipayAuthType, order_number: String, amount: &StringMajorUnit) -> Self {
+        Self {
+            request_source: IzipayTokenKind::Ecommerce.request_source(),
+            merchant_code: auth.merchant_code.clone(),
+            order_number,
+            public_key: auth.api_key.clone(),
+            amount: amount.get_amount_as_string(),
+        }
+    }
+}
+
+/// Generic session token: `orderNumber` is the merchant code and the amount is `0.00`, which
+/// Izipay accepts for search and refund operations.
+impl TryFrom<&RefreshTokenRouterData> for IzipayTokenRequest {
+    type Error = error_stack::Report<errors::ConnectorError>;
+
+    fn try_from(req: &RefreshTokenRouterData) -> Result<Self, Self::Error> {
+        let auth = IzipayAuthType::try_from(&req.connector_auth_type)?;
+        let kind = if req.refund_id.is_some() {
+            IzipayTokenKind::Refund
+        } else {
+            IzipayTokenKind::Ecommerce
+        };
+        Ok(Self {
+            request_source: kind.request_source(),
+            merchant_code: auth.merchant_code.clone(),
+            order_number: auth.merchant_code,
+            public_key: auth.api_key,
+            amount: "0.00".to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IzipayTokenResponse {
+    pub code: String,
+    pub message: Option<String>,
+    pub response: Option<IzipayTokenData>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IzipayTokenData {
+    pub token: Option<Secret<String>>,
+}
+
+impl IzipayTokenResponse {
+    fn session_token(&self) -> Option<Secret<String>> {
+        if self.code == SUCCESS_CODE {
+            self.response.as_ref().and_then(|data| data.token.clone())
+        } else {
+            None
+        }
+    }
+}
+
+/// What the access token carries: the session token, the correlation id it is bound to and
+/// the operation it was generated for.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IzipayPackedToken {
+    pub kind: IzipayTokenKind,
+    pub transaction_id: String,
+    pub token: Secret<String>,
+}
+
+/// The correlation id a session token is bound to is only sent in the request header, so it is
+/// read back from the token itself (claim `transactionId`), which is what Izipay checks the
+/// header of the following calls against. The signature is not verified: the token is only
+/// relayed back to the service that issued it.
+fn transaction_id_from_session_token(token: &str) -> Option<String> {
+    let payload_segment = token.split('.').nth(1)?;
+    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_segment.trim_end_matches('='))
+        .ok()?;
+    let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+    match payload.get("transactionId")? {
+        serde_json::Value::String(id) if !id.is_empty() => Some(id.clone()),
+        serde_json::Value::Number(id) => Some(id.to_string()),
+        _ => None,
+    }
+}
+
+fn error_response_from_code(
+    code: &str,
+    message: Option<&str>,
+    http_code: u16,
+    attempt_status: Option<enums::AttemptStatus>,
+) -> ErrorResponse {
+    ErrorResponse {
+        status_code: http_code,
+        code: code.to_string(),
+        message: message.unwrap_or("Izipay rejected the request").to_string(),
+        reason: message.map(str::to_string),
+        attempt_status,
+        connector_transaction_id: None,
+        network_advice_code: None,
+        network_decline_code: None,
+        network_error_message: None,
+        connector_metadata: None,
+    }
+}
+
+impl<F, T> TryFrom<ResponseRouterData<F, IzipayTokenResponse, T, AccessToken>>
+    for RouterData<F, T, AccessToken>
+{
+    type Error = error_stack::Report<errors::ConnectorError>;
+
+    fn try_from(
+        item: ResponseRouterData<F, IzipayTokenResponse, T, AccessToken>,
+    ) -> Result<Self, Self::Error> {
+        let Some(token) = item.response.session_token() else {
+            return Ok(Self {
+                response: Err(error_response_from_code(
+                    &item.response.code,
+                    item.response.message.as_deref(),
+                    item.http_code,
+                    None,
+                )),
+                ..item.data
+            });
+        };
+        let transaction_id = transaction_id_from_session_token(token.peek())
+            .ok_or(errors::ConnectorError::ResponseHandlingFailed)
+            .attach_printable("Izipay session token carries no transactionId claim")?;
+        let kind = if item.data.refund_id.is_some() {
+            IzipayTokenKind::Refund
+        } else {
+            IzipayTokenKind::Ecommerce
+        };
+        let packed = IzipayPackedToken {
+            kind,
+            transaction_id,
+            token,
+        };
+        let packed_json = serde_json::to_string(&packed)
+            .change_context(errors::ConnectorError::ResponseHandlingFailed)?;
+        Ok(Self {
+            response: Ok(AccessToken {
+                token: Secret::new(packed_json),
+                expires: ACCESS_TOKEN_EXPIRES_SECONDS,
+            }),
+            ..item.data
+        })
+    }
+}
+
+/// Unpacks the access token fetched by the router and checks it was generated for the kind of
+/// operation about to run. Izipay tokens are per operation, so a mismatch means another
+/// operation of the same account refreshed the shared access token in between: nothing has
+/// been sent yet, retrying the operation is safe.
+pub fn unpack_access_token(
+    access_token: Option<&AccessToken>,
+    expected_kind: IzipayTokenKind,
+) -> CustomResult<IzipayPackedToken, errors::ConnectorError> {
+    let access_token = access_token.ok_or(errors::ConnectorError::MissingRequiredField {
+        field_name: "access_token",
+    })?;
+    let packed: IzipayPackedToken = serde_json::from_str(access_token.token.peek())
+        .change_context(errors::ConnectorError::FailedToObtainAuthType)
+        .attach_printable("Izipay access token is not a packed session token")?;
+    if packed.kind != expected_kind {
+        return Err(report!(errors::ConnectorError::FailedToObtainAuthType)).attach_printable(
+            format!(
+                "Izipay session token was generated for {:?} but this operation needs {:?}; \
+                 a concurrent operation of the same account replaced it, retry the request",
+                packed.kind, expected_kind
+            ),
+        );
+    }
+    Ok(packed)
+}
+
+// ============================================================================
+// Authorize: validated billing, Token/Generate request and the SDK redirect page
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IzipayBilling {
+    pub first_name: String,
+    pub last_name: String,
+    pub email: String,
+    pub phone_number: String,
+    pub street: String,
+    pub city: String,
+    pub state: String,
+    pub country: String,
+    pub postal_code: String,
+    pub document_type: String,
+    pub document: String,
+}
+
+/// Everything of an Authorize request that has to be checked before anything is sent.
+#[derive(Debug, Clone)]
+pub struct IzipayCheckoutData {
+    pub billing: IzipayBilling,
+    pub merchant_buyer_id: String,
+    pub return_url: String,
+}
+
+fn char_len(value: &str) -> usize {
+    value.chars().count()
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn required_text(
+    value: Option<&Secret<String>>,
+    field_name: &'static str,
+) -> CustomResult<String, errors::ConnectorError> {
+    value
+        .map(|value| value.peek().trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| report!(errors::ConnectorError::MissingRequiredField { field_name }))
+}
+
+fn name_within_range(
+    value: String,
+    field_name: &'static str,
+) -> CustomResult<String, errors::ConnectorError> {
+    if (2..=50).contains(&char_len(&value)) {
+        Ok(value)
+    } else {
+        Err(report!(errors::ConnectorError::InvalidDataFormat {
+            field_name
+        }))
+    }
+}
+
+/// Free text that Izipay limits to `min..=max` characters: longer values are cut (a street or a
+/// city never has to be rejected for being too long), shorter ones cannot be repaired.
+fn truncated_text(
+    value: String,
+    min_chars: usize,
+    max_chars: usize,
+    field_name: &'static str,
+) -> CustomResult<String, errors::ConnectorError> {
+    let value = if char_len(&value) > max_chars {
+        truncate_chars(&value, max_chars).trim_end().to_string()
+    } else {
+        value
+    };
+    if char_len(&value) < min_chars {
+        return Err(report!(errors::ConnectorError::InvalidDataFormat {
+            field_name
+        }));
+    }
+    Ok(value)
+}
+
+/// Validates the billing data the Izipay SDK needs. Izipay's hosted page rejects a missing
+/// field only after the buyer was redirected, and the SDK throws client-side on a length out of
+/// range, so every rule is checked here, before the buyer is sent anywhere.
+pub fn build_billing(
+    router_data: &PaymentsAuthorizeRouterData,
+) -> CustomResult<IzipayBilling, errors::ConnectorError> {
+    let billing = router_data.get_optional_billing();
+    let address = billing.and_then(|billing| billing.address.as_ref());
+
+    let first_name = name_within_range(
+        required_text(
+            address.and_then(|address| address.first_name.as_ref()),
+            "billing.address.first_name",
+        )?,
+        "billing.address.first_name",
+    )?;
+    let last_name = name_within_range(
+        required_text(
+            address.and_then(|address| address.last_name.as_ref()),
+            "billing.address.last_name",
+        )?,
+        "billing.address.last_name",
+    )?;
+
+    let email = billing
+        .and_then(|billing| billing.email.as_ref())
+        .or(router_data.request.email.as_ref())
+        .map(|email| email.peek().trim().to_string())
+        .filter(|email| !email.is_empty())
+        .ok_or(errors::ConnectorError::MissingRequiredField {
+            field_name: "billing.email",
+        })?;
+
+    let phone_number: String = billing
+        .and_then(|billing| billing.phone.as_ref())
+        .and_then(|phone| phone.number.as_ref())
+        .map(|number| {
+            number
+                .peek()
+                .chars()
+                .filter(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .filter(|number| !number.is_empty())
+        .ok_or(errors::ConnectorError::MissingRequiredField {
+            field_name: "billing.phone.number",
+        })?;
+    if !(7..=15).contains(&phone_number.len()) {
+        return Err(report!(errors::ConnectorError::InvalidDataFormat {
+            field_name: "billing.phone.number"
+        }));
+    }
+
+    let line1 = required_text(
+        address.and_then(|address| address.line1.as_ref()),
+        "billing.address.line1",
+    )?;
+    let street = match address
+        .and_then(|address| address.line2.as_ref())
+        .map(|line2| line2.peek().trim().to_string())
+        .filter(|line2| !line2.is_empty())
+    {
+        Some(line2) => format!("{line1} {line2}"),
+        None => line1,
+    };
+    let street = truncated_text(street, 5, 40, "billing.address.line1")?;
+
+    let city = truncated_text(
+        address
+            .and_then(|address| address.city.as_ref())
+            .map(|city| city.trim().to_string())
+            .filter(|city| !city.is_empty())
+            .ok_or(errors::ConnectorError::MissingRequiredField {
+                field_name: "billing.address.city",
+            })?,
+        3,
+        25,
+        "billing.address.city",
+    )?;
+    let state = truncated_text(
+        required_text(
+            address.and_then(|address| address.state.as_ref()),
+            "billing.address.state",
+        )?,
+        3,
+        25,
+        "billing.address.state",
+    )?;
+
+    let country = address
+        .and_then(|address| address.country)
+        .ok_or(errors::ConnectorError::MissingRequiredField {
+            field_name: "billing.address.country",
+        })?
+        .to_string();
+
+    let postal_code = required_text(
+        address.and_then(|address| address.zip.as_ref()),
+        "billing.address.zip",
+    )?;
+    if !(5..=10).contains(&char_len(&postal_code)) {
+        return Err(report!(errors::ConnectorError::InvalidDataFormat {
+            field_name: "billing.address.zip"
+        }));
+    }
+
+    let (document_type, document) = build_document(router_data.request.metadata.as_ref())?;
+
+    Ok(IzipayBilling {
+        first_name,
+        last_name,
+        email,
+        phone_number,
+        street,
+        city,
+        state,
+        country,
+        postal_code,
+        document_type,
+        document,
+    })
+}
+
+const DOCUMENT_TYPE_METADATA_KEY: &str = "buyer_document_type";
+const DOCUMENT_NUMBER_METADATA_KEY: &str = "buyer_document_number";
+
+/// Identity document of the buyer: Izipay's hosted page silently refuses to submit a payment
+/// without one (verified in the sandbox), and the Hyperswitch billing address has no document
+/// field, so it comes from the payment metadata: `buyer_document_type` (DNI, CE, PASAPORTE,
+/// RUC or OTROS) and `buyer_document_number`, with the lengths Izipay documents per type.
+fn build_document(
+    metadata: Option<&serde_json::Value>,
+) -> CustomResult<(String, String), errors::ConnectorError> {
+    let metadata_text = |key: &str| {
+        metadata
+            .and_then(|metadata| metadata.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(|value| value.trim().to_ascii_uppercase())
+            .filter(|value| !value.is_empty())
+    };
+
+    let document_type = metadata_text(DOCUMENT_TYPE_METADATA_KEY).ok_or(
+        errors::ConnectorError::MissingRequiredField {
+            field_name: "metadata.buyer_document_type",
+        },
+    )?;
+    let document = metadata_text(DOCUMENT_NUMBER_METADATA_KEY).ok_or(
+        errors::ConnectorError::MissingRequiredField {
+            field_name: "metadata.buyer_document_number",
+        },
+    )?;
+
+    let (allowed_lengths, digits_only) = match document_type.as_str() {
+        "DNI" => (8..=8, true),
+        "RUC" => (11..=11, true),
+        "CE" => (9..=12, false),
+        "PASAPORTE" | "OTROS" => (8..=12, false),
+        _ => {
+            return Err(report!(errors::ConnectorError::InvalidDataFormat {
+                field_name: "metadata.buyer_document_type"
+            }))
+        }
+    };
+    let valid_characters = if digits_only {
+        document.chars().all(|character| character.is_ascii_digit())
+    } else {
+        document
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+    };
+    if !valid_characters || !allowed_lengths.contains(&document.len()) {
+        return Err(report!(errors::ConnectorError::InvalidDataFormat {
+            field_name: "metadata.buyer_document_number"
+        }));
+    }
+
+    Ok((document_type, document))
+}
+
+/// Checks shared by both modes: PEN or USD and automatic capture (Izipay has no authorize-only
+/// flow in this connector).
+fn validate_currency_and_capture_method(
+    router_data: &PaymentsAuthorizeRouterData,
+) -> CustomResult<(), errors::ConnectorError> {
+    if !matches!(
+        router_data.request.currency,
+        enums::Currency::PEN | enums::Currency::USD
+    ) {
+        return Err(errors::ConnectorError::CurrencyNotSupported {
+            message: router_data.request.currency.to_string(),
+            connector: IZIPAY_CONNECTOR_NAME,
+        }
+        .into());
+    }
+
+    if !matches!(
+        router_data.request.capture_method,
+        None | Some(enums::CaptureMethod::Automatic | enums::CaptureMethod::SequentialAutomatic)
+    ) {
+        return Err(errors::ConnectorError::NotSupported {
+            message: "manual capture".to_string(),
+            connector: IZIPAY_CONNECTOR_NAME,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_authorize_request(
+    router_data: &PaymentsAuthorizeRouterData,
+) -> CustomResult<IzipayCheckoutData, errors::ConnectorError> {
+    match &router_data.request.payment_method_data {
+        PaymentMethodData::Wallet(WalletData::IzipayCheckout {}) => {}
+        _ => {
+            return Err(errors::ConnectorError::NotImplemented(
+                get_unimplemented_payment_method_error_message("izipay"),
+            )
+            .into())
+        }
+    }
+
+    validate_currency_and_capture_method(router_data)?;
+
+    let return_url = router_data.request.router_return_url.clone().ok_or(
+        errors::ConnectorError::MissingRequiredField {
+            field_name: "router_return_url",
+        },
+    )?;
+    // Fails early when the return url cannot carry the result marker.
+    result_url(&return_url, "success")?;
+
+    let billing = build_billing(router_data)?;
+
+    let customer_id = router_data
+        .request
+        .customer_id
+        .as_ref()
+        .map(|customer_id| customer_id.get_string_repr().to_string())
+        .filter(|customer_id| (6..=100).contains(&char_len(customer_id)));
+    let merchant_buyer_id = customer_id.unwrap_or_else(|| router_data.payment_id.clone());
+
+    Ok(IzipayCheckoutData {
+        billing,
+        merchant_buyer_id,
+        return_url,
+    })
+}
+
+impl TryFrom<&IzipayRouterData<&PaymentsAuthorizeRouterData>> for IzipayTokenRequest {
+    type Error = error_stack::Report<errors::ConnectorError>;
+
+    fn try_from(
+        item: &IzipayRouterData<&PaymentsAuthorizeRouterData>,
+    ) -> Result<Self, Self::Error> {
+        // Everything the redirect page needs is checked now, so that a bad request fails here
+        // and not in the buyer's browser.
+        validate_authorize_request(item.router_data)?;
+        let auth = IzipayAuthType::try_from(&item.router_data.connector_auth_type)?;
+        Ok(Self::for_order(
+            &auth,
+            item.router_data.connector_request_reference_id.clone(),
+            &item.amount,
+        ))
+    }
+}
+
+/// Appends the `izipay_result` marker to the merchant return url (`?` or `&` as needed).
+fn result_url(return_url: &str, result: &str) -> CustomResult<String, errors::ConnectorError> {
+    let mut url =
+        url::Url::parse(return_url).change_context(errors::ConnectorError::InvalidDataFormat {
+            field_name: "router_return_url",
+        })?;
+    url.query_pairs_mut().append_pair("izipay_result", result);
+    Ok(url.to_string())
+}
+
+/// Serializes a value for embedding inside a `<script>` element: the characters that could
+/// close the element, open a comment or end a JavaScript line are written as `\uXXXX`
+/// escapes (valid both in JSON and in JavaScript string literals).
+fn json_for_script(value: &serde_json::Value) -> CustomResult<String, errors::ConnectorError> {
+    let json = serde_json::to_string(value)
+        .change_context(errors::ConnectorError::RequestEncodingFailed)?;
+    Ok(json
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029"))
+}
+
+const CHECKOUT_PAGE_TEMPLATE: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Izipay</title>
+<style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;color:#333}</style>
+</head>
+<body>
+<p id="izipay-status">Redirecting to Izipay&hellip;</p>
+<script src="__SDK_URL__"></script>
+<script>
+var izipayData = __PAGE_DATA__;
+window.addEventListener('load', function () {
+  try {
+    var checkout = new Izipay({ config: izipayData.config });
+    checkout.LoadForm({ authorization: izipayData.authorization, keyRSA: izipayData.keyRSA });
+  } catch (error) {
+    document.getElementById('izipay-status').textContent = 'The Izipay payment page could not be opened. Returning to the merchant…';
+    setTimeout(function () { window.location.replace(izipayData.sdkErrorUrl); }, 3000);
+  }
+});
+</script>
+</body>
+</html>
+"#;
+
+pub struct CheckoutPageParams<'a> {
+    pub environment: IzipayEnvironment,
+    pub transaction_id: &'a str,
+    pub merchant_code: &'a str,
+    pub order_number: &'a str,
+    pub currency: &'a str,
+    pub amount: &'a str,
+    pub checkout: &'a IzipayCheckoutData,
+    pub webhook_url: Option<&'a str>,
+    pub session_token: &'a str,
+    pub key_rsa: &'a str,
+    pub date_time_transaction: &'a str,
+}
+
+/// The page that loads the Izipay Web SDK and opens the hosted checkout in redirect mode.
+/// Every dynamic value (including buyer data) goes through JSON serialization and the script
+/// escaping above; nothing is concatenated into the markup.
+pub fn build_checkout_page(
+    params: &CheckoutPageParams<'_>,
+) -> CustomResult<String, errors::ConnectorError> {
+    let billing = &params.checkout.billing;
+    let return_url = &params.checkout.return_url;
+    let mut config = serde_json::json!({
+        "transactionId": params.transaction_id,
+        "action": "pay",
+        "merchantCode": params.merchant_code,
+        "order": {
+            "orderNumber": params.order_number,
+            "currency": params.currency,
+            "amount": params.amount,
+            "processType": "AT",
+            "merchantBuyerId": params.checkout.merchant_buyer_id,
+            "dateTimeTransaction": params.date_time_transaction,
+            "payMethod": "all",
+        },
+        "billing": {
+            "firstName": billing.first_name,
+            "lastName": billing.last_name,
+            "email": billing.email,
+            "phoneNumber": billing.phone_number,
+            "street": billing.street,
+            "city": billing.city,
+            "state": billing.state,
+            "country": billing.country,
+            "postalCode": billing.postal_code,
+            "documentType": billing.document_type,
+            "document": billing.document,
+        },
+        "render": {
+            "typeForm": "redirect",
+            "redirectUrls": {
+                "onSuccess": result_url(return_url, "success")?,
+                "onError": result_url(return_url, "error")?,
+                "onCancel": result_url(return_url, "cancel")?,
+            },
+        },
+    });
+    if let (Some(webhook_url), Some(config)) = (params.webhook_url, config.as_object_mut()) {
+        config.insert("urlIPN".to_string(), serde_json::json!(webhook_url));
+    }
+    let page_data = serde_json::json!({
+        "config": config,
+        "authorization": params.session_token,
+        "keyRSA": params.key_rsa,
+        "sdkErrorUrl": result_url(return_url, "sdk_error")?,
+    });
+
+    Ok(CHECKOUT_PAGE_TEMPLATE
+        .replace("__SDK_URL__", params.environment.sdk_url())
+        .replace("__PAGE_DATA__", &json_for_script(&page_data)?))
+}
+
+/// Token/Generate answered: builds the redirect to the hosted checkout. `amount` is the same
+/// major-unit string the session token was bound to.
+pub fn authorize_response(
+    response: IzipayTokenResponse,
+    data: PaymentsAuthorizeRouterData,
+    http_code: u16,
+    amount: &StringMajorUnit,
+) -> CustomResult<PaymentsAuthorizeRouterData, errors::ConnectorError> {
+    let Some(session_token) = response.session_token() else {
+        return Ok(RouterData {
+            status: enums::AttemptStatus::Failure,
+            response: Err(error_response_from_code(
+                &response.code,
+                response.message.as_deref(),
+                http_code,
+                Some(enums::AttemptStatus::Failure),
+            )),
+            ..data
+        });
+    };
+    let transaction_id = transaction_id_from_session_token(session_token.peek())
+        .ok_or(errors::ConnectorError::ResponseHandlingFailed)
+        .attach_printable("Izipay session token carries no transactionId claim")?;
+
+    let auth = IzipayAuthType::try_from(&data.connector_auth_type)?;
+    let checkout = validate_authorize_request(&data)?;
+    let order_number = data.connector_request_reference_id.clone();
+    let currency = data.request.currency.to_string();
+    let amount = amount.get_amount_as_string();
+
+    let page = build_checkout_page(&CheckoutPageParams {
+        environment: IzipayEnvironment::from_test_mode(data.test_mode),
+        transaction_id: &transaction_id,
+        merchant_code: &auth.merchant_code,
+        order_number: &order_number,
+        currency: &currency,
+        amount: &amount,
+        checkout: &checkout,
+        webhook_url: data.request.webhook_url.as_deref(),
+        session_token: session_token.peek(),
+        key_rsa: auth.rsa_key.peek(),
+        date_time_transaction: &current_date_time_transaction(),
+    })?;
+
+    Ok(RouterData {
+        status: enums::AttemptStatus::AuthenticationPending,
+        response: Ok(PaymentsResponseData::TransactionResponse {
+            resource_id: ResponseId::ConnectorTransactionId(order_number.clone()),
+            redirection_data: Box::new(Some(RedirectForm::Html { html_data: page })),
+            mandate_reference: Box::new(None),
+            connector_metadata: Some(serde_json::json!({
+                "mode": MODE_CHECKOUT,
+                "transaction_id": transaction_id,
+                "order_number": order_number,
+            })),
+            network_txn_id: None,
+            connector_response_reference_id: Some(order_number),
+            incremental_authorization_allowed: None,
+            charges: None,
+        }),
+        ..data
+    })
+}
+
+// ============================================================================
+// PSync: Transaction/Search (also the shape of the notification payload)
+// ============================================================================
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipaySearchRequest {
+    merchant_code: String,
+    number_orden: String,
+    language: &'static str,
+}
+
+impl TryFrom<&PaymentsSyncRouterData> for IzipaySearchRequest {
+    type Error = error_stack::Report<errors::ConnectorError>;
+
+    fn try_from(req: &PaymentsSyncRouterData) -> Result<Self, Self::Error> {
+        let auth = IzipayAuthType::try_from(&req.connector_auth_type)?;
+        Ok(Self {
+            merchant_code: auth.merchant_code,
+            number_orden: req.connector_request_reference_id.clone(),
+            language: "ESP",
+        })
+    }
+}
+
+/// Tolerant on purpose: Izipay sends `null` for many fields and the notification payload is a
+/// superset of the Search response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipaySearchResponse {
+    pub code: String,
+    pub message: Option<String>,
+    pub message_user: Option<String>,
+    pub response: Option<IzipaySearchBody>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipaySearchBody {
+    pub order: Option<Vec<IzipayOrder>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayOrder {
+    pub pay_method_authorization: Option<String>,
+    pub code_auth: Option<String>,
+    pub currency: Option<String>,
+    pub amount: Option<String>,
+    pub order_number: Option<String>,
+    pub payment_link_id: Option<String>,
+    pub state_message: Option<String>,
+    pub date_transaction: Option<String>,
+    pub time_transaction: Option<String>,
+    pub unique_id: Option<String>,
+    pub reference_number: Option<String>,
+}
+
+impl IzipaySearchResponse {
+    /// The order the outcome is read from: the authorized entry when there is one (a voided
+    /// order is listed with a different entry), otherwise the first one.
+    fn selected_order(&self) -> Option<&IzipayOrder> {
+        let orders = self.response.as_ref()?.order.as_ref()?;
+        orders
+            .iter()
+            .find(|order| state_is(order.state_message.as_deref(), ORDER_AUTHORIZED))
+            .or_else(|| orders.first())
+    }
+
+    fn user_message(&self) -> Option<&str> {
+        self.message_user
+            .as_deref()
+            .or(self.message.as_deref())
+            .filter(|message| !message.is_empty())
+    }
+}
+
+fn state_is(state_message: Option<&str>, expected: &str) -> bool {
+    state_message.is_some_and(|state| state.trim().eq_ignore_ascii_case(expected))
+}
+
+/// Outcome of a Search (or notification payload):
+/// - `00` and `Autorizado`: charged
+/// - `00` and `Anulado`: voided
+/// - `Denegado` or any code other than `00`: failed
+/// - anything else: still pending
+pub fn map_search_status(code: &str, order: Option<&IzipayOrder>) -> enums::AttemptStatus {
+    let state_message = order.and_then(|order| order.state_message.as_deref());
+    if code == SUCCESS_CODE && state_is(state_message, ORDER_AUTHORIZED) {
+        enums::AttemptStatus::Charged
+    } else if code == SUCCESS_CODE && state_is(state_message, ORDER_VOIDED) {
+        enums::AttemptStatus::Voided
+    } else if code != SUCCESS_CODE || state_is(state_message, ORDER_DENIED) {
+        enums::AttemptStatus::Failure
+    } else {
+        enums::AttemptStatus::Pending
+    }
+}
+
+/// `connector_metadata` of a charged payment: what Authorize stored plus the data a refund needs.
+fn charged_connector_metadata(
+    previous: Option<&serde_json::Value>,
+    order: &IzipayOrder,
+) -> serde_json::Value {
+    let mut metadata = match previous {
+        Some(serde_json::Value::Object(previous)) => previous.clone(),
+        _ => serde_json::Map::new(),
+    };
+    let fields = [
+        ("unique_id", &order.unique_id),
+        ("authorization_code", &order.code_auth),
+        ("reference_number", &order.reference_number),
+        ("transaction_date", &order.date_transaction),
+        ("transaction_time", &order.time_transaction),
+        ("pay_method", &order.pay_method_authorization),
+        ("currency", &order.currency),
+        ("amount", &order.amount),
+    ];
+    for (key, value) in fields {
+        if let Some(value) = value.as_ref().filter(|value| !value.is_empty()) {
+            metadata.insert(key.to_string(), serde_json::json!(value));
+        }
+    }
+    serde_json::Value::Object(metadata)
+}
+
+impl TryFrom<PaymentsSyncResponseRouterData<IzipaySearchResponse>> for PaymentsSyncRouterData {
+    type Error = error_stack::Report<errors::ConnectorError>;
+
+    fn try_from(
+        item: PaymentsSyncResponseRouterData<IzipaySearchResponse>,
+    ) -> Result<Self, Self::Error> {
+        let response = item.response;
+        let order = response.selected_order();
+        let order_number = order
+            .and_then(|order| order.order_number.clone())
+            .filter(|order_number| !order_number.is_empty())
+            .unwrap_or_else(|| item.data.connector_request_reference_id.clone());
+        // A payment link payment is identified by its link id: Izipay generates the order
+        // number of what the buyer pays (`LP...`), which is only metadata.
+        let payment_link_id = if is_payment_link_meta(item.data.request.connector_meta.as_ref()) {
+            Some(link_payment_id(&item.data)?)
+        } else {
+            None
+        };
+        let resource_id = payment_link_id
+            .clone()
+            .unwrap_or_else(|| order_number.clone());
+
+        // "Transaction does not exist": the buyer has not paid (yet), so the attempt keeps the
+        // status it has. Izipay answers it with HTTP 403, which is handled as an error (see
+        // `get_error_response`); this covers a 2xx carrying the same code.
+        let status = match map_search_status(&response.code, order) {
+            _ if response.code == "MC" => item.data.status,
+            // A declined attempt does not close a payment link: the buyer can retry on it, so
+            // the payment stays pending (same rule as the link transactions search).
+            enums::AttemptStatus::Failure if payment_link_id.is_some() => {
+                enums::AttemptStatus::AuthenticationPending
+            }
+            status => status,
+        };
+
+        let payment_response = if status == enums::AttemptStatus::Failure {
+            Err(ErrorResponse {
+                status_code: item.http_code,
+                code: response.code.clone(),
+                message: response
+                    .user_message()
+                    .unwrap_or("Transaction declined")
+                    .to_string(),
+                reason: response.message.clone(),
+                attempt_status: Some(status),
+                connector_transaction_id: Some(resource_id),
+                network_advice_code: None,
+                network_decline_code: None,
+                network_error_message: None,
+                connector_metadata: None,
+            })
+        } else {
+            // A voided order is listed with a new unique id and authorization code: they must
+            // never replace the ones a refund needs, so only a charged order refreshes them.
+            let connector_metadata = match (status, order) {
+                (enums::AttemptStatus::Charged, Some(order)) => {
+                    let mut metadata = charged_connector_metadata(
+                        item.data.request.connector_meta.as_ref(),
+                        order,
+                    );
+                    if let (Some(_), serde_json::Value::Object(map)) =
+                        (&payment_link_id, &mut metadata)
+                    {
+                        map.insert(
+                            "izipay_order_number".to_string(),
+                            order_number.clone().into(),
+                        );
+                    }
+                    Some(metadata)
+                }
+                _ => None,
+            };
+            Ok(PaymentsResponseData::TransactionResponse {
+                resource_id: ResponseId::ConnectorTransactionId(resource_id),
+                redirection_data: Box::new(None),
+                mandate_reference: Box::new(None),
+                connector_metadata,
+                network_txn_id: None,
+                connector_response_reference_id: Some(order_number),
+                incremental_authorization_allowed: None,
+                charges: None,
+            })
+        };
+
+        Ok(Self {
+            status,
+            response: payment_response,
+            ..item.data
+        })
+    }
+}
+
+// ============================================================================
+// Payment link mode: POST /paymentlink/api/v1/process/generate, then PSync through the
+// transactions of the link. Hyperswitch has no connector-side payment link flow, so the link is
+// modeled as a hosted redirect: the connector transaction id is the Izipay `paymentLinkId`.
+// ============================================================================
+
+const MODE_CHECKOUT: &str = "checkout";
+const MODE_PAYMENT_LINK: &str = "payment_link";
+const LINK_DEFAULT_PAY_METHOD: &str = "CARD";
+const LINK_ALLOWED_PAY_METHODS: [&str; 4] = ["CARD", "QR", "YAPE_CODE", "PAGO_PUSH"];
+const LINK_PRODUCT_DESCRIPTION_MAX_CHARS: usize = 100;
+const LINK_URL_MIN_CHARS: usize = 8;
+const LINK_URL_MAX_CHARS: usize = 255;
+/// Lima has no daylight saving time: it is always UTC-5.
+const LIMA_UTC_OFFSET_HOURS: i64 = 5;
+const LINK_DEFAULT_VALIDITY_HOURS: i64 = 24;
+const LINK_MIN_VALIDITY_MINUTES: i64 = 15;
+const LINK_SEARCH_PAGE_SIZE: &str = "100";
+const LINK_SEARCH_FALLBACK_DAYS: i64 = 30;
+const LINK_EXPIRED_CODE: &str = "LINK_EXPIRED";
+const LINK_EXPIRED_MESSAGE: &str = "The Izipay payment link expired without a payment";
+const PAYMENT_LINK_EXPIRES_AT_KEY: &str = "payment_link_expires_at";
+const LINK_STATUS_PAID: [&str; 4] = [
+    "AUTORIZADA",
+    "DEPOSITADA",
+    "ABONADA",
+    "PENDIENTE_DE_DEPOSITO",
+];
+const LINK_STATUS_VOIDED: &str = "ANULADA";
+
+fn metadata_str<'a>(metadata: Option<&'a serde_json::Value>, key: &str) -> Option<&'a str> {
+    metadata?
+        .get(key)?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// Whether the `connector_metadata` stored by Authorize says the payment is a payment link.
+pub fn is_payment_link_meta(connector_meta: Option<&serde_json::Value>) -> bool {
+    metadata_str(connector_meta, "mode") == Some(MODE_PAYMENT_LINK)
+}
+
+/// Whether the authorize request asks for an Izipay payment link.
+pub fn is_payment_link_request(router_data: &PaymentsAuthorizeRouterData) -> bool {
+    matches!(
+        router_data.request.payment_method_data,
+        PaymentMethodData::Wallet(WalletData::IzipayPaymentLink {})
+    )
+}
+
+/// The Izipay payment link id of a link payment: stored by Authorize, otherwise the connector
+/// transaction id (which is the same value).
+pub fn link_payment_id(
+    data: &PaymentsSyncRouterData,
+) -> CustomResult<String, errors::ConnectorError> {
+    match metadata_str(data.request.connector_meta.as_ref(), "payment_link_id") {
+        Some(link_id) => Ok(link_id.to_string()),
+        None => data
+            .request
+            .connector_transaction_id
+            .get_connector_transaction_id()
+            .change_context(errors::ConnectorError::MissingConnectorTransactionID),
+    }
+}
+
+// ---- Time helpers (Lima time = UTC-5, no external dependency) ----
+
+/// A UTC instant shifted to the Lima wall clock. The result is labelled UTC on purpose: only its
+/// calendar and clock fields are meaningful.
+fn lima_clock(utc: OffsetDateTime) -> OffsetDateTime {
+    utc.to_offset(UtcOffset::UTC) - Duration::hours(LIMA_UTC_OFFSET_HOURS)
+}
+
+fn format_date(date: Date) -> String {
+    format!(
+        "{:04}-{:02}-{:02}",
+        date.year(),
+        u8::from(date.month()),
+        date.day()
+    )
+}
+
+fn parse_date(value: &str) -> Option<Date> {
+    let mut parts = value.trim().split('-');
+    let year = parts.next()?.parse::<i32>().ok()?;
+    let month = Month::try_from(parts.next()?.parse::<u8>().ok()?).ok()?;
+    let day = parts.next()?.parse::<u8>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Date::from_calendar_date(year, month, day).ok()
+}
+
+/// `yyyy-MM-dd HH:mm:ss.fff` in Lima time, the format of `expirationDate`.
+fn format_lima_datetime(utc: OffsetDateTime) -> String {
+    let lima = lima_clock(utc);
+    format!(
+        "{} {:02}:{:02}:{:02}.{:03}",
+        format_date(lima.date()),
+        lima.hour(),
+        lima.minute(),
+        lima.second(),
+        lima.nanosecond() / 1_000_000
+    )
+}
+
+/// Parses `yyyy-MM-dd HH:mm:ss[.fff]` (Lima time) into the UTC instant.
+fn parse_lima_datetime(value: &str) -> Option<OffsetDateTime> {
+    let (date_part, time_part) = value.trim().split_once(' ')?;
+    let date = parse_date(date_part)?;
+    let mut clock = time_part.split('.').next()?.split(':');
+    let time = Time::from_hms(
+        clock.next()?.parse::<u8>().ok()?,
+        clock.next()?.parse::<u8>().ok()?,
+        clock.next()?.parse::<u8>().ok()?,
+    )
+    .ok()?;
+    Some(PrimitiveDateTime::new(date, time).assume_utc() + Duration::hours(LIMA_UTC_OFFSET_HOURS))
+}
+
+fn format_rfc3339_utc(instant: OffsetDateTime) -> String {
+    let utc = instant.to_offset(UtcOffset::UTC);
+    format!(
+        "{}T{:02}:{:02}:{:02}Z",
+        format_date(utc.date()),
+        utc.hour(),
+        utc.minute(),
+        utc.second()
+    )
+}
+
+fn parse_rfc3339(value: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(value.trim(), &time::format_description::well_known::Rfc3339).ok()
+}
+
+/// Rounds up to the next `:00` or `:30` (seconds and sub-seconds are zeroed). Whole hours
+/// offsets (Lima is UTC-5) do not change the minutes, so this is valid in UTC.
+fn round_up_to_half_hour(value: OffsetDateTime) -> OffsetDateTime {
+    let value = value.to_offset(UtcOffset::UTC);
+    if value.second() == 0 && value.nanosecond() == 0 && value.minute() % 30 == 0 {
+        return value;
+    }
+    let truncated = value
+        - Duration::seconds(i64::from(value.second()))
+        - Duration::nanoseconds(i64::from(value.nanosecond()));
+    truncated + Duration::minutes(i64::from(30 - truncated.minute() % 30))
+}
+
+/// Expiration of the link: the requested instant (default now + 24 h) rounded up to the next
+/// `:00`/`:30`, which is all Izipay accepts, and at least 15 minutes ahead.
+pub fn link_expiration(
+    requested: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+) -> CustomResult<OffsetDateTime, errors::ConnectorError> {
+    let wanted = requested.unwrap_or(now + Duration::hours(LINK_DEFAULT_VALIDITY_HOURS));
+    let rounded = round_up_to_half_hour(wanted);
+    if rounded < now + Duration::minutes(LINK_MIN_VALIDITY_MINUTES) {
+        return Err(report!(errors::ConnectorError::InvalidDataFormat {
+            field_name: "metadata.payment_link_expires_at"
+        }));
+    }
+    Ok(rounded)
+}
+
+/// `payment_link_expires_at` of the payment metadata (RFC 3339), when present.
+fn requested_expiration(
+    metadata: Option<&serde_json::Value>,
+) -> CustomResult<Option<OffsetDateTime>, errors::ConnectorError> {
+    match metadata.and_then(|metadata| metadata.get(PAYMENT_LINK_EXPIRES_AT_KEY)) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value
+            .as_str()
+            .and_then(parse_rfc3339)
+            .map(Some)
+            .ok_or_else(|| {
+                report!(errors::ConnectorError::InvalidDataFormat {
+                    field_name: "metadata.payment_link_expires_at"
+                })
+            }),
+    }
+}
+
+// ---- MCA metadata ----
+
+fn mca_metadata_text<'a>(
+    connector_meta_data: Option<&'a Secret<serde_json::Value>>,
+    key: &str,
+) -> Option<&'a str> {
+    metadata_str(connector_meta_data.map(PeekInterface::peek), key)
+}
+
+/// `terms_and_conditions_url` of the MCA metadata: Izipay requires it for every link.
+fn terms_and_conditions_url(
+    connector_meta_data: Option<&Secret<serde_json::Value>>,
+) -> CustomResult<String, errors::ConnectorError> {
+    let url = mca_metadata_text(connector_meta_data, "terms_and_conditions_url").ok_or(
+        errors::ConnectorError::MissingRequiredField {
+            field_name: "connector_metadata.terms_and_conditions_url",
+        },
+    )?;
+    let valid = (LINK_URL_MIN_CHARS..=LINK_URL_MAX_CHARS).contains(&char_len(url))
+        && url::Url::parse(url)
+            .map(|parsed| matches!(parsed.scheme(), "http" | "https") && parsed.host().is_some())
+            .unwrap_or(false);
+    if valid {
+        Ok(url.to_string())
+    } else {
+        Err(report!(errors::ConnectorError::InvalidDataFormat {
+            field_name: "connector_metadata.terms_and_conditions_url"
+        }))
+    }
+}
+
+/// `payment_link_pay_methods` of the MCA metadata: a comma list of the methods the link page
+/// offers. Izipay rejects `all`, so the list is explicit (default `CARD`).
+fn link_pay_methods(
+    connector_meta_data: Option<&Secret<serde_json::Value>>,
+) -> CustomResult<String, errors::ConnectorError> {
+    let mut methods: Vec<String> = Vec::new();
+    for item in mca_metadata_text(connector_meta_data, "payment_link_pay_methods")
+        .unwrap_or_default()
+        .split(',')
+        .map(|item| item.trim().to_ascii_uppercase())
+        .filter(|item| !item.is_empty())
+    {
+        if !LINK_ALLOWED_PAY_METHODS.contains(&item.as_str()) {
+            return Err(report!(errors::ConnectorError::InvalidDataFormat {
+                field_name: "connector_metadata.payment_link_pay_methods"
+            }));
+        }
+        if !methods.contains(&item) {
+            methods.push(item);
+        }
+    }
+    if methods.is_empty() {
+        Ok(LINK_DEFAULT_PAY_METHOD.to_string())
+    } else {
+        Ok(methods.join(","))
+    }
+}
+
+// ---- Generate request ----
+
+/// Billing/shipping object of the link. Izipay requires it, and requires it complete or
+/// entirely empty: the buyer types the data on the link page.
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayLinkContact {
+    first_name: String,
+    last_name: String,
+    email: String,
+    phone_number: String,
+    street: String,
+    postal_code: String,
+    city: String,
+    state: String,
+    country: String,
+    document_type: String,
+    document: String,
+}
+
+impl From<IzipayBilling> for IzipayLinkContact {
+    fn from(billing: IzipayBilling) -> Self {
+        Self {
+            first_name: billing.first_name,
+            last_name: billing.last_name,
+            email: billing.email,
+            phone_number: billing.phone_number,
+            street: billing.street,
+            postal_code: billing.postal_code,
+            city: billing.city,
+            state: billing.state,
+            country: billing.country,
+            document_type: billing.document_type,
+            document: billing.document,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayLinkRequest {
+    merchant_code: String,
+    product_description: String,
+    amount: StringMajorUnit,
+    currency: String,
+    expiration_date: String,
+    way_of_use: &'static str,
+    #[serde(rename = "email_Notification")]
+    email_notification: Option<String>,
+    pay_method: String,
+    reference_code: String,
+    language_used: &'static str,
+    #[serde(rename = "urL_Terms_and_Conditions")]
+    terms_and_conditions_url: String,
+    #[serde(rename = "urlIpn", skip_serializing_if = "Option::is_none")]
+    url_ipn: Option<String>,
+    billing: IzipayLinkContact,
+    shipping: IzipayLinkContact,
+    custom_fields: Vec<serde_json::Value>,
+}
+
+fn link_product_description(router_data: &PaymentsAuthorizeRouterData) -> String {
+    let request = &router_data.request;
+    let from_descriptor = request
+        .statement_descriptor
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let from_order_details = || {
+        let names = request
+            .order_details
+            .as_ref()?
+            .iter()
+            .map(|detail| detail.product_name.trim())
+            .filter(|name| !name.is_empty())
+            .collect::<Vec<_>>();
+        (!names.is_empty()).then(|| names.join(", "))
+    };
+    let description = from_descriptor
+        .or_else(from_order_details)
+        .unwrap_or_else(|| format!("Order {}", router_data.connector_request_reference_id));
+    truncate_chars(description.trim(), LINK_PRODUCT_DESCRIPTION_MAX_CHARS)
+        .trim_end()
+        .to_string()
+}
+
+fn validate_link_request(
+    router_data: &PaymentsAuthorizeRouterData,
+) -> CustomResult<(), errors::ConnectorError> {
+    match &router_data.request.payment_method_data {
+        PaymentMethodData::Wallet(WalletData::IzipayPaymentLink {}) => {}
+        _ => {
+            return Err(errors::ConnectorError::NotImplemented(
+                get_unimplemented_payment_method_error_message("izipay"),
+            )
+            .into())
+        }
+    }
+    validate_currency_and_capture_method(router_data)
+}
+
+/// Builds the generate request. `now` is a parameter so that the expiration is testable.
+pub fn build_link_request(
+    item: &IzipayRouterData<&PaymentsAuthorizeRouterData>,
+    now: OffsetDateTime,
+) -> CustomResult<IzipayLinkRequest, errors::ConnectorError> {
+    let router_data = item.router_data;
+    validate_link_request(router_data)?;
+    let auth = IzipayAuthType::try_from(&router_data.connector_auth_type)?;
+    let terms_url = terms_and_conditions_url(router_data.connector_meta_data.as_ref())?;
+    let pay_method = link_pay_methods(router_data.connector_meta_data.as_ref())?;
+    let expiration = link_expiration(
+        requested_expiration(router_data.request.metadata.as_ref())?,
+        now,
+    )?;
+
+    // The complete billing data is sent when the checkout validation passes; otherwise the
+    // buyer types it on the link page (never a partially filled object, Izipay rejects it).
+    let (billing, shipping) = match build_billing(router_data) {
+        Ok(billing) => {
+            let shipping = IzipayLinkContact::from(billing.clone());
+            (IzipayLinkContact::from(billing), shipping)
+        }
+        Err(_) => (IzipayLinkContact::default(), IzipayLinkContact::default()),
+    };
+
+    Ok(IzipayLinkRequest {
+        merchant_code: auth.merchant_code,
+        product_description: link_product_description(router_data),
+        amount: item.amount.clone(),
+        currency: router_data.request.currency.to_string(),
+        expiration_date: format_lima_datetime(expiration),
+        way_of_use: "INDIVIDUAL",
+        email_notification: None,
+        pay_method,
+        reference_code: router_data.connector_request_reference_id.clone(),
+        language_used: "ESP",
+        terms_and_conditions_url: terms_url,
+        url_ipn: router_data.request.webhook_url.clone(),
+        billing,
+        shipping,
+        custom_fields: Vec::new(),
+    })
+}
+
+impl TryFrom<&IzipayRouterData<&PaymentsAuthorizeRouterData>> for IzipayLinkRequest {
+    type Error = error_stack::Report<errors::ConnectorError>;
+
+    fn try_from(
+        item: &IzipayRouterData<&PaymentsAuthorizeRouterData>,
+    ) -> Result<Self, Self::Error> {
+        build_link_request(item, OffsetDateTime::now_utc())
+    }
+}
+
+// ---- Generate response ----
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayLinkResponse {
+    pub code: String,
+    pub message: Option<String>,
+    pub message_friendly: Option<String>,
+    pub response: Option<IzipayLinkBody>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayLinkBody {
+    pub payment_link_id: Option<String>,
+    #[serde(rename = "urL_PaymentLink")]
+    pub payment_link_url: Option<String>,
+    pub expiration_date: Option<String>,
+}
+
+pub fn link_authorize_response(
+    response: IzipayLinkResponse,
+    data: PaymentsAuthorizeRouterData,
+    http_code: u16,
+) -> CustomResult<PaymentsAuthorizeRouterData, errors::ConnectorError> {
+    link_authorize_response_at(response, data, http_code, OffsetDateTime::now_utc())
+}
+
+fn link_authorize_response_at(
+    response: IzipayLinkResponse,
+    data: PaymentsAuthorizeRouterData,
+    http_code: u16,
+    now: OffsetDateTime,
+) -> CustomResult<PaymentsAuthorizeRouterData, errors::ConnectorError> {
+    let body = response.response.as_ref();
+    let link = body
+        .and_then(|body| body.payment_link_id.clone())
+        .filter(|id| !id.is_empty())
+        .zip(
+            body.and_then(|body| body.payment_link_url.clone())
+                .filter(|url| !url.is_empty()),
+        );
+    let (payment_link_id, payment_link_url) = match (response.code == SUCCESS_CODE, link) {
+        (true, Some(link)) => link,
+        (true, None) => {
+            return Err(report!(errors::ConnectorError::ResponseHandlingFailed))
+                .attach_printable("Izipay generate answered 00 without a link id and url")
+        }
+        (false, _) => {
+            return Ok(RouterData {
+                status: enums::AttemptStatus::Failure,
+                response: Err(error_response_from_code(
+                    &response.code,
+                    response
+                        .message_friendly
+                        .as_deref()
+                        .or(response.message.as_deref()),
+                    http_code,
+                    Some(enums::AttemptStatus::Failure),
+                )),
+                ..data
+            })
+        }
+    };
+
+    // The expiration Izipay stored; recomputed from the request only if it is not echoed.
+    let expires_at = body
+        .and_then(|body| body.expiration_date.as_deref())
+        .and_then(parse_lima_datetime)
+        .or_else(|| {
+            requested_expiration(data.request.metadata.as_ref())
+                .ok()
+                .and_then(|requested| link_expiration(requested, now).ok())
+        });
+    let order_number = data.connector_request_reference_id.clone();
+    let mut metadata = serde_json::json!({
+        "mode": MODE_PAYMENT_LINK,
+        "payment_link_id": payment_link_id,
+        "payment_link_url": payment_link_url,
+        "order_number": order_number,
+        "created_date": format_date(lima_clock(now).date()),
+    });
+    if let (Some(expires_at), Some(map)) = (expires_at, metadata.as_object_mut()) {
+        map.insert(
+            "expires_at".to_string(),
+            serde_json::json!(format_rfc3339_utc(expires_at)),
+        );
+    }
+
+    Ok(RouterData {
+        status: enums::AttemptStatus::AuthenticationPending,
+        response: Ok(PaymentsResponseData::TransactionResponse {
+            resource_id: ResponseId::ConnectorTransactionId(payment_link_id),
+            redirection_data: Box::new(Some(RedirectForm::Form {
+                endpoint: payment_link_url,
+                method: Method::Get,
+                form_fields: HashMap::new(),
+            })),
+            mandate_reference: Box::new(None),
+            connector_metadata: Some(metadata),
+            network_txn_id: None,
+            connector_response_reference_id: Some(order_number),
+            incremental_authorization_allowed: None,
+            charges: None,
+        }),
+        ..data
+    })
+}
+
+// ---- PSync: transactions of the link ----
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayLinkTransactionsRequest {
+    state_list: Vec<&'static str>,
+    date_time_start: String,
+    date_time_end: String,
+    pay_method: &'static str,
+    order_number: &'static str,
+    transaction_id: &'static str,
+    pagination: IzipayLinkPagination,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayLinkPagination {
+    page_number: &'static str,
+    page_size: &'static str,
+}
+
+/// Search window: from the day before the link was created to the day after today (Lima), so
+/// that no clock difference with Izipay can hide a transaction.
+pub fn build_link_transactions_request(
+    connector_meta: Option<&serde_json::Value>,
+    now: OffsetDateTime,
+) -> IzipayLinkTransactionsRequest {
+    let today = lima_clock(now).date();
+    let start = metadata_str(connector_meta, "created_date")
+        .and_then(parse_date)
+        .unwrap_or_else(|| {
+            today
+                .checked_sub(Duration::days(LINK_SEARCH_FALLBACK_DAYS))
+                .unwrap_or(today)
+        });
+    let start = start.checked_sub(Duration::days(1)).unwrap_or(start);
+    let end = today.checked_add(Duration::days(1)).unwrap_or(today);
+    IzipayLinkTransactionsRequest {
+        state_list: vec!["0"],
+        date_time_start: format_date(start),
+        date_time_end: format_date(end),
+        pay_method: "",
+        order_number: "",
+        transaction_id: "",
+        pagination: IzipayLinkPagination {
+            page_number: "1",
+            page_size: LINK_SEARCH_PAGE_SIZE,
+        },
+    }
+}
+
+impl TryFrom<&PaymentsSyncRouterData> for IzipayLinkTransactionsRequest {
+    type Error = error_stack::Report<errors::ConnectorError>;
+
+    fn try_from(req: &PaymentsSyncRouterData) -> Result<Self, Self::Error> {
+        Ok(build_link_transactions_request(
+            req.request.connector_meta.as_ref(),
+            OffsetDateTime::now_utc(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayLinkTransactionsResponse {
+    pub code: String,
+    pub message: Option<String>,
+    pub message_user: Option<String>,
+    pub response: Option<IzipayLinkTransactionsBody>,
+}
+
+/// `transactions` is required on purpose: it is what tells this shape apart from a Search
+/// response in `IzipayPaymentsSyncResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayLinkTransactionsBody {
+    pub transactions: Vec<IzipayLinkTransaction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayLinkTransaction {
+    pub code: Option<String>,
+    pub description_status: Option<String>,
+    pub unique_id: Option<String>,
+    pub authorization_code: Option<String>,
+    pub reference_number: Option<String>,
+    pub order_number: Option<String>,
+    pub pay_method_authorization: Option<String>,
+    pub transaction_datetime: Option<String>,
+    pub amount: Option<serde_json::Number>,
+}
+
+impl IzipayLinkTransaction {
+    fn is_paid(&self) -> bool {
+        self.code.as_deref() == Some(SUCCESS_CODE)
+            && LINK_STATUS_PAID
+                .iter()
+                .any(|status| state_is(self.description_status.as_deref(), status))
+    }
+}
+
+/// Body of a payment sync: the transactions of a link, or an order Search response (what a
+/// notification payload looks like, which the router can hand to the sync of a link payment).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum IzipayPaymentsSyncResponse {
+    Link(IzipayLinkTransactionsResponse),
+    Order(IzipaySearchResponse),
+}
+
+impl TryFrom<PaymentsSyncResponseRouterData<IzipayPaymentsSyncResponse>>
+    for PaymentsSyncRouterData
+{
+    type Error = error_stack::Report<errors::ConnectorError>;
+
+    fn try_from(
+        item: PaymentsSyncResponseRouterData<IzipayPaymentsSyncResponse>,
+    ) -> Result<Self, Self::Error> {
+        let ResponseRouterData {
+            response,
+            data,
+            http_code,
+        } = item;
+        match response {
+            IzipayPaymentsSyncResponse::Link(response) => Self::try_from(ResponseRouterData {
+                response,
+                data,
+                http_code,
+            }),
+            IzipayPaymentsSyncResponse::Order(response) => Self::try_from(ResponseRouterData {
+                response,
+                data,
+                http_code,
+            }),
+        }
+    }
+}
+
+impl TryFrom<PaymentsSyncResponseRouterData<IzipayLinkTransactionsResponse>>
+    for PaymentsSyncRouterData
+{
+    type Error = error_stack::Report<errors::ConnectorError>;
+
+    fn try_from(
+        item: PaymentsSyncResponseRouterData<IzipayLinkTransactionsResponse>,
+    ) -> Result<Self, Self::Error> {
+        link_sync_response(item, OffsetDateTime::now_utc())
+    }
+}
+
+/// Outcome of the transactions of a link:
+/// - a paid transaction: charged (and what a refund needs is stored)
+/// - else a voided one: voided
+/// - else (nothing, or only denied attempts: the buyer can retry on the link): still pending,
+///   unless the link expired.
+pub(crate) fn link_sync_response(
+    item: PaymentsSyncResponseRouterData<IzipayLinkTransactionsResponse>,
+    now: OffsetDateTime,
+) -> CustomResult<PaymentsSyncRouterData, errors::ConnectorError> {
+    let payment_link_id = link_payment_id(&item.data)?;
+    let previous = item.data.request.connector_meta.as_ref();
+    let transactions: &[IzipayLinkTransaction] = item
+        .response
+        .response
+        .as_ref()
+        .map_or(&[], |body| body.transactions.as_slice());
+    let order_number = |transaction: &IzipayLinkTransaction| {
+        transaction
+            .order_number
+            .clone()
+            .filter(|order_number| !order_number.is_empty())
+            .unwrap_or_else(|| item.data.connector_request_reference_id.clone())
+    };
+
+    let paid = transactions
+        .iter()
+        .find(|transaction| transaction.is_paid());
+    let voided = transactions.iter().find(|transaction| {
+        state_is(
+            transaction.description_status.as_deref(),
+            LINK_STATUS_VOIDED,
+        )
+    });
+    let expired = metadata_str(previous, "expires_at")
+        .and_then(parse_rfc3339)
+        .is_some_and(|expires_at| expires_at <= now);
+
+    let (status, connector_metadata, response_reference) = if let Some(transaction) = paid {
+        let mut metadata = match previous {
+            Some(serde_json::Value::Object(previous)) => previous.clone(),
+            _ => serde_json::Map::new(),
+        };
+        let fields = [
+            ("unique_id", transaction.unique_id.clone()),
+            ("authorization_code", transaction.authorization_code.clone()),
+            ("reference_number", transaction.reference_number.clone()),
+            ("izipay_order_number", transaction.order_number.clone()),
+            (
+                "transaction_datetime",
+                transaction.transaction_datetime.clone(),
+            ),
+            ("pay_method", transaction.pay_method_authorization.clone()),
+            (
+                "amount",
+                transaction.amount.as_ref().map(ToString::to_string),
+            ),
+            ("currency", Some(item.data.request.currency.to_string())),
+        ];
+        for (key, value) in fields {
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                metadata.insert(key.to_string(), serde_json::json!(value));
+            }
+        }
+        (
+            enums::AttemptStatus::Charged,
+            Some(serde_json::Value::Object(metadata)),
+            Some(order_number(transaction)),
+        )
+    } else if let Some(transaction) = voided {
+        (
+            enums::AttemptStatus::Voided,
+            None,
+            Some(order_number(transaction)),
+        )
+    } else {
+        (enums::AttemptStatus::AuthenticationPending, None, None)
+    };
+
+    if status == enums::AttemptStatus::AuthenticationPending && expired {
+        return Ok(RouterData {
+            status: enums::AttemptStatus::Failure,
+            response: Err(ErrorResponse {
+                status_code: item.http_code,
+                code: LINK_EXPIRED_CODE.to_string(),
+                message: LINK_EXPIRED_MESSAGE.to_string(),
+                reason: None,
+                attempt_status: Some(enums::AttemptStatus::Failure),
+                connector_transaction_id: Some(payment_link_id),
+                network_advice_code: None,
+                network_decline_code: None,
+                network_error_message: None,
+                connector_metadata: None,
+            }),
+            ..item.data
+        });
+    }
+
+    Ok(RouterData {
+        status,
+        response: Ok(PaymentsResponseData::TransactionResponse {
+            resource_id: ResponseId::ConnectorTransactionId(payment_link_id),
+            redirection_data: Box::new(None),
+            mandate_reference: Box::new(None),
+            connector_metadata,
+            network_txn_id: None,
+            connector_response_reference_id: response_reference,
+            incremental_authorization_allowed: None,
+            charges: None,
+        }),
+        ..item.data
+    })
+}
+
+// ============================================================================
+// Refunds
+// ============================================================================
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayRefundRequest {
+    merchant_code: String,
+    ruc: String,
+    id_unique: String,
+    order: IzipayRefundOrder,
+    card: IzipayRefundCard,
+    language: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayRefundOrder {
+    authorization_code: String,
+    reference_number: String,
+    currency: String,
+    refund_amount: StringMajorUnit,
+    /// Izipay documents these two as "must be empty".
+    total_amount: &'static str,
+    transaction_date: &'static str,
+}
+
+/// Izipay documents every card field as "must be empty".
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayRefundCard {
+    brand: &'static str,
+    first_six_digits: &'static str,
+    last_four_digits: &'static str,
+}
+
+fn metadata_text(
+    metadata: Option<&serde_json::Value>,
+    key: &str,
+    field_name: &'static str,
+) -> CustomResult<String, errors::ConnectorError> {
+    metadata
+        .and_then(|metadata| metadata.get(key))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| report!(errors::ConnectorError::MissingRequiredField { field_name }))
+}
+
+fn merchant_ruc(
+    connector_meta_data: Option<&Secret<serde_json::Value>>,
+) -> CustomResult<String, errors::ConnectorError> {
+    let ruc = connector_meta_data
+        .and_then(|metadata| metadata.peek().get("ruc"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|ruc| !ruc.is_empty())
+        .ok_or(errors::ConnectorError::MissingRequiredField {
+            field_name: "connector_metadata.ruc",
+        })?;
+    if ruc.len() == 11 && ruc.chars().all(|digit| digit.is_ascii_digit()) {
+        Ok(ruc.to_string())
+    } else {
+        Err(report!(errors::ConnectorError::InvalidDataFormat {
+            field_name: "connector_metadata.ruc"
+        }))
+    }
+}
+
+impl TryFrom<&IzipayRouterData<&RefundsRouterData<Execute>>> for IzipayRefundRequest {
+    type Error = error_stack::Report<errors::ConnectorError>;
+
+    fn try_from(item: &IzipayRouterData<&RefundsRouterData<Execute>>) -> Result<Self, Self::Error> {
+        let req = item.router_data;
+        let auth = IzipayAuthType::try_from(&req.connector_auth_type)?;
+        let ruc = merchant_ruc(req.connector_meta_data.as_ref())?;
+        if !matches!(
+            req.request.currency,
+            enums::Currency::PEN | enums::Currency::USD
+        ) {
+            return Err(errors::ConnectorError::CurrencyNotSupported {
+                message: req.request.currency.to_string(),
+                connector: IZIPAY_CONNECTOR_NAME,
+            }
+            .into());
+        }
+        // What Izipay needs to find the payment was stored by the payment sync that charged it.
+        let payment_metadata = req.request.connector_metadata.as_ref();
+        Ok(Self {
+            merchant_code: auth.merchant_code,
+            ruc,
+            id_unique: metadata_text(
+                payment_metadata,
+                "unique_id",
+                "connector_metadata.unique_id",
+            )?,
+            order: IzipayRefundOrder {
+                authorization_code: metadata_text(
+                    payment_metadata,
+                    "authorization_code",
+                    "connector_metadata.authorization_code",
+                )?,
+                reference_number: metadata_text(
+                    payment_metadata,
+                    "reference_number",
+                    "connector_metadata.reference_number",
+                )?,
+                currency: req.request.currency.to_string(),
+                refund_amount: item.amount.clone(),
+                total_amount: "",
+                transaction_date: "",
+            },
+            card: IzipayRefundCard {
+                brand: "",
+                first_six_digits: "",
+                last_four_digits: "",
+            },
+            language: "ESP",
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayRefundResponse {
+    pub code: String,
+    pub message: Option<String>,
+    pub response: Option<IzipayRefundBody>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayRefundBody {
+    pub result: Option<IzipayRefundResult>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayRefundResult {
+    pub message_friendly: Option<String>,
+    pub refund_transaction_id: Option<String>,
+}
+
+impl TryFrom<RefundsResponseRouterData<Execute, IzipayRefundResponse>>
+    for RefundsRouterData<Execute>
+{
+    type Error = error_stack::Report<errors::ConnectorError>;
+
+    fn try_from(
+        item: RefundsResponseRouterData<Execute, IzipayRefundResponse>,
+    ) -> Result<Self, Self::Error> {
+        let refund_id = item
+            .response
+            .response
+            .as_ref()
+            .and_then(|body| body.result.as_ref())
+            .and_then(|result| result.refund_transaction_id.clone())
+            .filter(|refund_id| !refund_id.is_empty());
+        let response = match (item.response.code == SUCCESS_CODE, refund_id) {
+            (true, Some(connector_refund_id)) => Ok(RefundsResponseData {
+                connector_refund_id,
+                // Izipay registers the refund; its final state comes from the status API.
+                refund_status: enums::RefundStatus::Pending,
+            }),
+            (true, None) => return Err(errors::ConnectorError::ResponseHandlingFailed.into()),
+            (false, _) => Err(error_response_from_code(
+                &item.response.code,
+                item.response.message.as_deref(),
+                item.http_code,
+                None,
+            )),
+        };
+        Ok(Self {
+            response,
+            ..item.data
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayRefundStatusResponse {
+    pub code: String,
+    pub message: Option<String>,
+    pub response: Option<IzipayRefundStatusBody>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayRefundStatusBody {
+    pub status_code: Option<String>,
+    pub status_name: Option<String>,
+    pub response_code: Option<String>,
+    pub rejection_reason: Option<String>,
+}
+
+/// Maps the refund status by its name. Izipay documents the status codes only by example
+/// (`50`, `60`, `40`), not their meaning, so the codes are deliberately not used.
+pub fn map_refund_status(status_name: Option<&str>) -> enums::RefundStatus {
+    match status_name
+        .map(|name| name.trim().to_uppercase())
+        .as_deref()
+    {
+        Some("AUTORIZADO" | "PROCESADO" | "APROBADO" | "ABONADO" | "DEVUELTO") => {
+            enums::RefundStatus::Success
+        }
+        Some("RECHAZADO" | "DENEGADO" | "ANULADO" | "ERROR") => enums::RefundStatus::Failure,
+        _ => enums::RefundStatus::Pending,
+    }
+}
+
+impl TryFrom<RefundsResponseRouterData<RSync, IzipayRefundStatusResponse>>
+    for RefundsRouterData<RSync>
+{
+    type Error = error_stack::Report<errors::ConnectorError>;
+
+    fn try_from(
+        item: RefundsResponseRouterData<RSync, IzipayRefundStatusResponse>,
+    ) -> Result<Self, Self::Error> {
+        let connector_refund_id = item.data.request.connector_refund_id.clone().ok_or(
+            errors::ConnectorError::MissingRequiredField {
+                field_name: "connector_refund_id",
+            },
+        )?;
+        let body = item.response.response.as_ref();
+        let response = if item.response.code != SUCCESS_CODE {
+            Err(error_response_from_code(
+                &item.response.code,
+                item.response.message.as_deref(),
+                item.http_code,
+                None,
+            ))
+        } else {
+            let refund_status =
+                map_refund_status(body.and_then(|body| body.status_name.as_deref()));
+            if refund_status == enums::RefundStatus::Failure {
+                Err(ErrorResponse {
+                    status_code: item.http_code,
+                    code: body
+                        .and_then(|body| body.response_code.clone())
+                        .unwrap_or_else(|| item.response.code.clone()),
+                    message: body
+                        .and_then(|body| body.rejection_reason.clone())
+                        .filter(|reason| !reason.is_empty())
+                        .or_else(|| body.and_then(|body| body.status_name.clone()))
+                        .unwrap_or_else(|| "Refund rejected by Izipay".to_string()),
+                    reason: item.response.message.clone(),
+                    attempt_status: None,
+                    connector_transaction_id: Some(connector_refund_id),
+                    network_advice_code: None,
+                    network_decline_code: None,
+                    network_error_message: None,
+                    connector_metadata: None,
+                })
+            } else {
+                Ok(RefundsResponseData {
+                    connector_refund_id,
+                    refund_status,
+                })
+            }
+        };
+        Ok(Self {
+            response,
+            ..item.data
+        })
+    }
+}
+
+// ============================================================================
+// Errors
+// ============================================================================
+
+/// Izipay error bodies vary by service: `{code, message}`, `{code, message, messageUser, ..}`
+/// and, for refunds, `{code, message, header, response: {messageFriendly, ..}}`.
+#[derive(Debug, Serialize)]
+pub struct IzipayErrorResponse {
+    pub code: String,
+    pub message: String,
+    pub reason: Option<String>,
+}
+
+impl IzipayErrorResponse {
+    /// `None` when the body is not a JSON object carrying a code or a message.
+    pub fn parse(body: &[u8]) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+        let object = value.as_object()?;
+        let text = |value: Option<&serde_json::Value>| -> Option<String> {
+            match value? {
+                serde_json::Value::String(text) if !text.trim().is_empty() => {
+                    Some(text.trim().to_string())
+                }
+                serde_json::Value::Number(number) => Some(number.to_string()),
+                _ => None,
+            }
+        };
+        let code = text(object.get("code"));
+        let message = text(object.get("message"));
+        let friendly = text(
+            object
+                .get("response")
+                .and_then(|response| response.get("messageFriendly")),
+        );
+        let message_user = text(object.get("messageUser"));
+        if code.is_none() && message.is_none() && friendly.is_none() && message_user.is_none() {
+            return None;
+        }
+        let best_message = friendly
+            .or(message_user)
+            .or_else(|| message.clone())
+            .unwrap_or_else(|| "Izipay rejected the request".to_string());
+        Some(Self {
+            code: code.unwrap_or_else(|| "NO_ERROR_CODE".to_string()),
+            reason: message.filter(|message| *message != best_message),
+            message: best_message,
+        })
+    }
+}
+
+// ============================================================================
+// Incoming notifications (IPN)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayWebhookBody {
+    pub payload_http: Option<String>,
+    pub signature: Option<String>,
+    /// The unsigned copy of the notification: only used to find a payment link id.
+    pub response: Option<serde_json::Value>,
+}
+
+/// Checks `base64(HMAC-SHA256(payloadHttp, hash key)) == signature`. The signature is read from
+/// the body, falling back to the `Signature` header. The comparison is constant time.
+pub fn verify_webhook_signature(
+    body: &[u8],
+    header_signature: Option<&str>,
+    hash_key: &Secret<String>,
+) -> CustomResult<bool, errors::ConnectorError> {
+    let webhook_body: IzipayWebhookBody = serde_json::from_slice(body)
+        .change_context(errors::ConnectorError::WebhookSignatureNotFound)?;
+    let payload_http = webhook_body
+        .payload_http
+        .ok_or(errors::ConnectorError::WebhookSignatureNotFound)?;
+    let signature = webhook_body
+        .signature
+        .filter(|signature| !signature.is_empty())
+        .or_else(|| header_signature.map(str::to_string))
+        .ok_or(errors::ConnectorError::WebhookSignatureNotFound)?;
+    let signature = base64::engine::general_purpose::STANDARD
+        .decode(signature.trim())
+        .change_context(errors::ConnectorError::WebhookSignatureNotFound)?;
+    HmacSha256
+        .verify_signature(
+            hash_key.peek().as_bytes(),
+            &signature,
+            payload_http.as_bytes(),
+        )
+        .change_context(errors::ConnectorError::WebhookSourceVerificationFailed)
+}
+
+/// The signed payload of a notification, parsed. Only this is ever read: the unsigned fields of
+/// the notification body can be edited by anyone.
+pub fn parse_signed_payload(
+    body: &[u8],
+) -> CustomResult<IzipaySearchResponse, errors::ConnectorError> {
+    let webhook_body: IzipayWebhookBody = serde_json::from_slice(body)
+        .change_context(errors::ConnectorError::WebhookBodyDecodingFailed)?;
+    let payload_http = webhook_body
+        .payload_http
+        .ok_or(errors::ConnectorError::WebhookBodyDecodingFailed)?;
+    serde_json::from_str(&payload_http)
+        .change_context(errors::ConnectorError::WebhookBodyDecodingFailed)
+}
+
+/// The signed payload as a JSON value, handed to the PSync response handler.
+pub fn signed_payload_value(
+    body: &[u8],
+) -> CustomResult<serde_json::Value, errors::ConnectorError> {
+    let webhook_body: IzipayWebhookBody = serde_json::from_slice(body)
+        .change_context(errors::ConnectorError::WebhookResourceObjectNotFound)?;
+    let payload_http = webhook_body
+        .payload_http
+        .ok_or(errors::ConnectorError::WebhookResourceObjectNotFound)?;
+    serde_json::from_str(&payload_http)
+        .change_context(errors::ConnectorError::WebhookResourceObjectNotFound)
+}
+
+/// Reference of a notification and whether it was taken from the unsigned part of the body.
+///
+/// In order: the `paymentLinkId` of the signed payload, the `paymentLinkId` of the unsigned
+/// outer body (Izipay's documented signed payload does not carry it), the signed order number.
+/// A reference from the unsigned body can be forged, so the notification must not be trusted
+/// as it is: the caller reports it as unverified and the router asks Izipay instead.
+pub fn webhook_reference_with_source(
+    body: &[u8],
+    payload: &IzipaySearchResponse,
+) -> Option<(String, bool)> {
+    let non_empty = |value: Option<&String>| value.filter(|value| !value.is_empty()).cloned();
+    let signed_order = payload.response.as_ref()?.order.as_ref()?.first()?;
+    if let Some(link_id) = non_empty(signed_order.payment_link_id.as_ref()) {
+        return Some((link_id, false));
+    }
+    let unsigned_link_id = serde_json::from_slice::<IzipayWebhookBody>(body)
+        .ok()
+        .and_then(|webhook_body| webhook_body.response)
+        .and_then(|response| {
+            response
+                .get("order")?
+                .get(0)?
+                .get("paymentLinkId")?
+                .as_str()
+                .map(str::to_string)
+        })
+        .filter(|link_id| !link_id.is_empty());
+    if let Some(link_id) = unsigned_link_id {
+        return Some((link_id, true));
+    }
+    non_empty(signed_order.order_number.as_ref()).map(|order_number| (order_number, false))
+}
+
+/// Whether the reference of the notification comes from the unsigned part of the body.
+pub fn webhook_reference_is_unsigned(body: &[u8]) -> bool {
+    parse_signed_payload(body)
+        .ok()
+        .and_then(|payload| webhook_reference_with_source(body, &payload))
+        .is_some_and(|(_, unsigned)| unsigned)
+}
+
+pub fn map_webhook_event(payload: &IzipaySearchResponse) -> IncomingWebhookEvent {
+    match map_search_status(&payload.code, payload.selected_order()) {
+        enums::AttemptStatus::Charged => IncomingWebhookEvent::PaymentIntentSuccess,
+        enums::AttemptStatus::Failure => IncomingWebhookEvent::PaymentIntentFailure,
+        // A cancelled (voided) order is not turned into a failed payment: it may be the
+        // reversal of a payment that was charged and refunded outside Hyperswitch.
+        _ => IncomingWebhookEvent::EventNotSupported,
+    }
+}

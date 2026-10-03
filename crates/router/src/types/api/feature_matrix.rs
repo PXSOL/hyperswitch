@@ -215,6 +215,9 @@ impl FeatureMatrixConnectorData {
                 enums::Connector::Itaubank => {
                     Ok(ConnectorEnum::Old(Box::new(connector::Itaubank::new())))
                 }
+                enums::Connector::Izipay => {
+                    Ok(ConnectorEnum::Old(Box::new(connector::Izipay::new())))
+                }
                 enums::Connector::Jpmorgan => {
                     Ok(ConnectorEnum::Old(Box::new(connector::Jpmorgan::new())))
                 }
