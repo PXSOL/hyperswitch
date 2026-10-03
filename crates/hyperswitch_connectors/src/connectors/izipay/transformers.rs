@@ -2337,3 +2337,2283 @@ pub fn map_webhook_event(payload: &IzipaySearchResponse) -> IncomingWebhookEvent
         _ => IncomingWebhookEvent::EventNotSupported,
     }
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod tests {
+    use std::str::FromStr;
+
+    use common_utils::{crypto::SignMessage, types::MinorUnit};
+    use hyperswitch_domain_models::{
+        address::{Address, AddressDetails, PhoneDetails},
+        payment_address::PaymentAddress,
+        router_flow_types::payments::{Authorize, PSync},
+        router_request_types::{PaymentsAuthorizeData, PaymentsSyncData, RefundsData},
+    };
+
+    use super::*;
+
+    const SEARCH_APPROVED: &str = r#"{"code":"00","message":"Operación exitosa","messageUser":"Operación exitosa","messageUserEng":"Successful","response":{"payMethod":"CARD","order":[{"payMethodAuthorization":"CARD","codeAuth":"S97758","currency":"PEN","amount":"1.99","installment":"00","deferred":"0","orderNumber":"PX1790971180429","stateMessage":"Autorizado","dateTransaction":"20261002","timeTransaction":"150001","uniqueId":"450249587","referenceNumber":"2000000"}],"card":{"brand":"VS","pan":"497010******0055","save":"false"},"billing":{"firstName":"Lucho","lastName":"Torres","email":"luchotorres@izipay.pe","phoneNumber":"989897960","street":"Av. Jorge Chavez 275","city":"Lima","state":"Lima","country":"PE","postalCode":"15000","documentType":"DNI","document":"12345678","companyName":""},"merchant":{"merchantCode":"4004353","facilitatorCode":""},"token":{"merchantBuyerId":"pxsol-test-buyer","cardToken":"","alias":""},"authentication":{"result":""},"customFields":[{"name":"field1","value":""}],"miles":{"netMiles":"","miles":""}},"payloadHttp":"{}","transactionId":"17909712094450964","signature":"CoFcYSUHzQJmJHuSwRY38K6TDyqmdDAmuxyRcEtHMsI="}"#;
+
+    const SEARCH_DECLINED: &str = r#"{"code":"51","message":"Fondos Insuficientes","messageUser":"Fondos Insuficientes","messageUserEng":"Insufficient funds","response":{"payMethod":"CARD","order":[{"payMethodAuthorization":"CARD","codeAuth":"","currency":"PEN","amount":"1.99","installment":"00","deferred":"0","orderNumber":"PX1790971250459","stateMessage":"Denegado","dateTransaction":"20261002","timeTransaction":"150109","uniqueId":"450249588","referenceNumber":"2000000"}]}}"#;
+
+    const SEARCH_VOIDED: &str = r#"{"code":"00","message":"Operación exitosa","messageUser":"Operación exitosa","messageUserEng":"Successful","response":{"payMethod":"CARD","order":[{"payMethodAuthorization":"CARD","codeAuth":"S80214","currency":"PEN","amount":"1.99","installment":"00","deferred":"0","orderNumber":"PX1790971180429","stateMessage":"Anulado","dateTransaction":"20261002","timeTransaction":"150627","uniqueId":"000000000000313455","referenceNumber":"2000000"}]}}"#;
+
+    const SEARCH_NOT_FOUND: &str = r#"{"code":"MC","message":"Transacción Invalido","messageUser":"Transacción No Existe.","messageUserEng":"Transaction Does Not Exist.","response":{"order":[{"codeAuth":"","currency":"","amount":"0.00","installment":"","deferred":"","orderNumber":"PX1790971729304","stateMessage":"Denegado","dateTransaction":"00010101","timeTransaction":"000000","uniqueId":"","referenceNumber":""}],"card":{"brand":"","pan":"","save":"false"},"merchant":{"merchantCode":"4004353","facilitatorCode":""},"customFields":[],"miles":{"netMiles":"","miles":""}}}"#;
+
+    const TOKEN_GENERATE_OK: &str = r#"{"code":"00","message":"OK","response":{"token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJtZXJjaGFudENvZGUiOiI0MDA0MzUzIiwiZmFjaWxpdGF0b3JDb2RlIjoiMCIsInRyYW5zYWN0aW9uSWQiOiIxNzkwOTcxMDU1NjgzMTY4OCIsIk9yZGVyTnVtYmVyIjoiUFgxNzkwOTcxMDU1NjgzIiwiQW1vdW50IjoiMS45OSIsIlRva2VuSWQiOiJmYzNhNWZjNy0wOGYyLTQwZGItYjI0YS1jNDE3ODhjY2Y5MmYiLCJuYmYiOjE3OTA5NzEwNTUsImV4cCI6MTc5MDk3MTk1NSwiaWF0IjoxNzkwOTcxMDU1fQ.qAedKjW_TGS6BpZ6ygOZQsiRnF_ZdzZRBmPDouZU49U","userOrg":"1snn5n9w","userScoring":"izipay_low"}}"#;
+
+    const TOKEN_TRANSACTION_ID: &str = "17909710556831688";
+
+    const RETURN_URL: &str = "https://hyperswitch.example/payments/pay_1/merchant_1/return";
+
+    fn test_auth() -> ConnectorAuthType {
+        ConnectorAuthType::MultiAuthKey {
+            api_key: Secret::new("sample_api_key".to_string()),
+            key1: Secret::new("4004353".to_string()),
+            api_secret: Secret::new("sample_hash_key".to_string()),
+            key2: Secret::new("sample_rsa_key".to_string()),
+        }
+    }
+
+    fn billing_address(
+        first_name: &str,
+        zip: Option<&str>,
+        line1: &str,
+        city: &str,
+    ) -> PaymentAddress {
+        let address = Address {
+            address: Some(AddressDetails {
+                city: Some(city.to_string()),
+                country: Some(common_enums::CountryAlpha2::PE),
+                line1: Some(Secret::new(line1.to_string())),
+                line2: None,
+                line3: None,
+                zip: zip.map(|zip| Secret::new(zip.to_string())),
+                state: Some(Secret::new("Lima".to_string())),
+                first_name: Some(Secret::new(first_name.to_string())),
+                last_name: Some(Secret::new("Torres".to_string())),
+                origin_zip: None,
+            }),
+            phone: Some(PhoneDetails {
+                number: Some(Secret::new("+51 989-897-960".to_string())),
+                country_code: Some("+51".to_string()),
+            }),
+            email: Some(common_utils::pii::Email::from_str("buyer@example.com").unwrap()),
+        };
+        PaymentAddress::new(None, Some(address), None, None)
+    }
+
+    fn authorize_request_data() -> PaymentsAuthorizeData {
+        PaymentsAuthorizeData {
+            payment_method_data: PaymentMethodData::Wallet(WalletData::IzipayCheckout {}),
+            amount: 199,
+            minor_amount: MinorUnit::new(199),
+            order_tax_amount: None,
+            email: None,
+            customer_name: None,
+            currency: enums::Currency::PEN,
+            confirm: true,
+            statement_descriptor_suffix: None,
+            statement_descriptor: None,
+            capture_method: Some(enums::CaptureMethod::Automatic),
+            router_return_url: Some(RETURN_URL.to_string()),
+            webhook_url: Some("https://hyperswitch.example/webhooks/merchant_1/mca_1".to_string()),
+            complete_authorize_url: None,
+            setup_future_usage: None,
+            mandate_id: None,
+            off_session: None,
+            customer_acceptance: None,
+            setup_mandate_details: None,
+            browser_info: None,
+            order_details: None,
+            order_category: None,
+            session_token: None,
+            enrolled_for_3ds: false,
+            related_transaction_id: None,
+            payment_experience: None,
+            payment_method_type: None,
+            surcharge_details: None,
+            customer_id: None,
+            request_incremental_authorization: false,
+            metadata: Some(serde_json::json!({
+                "buyer_document_type": "DNI",
+                "buyer_document_number": "12345678",
+            })),
+            authentication_data: None,
+            request_extended_authorization: None,
+            split_payments: None,
+            merchant_order_reference_id: None,
+            integrity_object: None,
+            shipping_cost: None,
+            additional_payment_method_data: None,
+            merchant_account_id: None,
+            merchant_config_currency: None,
+            connector_testing_data: None,
+            order_id: None,
+            locale: None,
+            payment_channel: None,
+            enable_partial_authorization: None,
+            enable_overcapture: None,
+        }
+    }
+
+    fn base_router_data<F, Req, Res>(
+        request: Req,
+        address: PaymentAddress,
+        reference: &str,
+    ) -> RouterData<F, Req, Res> {
+        RouterData {
+            flow: std::marker::PhantomData,
+            merchant_id: common_utils::id_type::MerchantId::try_from(std::borrow::Cow::from(
+                "izipay",
+            ))
+            .unwrap(),
+            customer_id: None,
+            connector_customer: None,
+            connector: "izipay".to_string(),
+            payment_id: "pay_test_izipay_1".to_string(),
+            attempt_id: "pay_test_izipay_1_1".to_string(),
+            tenant_id: common_utils::id_type::TenantId::try_from_string("public".to_string())
+                .unwrap(),
+            status: enums::AttemptStatus::AuthenticationPending,
+            payment_method: enums::PaymentMethod::Wallet,
+            connector_auth_type: test_auth(),
+            description: None,
+            address,
+            auth_type: enums::AuthenticationType::NoThreeDs,
+            connector_meta_data: None,
+            connector_wallets_details: None,
+            amount_captured: None,
+            access_token: None,
+            session_token: None,
+            reference_id: None,
+            payment_method_token: None,
+            recurring_mandate_payment_data: None,
+            preprocessing_id: None,
+            payment_method_balance: None,
+            connector_api_version: None,
+            request,
+            response: Err(ErrorResponse::default()),
+            connector_request_reference_id: reference.to_string(),
+            #[cfg(feature = "payouts")]
+            payout_method_data: None,
+            #[cfg(feature = "payouts")]
+            quote_id: None,
+            test_mode: Some(true),
+            connector_http_status_code: None,
+            external_latency: None,
+            apple_pay_flow: None,
+            frm_metadata: None,
+            dispute_id: None,
+            refund_id: None,
+            connector_response: None,
+            payment_method_status: None,
+            minor_amount_captured: None,
+            minor_amount_capturable: None,
+            integrity_check: Ok(()),
+            additional_merchant_data: None,
+            header_payload: None,
+            connector_mandate_request_reference_id: None,
+            l2_l3_data: None,
+            authentication_id: None,
+            psd2_sca_exemption_type: None,
+            raw_connector_response: None,
+            is_payment_id_from_merchant: None,
+        }
+    }
+
+    fn authorize_router_data() -> PaymentsAuthorizeRouterData {
+        base_router_data::<Authorize, _, PaymentsResponseData>(
+            authorize_request_data(),
+            billing_address("Lucho", Some("15074"), "Av. Jorge Chavez 275", "Lima"),
+            "PX1790971180429",
+        )
+    }
+
+    fn sync_router_data(connector_meta: Option<serde_json::Value>) -> PaymentsSyncRouterData {
+        base_router_data::<PSync, _, PaymentsResponseData>(
+            PaymentsSyncData {
+                connector_transaction_id: ResponseId::ConnectorTransactionId(
+                    "PX1790971180429".to_string(),
+                ),
+                encoded_data: None,
+                capture_method: None,
+                connector_meta,
+                sync_type: hyperswitch_domain_models::router_request_types::SyncRequestType::SinglePaymentSync,
+                mandate_id: None,
+                payment_method_type: None,
+                currency: enums::Currency::PEN,
+                payment_experience: None,
+                split_payments: None,
+                amount: MinorUnit::new(199),
+                integrity_object: None,
+                connector_reference_id: None,
+                setup_future_usage: None,
+            },
+            PaymentAddress::default(),
+            "PX1790971180429",
+        )
+    }
+
+    fn refund_request_data(connector_metadata: Option<serde_json::Value>) -> RefundsData {
+        RefundsData {
+            refund_id: "ref_1".to_string(),
+            connector_transaction_id: "PX1790971180429".to_string(),
+            connector_refund_id: None,
+            currency: enums::Currency::PEN,
+            payment_amount: 199,
+            reason: None,
+            webhook_url: None,
+            refund_amount: 100,
+            connector_metadata,
+            refund_connector_metadata: None,
+            browser_info: None,
+            split_refunds: None,
+            minor_payment_amount: MinorUnit::new(199),
+            minor_refund_amount: MinorUnit::new(100),
+            integrity_object: None,
+            refund_status: enums::RefundStatus::Pending,
+            merchant_account_id: None,
+            merchant_config_currency: None,
+            capture_method: None,
+            additional_payment_method_data: None,
+        }
+    }
+
+    fn refund_router_data<F>(
+        request: RefundsData,
+        ruc: Option<&str>,
+    ) -> RouterData<F, RefundsData, RefundsResponseData> {
+        let mut router_data = base_router_data::<F, _, RefundsResponseData>(
+            request,
+            PaymentAddress::default(),
+            "ref_1",
+        );
+        router_data.refund_id = Some("ref_1".to_string());
+        router_data.connector_meta_data =
+            ruc.map(|ruc| Secret::new(serde_json::json!({ "ruc": ruc })));
+        router_data
+    }
+
+    fn amount(value: &str) -> StringMajorUnit {
+        // Built through the same path as the connector: the converter output is only ever
+        // serialized, so deserializing a string yields an identical value.
+        serde_json::from_value(serde_json::json!(value)).unwrap()
+    }
+
+    // ------------------------------------------------------------------
+    // Identifiers and environment
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn order_number_is_15_uppercase_alphanumerics_and_deterministic() {
+        let first = order_number_from_attempt_id("pay_abc123_1");
+        let second = order_number_from_attempt_id("pay_abc123_1");
+        let other = order_number_from_attempt_id("pay_abc123_2");
+        assert_eq!(first.len(), 15);
+        assert!(first
+            .chars()
+            .all(|c| c.is_ascii_digit() || c.is_ascii_uppercase()));
+        assert_eq!(first, second);
+        assert_ne!(first, other);
+    }
+
+    #[test]
+    fn transaction_id_is_numeric_and_unique_enough() {
+        let first = new_transaction_id();
+        let second = new_transaction_id();
+        assert!(first.chars().all(|c| c.is_ascii_digit()));
+        assert!((17..=40).contains(&first.len()));
+        // Same millisecond is possible, the random suffix then differs almost always.
+        assert!(first.len() == second.len());
+    }
+
+    #[test]
+    fn environment_follows_test_mode_and_defaults_to_production() {
+        assert_eq!(
+            IzipayEnvironment::from_test_mode(Some(true)),
+            IzipayEnvironment::Sandbox
+        );
+        assert_eq!(
+            IzipayEnvironment::from_test_mode(Some(false)),
+            IzipayEnvironment::Production
+        );
+        assert_eq!(
+            IzipayEnvironment::from_test_mode(None),
+            IzipayEnvironment::Production
+        );
+        assert_eq!(
+            IzipayEnvironment::Sandbox.sdk_url(),
+            "https://sandbox-checkout.izipay.pe/payments/v1/js/index.js"
+        );
+        assert_eq!(
+            IzipayEnvironment::Production.sdk_url(),
+            "https://checkout.izipay.pe/payments/v1/js/index.js"
+        );
+    }
+
+    #[test]
+    fn auth_requires_multi_auth_key() {
+        let auth = IzipayAuthType::try_from(&test_auth()).unwrap();
+        assert_eq!(auth.merchant_code, "4004353");
+        assert!(IzipayAuthType::try_from(&ConnectorAuthType::HeaderKey {
+            api_key: Secret::new("x".to_string())
+        })
+        .is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Billing validation
+    // ------------------------------------------------------------------
+
+    fn billing_error(
+        router_data: &PaymentsAuthorizeRouterData,
+    ) -> error_stack::Report<errors::ConnectorError> {
+        build_billing(router_data).expect_err("billing must be rejected")
+    }
+
+    #[test]
+    fn billing_is_normalized() {
+        let billing = build_billing(&authorize_router_data()).unwrap();
+        assert_eq!(billing.first_name, "Lucho");
+        assert_eq!(billing.email, "buyer@example.com");
+        assert_eq!(billing.phone_number, "51989897960");
+        assert_eq!(billing.street, "Av. Jorge Chavez 275");
+        assert_eq!(billing.country, "PE");
+        assert_eq!(billing.postal_code, "15074");
+    }
+
+    #[test]
+    fn billing_requires_each_field() {
+        let mut router_data = authorize_router_data();
+        router_data.address = PaymentAddress::default();
+        assert!(matches!(
+            billing_error(&router_data).current_context(),
+            errors::ConnectorError::MissingRequiredField {
+                field_name: "billing.address.first_name"
+            }
+        ));
+
+        let mut router_data = authorize_router_data();
+        router_data.address = billing_address("Lucho", None, "Av. Jorge Chavez 275", "Lima");
+        assert!(matches!(
+            billing_error(&router_data).current_context(),
+            errors::ConnectorError::MissingRequiredField {
+                field_name: "billing.address.zip"
+            }
+        ));
+
+        // Neither a billing email nor a request email.
+        let mut router_data = authorize_router_data();
+        router_data.address = PaymentAddress::new(
+            None,
+            Some(Address {
+                address: Some(AddressDetails {
+                    city: None,
+                    country: None,
+                    line1: None,
+                    line2: None,
+                    line3: None,
+                    zip: None,
+                    state: None,
+                    first_name: Some(Secret::new("Lucho".to_string())),
+                    last_name: Some(Secret::new("Torres".to_string())),
+                    origin_zip: None,
+                }),
+                phone: None,
+                email: None,
+            }),
+            None,
+            None,
+        );
+        assert!(matches!(
+            billing_error(&router_data).current_context(),
+            errors::ConnectorError::MissingRequiredField {
+                field_name: "billing.email"
+            }
+        ));
+    }
+
+    #[test]
+    fn billing_rejects_short_postal_code() {
+        let mut router_data = authorize_router_data();
+        router_data.address =
+            billing_address("Lucho", Some("1425"), "Av. Jorge Chavez 275", "Lima");
+        assert!(matches!(
+            billing_error(&router_data).current_context(),
+            errors::ConnectorError::InvalidDataFormat {
+                field_name: "billing.address.zip"
+            }
+        ));
+    }
+
+    #[test]
+    fn billing_truncates_street_and_city_on_char_boundaries() {
+        let mut router_data = authorize_router_data();
+        let long_street = "Ñandú ".repeat(10);
+        let long_city = "Ñuñoa de la Santísima Trinidad del Norte";
+        router_data.address = billing_address("Lucho", Some("15074"), &long_street, long_city);
+        let billing = build_billing(&router_data).unwrap();
+        assert!(billing.street.chars().count() <= 40);
+        assert!(billing.street.starts_with("Ñandú Ñandú"));
+        assert_eq!(billing.city.chars().count(), 25);
+        assert!(billing.city.starts_with("Ñuñoa de la Santísima"));
+    }
+
+    #[test]
+    fn billing_counts_characters_not_bytes() {
+        // 5 characters but 10 bytes: valid. A byte count would also accept it, the opposite
+        // case below (4 characters, 8 bytes) is what a byte count would wrongly accept.
+        let mut router_data = authorize_router_data();
+        router_data.address = billing_address("Lucho", Some("15074"), "ÑÑÑÑÑ", "Lima");
+        assert_eq!(build_billing(&router_data).unwrap().street, "ÑÑÑÑÑ");
+
+        router_data.address = billing_address("Lucho", Some("15074"), "ÑÑÑÑ", "Lima");
+        assert!(matches!(
+            billing_error(&router_data).current_context(),
+            errors::ConnectorError::InvalidDataFormat {
+                field_name: "billing.address.line1"
+            }
+        ));
+
+        router_data.address = billing_address("Ñ", Some("15074"), "Av. Jorge Chavez 275", "Lima");
+        assert!(matches!(
+            billing_error(&router_data).current_context(),
+            errors::ConnectorError::InvalidDataFormat {
+                field_name: "billing.address.first_name"
+            }
+        ));
+
+        router_data.address = billing_address("Ñé", Some("15074"), "Av. Jorge Chavez 275", "Lima");
+        assert!(build_billing(&router_data).is_ok());
+    }
+
+    fn with_document(document_type: &str, document: &str) -> PaymentsAuthorizeRouterData {
+        let mut router_data = authorize_router_data();
+        router_data.request.metadata = Some(serde_json::json!({
+            "buyer_document_type": document_type,
+            "buyer_document_number": document,
+        }));
+        router_data
+    }
+
+    #[test]
+    fn billing_requires_the_buyer_document_from_metadata() {
+        let billing = build_billing(&authorize_router_data()).unwrap();
+        assert_eq!(billing.document_type, "DNI");
+        assert_eq!(billing.document, "12345678");
+
+        let mut router_data = authorize_router_data();
+        router_data.request.metadata = None;
+        assert!(matches!(
+            billing_error(&router_data).current_context(),
+            errors::ConnectorError::MissingRequiredField {
+                field_name: "metadata.buyer_document_type"
+            }
+        ));
+
+        router_data.request.metadata = Some(serde_json::json!({ "buyer_document_type": "DNI" }));
+        assert!(matches!(
+            billing_error(&router_data).current_context(),
+            errors::ConnectorError::MissingRequiredField {
+                field_name: "metadata.buyer_document_number"
+            }
+        ));
+    }
+
+    #[test]
+    fn billing_checks_the_document_length_per_type() {
+        // Lowercase input is normalized.
+        let billing = build_billing(&with_document("pasaporte", "ab1234567")).unwrap();
+        assert_eq!(billing.document_type, "PASAPORTE");
+        assert_eq!(billing.document, "AB1234567");
+        assert!(build_billing(&with_document("RUC", "20123456789")).is_ok());
+        assert!(build_billing(&with_document("CE", "001234567")).is_ok());
+        assert!(build_billing(&with_document("OTROS", "X1234567")).is_ok());
+
+        for (document_type, document) in [
+            ("DNI", "1234567"),
+            ("DNI", "1234567A"),
+            ("RUC", "2012345678"),
+            ("CE", "12345678"),
+            ("PASAPORTE", "AB-123456"),
+            ("OTROS", "1234567890123"),
+        ] {
+            assert!(
+                matches!(
+                    billing_error(&with_document(document_type, document)).current_context(),
+                    errors::ConnectorError::InvalidDataFormat {
+                        field_name: "metadata.buyer_document_number"
+                    }
+                ),
+                "{document_type} {document} must be rejected"
+            );
+        }
+
+        assert!(matches!(
+            billing_error(&with_document("LIBRETA", "12345678")).current_context(),
+            errors::ConnectorError::InvalidDataFormat {
+                field_name: "metadata.buyer_document_type"
+            }
+        ));
+    }
+
+    // ------------------------------------------------------------------
+    // Token/Generate and the redirect page
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn token_generate_request_matches_the_documented_shape() {
+        let router_data = authorize_router_data();
+        let item = IzipayRouterData::from((amount("1.99"), &router_data));
+        let request = IzipayTokenRequest::try_from(&item).unwrap();
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({
+                "requestSource": "ECOMMERCE",
+                "merchantCode": "4004353",
+                "orderNumber": "PX1790971180429",
+                "publicKey": "sample_api_key",
+                "amount": "1.99"
+            })
+        );
+    }
+
+    #[test]
+    fn authorize_rejects_unsupported_requests() {
+        let mut router_data = authorize_router_data();
+        router_data.request.currency = enums::Currency::EUR;
+        assert!(matches!(
+            validate_authorize_request(&router_data)
+                .unwrap_err()
+                .current_context(),
+            errors::ConnectorError::CurrencyNotSupported { .. }
+        ));
+
+        let mut router_data = authorize_router_data();
+        router_data.request.capture_method = Some(enums::CaptureMethod::Manual);
+        assert!(matches!(
+            validate_authorize_request(&router_data)
+                .unwrap_err()
+                .current_context(),
+            errors::ConnectorError::NotSupported { .. }
+        ));
+
+        let mut router_data = authorize_router_data();
+        router_data.request.router_return_url = None;
+        assert!(matches!(
+            validate_authorize_request(&router_data)
+                .unwrap_err()
+                .current_context(),
+            errors::ConnectorError::MissingRequiredField {
+                field_name: "router_return_url"
+            }
+        ));
+
+        let mut router_data = authorize_router_data();
+        router_data.request.payment_method_data =
+            PaymentMethodData::Wallet(WalletData::WompiCheckout {});
+        assert!(matches!(
+            validate_authorize_request(&router_data)
+                .unwrap_err()
+                .current_context(),
+            errors::ConnectorError::NotImplemented(_)
+        ));
+
+        // three_ds is not rejected: Izipay's hosted page runs it.
+        let mut router_data = authorize_router_data();
+        router_data.auth_type = enums::AuthenticationType::ThreeDs;
+        assert!(validate_authorize_request(&router_data).is_ok());
+    }
+
+    #[test]
+    fn merchant_buyer_id_falls_back_to_the_payment_id() {
+        let router_data = authorize_router_data();
+        let checkout = validate_authorize_request(&router_data).unwrap();
+        assert_eq!(checkout.merchant_buyer_id, "pay_test_izipay_1");
+
+        let mut router_data = authorize_router_data();
+        router_data.request.customer_id = Some(
+            common_utils::id_type::CustomerId::try_from(std::borrow::Cow::from("cus_123456"))
+                .unwrap(),
+        );
+        let checkout = validate_authorize_request(&router_data).unwrap();
+        assert_eq!(checkout.merchant_buyer_id, "cus_123456");
+
+        router_data.request.customer_id = Some(
+            common_utils::id_type::CustomerId::try_from(std::borrow::Cow::from("c_1")).unwrap(),
+        );
+        let checkout = validate_authorize_request(&router_data).unwrap();
+        assert_eq!(checkout.merchant_buyer_id, "pay_test_izipay_1");
+    }
+
+    fn token_response() -> IzipayTokenResponse {
+        serde_json::from_str(TOKEN_GENERATE_OK).unwrap()
+    }
+
+    #[test]
+    fn authorize_response_builds_the_redirect_page() {
+        let response = token_response();
+        let result = authorize_response(response, authorize_router_data(), 200, &amount("1.99"))
+            .expect("authorize must succeed");
+        assert_eq!(result.status, enums::AttemptStatus::AuthenticationPending);
+        match result.response.expect("must be Ok") {
+            PaymentsResponseData::TransactionResponse {
+                resource_id,
+                redirection_data,
+                connector_metadata,
+                connector_response_reference_id,
+                ..
+            } => {
+                assert!(matches!(
+                    resource_id,
+                    ResponseId::ConnectorTransactionId(ref id) if id == "PX1790971180429"
+                ));
+                assert_eq!(
+                    connector_response_reference_id.as_deref(),
+                    Some("PX1790971180429")
+                );
+                assert_eq!(
+                    connector_metadata,
+                    Some(serde_json::json!({
+                        "mode": "checkout",
+                        "transaction_id": TOKEN_TRANSACTION_ID,
+                        "order_number": "PX1790971180429",
+                    }))
+                );
+                match *redirection_data {
+                    Some(RedirectForm::Html { html_data }) => {
+                        assert!(html_data.contains(
+                            r#"<script src="https://sandbox-checkout.izipay.pe/payments/v1/js/index.js"></script>"#
+                        ));
+                        assert!(html_data.contains("Redirecting to Izipay"));
+                        assert!(html_data.contains("new Izipay({ config: izipayData.config })"));
+                        assert!(html_data.contains("LoadForm"));
+                        assert!(html_data.contains(r#""typeForm":"redirect""#));
+                        assert!(html_data.contains(r#""processType":"AT""#));
+                        assert!(html_data
+                            .contains(&format!(r#""transactionId":"{TOKEN_TRANSACTION_ID}""#)));
+                        assert!(html_data.contains(r#""amount":"1.99""#));
+                        assert!(html_data.contains(r#""currency":"PEN""#));
+                        assert!(html_data.contains(r#""documentType":"DNI""#));
+                        assert!(html_data.contains(r#""document":"12345678""#));
+                        assert!(html_data.contains(r#""keyRSA":"sample_rsa_key""#));
+                        assert!(html_data.contains(
+                            r#""urlIPN":"https://hyperswitch.example/webhooks/merchant_1/mca_1""#
+                        ));
+                        assert!(html_data.contains(&format!(
+                            r#""onSuccess":"{RETURN_URL}?izipay_result=success""#
+                        )));
+                        assert!(html_data.contains("izipay_result=error"));
+                        assert!(html_data.contains("izipay_result=cancel"));
+                        assert!(html_data.contains("izipay_result=sdk_error"));
+                    }
+                    other => panic!("expected an html redirect form, got {other:?}"),
+                }
+            }
+            other => panic!("expected a TransactionResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn production_page_uses_the_production_sdk_and_omits_a_missing_ipn_url() {
+        let mut router_data = authorize_router_data();
+        router_data.test_mode = Some(false);
+        router_data.request.webhook_url = None;
+        router_data.request.router_return_url = Some(format!("{RETURN_URL}?a=b"));
+        let result =
+            authorize_response(token_response(), router_data, 200, &amount("1.99")).unwrap();
+        match result.response.unwrap() {
+            PaymentsResponseData::TransactionResponse {
+                redirection_data, ..
+            } => match *redirection_data {
+                Some(RedirectForm::Html { html_data }) => {
+                    assert!(html_data.contains(
+                        r#"<script src="https://checkout.izipay.pe/payments/v1/js/index.js"></script>"#
+                    ));
+                    assert!(!html_data.contains("urlIPN"));
+                    assert!(html_data.contains(&format!(
+                        r#""onCancel":"{RETURN_URL}?a=b\u0026izipay_result=cancel""#
+                    )));
+                }
+                other => panic!("expected an html redirect form, got {other:?}"),
+            },
+            other => panic!("expected a TransactionResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn page_escapes_buyer_data_for_a_script_context() {
+        let mut router_data = authorize_router_data();
+        router_data.address = billing_address(
+            "</script><script>alert(1)</script>",
+            Some("15074"),
+            "Av. Jorge Chavez 275 \u{2028}\u{2029} & co",
+            "Lima",
+        );
+        let result =
+            authorize_response(token_response(), router_data, 200, &amount("1.99")).unwrap();
+        let PaymentsResponseData::TransactionResponse {
+            redirection_data, ..
+        } = result.response.unwrap()
+        else {
+            panic!("expected a TransactionResponse");
+        };
+        let Some(RedirectForm::Html { html_data }) = *redirection_data else {
+            panic!("expected an html redirect form");
+        };
+        // The name is 34 characters long, so it is valid and has to appear escaped.
+        assert!(!html_data.contains("alert(1)</script>"));
+        assert!(
+            html_data.contains(r"\u003c/script\u003e\u003cscript\u003ealert(1)\u003c/script\u003e")
+        );
+        assert!(!html_data.contains('\u{2028}'));
+        assert!(!html_data.contains('\u{2029}'));
+        assert!(html_data.contains(r"\u2028\u2029 \u0026 co"));
+        // The only closing script tags are the two of the page itself.
+        assert_eq!(html_data.matches("</script>").count(), 2);
+    }
+
+    #[test]
+    fn authorize_error_responses_carry_the_izipay_code() {
+        let response: IzipayTokenResponse =
+            serde_json::from_str(r#"{"code":"500","message":"Error interno","response":{}}"#)
+                .unwrap();
+        let result =
+            authorize_response(response, authorize_router_data(), 200, &amount("1.99")).unwrap();
+        assert_eq!(result.status, enums::AttemptStatus::Failure);
+        let error = result.response.unwrap_err();
+        assert_eq!(error.code, "500");
+        assert_eq!(error.message, "Error interno");
+    }
+
+    // ------------------------------------------------------------------
+    // Session tokens
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn transaction_id_is_read_from_the_session_token() {
+        let token = token_response().session_token().unwrap();
+        assert_eq!(
+            transaction_id_from_session_token(token.peek()).as_deref(),
+            Some(TOKEN_TRANSACTION_ID)
+        );
+        assert_eq!(transaction_id_from_session_token("not-a-jwt"), None);
+    }
+
+    #[test]
+    fn generic_token_request_depends_on_the_operation() {
+        let router_data = base_router_data::<
+            hyperswitch_domain_models::router_flow_types::access_token_auth::AccessTokenAuth,
+            hyperswitch_domain_models::router_request_types::AccessTokenRequestData,
+            AccessToken,
+        >(
+            hyperswitch_domain_models::router_request_types::AccessTokenRequestData {
+                app_id: Secret::new("x".to_string()),
+                id: None,
+                authentication_token: None,
+            },
+            PaymentAddress::default(),
+            "PX1790971180429",
+        );
+        let request = IzipayTokenRequest::try_from(&router_data).unwrap();
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({
+                "requestSource": "ECOMMERCE",
+                "merchantCode": "4004353",
+                "orderNumber": "4004353",
+                "publicKey": "sample_api_key",
+                "amount": "0.00"
+            })
+        );
+        let mut refund_data = router_data;
+        refund_data.refund_id = Some("ref_1".to_string());
+        let request = IzipayTokenRequest::try_from(&refund_data).unwrap();
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["requestSource"],
+            "REFUND"
+        );
+    }
+
+    #[test]
+    fn access_token_response_packs_and_unpacks() {
+        let router_data = base_router_data::<
+            hyperswitch_domain_models::router_flow_types::access_token_auth::AccessTokenAuth,
+            hyperswitch_domain_models::router_request_types::AccessTokenRequestData,
+            AccessToken,
+        >(
+            hyperswitch_domain_models::router_request_types::AccessTokenRequestData {
+                app_id: Secret::new("x".to_string()),
+                id: None,
+                authentication_token: None,
+            },
+            PaymentAddress::default(),
+            "PX1790971180429",
+        );
+        let converted = RouterData::try_from(ResponseRouterData {
+            response: token_response(),
+            data: router_data,
+            http_code: 200,
+        })
+        .unwrap();
+        let access_token = converted.response.unwrap();
+        assert_eq!(access_token.expires, 16);
+
+        let packed = unpack_access_token(Some(&access_token), IzipayTokenKind::Ecommerce).unwrap();
+        assert_eq!(packed.transaction_id, TOKEN_TRANSACTION_ID);
+        assert!(packed.token.peek().starts_with("eyJ"));
+
+        // The token was generated for an ecommerce operation: a refund must not use it.
+        let mismatch = unpack_access_token(Some(&access_token), IzipayTokenKind::Refund)
+            .expect_err("kind mismatch must fail");
+        assert!(matches!(
+            mismatch.current_context(),
+            errors::ConnectorError::FailedToObtainAuthType
+        ));
+        assert!(matches!(
+            unpack_access_token(None, IzipayTokenKind::Ecommerce)
+                .unwrap_err()
+                .current_context(),
+            errors::ConnectorError::MissingRequiredField { .. }
+        ));
+    }
+
+    // ------------------------------------------------------------------
+    // PSync
+    // ------------------------------------------------------------------
+
+    fn sync(
+        body: &str,
+        connector_meta: Option<serde_json::Value>,
+        http_code: u16,
+    ) -> PaymentsSyncRouterData {
+        let response: IzipaySearchResponse = serde_json::from_str(body).unwrap();
+        PaymentsSyncRouterData::try_from(ResponseRouterData {
+            response,
+            data: sync_router_data(connector_meta),
+            http_code,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn approved_search_is_charged_with_refund_metadata() {
+        let authorize_metadata = serde_json::json!({
+            "transaction_id": TOKEN_TRANSACTION_ID,
+            "order_number": "PX1790971180429",
+        });
+        let result = sync(SEARCH_APPROVED, Some(authorize_metadata), 200);
+        assert_eq!(result.status, enums::AttemptStatus::Charged);
+        match result.response.unwrap() {
+            PaymentsResponseData::TransactionResponse {
+                resource_id,
+                connector_metadata,
+                ..
+            } => {
+                assert!(matches!(
+                    resource_id,
+                    ResponseId::ConnectorTransactionId(ref id) if id == "PX1790971180429"
+                ));
+                assert_eq!(
+                    connector_metadata,
+                    Some(serde_json::json!({
+                        "transaction_id": TOKEN_TRANSACTION_ID,
+                        "order_number": "PX1790971180429",
+                        "unique_id": "450249587",
+                        "authorization_code": "S97758",
+                        "reference_number": "2000000",
+                        "transaction_date": "20261002",
+                        "transaction_time": "150001",
+                        "pay_method": "CARD",
+                        "currency": "PEN",
+                        "amount": "1.99",
+                    }))
+                );
+            }
+            other => panic!("expected a TransactionResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn declined_search_fails_with_the_izipay_code_and_message() {
+        let result = sync(SEARCH_DECLINED, None, 200);
+        assert_eq!(result.status, enums::AttemptStatus::Failure);
+        let error = result.response.unwrap_err();
+        assert_eq!(error.code, "51");
+        assert_eq!(error.message, "Fondos Insuficientes");
+        assert_eq!(error.attempt_status, Some(enums::AttemptStatus::Failure));
+        assert_eq!(
+            error.connector_transaction_id.as_deref(),
+            Some("PX1790971250459")
+        );
+    }
+
+    #[test]
+    fn voided_search_is_voided_and_keeps_the_original_metadata() {
+        let result = sync(SEARCH_VOIDED, None, 200);
+        assert_eq!(result.status, enums::AttemptStatus::Voided);
+        match result.response.unwrap() {
+            PaymentsResponseData::TransactionResponse {
+                connector_metadata, ..
+            } => assert_eq!(connector_metadata, None),
+            other => panic!("expected a TransactionResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn authorized_entry_wins_over_a_voided_one() {
+        let body = SEARCH_APPROVED.replace(
+            r#""order":[{"#,
+            r#""order":[{"orderNumber":"PX1790971180429","stateMessage":"Anulado","uniqueId":"313455"},{"#,
+        );
+        let result = sync(&body, None, 200);
+        assert_eq!(result.status, enums::AttemptStatus::Charged);
+    }
+
+    #[test]
+    fn not_found_keeps_the_attempt_status() {
+        let result = sync(SEARCH_NOT_FOUND, None, 200);
+        assert_eq!(result.status, enums::AttemptStatus::AuthenticationPending);
+        assert!(result.response.is_ok());
+    }
+
+    #[test]
+    fn search_status_mapping() {
+        let order = |state: &str| IzipayOrder {
+            pay_method_authorization: None,
+            code_auth: None,
+            currency: None,
+            amount: None,
+            order_number: None,
+            payment_link_id: None,
+            state_message: Some(state.to_string()),
+            date_transaction: None,
+            time_transaction: None,
+            unique_id: None,
+            reference_number: None,
+        };
+        assert_eq!(
+            map_search_status("00", Some(&order("autorizado"))),
+            enums::AttemptStatus::Charged
+        );
+        assert_eq!(
+            map_search_status("00", Some(&order("Denegado"))),
+            enums::AttemptStatus::Failure
+        );
+        assert_eq!(
+            map_search_status("05", Some(&order("Autorizado"))),
+            enums::AttemptStatus::Failure
+        );
+        assert_eq!(
+            map_search_status("00", Some(&order("Pendiente"))),
+            enums::AttemptStatus::Pending
+        );
+        assert_eq!(map_search_status("00", None), enums::AttemptStatus::Pending);
+    }
+
+    #[test]
+    fn search_request_uses_the_order_number() {
+        let request = IzipaySearchRequest::try_from(&sync_router_data(None)).unwrap();
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({
+                "merchantCode": "4004353",
+                "numberOrden": "PX1790971180429",
+                "language": "ESP"
+            })
+        );
+    }
+
+    #[test]
+    fn error_bodies_are_parsed_tolerantly() {
+        let not_found = IzipayErrorResponse::parse(SEARCH_NOT_FOUND.as_bytes()).unwrap();
+        assert_eq!(not_found.code, "MC");
+        assert_eq!(not_found.message, "Transacción No Existe.");
+
+        let refund_error = IzipayErrorResponse::parse(
+            r#"{"header":{},"code":"PI5","message":"El valor del tipo de proceso es inválido","response":{"messageFriendly":"Valor inválido"}}"#
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(refund_error.code, "PI5");
+        assert_eq!(refund_error.message, "Valor inválido");
+
+        let numeric = IzipayErrorResponse::parse(br#"{"code":400,"message":"Bad"}"#).unwrap();
+        assert_eq!(numeric.code, "400");
+
+        assert!(IzipayErrorResponse::parse(b"<html>bad gateway</html>").is_none());
+        assert!(IzipayErrorResponse::parse(b"{}").is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Refunds
+    // ------------------------------------------------------------------
+
+    fn charged_metadata() -> serde_json::Value {
+        serde_json::json!({
+            "order_number": "PX1790971180429",
+            "unique_id": "450249587",
+            "authorization_code": "S97758",
+            "reference_number": "2000000",
+        })
+    }
+
+    #[test]
+    fn refund_request_matches_the_documented_shape() {
+        let router_data = refund_router_data::<Execute>(
+            refund_request_data(Some(charged_metadata())),
+            Some("20493020618"),
+        );
+        let item = IzipayRouterData::from((amount("1.00"), &router_data));
+        let request = IzipayRefundRequest::try_from(&item).unwrap();
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({
+                "merchantCode": "4004353",
+                "ruc": "20493020618",
+                "idUnique": "450249587",
+                "order": {
+                    "authorizationCode": "S97758",
+                    "referenceNumber": "2000000",
+                    "currency": "PEN",
+                    "refundAmount": "1.00",
+                    "totalAmount": "",
+                    "transactionDate": ""
+                },
+                "card": {"brand": "", "firstSixDigits": "", "lastFourDigits": ""},
+                "language": "ESP"
+            })
+        );
+    }
+
+    #[test]
+    fn refund_request_requires_the_ruc_and_the_payment_metadata() {
+        let router_data =
+            refund_router_data::<Execute>(refund_request_data(Some(charged_metadata())), None);
+        let item = IzipayRouterData::from((amount("1.00"), &router_data));
+        assert!(matches!(
+            IzipayRefundRequest::try_from(&item)
+                .unwrap_err()
+                .current_context(),
+            errors::ConnectorError::MissingRequiredField {
+                field_name: "connector_metadata.ruc"
+            }
+        ));
+
+        let router_data = refund_router_data::<Execute>(
+            refund_request_data(Some(charged_metadata())),
+            Some("1234"),
+        );
+        let item = IzipayRouterData::from((amount("1.00"), &router_data));
+        assert!(matches!(
+            IzipayRefundRequest::try_from(&item)
+                .unwrap_err()
+                .current_context(),
+            errors::ConnectorError::InvalidDataFormat { .. }
+        ));
+
+        let router_data =
+            refund_router_data::<Execute>(refund_request_data(None), Some("20493020618"));
+        let item = IzipayRouterData::from((amount("1.00"), &router_data));
+        assert!(matches!(
+            IzipayRefundRequest::try_from(&item)
+                .unwrap_err()
+                .current_context(),
+            errors::ConnectorError::MissingRequiredField {
+                field_name: "connector_metadata.unique_id"
+            }
+        ));
+    }
+
+    #[test]
+    fn refund_response_is_pending_with_the_refund_transaction_id() {
+        let response: IzipayRefundResponse = serde_json::from_str(
+            r#"{"header":{"millis":1201},"code":"00","message":"La devolución fue registrada","response":{"merchantCode":"4007701","ruc":"20432405525","result":{"messageFriendly":"aprobado","refundTransactionId":"762954"}}}"#,
+        )
+        .unwrap();
+        let router_data = refund_router_data::<Execute>(refund_request_data(None), None);
+        let converted = RefundsRouterData::try_from(RefundsResponseRouterData {
+            response,
+            data: router_data,
+            http_code: 200,
+        })
+        .unwrap();
+        let refund = converted.response.unwrap();
+        assert_eq!(refund.connector_refund_id, "762954");
+        assert_eq!(refund.refund_status, enums::RefundStatus::Pending);
+    }
+
+    #[test]
+    fn refund_rejection_carries_the_izipay_error() {
+        let response: IzipayRefundResponse = serde_json::from_str(
+            r#"{"code":"PI5","message":"El valor del tipo de proceso es inválido","response":null}"#,
+        )
+        .unwrap();
+        let router_data = refund_router_data::<Execute>(refund_request_data(None), None);
+        let converted = RefundsRouterData::try_from(RefundsResponseRouterData {
+            response,
+            data: router_data,
+            http_code: 200,
+        })
+        .unwrap();
+        let error = converted.response.unwrap_err();
+        assert_eq!(error.code, "PI5");
+    }
+
+    #[test]
+    fn refund_status_is_mapped_by_name() {
+        for name in ["AUTORIZADO", "procesado", "Aprobado", "ABONADO", "DEVUELTO"] {
+            assert_eq!(map_refund_status(Some(name)), enums::RefundStatus::Success);
+        }
+        for name in ["RECHAZADO", "DENEGADO", "ANULADO", "error"] {
+            assert_eq!(map_refund_status(Some(name)), enums::RefundStatus::Failure);
+        }
+        for name in ["PENDIENTE", "EN PROCESO", ""] {
+            assert_eq!(map_refund_status(Some(name)), enums::RefundStatus::Pending);
+        }
+        assert_eq!(map_refund_status(None), enums::RefundStatus::Pending);
+    }
+
+    #[test]
+    fn refund_sync_response_uses_the_status_name() {
+        let convert = |body: &str| {
+            let response: IzipayRefundStatusResponse = serde_json::from_str(body).unwrap();
+            let mut router_data = refund_router_data::<RSync>(refund_request_data(None), None);
+            router_data.request.connector_refund_id = Some("762954".to_string());
+            RefundsRouterData::<RSync>::try_from(RefundsResponseRouterData {
+                response,
+                data: router_data,
+                http_code: 200,
+            })
+            .unwrap()
+        };
+        let approved = convert(
+            r#"{"code":"00","message":"Operación exitosa","response":{"statusCode":"50","statusName":"AUTORIZADO","responseCode":"00","rejectionReason":""}}"#,
+        );
+        assert_eq!(
+            approved.response.unwrap().refund_status,
+            enums::RefundStatus::Success
+        );
+        let rejected = convert(
+            r#"{"code":"00","message":"Operación exitosa","response":{"statusCode":"40","statusName":"RECHAZADO","responseCode":"D01","rejectionReason":"Monto excede"}}"#,
+        );
+        let error = rejected.response.unwrap_err();
+        assert_eq!(error.code, "D01");
+        assert_eq!(error.message, "Monto excede");
+        let pending = convert(
+            r#"{"code":"00","message":"Operación exitosa","response":{"statusCode":"10","statusName":"PENDIENTE"}}"#,
+        );
+        assert_eq!(
+            pending.response.unwrap().refund_status,
+            enums::RefundStatus::Pending
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Webhooks
+    // ------------------------------------------------------------------
+
+    const HASH_KEY: &str = "test-hash-key";
+
+    fn signed_notification(payload: &str, hash_key: &str) -> Vec<u8> {
+        let signature = HmacSha256
+            .sign_message(hash_key.as_bytes(), payload.as_bytes())
+            .unwrap();
+        serde_json::to_vec(&serde_json::json!({
+            "code": "00",
+            "message": "OK",
+            "messageUser": "Operación exitosa",
+            "messageUserEng": "Successful",
+            "response": {"order": [{"orderNumber": "UNSIGNED-ORDER"}]},
+            "payloadHttp": payload,
+            "signature": base64::engine::general_purpose::STANDARD.encode(signature),
+            "transactionId": "17909712094450964"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn webhook_signature_is_verified_against_the_payload() {
+        let hash_key = Secret::new(HASH_KEY.to_string());
+        let body = signed_notification(SEARCH_APPROVED, HASH_KEY);
+        assert!(verify_webhook_signature(&body, None, &hash_key).unwrap());
+        assert!(
+            !verify_webhook_signature(&body, None, &Secret::new("other-key".to_string())).unwrap()
+        );
+
+        // Editing the signed payload invalidates it.
+        let mut tampered: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        tampered["payloadHttp"] = serde_json::json!(SEARCH_APPROVED.replace("S97758", "S00000"));
+        let tampered = serde_json::to_vec(&tampered).unwrap();
+        assert!(!verify_webhook_signature(&tampered, None, &hash_key).unwrap());
+
+        // A body without a signature falls back to the header.
+        let mut unsigned: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let signature = unsigned["signature"].as_str().unwrap().to_string();
+        unsigned.as_object_mut().unwrap().remove("signature");
+        let unsigned = serde_json::to_vec(&unsigned).unwrap();
+        assert!(verify_webhook_signature(&unsigned, Some(&signature), &hash_key).unwrap());
+        assert!(verify_webhook_signature(&unsigned, None, &hash_key).is_err());
+    }
+
+    #[test]
+    fn webhook_reference_comes_from_the_signed_payload() {
+        let body = signed_notification(SEARCH_APPROVED, HASH_KEY);
+        let payload = parse_signed_payload(&body).unwrap();
+        // The unsigned outer `response` says UNSIGNED-ORDER and must be ignored.
+        assert_eq!(
+            webhook_reference_with_source(&body, &payload)
+                .map(|(reference, _)| reference)
+                .as_deref(),
+            Some("PX1790971180429")
+        );
+
+        let link_payload = SEARCH_APPROVED.replace(
+            r#""orderNumber":"PX1790971180429""#,
+            r#""orderNumber":"IZIORDER1","paymentLinkId":"LINK123""#,
+        );
+        let body = signed_notification(&link_payload, HASH_KEY);
+        assert_eq!(
+            webhook_reference_with_source(&body, &parse_signed_payload(&body).unwrap())
+                .map(|(reference, _)| reference)
+                .as_deref(),
+            Some("LINK123")
+        );
+    }
+
+    #[test]
+    fn webhook_event_types() {
+        let event = |payload: &str| {
+            map_webhook_event(
+                &parse_signed_payload(&signed_notification(payload, HASH_KEY)).unwrap(),
+            )
+        };
+        assert_eq!(
+            event(SEARCH_APPROVED),
+            IncomingWebhookEvent::PaymentIntentSuccess
+        );
+        assert_eq!(
+            event(SEARCH_DECLINED),
+            IncomingWebhookEvent::PaymentIntentFailure
+        );
+        assert_eq!(
+            event(SEARCH_VOIDED),
+            IncomingWebhookEvent::EventNotSupported
+        );
+
+        assert!(parse_signed_payload(b"{}").is_err());
+        assert!(parse_signed_payload(br#"{"payloadHttp":"not json"}"#).is_err());
+    }
+
+    #[test]
+    fn webhook_payload_is_parsed_by_the_sync_response_type() {
+        let body = signed_notification(SEARCH_APPROVED, HASH_KEY);
+        let resource = signed_payload_value(&body).unwrap();
+        let response: IzipaySearchResponse = serde_json::from_value(resource).unwrap();
+        assert_eq!(response.code, "00");
+        let result = PaymentsSyncRouterData::try_from(ResponseRouterData {
+            response,
+            data: sync_router_data(None),
+            http_code: 200,
+        })
+        .unwrap();
+        assert_eq!(result.status, enums::AttemptStatus::Charged);
+    }
+
+    // ------------------------------------------------------------------
+    // Payment link mode
+    // ------------------------------------------------------------------
+
+    const LINK_GENERATE_OK: &str = r#"{
+  "status": 200,
+  "request": {
+    "merchantCode": "4004353",
+    "productDescription": "Reserva Pxsol link test",
+    "amount": "2.50",
+    "currency": "PEN",
+    "expirationDate": "2026-10-04 23:59:00.000",
+    "wayOfUse": "INDIVIDUAL",
+    "email_Notification": "",
+    "payMethod": "CARD",
+    "referenceCode": "REF1790972320",
+    "languageUsed": "ESP",
+    "urL_Terms_and_Conditions": "https://www.pxsol.com/terminos",
+    "urlIpn": "https://example.com/ipn",
+    "billing": {
+      "firstName": "Lucho",
+      "lastName": "Torres",
+      "email": "luchotorres@izipay.pe",
+      "phoneNumber": "989897960",
+      "street": "Av. Jorge Chavez 275",
+      "postalCode": "15074",
+      "city": "Lima",
+      "state": "Lima",
+      "country": "PE",
+      "documentType": "DNI",
+      "document": "12345678"
+    },
+    "shipping": {
+      "firstName": "Lucho",
+      "lastName": "Torres",
+      "email": "luchotorres@izipay.pe",
+      "phoneNumber": "989897960",
+      "street": "Av. Jorge Chavez 275",
+      "postalCode": "15074",
+      "city": "Lima",
+      "state": "Lima",
+      "country": "PE",
+      "documentType": "DNI",
+      "document": "12345678"
+    },
+    "customFields": []
+  },
+  "response": {
+    "header": {
+      "transactionStartDatetime": "2026-10-02 15:18:41.288",
+      "transactionEndDatetime": "2026-10-02 15:18:41.472",
+      "millis": "183"
+    },
+    "code": "00",
+    "message": "OK",
+    "messageFriendly": "OK",
+    "response": {
+      "paymentLinkId": "3c591eccc4314e95b1e3846ba2891898",
+      "merchantCode": "4004353",
+      "urL_PaymentLink": "https://sandbox-checkout.izipay.pe/link/14d749e1ahvp6e",
+      "productDescription": "Reserva Pxsol link test",
+      "amount": "2.50",
+      "amountType": "FIXED",
+      "currency": "PEN",
+      "expirationDate": "2026-10-04 23:59:00.000",
+      "wayOfUse": "INDIVIDUAL",
+      "email_Notification": "",
+      "payMethod": "CARD",
+      "referenceCode": "REF1790972320",
+      "languageUsed": "ESP",
+      "urL_Terms_and_Conditions": "https://www.pxsol.com/terminos",
+      "urlIpn": "https://example.com/ipn",
+      "billing": {
+        "firstname": "Lucho",
+        "lastname": "Torres",
+        "email": "luchotorres@izipay.pe",
+        "phoneNumber": "989897960",
+        "street": "Av. Jorge Chavez 275",
+        "postalCode": "15074",
+        "city": "Lima",
+        "state": "Lima",
+        "country": "PE",
+        "documentType": "DNI",
+        "document": "12345678"
+      },
+      "shipping": {
+        "firstname": "Lucho",
+        "lastname": "Torres",
+        "email": "luchotorres@izipay.pe",
+        "phoneNumber": "989897960",
+        "street": "Av. Jorge Chavez 275",
+        "postalCode": "15074",
+        "city": "Lima",
+        "state": "Lima",
+        "country": "PE",
+        "documentType": "DNI",
+        "document": "12345678"
+      },
+      "state": "1",
+      "customFieldsEnabled": false,
+      "customFields": [
+        {
+          "name": "field1",
+          "value": ""
+        },
+        {
+          "name": "field2",
+          "value": ""
+        },
+        {
+          "name": "field3",
+          "value": ""
+        },
+        {
+          "name": "field4",
+          "value": ""
+        },
+        {
+          "name": "field5",
+          "value": ""
+        },
+        {
+          "name": "field6",
+          "value": ""
+        },
+        {
+          "name": "field7",
+          "value": ""
+        },
+        {
+          "name": "field8",
+          "value": ""
+        },
+        {
+          "name": "field9",
+          "value": ""
+        },
+        {
+          "name": "field10",
+          "value": ""
+        }
+      ]
+    },
+    "statusCode": 200
+  }
+}"#;
+
+    const LINK_TRANSACTIONS_APPROVED: &str = r#"{
+  "status": 200,
+  "request": {
+    "stateList": [
+      "0"
+    ],
+    "dateTimeStart": "2026-09-02",
+    "dateTimeEnd": "2026-10-03",
+    "payMethod": "",
+    "orderNumber": "",
+    "transactionId": "",
+    "pagination": {
+      "pageNumber": "1",
+      "pageSize": "20"
+    }
+  },
+  "response": {
+    "code": "00",
+    "message": "OK",
+    "messageUser": "OK",
+    "messageUserEng": "OK",
+    "header": {
+      "transactionStartDatetime": "2026-10-02 15:20:32.838",
+      "transactionEndDatetime": "2026-10-02 15:20:37.432",
+      "millis": "4593"
+    },
+    "response": {
+      "totalRecords": 1,
+      "currentPage": 1,
+      "pageSize": 20,
+      "transactions": [
+        {
+          "transactionId": "LP261002-201957735-jjGX5G",
+          "code": "00",
+          "payMethodAuthorization": "CARD",
+          "amount": 2.5,
+          "installment": 0,
+          "deferred": 0,
+          "orderNumber": "LP0010443700001",
+          "dateTransaction": "02/10/2026",
+          "timeTransaction": "15:20:12",
+          "uniqueId": "450249598",
+          "referenceNumber": "PV1002000000",
+          "idTxn": "BsqDCmbfOZ4K6McABjRSKg==",
+          "transactionDatetime": "02/10/2026 15:20:12",
+          "currencyCode": "S/",
+          "payMethodId": "1",
+          "pan": "497010******0055",
+          "id_Brand": "14",
+          "authorizationCode": "S82451",
+          "descriptionStatus": "AUTORIZADA",
+          "totalRecordsFound": "1"
+        }
+      ]
+    },
+    "statusCode": 200
+  }
+}"#;
+
+    const LINK_ID: &str = "3c591eccc4314e95b1e3846ba2891898";
+    const LINK_URL: &str = "https://sandbox-checkout.izipay.pe/link/14d749e1ahvp6e";
+
+    fn fixture_response(fixture: &str) -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(fixture).unwrap()["response"].clone()
+    }
+
+    fn at(rfc3339: &str) -> OffsetDateTime {
+        parse_rfc3339(rfc3339).unwrap()
+    }
+
+    /// 2026-10-02 15:18:41 in Lima.
+    fn link_now() -> OffsetDateTime {
+        at("2026-10-02T20:18:41Z")
+    }
+
+    fn link_mca_metadata() -> Secret<serde_json::Value> {
+        Secret::new(serde_json::json!({
+            "ruc": "20123456789",
+            "terms_and_conditions_url": "https://www.pxsol.com/terminos",
+        }))
+    }
+
+    fn link_router_data() -> PaymentsAuthorizeRouterData {
+        let mut router_data = authorize_router_data();
+        router_data.request.payment_method_data =
+            PaymentMethodData::Wallet(WalletData::IzipayPaymentLink {});
+        router_data.request.router_return_url = None;
+        router_data.request.statement_descriptor = Some("Reserva Pxsol link test".to_string());
+        router_data.request.metadata = Some(serde_json::json!({
+            "buyer_document_type": "DNI",
+            "buyer_document_number": "12345678",
+            "payment_link_expires_at": "2026-10-05T05:00:00Z",
+        }));
+        router_data.connector_meta_data = Some(link_mca_metadata());
+        router_data.connector_request_reference_id = "REF1790972320".to_string();
+        router_data
+    }
+
+    fn link_request_json(router_data: &PaymentsAuthorizeRouterData) -> serde_json::Value {
+        let item = IzipayRouterData::from((amount("2.50"), router_data));
+        serde_json::to_value(build_link_request(&item, link_now()).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn link_request_matches_the_documented_shape() {
+        let request = link_request_json(&link_router_data());
+
+        let mut expected = fixture_response_request(LINK_GENERATE_OK);
+        expected["expirationDate"] = serde_json::json!("2026-10-05 00:00:00.000");
+        expected["email_Notification"] = serde_json::Value::Null;
+        expected["urlIpn"] =
+            serde_json::json!("https://hyperswitch.example/webhooks/merchant_1/mca_1");
+        for key in ["billing", "shipping"] {
+            expected[key]["email"] = serde_json::json!("buyer@example.com");
+            // The test billing phone carries the country code.
+            expected[key]["phoneNumber"] = serde_json::json!("51989897960");
+        }
+        assert_eq!(request, expected);
+    }
+
+    fn fixture_response_request(fixture: &str) -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(fixture).unwrap()["request"].clone()
+    }
+
+    #[test]
+    fn link_request_omits_the_ipn_url_when_there_is_none() {
+        let mut router_data = link_router_data();
+        router_data.request.webhook_url = None;
+        let request = link_request_json(&router_data);
+        assert!(request.as_object().unwrap().get("urlIpn").is_none());
+    }
+
+    #[test]
+    fn link_request_sends_empty_contacts_when_the_billing_is_incomplete() {
+        let mut router_data = link_router_data();
+        // No buyer document in the metadata: the full checkout validation fails.
+        router_data.request.metadata =
+            Some(serde_json::json!({"payment_link_expires_at": "2026-10-05T05:00:00Z"}));
+        let request = link_request_json(&router_data);
+        let empty = serde_json::json!({
+            "firstName": "", "lastName": "", "email": "", "phoneNumber": "", "street": "",
+            "postalCode": "", "city": "", "state": "", "country": "", "documentType": "",
+            "document": ""
+        });
+        assert_eq!(request["billing"], empty);
+        assert_eq!(request["shipping"], empty);
+    }
+
+    #[test]
+    fn link_request_defaults() {
+        let mut router_data = link_router_data();
+        router_data.request.metadata = None;
+        router_data.request.statement_descriptor = None;
+        let request = link_request_json(&router_data);
+        // Default validity: 24 h, rounded up to the half hour (Lima 2026-10-03 15:30).
+        assert_eq!(request["expirationDate"], "2026-10-03 15:30:00.000");
+        assert_eq!(request["payMethod"], "CARD");
+        assert_eq!(request["productDescription"], "Order REF1790972320");
+        assert_eq!(request["wayOfUse"], "INDIVIDUAL");
+        assert_eq!(request["languageUsed"], "ESP");
+        assert_eq!(request["referenceCode"], "REF1790972320");
+        assert_eq!(request["customFields"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn link_request_checks_the_payment_method_currency_and_capture() {
+        let mut router_data = link_router_data();
+        router_data.request.currency = enums::Currency::EUR;
+        let item = IzipayRouterData::from((amount("2.50"), &router_data));
+        assert!(matches!(
+            build_link_request(&item, link_now())
+                .unwrap_err()
+                .current_context(),
+            errors::ConnectorError::CurrencyNotSupported { .. }
+        ));
+
+        let mut router_data = link_router_data();
+        router_data.request.capture_method = Some(enums::CaptureMethod::Manual);
+        let item = IzipayRouterData::from((amount("2.50"), &router_data));
+        assert!(matches!(
+            build_link_request(&item, link_now())
+                .unwrap_err()
+                .current_context(),
+            errors::ConnectorError::NotSupported { .. }
+        ));
+
+        let mut router_data = link_router_data();
+        router_data.request.payment_method_data =
+            PaymentMethodData::Wallet(WalletData::IzipayCheckout {});
+        let item = IzipayRouterData::from((amount("2.50"), &router_data));
+        assert!(matches!(
+            build_link_request(&item, link_now())
+                .unwrap_err()
+                .current_context(),
+            errors::ConnectorError::NotImplemented(_)
+        ));
+    }
+
+    #[test]
+    fn link_pay_methods_are_validated() {
+        let methods = |value: serde_json::Value| link_pay_methods(Some(&Secret::new(value)));
+        assert_eq!(link_pay_methods(None).unwrap(), "CARD");
+        assert_eq!(methods(serde_json::json!({})).unwrap(), "CARD");
+        assert_eq!(
+            methods(serde_json::json!({"payment_link_pay_methods": " "})).unwrap(),
+            "CARD"
+        );
+        assert_eq!(
+            methods(
+                serde_json::json!({"payment_link_pay_methods": "card, qr,CARD,yape_code,pago_push"})
+            )
+            .unwrap(),
+            "CARD,QR,YAPE_CODE,PAGO_PUSH"
+        );
+        assert!(matches!(
+            methods(serde_json::json!({"payment_link_pay_methods": "CARD,all"}))
+                .as_ref()
+                .map_err(|error| error.current_context()),
+            Err(errors::ConnectorError::InvalidDataFormat {
+                field_name: "connector_metadata.payment_link_pay_methods"
+            })
+        ));
+    }
+
+    #[test]
+    fn terms_and_conditions_url_is_required_and_validated() {
+        let url = |value: Option<&str>| {
+            let metadata = value
+                .map(|value| Secret::new(serde_json::json!({"terms_and_conditions_url": value})));
+            terms_and_conditions_url(metadata.as_ref())
+        };
+        assert_eq!(
+            url(Some(" https://www.pxsol.com/terminos ")).unwrap(),
+            "https://www.pxsol.com/terminos"
+        );
+        assert!(matches!(
+            terms_and_conditions_url(None)
+                .as_ref()
+                .map_err(|error| error.current_context()),
+            Err(errors::ConnectorError::MissingRequiredField {
+                field_name: "connector_metadata.terms_and_conditions_url"
+            })
+        ));
+        assert!(matches!(
+            url(None).as_ref().map_err(|error| error.current_context()),
+            Err(errors::ConnectorError::MissingRequiredField { .. })
+        ));
+        for invalid in ["ftp://www.pxsol.com/terminos", "not a url", "https://"] {
+            assert!(
+                matches!(
+                    url(Some(invalid))
+                        .as_ref()
+                        .map_err(|error| error.current_context()),
+                    Err(errors::ConnectorError::InvalidDataFormat { .. })
+                ),
+                "{invalid}"
+            );
+        }
+        let too_long = format!("https://www.pxsol.com/{}", "a".repeat(240));
+        assert!(matches!(
+            url(Some(&too_long))
+                .as_ref()
+                .map_err(|error| error.current_context()),
+            Err(errors::ConnectorError::InvalidDataFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn link_product_description_falls_back_and_is_truncated() {
+        let mut router_data = link_router_data();
+        assert_eq!(
+            link_product_description(&router_data),
+            "Reserva Pxsol link test"
+        );
+
+        router_data.request.statement_descriptor = Some("   ".to_string());
+        router_data.request.order_details = Some(
+            serde_json::from_value(serde_json::json!([
+                {"product_name": "Room 101", "quantity": 1, "amount": 100},
+                {"product_name": " ", "quantity": 1, "amount": 100},
+                {"product_name": "Breakfast", "quantity": 2, "amount": 50}
+            ]))
+            .unwrap(),
+        );
+        assert_eq!(
+            link_product_description(&router_data),
+            "Room 101, Breakfast"
+        );
+
+        router_data.request.order_details = None;
+        assert_eq!(
+            link_product_description(&router_data),
+            "Order REF1790972320"
+        );
+
+        router_data.request.statement_descriptor = Some(format!("  {}  ", "ñ".repeat(150)));
+        let description = link_product_description(&router_data);
+        assert_eq!(description.chars().count(), 100);
+    }
+
+    #[test]
+    fn link_expiration_is_rounded_up_to_the_half_hour() {
+        let now = at("2026-10-02T12:00:00Z");
+        let rounded =
+            |requested: &str| link_expiration(Some(at(requested)), now).map(format_rfc3339_utc);
+        assert_eq!(
+            rounded("2026-10-02T15:07:00Z").unwrap(),
+            "2026-10-02T15:30:00Z"
+        );
+        assert_eq!(
+            rounded("2026-10-02T15:30:00Z").unwrap(),
+            "2026-10-02T15:30:00Z"
+        );
+        assert_eq!(
+            rounded("2026-10-02T15:30:00.5Z").unwrap(),
+            "2026-10-02T16:00:00Z"
+        );
+        assert_eq!(
+            rounded("2026-10-02T15:31:00Z").unwrap(),
+            "2026-10-02T16:00:00Z"
+        );
+        assert_eq!(
+            rounded("2026-10-02T15:00:00Z").unwrap(),
+            "2026-10-02T15:00:00Z"
+        );
+        assert_eq!(
+            rounded("2026-10-02T23:45:10Z").unwrap(),
+            "2026-10-03T00:00:00Z"
+        );
+        // A requested time in another offset is converted first: 10:07 at UTC-5 is 15:07 UTC.
+        assert_eq!(
+            rounded("2026-10-02T10:07:00-05:00").unwrap(),
+            "2026-10-02T15:30:00Z"
+        );
+
+        // Less than 15 minutes ahead once rounded.
+        assert!(matches!(
+            rounded("2026-10-02T12:00:00Z")
+                .as_ref()
+                .map_err(|error| error.current_context()),
+            Err(errors::ConnectorError::InvalidDataFormat {
+                field_name: "metadata.payment_link_expires_at"
+            })
+        ));
+        assert!(matches!(
+            rounded("2026-10-01T12:00:00Z")
+                .as_ref()
+                .map_err(|error| error.current_context()),
+            Err(errors::ConnectorError::InvalidDataFormat { .. })
+        ));
+        // Exactly 15 minutes ahead is accepted.
+        assert_eq!(
+            rounded("2026-10-02T12:15:00Z").unwrap(),
+            "2026-10-02T12:30:00Z"
+        );
+        // The default is 24 hours ahead.
+        assert_eq!(
+            format_rfc3339_utc(link_expiration(None, at("2026-10-02T12:10:00Z")).unwrap()),
+            "2026-10-03T12:30:00Z"
+        );
+    }
+
+    #[test]
+    fn link_times_use_the_lima_clock() {
+        // Lima is UTC-5 and has no daylight saving time.
+        assert_eq!(
+            format_lima_datetime(at("2026-10-05T04:59:00Z")),
+            "2026-10-04 23:59:00.000"
+        );
+        assert_eq!(
+            format_lima_datetime(at("2026-01-01T03:00:00Z")),
+            "2025-12-31 22:00:00.000"
+        );
+        assert_eq!(
+            parse_lima_datetime("2026-10-04 23:59:00.000").map(format_rfc3339_utc),
+            Some("2026-10-05T04:59:00Z".to_string())
+        );
+        assert_eq!(parse_lima_datetime("2026-10-04"), None);
+        assert_eq!(parse_lima_datetime("garbage 12:00:00"), None);
+    }
+
+    #[test]
+    fn invalid_requested_expiration_is_rejected() {
+        let mut router_data = link_router_data();
+        router_data.request.metadata =
+            Some(serde_json::json!({"payment_link_expires_at": "tomorrow"}));
+        let item = IzipayRouterData::from((amount("2.50"), &router_data));
+        assert!(matches!(
+            build_link_request(&item, link_now())
+                .unwrap_err()
+                .current_context(),
+            errors::ConnectorError::InvalidDataFormat {
+                field_name: "metadata.payment_link_expires_at"
+            }
+        ));
+    }
+
+    fn link_generate_response() -> IzipayLinkResponse {
+        serde_json::from_value(fixture_response(LINK_GENERATE_OK)).unwrap()
+    }
+
+    #[test]
+    fn link_generate_response_redirects_to_the_link_page() {
+        let result = link_authorize_response_at(
+            link_generate_response(),
+            link_router_data(),
+            200,
+            link_now(),
+        )
+        .unwrap();
+        assert_eq!(result.status, enums::AttemptStatus::AuthenticationPending);
+        match result.response.unwrap() {
+            PaymentsResponseData::TransactionResponse {
+                resource_id,
+                redirection_data,
+                connector_metadata,
+                connector_response_reference_id,
+                ..
+            } => {
+                assert!(matches!(
+                    resource_id,
+                    ResponseId::ConnectorTransactionId(ref id) if id == LINK_ID
+                ));
+                assert_eq!(
+                    connector_response_reference_id.as_deref(),
+                    Some("REF1790972320")
+                );
+                match *redirection_data {
+                    Some(RedirectForm::Form {
+                        endpoint,
+                        method,
+                        form_fields,
+                    }) => {
+                        assert_eq!(endpoint, LINK_URL);
+                        assert_eq!(method, Method::Get);
+                        assert!(form_fields.is_empty());
+                    }
+                    other => panic!("expected a RedirectForm::Form, got {other:?}"),
+                }
+                assert_eq!(
+                    connector_metadata,
+                    Some(serde_json::json!({
+                        "mode": "payment_link",
+                        "payment_link_id": LINK_ID,
+                        "payment_link_url": LINK_URL,
+                        "order_number": "REF1790972320",
+                        "expires_at": "2026-10-05T04:59:00Z",
+                        "created_date": "2026-10-02",
+                    }))
+                );
+            }
+            other => panic!("expected a TransactionResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn link_generate_response_without_an_echoed_expiration_recomputes_it() {
+        let mut response = link_generate_response();
+        response.response.as_mut().unwrap().expiration_date = None;
+        let result =
+            link_authorize_response_at(response, link_router_data(), 200, link_now()).unwrap();
+        match result.response.unwrap() {
+            PaymentsResponseData::TransactionResponse {
+                connector_metadata, ..
+            } => assert_eq!(
+                connector_metadata.unwrap()["expires_at"],
+                "2026-10-05T05:00:00Z"
+            ),
+            other => panic!("expected a TransactionResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn link_generate_errors_fail_the_attempt() {
+        let response: IzipayLinkResponse = serde_json::from_str(
+            r#"{"code":"L28","message":"Invalid payMethod","messageFriendly":"Medio de pago invalido","response":null}"#,
+        )
+        .unwrap();
+        let result =
+            link_authorize_response_at(response, link_router_data(), 200, link_now()).unwrap();
+        assert_eq!(result.status, enums::AttemptStatus::Failure);
+        let error = result.response.unwrap_err();
+        assert_eq!(error.code, "L28");
+        assert_eq!(error.message, "Medio de pago invalido");
+        assert_eq!(error.attempt_status, Some(enums::AttemptStatus::Failure));
+
+        // A "00" without the link is not a success.
+        let response: IzipayLinkResponse =
+            serde_json::from_str(r#"{"code":"00","message":"OK","response":{}}"#).unwrap();
+        assert!(link_authorize_response_at(response, link_router_data(), 200, link_now()).is_err());
+    }
+
+    fn link_meta() -> serde_json::Value {
+        serde_json::json!({
+            "mode": "payment_link",
+            "payment_link_id": LINK_ID,
+            "payment_link_url": LINK_URL,
+            "order_number": "REF1790972320",
+            "expires_at": "2026-10-05T04:59:00Z",
+            "created_date": "2026-10-02",
+        })
+    }
+
+    fn link_sync_router_data(connector_meta: Option<serde_json::Value>) -> PaymentsSyncRouterData {
+        let mut router_data = sync_router_data(connector_meta);
+        router_data.request.connector_transaction_id =
+            ResponseId::ConnectorTransactionId(LINK_ID.to_string());
+        router_data.connector_request_reference_id = "REF1790972320".to_string();
+        router_data
+    }
+
+    fn transactions_body(statuses: &[(&str, &str)]) -> serde_json::Value {
+        let mut body = fixture_response(LINK_TRANSACTIONS_APPROVED);
+        let template = body["response"]["transactions"][0].clone();
+        body["response"]["transactions"] = serde_json::Value::Array(
+            statuses
+                .iter()
+                .map(|(code, status)| {
+                    let mut transaction = template.clone();
+                    transaction["code"] = serde_json::json!(code);
+                    transaction["descriptionStatus"] = serde_json::json!(status);
+                    transaction
+                })
+                .collect(),
+        );
+        body
+    }
+
+    fn link_sync(
+        body: serde_json::Value,
+        connector_meta: Option<serde_json::Value>,
+        now: OffsetDateTime,
+    ) -> PaymentsSyncRouterData {
+        let response: IzipayLinkTransactionsResponse = serde_json::from_value(body).unwrap();
+        link_sync_response(
+            ResponseRouterData {
+                response,
+                data: link_sync_router_data(connector_meta),
+                http_code: 200,
+            },
+            now,
+        )
+        .unwrap()
+    }
+
+    fn link_sync_resource_id(result: &PaymentsSyncRouterData) -> String {
+        match result.response.as_ref().unwrap() {
+            PaymentsResponseData::TransactionResponse { resource_id, .. } => {
+                resource_id.get_connector_transaction_id().unwrap()
+            }
+            other => panic!("expected a TransactionResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn approved_link_transaction_is_charged_with_refund_metadata() {
+        let result = link_sync(
+            fixture_response(LINK_TRANSACTIONS_APPROVED),
+            Some(link_meta()),
+            link_now(),
+        );
+        assert_eq!(result.status, enums::AttemptStatus::Charged);
+        match result.response.unwrap() {
+            PaymentsResponseData::TransactionResponse {
+                resource_id,
+                connector_metadata,
+                connector_response_reference_id,
+                ..
+            } => {
+                assert!(matches!(
+                    resource_id,
+                    ResponseId::ConnectorTransactionId(ref id) if id == LINK_ID
+                ));
+                assert_eq!(
+                    connector_response_reference_id.as_deref(),
+                    Some("LP0010443700001")
+                );
+                let mut expected = link_meta();
+                for (key, value) in [
+                    ("unique_id", "450249598"),
+                    ("authorization_code", "S82451"),
+                    ("reference_number", "PV1002000000"),
+                    ("izipay_order_number", "LP0010443700001"),
+                    ("transaction_datetime", "02/10/2026 15:20:12"),
+                    ("pay_method", "CARD"),
+                    ("amount", "2.5"),
+                    ("currency", "PEN"),
+                ] {
+                    expected[key] = serde_json::json!(value);
+                }
+                assert_eq!(connector_metadata, Some(expected));
+            }
+            other => panic!("expected a TransactionResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_paid_link_status_is_charged() {
+        for status in [
+            "AUTORIZADA",
+            "DEPOSITADA",
+            "ABONADA",
+            "PENDIENTE_DE_DEPOSITO",
+        ] {
+            let result = link_sync(
+                transactions_body(&[("00", status)]),
+                Some(link_meta()),
+                link_now(),
+            );
+            assert_eq!(result.status, enums::AttemptStatus::Charged, "{status}");
+        }
+        // PRE_AUTORIZADA and a non "00" code are not a payment.
+        for (code, status) in [("00", "PRE_AUTORIZADA"), ("51", "AUTORIZADA")] {
+            let result = link_sync(
+                transactions_body(&[(code, status)]),
+                Some(link_meta()),
+                link_now(),
+            );
+            assert_eq!(
+                result.status,
+                enums::AttemptStatus::AuthenticationPending,
+                "{code} {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_paid_transaction_wins_over_denied_ones() {
+        let result = link_sync(
+            transactions_body(&[("51", "DENEGADA"), ("00", "AUTORIZADA")]),
+            Some(link_meta()),
+            link_now(),
+        );
+        assert_eq!(result.status, enums::AttemptStatus::Charged);
+        assert_eq!(link_sync_resource_id(&result), LINK_ID);
+    }
+
+    #[test]
+    fn only_denied_transactions_keep_the_link_pending() {
+        let result = link_sync(
+            transactions_body(&[("51", "DENEGADA"), ("05", "DENEGADA")]),
+            Some(link_meta()),
+            link_now(),
+        );
+        assert_eq!(result.status, enums::AttemptStatus::AuthenticationPending);
+        assert_eq!(link_sync_resource_id(&result), LINK_ID);
+    }
+
+    #[test]
+    fn an_empty_transaction_list_keeps_the_link_pending() {
+        let result = link_sync(transactions_body(&[]), Some(link_meta()), link_now());
+        assert_eq!(result.status, enums::AttemptStatus::AuthenticationPending);
+        assert_eq!(link_sync_resource_id(&result), LINK_ID);
+    }
+
+    #[test]
+    fn a_voided_link_transaction_is_voided() {
+        let result = link_sync(
+            transactions_body(&[("00", "ANULADA")]),
+            Some(link_meta()),
+            link_now(),
+        );
+        assert_eq!(result.status, enums::AttemptStatus::Voided);
+        assert_eq!(link_sync_resource_id(&result), LINK_ID);
+    }
+
+    #[test]
+    fn an_expired_link_without_payment_fails() {
+        let after_expiry = at("2026-10-05T05:00:01Z");
+        for body in [
+            transactions_body(&[]),
+            transactions_body(&[("51", "DENEGADA")]),
+        ] {
+            let result = link_sync(body, Some(link_meta()), after_expiry);
+            assert_eq!(result.status, enums::AttemptStatus::Failure);
+            let error = result.response.unwrap_err();
+            assert_eq!(error.code, "LINK_EXPIRED");
+            assert_eq!(
+                error.message,
+                "The Izipay payment link expired without a payment"
+            );
+            assert_eq!(error.connector_transaction_id.as_deref(), Some(LINK_ID));
+        }
+        // A payment made before the sync wins over the expiration.
+        let result = link_sync(
+            fixture_response(LINK_TRANSACTIONS_APPROVED),
+            Some(link_meta()),
+            after_expiry,
+        );
+        assert_eq!(result.status, enums::AttemptStatus::Charged);
+    }
+
+    #[test]
+    fn link_sync_falls_back_to_the_connector_transaction_id() {
+        let result = link_sync(
+            fixture_response(LINK_TRANSACTIONS_APPROVED),
+            Some(serde_json::json!({"mode": "payment_link"})),
+            link_now(),
+        );
+        assert_eq!(result.status, enums::AttemptStatus::Charged);
+        assert_eq!(link_sync_resource_id(&result), LINK_ID);
+    }
+
+    #[test]
+    fn link_transactions_request_covers_the_link_lifetime() {
+        let request =
+            build_link_transactions_request(Some(&link_meta()), at("2026-10-03T03:00:00Z"));
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({
+                "stateList": ["0"],
+                // Lima is still 2026-10-02 22:00.
+                "dateTimeStart": "2026-10-01",
+                "dateTimeEnd": "2026-10-03",
+                "payMethod": "",
+                "orderNumber": "",
+                "transactionId": "",
+                "pagination": {"pageNumber": "1", "pageSize": "100"}
+            })
+        );
+        // Without the creation date the last 30 days are searched.
+        let request = build_link_transactions_request(None, link_now());
+        let request = serde_json::to_value(&request).unwrap();
+        assert_eq!(request["dateTimeStart"], "2026-09-01");
+        assert_eq!(request["dateTimeEnd"], "2026-10-03");
+    }
+
+    #[test]
+    fn the_sync_response_type_tells_links_from_orders() {
+        let link: IzipayPaymentsSyncResponse =
+            serde_json::from_value(fixture_response(LINK_TRANSACTIONS_APPROVED)).unwrap();
+        assert!(matches!(link, IzipayPaymentsSyncResponse::Link(_)));
+        let order: IzipayPaymentsSyncResponse = serde_json::from_str(SEARCH_APPROVED).unwrap();
+        assert!(matches!(order, IzipayPaymentsSyncResponse::Order(_)));
+        let not_found: IzipayPaymentsSyncResponse = serde_json::from_str(SEARCH_NOT_FOUND).unwrap();
+        assert!(matches!(not_found, IzipayPaymentsSyncResponse::Order(_)));
+    }
+
+    #[test]
+    fn a_search_shaped_body_for_a_link_payment_keeps_the_link_id() {
+        let response: IzipayPaymentsSyncResponse = serde_json::from_str(SEARCH_APPROVED).unwrap();
+        let result = PaymentsSyncRouterData::try_from(ResponseRouterData {
+            response,
+            data: link_sync_router_data(Some(link_meta())),
+            http_code: 200,
+        })
+        .unwrap();
+        assert_eq!(result.status, enums::AttemptStatus::Charged);
+        match result.response.unwrap() {
+            PaymentsResponseData::TransactionResponse {
+                resource_id,
+                connector_metadata,
+                ..
+            } => {
+                assert!(matches!(
+                    resource_id,
+                    ResponseId::ConnectorTransactionId(ref id) if id == LINK_ID
+                ));
+                let metadata = connector_metadata.unwrap();
+                assert_eq!(metadata["mode"], "payment_link");
+                assert_eq!(metadata["payment_link_id"], LINK_ID);
+                assert_eq!(metadata["izipay_order_number"], "PX1790971180429");
+                assert_eq!(metadata["unique_id"], "450249587");
+                assert_eq!(metadata["authorization_code"], "S97758");
+                assert_eq!(metadata["reference_number"], "2000000");
+            }
+            other => panic!("expected a TransactionResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_declined_search_shaped_body_keeps_a_link_payment_pending() {
+        // The buyer can retry on the same link, so a declined attempt is not final for it,
+        // while it is for a checkout order.
+        let response: IzipayPaymentsSyncResponse = serde_json::from_str(SEARCH_DECLINED).unwrap();
+        let result = PaymentsSyncRouterData::try_from(ResponseRouterData {
+            response,
+            data: link_sync_router_data(Some(link_meta())),
+            http_code: 200,
+        })
+        .unwrap();
+        assert_eq!(result.status, enums::AttemptStatus::AuthenticationPending);
+        assert!(result.response.is_ok());
+    }
+
+    #[test]
+    fn webhook_reference_prefers_the_signed_link_id_then_the_unsigned_one() {
+        let hash_key = Secret::new(HASH_KEY.to_string());
+        let with_outer = |payload: &str, outer: serde_json::Value| {
+            let mut body: serde_json::Value =
+                serde_json::from_slice(&signed_notification(payload, HASH_KEY)).unwrap();
+            body["response"] = outer;
+            serde_json::to_vec(&body).unwrap()
+        };
+        let reference =
+            |body: &[u8]| webhook_reference_with_source(body, &parse_signed_payload(body).unwrap());
+
+        // Signed link id.
+        let signed_link = SEARCH_APPROVED.replace(
+            r#""orderNumber":"PX1790971180429""#,
+            r#""orderNumber":"LP1","paymentLinkId":"SIGNEDLINK""#,
+        );
+        let body = with_outer(
+            &signed_link,
+            serde_json::json!({"order": [{"paymentLinkId": "OUTERLINK"}]}),
+        );
+        assert_eq!(reference(&body), Some(("SIGNEDLINK".to_string(), false)));
+        assert!(!webhook_reference_is_unsigned(&body));
+
+        // Only the unsigned outer body has it: used, but flagged.
+        let body = with_outer(
+            SEARCH_APPROVED,
+            serde_json::json!({"order": [{"orderNumber": "LP2", "paymentLinkId": "OUTERLINK"}]}),
+        );
+        assert_eq!(reference(&body), Some(("OUTERLINK".to_string(), true)));
+        assert!(webhook_reference_is_unsigned(&body));
+        // The signature itself is still valid: the caller decides.
+        assert!(verify_webhook_signature(&body, None, &hash_key).unwrap());
+
+        // Neither: the signed order number.
+        let body = with_outer(
+            SEARCH_APPROVED,
+            serde_json::json!({"order": [{"orderNumber": "LP3"}]}),
+        );
+        assert_eq!(
+            reference(&body),
+            Some(("PX1790971180429".to_string(), false))
+        );
+        assert!(!webhook_reference_is_unsigned(&body));
+
+        // An empty or missing outer link id is ignored.
+        let body = with_outer(
+            SEARCH_APPROVED,
+            serde_json::json!({"order": [{"paymentLinkId": ""}]}),
+        );
+        assert_eq!(
+            reference(&body),
+            Some(("PX1790971180429".to_string(), false))
+        );
+        let body = with_outer(SEARCH_APPROVED, serde_json::Value::Null);
+        assert!(!webhook_reference_is_unsigned(&body));
+    }
+}
