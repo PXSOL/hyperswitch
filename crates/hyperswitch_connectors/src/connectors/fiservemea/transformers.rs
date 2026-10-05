@@ -2167,6 +2167,7 @@ fn reported_activity_from_transactions(
                 .ok()?;
             Some(ConnectorReportedRefund {
                 amount_is_remaining_balance: false,
+                amount_is_cumulative_total: false,
                 connector_refund_id,
                 amount,
                 status: map_refund_status(

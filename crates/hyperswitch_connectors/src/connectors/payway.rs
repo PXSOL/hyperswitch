@@ -689,6 +689,7 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Pay
             router_data,
             data.status,
             &data.request.connector_transaction_id,
+            data.request.amount,
             &response,
         ))
     }
@@ -1035,7 +1036,7 @@ mod payment_sync_tests {
     use common_utils::types::MinorUnit;
     use hyperswitch_domain_models::{
         payment_address::PaymentAddress,
-        router_data::ConnectorReportedActivity,
+        router_data::{ConnectorReportedActivity, ConnectorReportedRefund},
         router_request_types::{ResponseId, SyncRequestType},
     };
     use hyperswitch_interfaces::consts;
@@ -1151,7 +1152,13 @@ mod payment_sync_tests {
         })
         .unwrap();
         let attempt_id = ResponseId::ConnectorTransactionId("15403386".to_string());
-        let router_data = finish_payment_sync(router_data, attempt_status, &attempt_id, response);
+        let router_data = finish_payment_sync(
+            router_data,
+            attempt_status,
+            &attempt_id,
+            MinorUnit::new(12050),
+            response,
+        );
         let id = match &router_data.response {
             Ok(PaymentsResponseData::TransactionResponse { resource_id, .. }) => {
                 Ok(resource_id.get_connector_transaction_id().ok())
@@ -1461,7 +1468,7 @@ mod payment_sync_tests {
         let reported = |value: serde_json::Value| {
             let response = parse(json!({"id": 1, "status": "refunded", "amount": value}));
             response
-                .reported_activity(AttemptStatus::Charged)
+                .reported_activity(AttemptStatus::Charged, Some(MinorUnit::new(12050)))
                 .unwrap()
                 .refunds[0]
                 .amount
@@ -1554,9 +1561,20 @@ mod payment_sync_tests {
         attempt_status: AttemptStatus,
         body: serde_json::Value,
     ) -> PaymentsSyncRouterData {
+        handle_sync_response_for(attempt_status, 12050, body)
+    }
+
+    /// Same, for an attempt whose original amount (minor units) is `original_amount`.
+    fn handle_sync_response_for(
+        attempt_status: AttemptStatus,
+        original_amount: i64,
+        body: serde_json::Value,
+    ) -> PaymentsSyncRouterData {
+        let mut data = sync_router_data(attempt_status);
+        data.request.amount = MinorUnit::new(original_amount);
         ConnectorIntegration::<PSync, PaymentsSyncData, PaymentsResponseData>::handle_response(
             Payway::new(),
-            &sync_router_data(attempt_status),
+            &data,
             None,
             Response {
                 headers: None,
@@ -1595,6 +1613,154 @@ mod payment_sync_tests {
             json!({"id": 15403386, "status": "approved"}),
         );
         assert_eq!(data.status, AttemptStatus::Charged);
+        assert!(data.connector_response.is_none());
+    }
+
+    /// `GET /payments/{id}` as the Payway sandbox returned it (2026-10-05, ids and ticket data
+    /// are sandbox values), reduced to the fields that matter.
+    fn sandbox_payment(id: i64, status: &str, amount: i64) -> serde_json::Value {
+        json!({
+            "id": id,
+            "site_transaction_id": "hs-e2e-1791207547883",
+            "payment_method_id": 1,
+            "card_brand": "Visa",
+            "amount": amount,
+            "currency": "ars",
+            "status": status,
+            "status_details": {
+                "ticket": "3",
+                "card_authorization_code": "103908",
+                "address_validation_code": "VTE0011",
+                "error": null
+            },
+            "payment_type": "single",
+            "sub_payments": [],
+            "site_id": "92014297",
+            "fraud_detection": {"status": null}
+        })
+    }
+
+    fn only_activity_refund(data: &PaymentsSyncRouterData) -> ConnectorReportedRefund {
+        let activity = data
+            .connector_response
+            .as_ref()
+            .and_then(|response| response.get_reported_activity().cloned())
+            .expect("an activity is reported");
+        assert!(activity.dispute.is_none());
+        assert_eq!(activity.refunds.len(), 1);
+        activity.refunds[0].clone()
+    }
+
+    #[test]
+    fn a_partial_refund_before_the_batch_close_reports_one_cumulative_refund() {
+        // Sandbox: 10000 approved, 3000 refunded in the panel -> still `approved`, amount 7000.
+        let data = handle_sync_response_for(
+            AttemptStatus::Charged,
+            10_000,
+            sandbox_payment(16132607, "approved", 7_000),
+        );
+        assert_eq!(data.status, AttemptStatus::Charged);
+        let refund = only_activity_refund(&data);
+        assert_eq!(refund.connector_refund_id, "partial_16132607_3000");
+        assert_eq!(refund.amount, MinorUnit::new(3_000));
+        assert_eq!(refund.status, enums::RefundStatus::Success);
+        assert!(refund.amount_is_cumulative_total);
+        assert!(!refund.amount_is_remaining_balance);
+
+        // A second partial refund is a new cumulative value, hence a new id.
+        let data = handle_sync_response_for(
+            AttemptStatus::PartialCharged,
+            10_000,
+            sandbox_payment(16132607, "accredited", 5_000),
+        );
+        let refund = only_activity_refund(&data);
+        assert_eq!(refund.connector_refund_id, "partial_16132607_5000");
+        assert_eq!(refund.amount, MinorUnit::new(5_000));
+
+        // `approved_with_refund` with a lower amount is the same report.
+        let data = handle_sync_response_for(
+            AttemptStatus::Charged,
+            10_000,
+            sandbox_payment(16132607, "APPROVED_WITH_REFUND", 7_000),
+        );
+        assert_eq!(
+            only_activity_refund(&data).connector_refund_id,
+            "partial_16132607_3000"
+        );
+    }
+
+    #[test]
+    fn the_refund_that_empties_the_payment_still_reports_a_balance_refund() {
+        // Remainder refund: annulled, amount 0.
+        let data = handle_sync_response_for(
+            AttemptStatus::Charged,
+            10_000,
+            sandbox_payment(16132607, "annulled", 0),
+        );
+        assert_eq!(data.status, AttemptStatus::Charged);
+        let refund = only_activity_refund(&data);
+        assert_eq!(refund.connector_refund_id, "annulment_16132607");
+        assert!(refund.amount_is_remaining_balance);
+        assert!(!refund.amount_is_cumulative_total);
+
+        // One-shot total refund: annulled, original amount kept.
+        let data = handle_sync_response_for(
+            AttemptStatus::Charged,
+            10_000,
+            sandbox_payment(16132608, "annulled", 10_000),
+        );
+        let refund = only_activity_refund(&data);
+        assert_eq!(refund.connector_refund_id, "annulment_16132608");
+        assert!(refund.amount_is_remaining_balance);
+    }
+
+    #[test]
+    fn an_untouched_or_unusable_amount_reports_nothing() {
+        // Approved with the original amount.
+        let data = handle_sync_response_for(
+            AttemptStatus::Charged,
+            10_000,
+            sandbox_payment(16132604, "approved", 10_000),
+        );
+        assert_eq!(data.status, AttemptStatus::Charged);
+        assert!(data.connector_response.is_none());
+
+        // An amount above the original is not a refund.
+        let data = handle_sync_response_for(
+            AttemptStatus::Charged,
+            10_000,
+            sandbox_payment(16132604, "approved", 12_000),
+        );
+        assert!(data.connector_response.is_none());
+
+        // No amount at all.
+        let data = handle_sync_response_for(
+            AttemptStatus::Charged,
+            10_000,
+            json!({"id": 16132604, "status": "approved_with_refund"}),
+        );
+        assert!(data.connector_response.is_none());
+    }
+
+    #[test]
+    fn a_partial_refund_is_reported_only_when_the_sync_leaves_the_attempt_settled() {
+        let data = handle_sync_response_for(
+            AttemptStatus::Pending,
+            10_000,
+            sandbox_payment(16132607, "approved", 7_000),
+        );
+        // The sync itself settles the attempt (same rule as the annulment balance refund).
+        assert_eq!(data.status, AttemptStatus::Charged);
+        assert_eq!(
+            only_activity_refund(&data).connector_refund_id,
+            "partial_16132607_3000"
+        );
+        // A sync that does not settle the attempt reports nothing.
+        let data = handle_sync_response_for(
+            AttemptStatus::Authorized,
+            10_000,
+            sandbox_payment(16132607, "pre_approved", 7_000),
+        );
         assert!(data.connector_response.is_none());
     }
 }

@@ -166,6 +166,16 @@ fn is_counted_against_balance(status: common_enums::enums::RefundStatus) -> bool
 /// connector may leave it at any value (Payway sends the payment amount for reference).
 /// A Pending/ManualReview refund of Hyperswitch counts against the balance (see
 /// `is_counted_against_balance`), so it blocks the balance refund until it resolves.
+///
+/// A refund flagged `amount_is_cumulative_total` (a connector that reports how much of the
+/// payment was refunded so far, e.g. Payway before the batch close) works the same way
+/// with the reported `amount` as the total instead of `payment_total`: it is deduplicated
+/// by `connector_refund_id` first, otherwise the amount recorded is the reported total
+/// minus the refunds in Success, Pending or ManualReview (existing plus created by this
+/// plan), nothing when they already cover it. The balance mode is the special case where
+/// the cumulative total is the payment total. The connector must use a new
+/// `connector_refund_id` for every new cumulative value so the next increase is recorded;
+/// a Pending refund of Hyperswitch blocks the increase until it resolves, as above.
 pub fn plan_refund_reconciliation_for_payment(
     existing_refunds: &[ExistingRefundView],
     reported_refunds: &[ConnectorReportedRefund],
@@ -199,23 +209,33 @@ pub fn plan_refund_reconciliation_for_payment(
             continue;
         }
 
-        let amount = if reported.amount_is_remaining_balance {
+        // The refunded total this report stands for, when it is not a plain refund: the
+        // payment total for a balance refund, the reported amount for a cumulative one.
+        let cumulative_total = if reported.amount_is_remaining_balance {
             let Some(payment_total) = payment_total else {
                 continue;
             };
-            let already_refunded: i64 = existing_refunds
-                .iter()
-                .filter(|refund| is_counted_against_balance(refund.status))
-                .map(|refund| refund.amount.get_amount_as_i64())
-                .sum();
-            let remaining =
-                payment_total.get_amount_as_i64() - already_refunded - planned_creates_total;
-            if remaining <= 0 {
-                continue;
-            }
-            MinorUnit::new(remaining)
+            Some(payment_total)
+        } else if reported.amount_is_cumulative_total {
+            Some(reported.amount)
         } else {
-            reported.amount
+            None
+        };
+        let amount = match cumulative_total {
+            Some(cumulative_total) => {
+                let already_refunded: i64 = existing_refunds
+                    .iter()
+                    .filter(|refund| is_counted_against_balance(refund.status))
+                    .map(|refund| refund.amount.get_amount_as_i64())
+                    .sum();
+                let remaining =
+                    cumulative_total.get_amount_as_i64() - already_refunded - planned_creates_total;
+                if remaining <= 0 {
+                    continue;
+                }
+                MinorUnit::new(remaining)
+            }
+            None => reported.amount,
         };
 
         // (b) the oldest still-unconfirmed HS refund with the same amount, not
@@ -351,6 +371,14 @@ mod tests {
             amount: MinorUnit::new(amount),
             status,
             amount_is_remaining_balance: false,
+            amount_is_cumulative_total: false,
+        }
+    }
+
+    fn cumulative_refund(connector_refund_id: &str, total: i64) -> ConnectorReportedRefund {
+        ConnectorReportedRefund {
+            amount_is_cumulative_total: true,
+            ..reported_refund(connector_refund_id, total, RefundStatus::Success)
         }
     }
 
@@ -848,6 +876,110 @@ mod tests {
                 Some(MinorUnit::new(5)),
             ),
             plan_refund_reconciliation(&[], &reported, "mercadopago")
+        );
+    }
+
+    fn plan_cumulative(
+        existing: &[ExistingRefundView],
+        id: &str,
+        total: i64,
+    ) -> Vec<RefundReconciliationAction> {
+        plan_refund_reconciliation_for_payment(
+            existing,
+            &[cumulative_refund(id, total)],
+            "payway",
+            Some(MinorUnit::new(10_000)),
+        )
+    }
+
+    fn cumulative_create(id: &str, amount: i64) -> RefundReconciliationAction {
+        RefundReconciliationAction::Create {
+            refund_id: format!("ref_payway_{id}"),
+            connector_refund_id: id.to_string(),
+            amount: MinorUnit::new(amount),
+            status: RefundStatus::Success,
+        }
+    }
+
+    #[test]
+    fn cumulative_total_without_refunds_creates_the_whole_total() {
+        assert_eq!(
+            plan_cumulative(&[], "partial_77_3000", 3_000),
+            vec![cumulative_create("partial_77_3000", 3_000)]
+        );
+    }
+
+    #[test]
+    fn cumulative_total_is_a_no_op_when_an_own_refund_already_covers_it() {
+        let existing = vec![existing_refund(
+            "ref_1",
+            Some("5"),
+            RefundStatus::Success,
+            3_000,
+            dt(1),
+        )];
+        assert!(plan_cumulative(&existing, "partial_77_3000", 3_000).is_empty());
+    }
+
+    #[test]
+    fn cumulative_total_records_only_the_increase_over_a_previous_report() {
+        let existing = vec![existing_refund(
+            "ref_payway_partial_77_3000",
+            Some("partial_77_3000"),
+            RefundStatus::Success,
+            3_000,
+            dt(1),
+        )];
+        assert_eq!(
+            plan_cumulative(&existing, "partial_77_5000", 5_000),
+            vec![cumulative_create("partial_77_5000", 2_000)]
+        );
+        // The earlier value is deduplicated by its connector refund id.
+        assert!(plan_cumulative(&existing, "partial_77_3000", 3_000).is_empty());
+    }
+
+    #[test]
+    fn cumulative_total_is_blocked_by_a_pending_own_refund() {
+        let existing = vec![existing_refund(
+            "ref_1",
+            None,
+            RefundStatus::Pending,
+            3_000,
+            dt(1),
+        )];
+        assert!(plan_cumulative(&existing, "partial_77_3000", 3_000).is_empty());
+    }
+
+    #[test]
+    fn cumulative_total_ignores_failed_refunds_and_does_not_need_a_payment_total() {
+        let existing = vec![existing_refund(
+            "ref_1",
+            Some("5"),
+            RefundStatus::Failure,
+            3_000,
+            dt(1),
+        )];
+        let actions = plan_refund_reconciliation_for_payment(
+            &existing,
+            &[cumulative_refund("partial_77_3000", 3_000)],
+            "payway",
+            None,
+        );
+        assert_eq!(actions, vec![cumulative_create("partial_77_3000", 3_000)]);
+    }
+
+    #[test]
+    fn cumulative_total_subtracts_an_own_smaller_refund() {
+        let existing = vec![existing_refund(
+            "ref_1",
+            Some("5"),
+            RefundStatus::Success,
+            1_000,
+            dt(1),
+        )];
+        assert_eq!(
+            plan_cumulative(&existing, "partial_77_3000", 3_000),
+            vec![cumulative_create("partial_77_3000", 2_000)]
         );
     }
 }

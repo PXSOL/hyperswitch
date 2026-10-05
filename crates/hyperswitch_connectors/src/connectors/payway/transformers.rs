@@ -472,6 +472,9 @@ pub fn declined_error_code(reason_id: Option<&str>) -> String {
 const ANNULMENT_REFUND_ID_PREFIX: &str = "annulment_";
 /// Prefix of the id of the refund that stands for a fully refunded payment.
 const REFUND_REFUND_ID_PREFIX: &str = "refund_";
+/// Prefix of the id of the refund that stands for a cumulative partial refund; the cumulative
+/// refunded amount (minor units) is appended, so every new total gets its own id.
+const PARTIAL_REFUND_ID_PREFIX: &str = "partial_";
 
 pub fn is_settled_attempt(status: enums::AttemptStatus) -> bool {
     matches!(
@@ -530,47 +533,80 @@ impl PaywayPaymentsResponse {
         }
     }
 
-    /// Refund the sync reports when the payment was annulled or refunded in full outside
-    /// Hyperswitch (Payway panel).
+    /// Refund the sync reports when the payment was annulled or refunded outside Hyperswitch
+    /// (Payway panel).
     ///
     /// It depends on the status the sync RESULTS in (`resulting_status`), not on the one the
     /// attempt had before: an attempt that was not settled yet but this sync moves to `Charged`
     /// (a refunded payment maps to `Charged`) reports its refund right away, while an annulled
     /// payment of a non-settled attempt becomes `Voided` and reports nothing.
     ///
-    /// Payway exposes neither a refund id nor an amount, so the refund is a "balance" one: its
-    /// amount is computed by the reconciliation (the refundable total minus the refunds
-    /// Hyperswitch already has) and `amount` here is only the payment amount for reference,
-    /// ignored because of `amount_is_remaining_balance`. The id is deterministic per payment
-    /// and kind, which makes repeated syncs idempotent. A partial refund
-    /// (`approved_with_refund`) carries no amount, so it is logged and not reported.
+    /// - Annulled or refunded in full: Payway exposes neither a refund id nor an amount, so the
+    ///   refund is a "balance" one: its amount is computed by the reconciliation (the refundable
+    ///   total minus the refunds Hyperswitch already has) and `amount` here is only the payment
+    ///   amount for reference, ignored because of `amount_is_remaining_balance`. The id is
+    ///   deterministic per payment and kind, which makes repeated syncs idempotent.
+    /// - Partially refunded: before the batch close Payway keeps the status `approved` and only
+    ///   lowers `amount` (it never returns `approved_with_refund` then). When the reported
+    ///   `amount` is lower than `original_amount` (the amount of the attempt, minor units, same
+    ///   unit as Payway's), the difference is the TOTAL refunded so far and is reported as one
+    ///   cumulative refund (`amount_is_cumulative_total`) whose id carries that total, so the
+    ///   reconciliation records only what Hyperswitch does not hold yet. Without a usable lower
+    ///   amount a `approved_with_refund` is logged and not reported.
     pub fn reported_activity(
         &self,
         resulting_status: enums::AttemptStatus,
+        original_amount: Option<MinorUnit>,
     ) -> Option<ConnectorReportedActivity> {
         if !is_settled_attempt(resulting_status) {
             return None;
         }
-        let prefix = match self.payway_status() {
+        let payment_id = self.payment_id();
+        let status = self.payway_status();
+        let prefix = match status {
             PaywayStatus::Annulled => ANNULMENT_REFUND_ID_PREFIX,
             PaywayStatus::Refunded => REFUND_REFUND_ID_PREFIX,
-            PaywayStatus::PartiallyRefunded => {
-                router_env::logger::warn!(
-                    payment_id = ?self.payment_id(),
-                    "payway: payment partially refunded outside Hyperswitch; the API does not \
-                     expose the amount, so it is not reported"
-                );
-                return None;
+            PaywayStatus::Approved | PaywayStatus::PartiallyRefunded => {
+                let refunded_total = original_amount
+                    .map(MinorUnit::get_amount_as_i64)
+                    .zip(self.amount)
+                    .filter(|(original, current)| *current >= 0 && current < original)
+                    .map(|(original, current)| original - current);
+                return match (refunded_total, payment_id) {
+                    (Some(refunded_total), Some(payment_id)) => Some(ConnectorReportedActivity {
+                        refunds: vec![ConnectorReportedRefund {
+                            connector_refund_id: format!(
+                                "{PARTIAL_REFUND_ID_PREFIX}{payment_id}_{refunded_total}"
+                            ),
+                            amount: MinorUnit::new(refunded_total),
+                            status: enums::RefundStatus::Success,
+                            amount_is_remaining_balance: false,
+                            amount_is_cumulative_total: true,
+                        }],
+                        dispute: None,
+                    }),
+                    _ => {
+                        if status == PaywayStatus::PartiallyRefunded {
+                            router_env::logger::warn!(
+                                payment_id = ?self.payment_id(),
+                                "payway: payment partially refunded outside Hyperswitch without a \
+                                 lower amount; the refunded amount is unknown, so it is not reported"
+                            );
+                        }
+                        None
+                    }
+                };
             }
             _ => return None,
         };
-        let payment_id = self.payment_id()?;
+        let payment_id = payment_id?;
         Some(ConnectorReportedActivity {
             refunds: vec![ConnectorReportedRefund {
                 connector_refund_id: format!("{prefix}{payment_id}"),
                 amount: MinorUnit::new(self.amount.unwrap_or_default()),
                 status: enums::RefundStatus::Success,
                 amount_is_remaining_balance: true,
+                amount_is_cumulative_total: false,
             }],
             dispute: None,
         })
@@ -624,6 +660,7 @@ pub fn finish_payment_sync<F, T>(
     mut router_data: RouterData<F, T, PaymentsResponseData>,
     attempt_status: enums::AttemptStatus,
     attempt_connector_transaction_id: &ResponseId,
+    original_amount: MinorUnit,
     response: &PaywayPaymentsResponse,
 ) -> RouterData<F, T, PaymentsResponseData> {
     if is_settled_attempt(attempt_status) && !is_settled_attempt(router_data.status) {
@@ -649,7 +686,7 @@ pub fn finish_payment_sync<F, T>(
             charges: None,
         });
     }
-    if let Some(activity) = response.reported_activity(router_data.status) {
+    if let Some(activity) = response.reported_activity(router_data.status, Some(original_amount)) {
         match router_data.connector_response.as_mut() {
             Some(connector_response) => connector_response.set_reported_activity(activity),
             None => {

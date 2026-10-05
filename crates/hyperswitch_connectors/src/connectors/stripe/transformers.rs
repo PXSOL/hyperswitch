@@ -2747,6 +2747,7 @@ impl StripeChargeRefunds {
                 };
                 Some(ConnectorReportedRefund {
                     amount_is_remaining_balance: false,
+                    amount_is_cumulative_total: false,
                     connector_refund_id,
                     amount,
                     status: map_reported_refund_status(refund.status.as_deref()),
