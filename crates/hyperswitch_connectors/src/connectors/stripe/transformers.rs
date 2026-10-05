@@ -981,18 +981,23 @@ pub enum StripeBankNames {
     Boz,
 }
 
-// This is used only for Disputes
+// This is used only for Disputes. `EventNotSupported` means the status is not a dispute one.
 impl From<WebhookEventStatus> for api_models::webhooks::IncomingWebhookEvent {
     fn from(value: WebhookEventStatus) -> Self {
         match value {
-            WebhookEventStatus::WarningNeedsResponse => Self::DisputeOpened,
-            WebhookEventStatus::WarningClosed => Self::DisputeCancelled,
-            WebhookEventStatus::WarningUnderReview => Self::DisputeChallenged,
+            WebhookEventStatus::WarningNeedsResponse | WebhookEventStatus::NeedsResponse => {
+                Self::DisputeOpened
+            }
+            WebhookEventStatus::WarningUnderReview | WebhookEventStatus::UnderReview => {
+                Self::DisputeChallenged
+            }
+            // An inquiry closed without a chargeback, or a dispute stopped before it started.
+            WebhookEventStatus::WarningClosed | WebhookEventStatus::Prevented => {
+                Self::DisputeCancelled
+            }
             WebhookEventStatus::Won => Self::DisputeWon,
             WebhookEventStatus::Lost => Self::DisputeLost,
-            WebhookEventStatus::NeedsResponse
-            | WebhookEventStatus::UnderReview
-            | WebhookEventStatus::ChargeRefunded
+            WebhookEventStatus::ChargeRefunded
             | WebhookEventStatus::Succeeded
             | WebhookEventStatus::RequiresPaymentMethod
             | WebhookEventStatus::RequiresConfirmation
@@ -1005,6 +1010,29 @@ impl From<WebhookEventStatus> for api_models::webhooks::IncomingWebhookEvent {
             | WebhookEventStatus::Unknown => Self::EventNotSupported,
         }
     }
+}
+
+/// Hyperswitch event of a `charge.dispute.*` webhook. The dispute object's `status` decides,
+/// not the event name: Stripe withdraws the funds when a dispute OPENS
+/// (`charge.dispute.funds_withdrawn` carries a `needs_response` dispute), so reading that
+/// event as a lost dispute would claw the payment back while the merchant can still win it.
+/// Only when the status is missing or not a dispute one does the event name decide, and then
+/// never as a final outcome (`Won`/`Lost`) for the funds events.
+pub fn dispute_webhook_event(
+    event_type: &WebhookEventType,
+    status: Option<WebhookEventStatus>,
+) -> api_models::webhooks::IncomingWebhookEvent {
+    use api_models::webhooks::IncomingWebhookEvent;
+    status
+        .map(IncomingWebhookEvent::from)
+        .filter(|event| *event != IncomingWebhookEvent::EventNotSupported)
+        .unwrap_or(match event_type {
+            WebhookEventType::DisputeClosed => IncomingWebhookEvent::DisputeCancelled,
+            WebhookEventType::DisputeCreated
+            | WebhookEventType::ChargeDisputeFundsWithdrawn
+            | WebhookEventType::ChargeDisputeFundsReinstated => IncomingWebhookEvent::DisputeOpened,
+            _ => IncomingWebhookEvent::EventNotSupported,
+        })
 }
 
 impl TryFrom<&enums::BankNames> for StripeBankNames {
@@ -4499,6 +4527,7 @@ pub enum WebhookEventStatus {
     Lost,
     NeedsResponse,
     UnderReview,
+    Prevented,
     ChargeRefunded,
     Succeeded,
     RequiresPaymentMethod,
@@ -5125,6 +5154,12 @@ mod external_refund_sync_tests {
 
     const PI_ID: &str = "pi_3PxyzABCDEF";
 
+    /// Real Stripe TEST payment intent 2026-10-05 (secrets redacted): succeeded, one dashboard-style partial refund of 300.
+    const PI1_EXPANDED: &str = r#"{"id":"pi_3UNBOCKMN9YFmEPb0UTbEvFd","object":"payment_intent","allowed_payment_method_types":null,"amount":1000,"amount_capturable":0,"amount_details":{"tip":{}},"amount_received":1000,"application":null,"application_fee_amount":null,"automatic_payment_methods":null,"canceled_at":null,"cancellation_reason":null,"capture_method":"automatic","client_secret":"REDACTED","confirmation_method":"automatic","created":1791204788,"currency":"usd","customer":null,"customer_account":null,"description":null,"excluded_payment_method_types":null,"invoice":null,"last_payment_error":null,"latest_charge":{"id":"ch_3UNBOCKMN9YFmEPb0Nnv369X","object":"charge","amount":1000,"amount_captured":1000,"amount_refunded":300,"amount_updates":[],"application":null,"application_fee":null,"application_fee_amount":null,"balance_transaction":"txn_3UNBOCKMN9YFmEPb0EX62ia9","billing_details":{"address":{"city":null,"country":null,"line1":null,"line2":null,"postal_code":null,"state":null},"email":null,"name":null,"phone":null,"tax_id":null},"calculated_statement_descriptor":"PXSOL USA, INC.","captured":true,"created":1791204788,"currency":"usd","customer":null,"description":null,"destination":null,"dispute":null,"disputed":false,"failure_balance_transaction":null,"failure_code":null,"failure_message":null,"fraud_details":{},"invoice":null,"livemode":false,"metadata":{},"on_behalf_of":null,"order":null,"outcome":{"advice_code":null,"network_advice_code":null,"network_decline_code":null,"network_status":"approved_by_network","reason":null,"risk_level":"normal","risk_score":17,"seller_message":"Payment complete.","type":"authorized"},"paid":true,"payment_intent":"pi_3UNBOCKMN9YFmEPb0UTbEvFd","payment_method":"pm_1UNBOCKMN9YFmEPblrcIGABf","payment_method_details":{"card":{"amount_authorized":1000,"authorization_code":"464928","brand":"visa","checks":{"address_line1_check":null,"address_postal_code_check":null,"cvc_check":"pass"},"country":"US","electronic_commerce_indicator":"07","exp_month":10,"exp_year":2027,"extended_authorization":{"status":"disabled"},"fingerprint":"YBHgZOgYQ2qL2HRG","funding":"credit","incremental_authorization":{"status":"unavailable"},"installments":null,"last4":"4242","mandate":null,"multicapture":{"status":"unavailable"},"network":"visa","network_token":{"used":false},"network_transaction_id":"896672103907910","overcapture":{"maximum_amount_capturable":1000,"status":"unavailable"},"regulated_status":"unregulated","three_d_secure":null,"transaction_link_id":null,"wallet":null},"type":"card"},"radar_options":{},"receipt_email":null,"receipt_number":null,"receipt_url":"https://pay.stripe.com/receipts/REDACTED","refunded":false,"refunds":{"object":"list","data":[{"id":"re_3UNBOCKMN9YFmEPb0o33PHHw","object":"refund","amount":300,"balance_transaction":"txn_3UNBOCKMN9YFmEPb0UG5x1hj","charge":"ch_3UNBOCKMN9YFmEPb0Nnv369X","created":1791204790,"currency":"usd","customer":null,"customer_account":null,"destination_details":{"card":{"reference":"9716644176774460","reference_status":"available","reference_type":"acquirer_reference_number","type":"refund"},"type":"card"},"metadata":{},"payment_intent":"pi_3UNBOCKMN9YFmEPb0UTbEvFd","payment_method":"pm_1UNBOCKMN9YFmEPblrcIGABf","reason":null,"receipt_number":null,"source_transfer_reversal":null,"status":"succeeded","transfer_reversal":null}],"has_more":false,"total_count":1,"url":"/v1/charges/ch_3UNBOCKMN9YFmEPb0Nnv369X/refunds"},"review":null,"shipping":null,"source":null,"source_transfer":null,"statement_descriptor":null,"statement_descriptor_suffix":null,"status":"succeeded","transfer_data":null,"transfer_group":null},"livemode":false,"managed_payments":{"enabled":false},"metadata":{},"next_action":null,"on_behalf_of":null,"payment_method":"pm_1UNBOCKMN9YFmEPblrcIGABf","payment_method_configuration_details":null,"payment_method_options":{"card":{"installments":null,"mandate_options":null,"network":null,"request_three_d_secure":"automatic"}},"payment_method_types":["card"],"payment_record":null,"processing":null,"receipt_email":null,"review":null,"setup_future_usage":null,"shared_payment_granted_token":null,"shipping":null,"source":null,"statement_descriptor":null,"statement_descriptor_suffix":null,"status":"succeeded","transfer_data":null,"transfer_group":null}"#;
+
+    /// Real Stripe TEST payment intent 2026-10-05 (secrets redacted): disputed, no refunds.
+    const PI2_EXPANDED: &str = r#"{"id":"pi_3UNBOFKMN9YFmEPb00WexzTQ","object":"payment_intent","allowed_payment_method_types":null,"amount":1000,"amount_capturable":0,"amount_details":{"tip":{}},"amount_received":1000,"application":null,"application_fee_amount":null,"automatic_payment_methods":null,"canceled_at":null,"cancellation_reason":null,"capture_method":"automatic","client_secret":"REDACTED","confirmation_method":"automatic","created":1791204791,"currency":"usd","customer":null,"customer_account":null,"description":null,"excluded_payment_method_types":null,"invoice":null,"last_payment_error":null,"latest_charge":{"id":"ch_3UNBOFKMN9YFmEPb0P8XvlDX","object":"charge","amount":1000,"amount_captured":1000,"amount_refunded":0,"amount_updates":[],"application":null,"application_fee":null,"application_fee_amount":null,"balance_transaction":"txn_3UNBOFKMN9YFmEPb0YgQcVZR","billing_details":{"address":{"city":null,"country":null,"line1":null,"line2":null,"postal_code":null,"state":null},"email":null,"name":null,"phone":null,"tax_id":null},"calculated_statement_descriptor":"PXSOL USA, INC.","captured":true,"created":1791204791,"currency":"usd","customer":null,"description":null,"destination":null,"dispute":"du_1UNBOHKMN9YFmEPb3cLJ7Uhs","disputed":true,"failure_balance_transaction":null,"failure_code":null,"failure_message":null,"fraud_details":{},"invoice":null,"livemode":false,"metadata":{},"on_behalf_of":null,"order":null,"outcome":{"advice_code":null,"network_advice_code":null,"network_decline_code":null,"network_status":"approved_by_network","reason":null,"risk_level":"normal","risk_score":47,"seller_message":"Payment complete.","type":"authorized"},"paid":true,"payment_intent":"pi_3UNBOFKMN9YFmEPb00WexzTQ","payment_method":"pm_1UNBOFKMN9YFmEPbktGIqWU7","payment_method_details":{"card":{"amount_authorized":1000,"authorization_code":"210532","brand":"visa","checks":{"address_line1_check":null,"address_postal_code_check":null,"cvc_check":"pass"},"country":"US","electronic_commerce_indicator":"07","exp_month":10,"exp_year":2027,"extended_authorization":{"status":"disabled"},"fingerprint":"AdVjHaIeBVJGlzpP","funding":"credit","incremental_authorization":{"status":"unavailable"},"installments":null,"last4":"0259","mandate":null,"multicapture":{"status":"unavailable"},"network":"visa","network_token":{"used":false},"network_transaction_id":"651008610672977","overcapture":{"maximum_amount_capturable":1000,"status":"unavailable"},"regulated_status":"unregulated","three_d_secure":null,"transaction_link_id":null,"wallet":null},"type":"card"},"radar_options":{},"receipt_email":null,"receipt_number":null,"receipt_url":"https://pay.stripe.com/receipts/REDACTED","refunded":false,"refunds":{"object":"list","data":[],"has_more":false,"total_count":0,"url":"/v1/charges/ch_3UNBOFKMN9YFmEPb0P8XvlDX/refunds"},"review":null,"shipping":null,"source":null,"source_transfer":null,"statement_descriptor":null,"statement_descriptor_suffix":null,"status":"succeeded","transfer_data":null,"transfer_group":null},"livemode":false,"managed_payments":{"enabled":false},"metadata":{},"next_action":null,"on_behalf_of":null,"payment_method":"pm_1UNBOFKMN9YFmEPbktGIqWU7","payment_method_configuration_details":null,"payment_method_options":{"card":{"installments":null,"mandate_options":null,"network":null,"request_three_d_secure":"automatic"}},"payment_method_types":["card"],"payment_record":null,"processing":null,"receipt_email":null,"review":null,"setup_future_usage":null,"shared_payment_granted_token":null,"shipping":null,"source":null,"statement_descriptor":null,"statement_descriptor_suffix":null,"status":"succeeded","transfer_data":null,"transfer_group":null}"#;
+
     fn router_data<Flow, Req, Res>(request: Req) -> RouterData<Flow, Req, Res> {
         RouterData {
             flow: PhantomData,
@@ -5597,5 +5632,38 @@ mod external_refund_sync_tests {
             .as_ref()
             .and_then(|response| response.get_reported_activity())
             .is_some());
+    }
+
+    #[test]
+    fn real_stripe_payment_intent_with_a_partial_refund_is_charged_and_reports_it() {
+        let body: Value = serde_json::from_str(PI1_EXPANDED).unwrap();
+        let data = connector_sync(AttemptStatus::Charged, body);
+        assert_eq!(data.status, AttemptStatus::Charged);
+        let activity = data
+            .connector_response
+            .as_ref()
+            .and_then(|response| response.get_reported_activity())
+            .expect("the refund of the charge must be reported");
+        assert_eq!(activity.refunds.len(), 1);
+        assert_eq!(
+            activity.refunds[0].connector_refund_id,
+            "re_3UNBOCKMN9YFmEPb0o33PHHw"
+        );
+        assert_eq!(activity.refunds[0].amount, MinorUnit::new(300));
+        assert_eq!(activity.refunds[0].status, enums::RefundStatus::Success);
+        assert!(activity.dispute.is_none());
+    }
+
+    #[test]
+    fn real_stripe_disputed_payment_intent_is_charged_and_reports_no_refund() {
+        let body: Value = serde_json::from_str(PI2_EXPANDED).unwrap();
+        let data = connector_sync(AttemptStatus::Charged, body);
+        assert_eq!(data.status, AttemptStatus::Charged);
+        // The dispute itself arrives by webhook, the sync reports no activity for it.
+        assert!(data
+            .connector_response
+            .as_ref()
+            .and_then(|response| response.get_reported_activity())
+            .is_none());
     }
 }

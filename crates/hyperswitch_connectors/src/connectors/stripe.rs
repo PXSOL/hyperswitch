@@ -2478,25 +2478,21 @@ impl IncomingWebhook for Stripe {
                 })
                 .unwrap_or(IncomingWebhookEvent::EventNotSupported),
             stripe::WebhookEventType::SourceChargeable => IncomingWebhookEvent::SourceChargeable,
-            stripe::WebhookEventType::DisputeCreated => IncomingWebhookEvent::DisputeOpened,
-            stripe::WebhookEventType::DisputeClosed => IncomingWebhookEvent::DisputeCancelled,
-            stripe::WebhookEventType::DisputeUpdated => details
-                .event_data
-                .event_object
-                .status
-                .map(Into::into)
-                .unwrap_or(IncomingWebhookEvent::EventNotSupported),
             stripe::WebhookEventType::PaymentIntentPartiallyFunded => {
                 IncomingWebhookEvent::PaymentIntentPartiallyFunded
             }
             stripe::WebhookEventType::PaymentIntentRequiresAction => {
                 IncomingWebhookEvent::PaymentActionRequired
             }
-            stripe::WebhookEventType::ChargeDisputeFundsWithdrawn => {
-                IncomingWebhookEvent::DisputeLost
-            }
-            stripe::WebhookEventType::ChargeDisputeFundsReinstated => {
-                IncomingWebhookEvent::DisputeWon
+            stripe::WebhookEventType::DisputeCreated
+            | stripe::WebhookEventType::DisputeClosed
+            | stripe::WebhookEventType::DisputeUpdated
+            | stripe::WebhookEventType::ChargeDisputeFundsWithdrawn
+            | stripe::WebhookEventType::ChargeDisputeFundsReinstated => {
+                stripe::dispute_webhook_event(
+                    &details.event_type,
+                    details.event_data.event_object.status,
+                )
             }
             stripe::WebhookEventType::Unknown
             | stripe::WebhookEventType::ChargeCaptured
@@ -3383,6 +3379,15 @@ mod external_refund_tests {
 
     const PI_ID: &str = "pi_3PxyzABCDEF";
 
+    /// Real Stripe TEST `charge.refunded` delivery body, 2026-10-05.
+    const REAL_CHARGE_REFUNDED: &str = r#"{"id":"evt_3UNBOCKMN9YFmEPb0WakgDBB","object":"event","api_version":"2022-11-15","created":1791204790,"data":{"object":{"id":"ch_3UNBOCKMN9YFmEPb0Nnv369X","object":"charge","amount":1000,"amount_captured":1000,"amount_refunded":300,"amount_updates":[],"application":null,"application_fee":null,"application_fee_amount":null,"balance_transaction":"txn_3UNBOCKMN9YFmEPb0EX62ia9","billing_details":{"address":{"city":null,"country":null,"line1":null,"line2":null,"postal_code":null,"state":null},"email":null,"name":null,"phone":null,"tax_id":null},"calculated_statement_descriptor":"PXSOL USA, INC.","captured":true,"created":1791204788,"currency":"usd","customer":null,"description":null,"destination":null,"dispute":null,"disputed":false,"failure_balance_transaction":null,"failure_code":null,"failure_message":null,"fraud_details":{},"invoice":null,"livemode":false,"metadata":{},"on_behalf_of":null,"order":null,"outcome":{"advice_code":null,"network_advice_code":null,"network_decline_code":null,"network_status":"approved_by_network","reason":null,"risk_level":"normal","risk_score":17,"seller_message":"Payment complete.","type":"authorized"},"paid":true,"payment_intent":"pi_3UNBOCKMN9YFmEPb0UTbEvFd","payment_method":"pm_1UNBOCKMN9YFmEPblrcIGABf","payment_method_details":{"card":{"amount_authorized":1000,"authorization_code":"464928","brand":"visa","checks":{"address_line1_check":null,"address_postal_code_check":null,"cvc_check":"pass"},"country":"US","electronic_commerce_indicator":"07","exp_month":10,"exp_year":2027,"extended_authorization":{"status":"disabled"},"fingerprint":"YBHgZOgYQ2qL2HRG","funding":"credit","incremental_authorization":{"status":"unavailable"},"installments":null,"last4":"4242","mandate":null,"multicapture":{"status":"unavailable"},"network":"visa","network_token":{"used":false},"network_transaction_id":"896672103907910","overcapture":{"maximum_amount_capturable":1000,"status":"unavailable"},"regulated_status":"unregulated","three_d_secure":null,"transaction_link_id":null,"wallet":null},"type":"card"},"radar_options":{},"receipt_email":null,"receipt_number":null,"receipt_url":"https://pay.stripe.com/receipts/REDACTED","refunded":false,"review":null,"shipping":null,"source":null,"source_transfer":null,"statement_descriptor":null,"statement_descriptor_suffix":null,"status":"succeeded","transfer_data":null,"transfer_group":null},"previous_attributes":{"amount_refunded":0,"receipt_url":"https://pay.stripe.com/receipts/REDACTED"}},"livemode":false,"pending_webhooks":4,"request":{"id":"req_D50QhO2NZoQSAX","idempotency_key":"f1356da8-3a23-4998-ab0c-7f76da16cb43"},"type":"charge.refunded"}"#;
+
+    /// Real Stripe TEST `charge.dispute.created` delivery body, 2026-10-05.
+    const REAL_DISPUTE_CREATED: &str = r#"{"id":"evt_1UNBOIKMN9YFmEPblvjH0obP","object":"event","api_version":"2022-11-15","created":1791204794,"data":{"object":{"id":"du_1UNBOHKMN9YFmEPb3cLJ7Uhs","object":"dispute","amount":1000,"balance_transaction":"txn_1UNBOIKMN9YFmEPbBE8pC9zL","balance_transactions":[{"available_on":1791331200,"created":1791204793,"net":-2500,"currency":"usd","source":"du_1UNBOHKMN9YFmEPb3cLJ7Uhs","reporting_category":"dispute","fee_details":[{"application":null,"amount":1500,"type":"stripe_fee","description":"Dispute fee","currency":"usd"}],"amount":-1000,"status":"pending","balance_type":"payments","object":"balance_transaction","id":"txn_1UNBOIKMN9YFmEPbBE8pC9zL","exchange_rate":null,"type":"adjustment","description":"Chargeback withdrawal for ch_3UNBOFKMN9YFmEPb0P8XvlDX","fee":1500}],"charge":"ch_3UNBOFKMN9YFmEPb0P8XvlDX","created":1791204793,"currency":"usd","enhanced_eligibility_types":[],"evidence":{"access_activity_log":null,"billing_address":null,"cancellation_policy":null,"cancellation_policy_disclosure":null,"cancellation_rebuttal":null,"customer_communication":null,"customer_email_address":null,"customer_name":null,"customer_purchase_ip":null,"customer_signature":null,"duplicate_charge_documentation":null,"duplicate_charge_explanation":null,"duplicate_charge_id":null,"enhanced_evidence":{},"product_description":null,"receipt":null,"refund_policy":null,"refund_policy_disclosure":null,"refund_refusal_explanation":null,"service_date":null,"service_documentation":null,"shipping_address":null,"shipping_carrier":null,"shipping_date":null,"shipping_documentation":null,"shipping_tracking_number":null,"uncategorized_file":null,"uncategorized_text":null},"evidence_details":{"due_by":1791935999,"enhanced_eligibility":{},"has_evidence":false,"past_due":false,"submission_count":0},"is_charge_refundable":false,"livemode":false,"metadata":{},"payment_intent":"pi_3UNBOFKMN9YFmEPb00WexzTQ","payment_method_details":{"card":{"brand":"visa","case_type":"chargeback","network":"visa","network_reason_code":"10.4"},"type":"card"},"reason":"fraudulent","status":"needs_response"}},"livemode":false,"pending_webhooks":6,"request":{"id":"req_gSJPUEqu7Hgkr6","idempotency_key":"03f4c5e3-c655-4a8e-bbc0-6e17d421c7e2"},"type":"charge.dispute.created"}"#;
+
+    /// Real Stripe TEST `charge.dispute.funds_withdrawn` delivery body, 2026-10-05: same second as the creation, the dispute is still `needs_response`.
+    const REAL_DISPUTE_FUNDS_WITHDRAWN: &str = r#"{"id":"evt_1UNBOIKMN9YFmEPbW3wvcwcY","object":"event","api_version":"2022-11-15","created":1791204794,"data":{"object":{"id":"du_1UNBOHKMN9YFmEPb3cLJ7Uhs","object":"dispute","amount":1000,"balance_transaction":"txn_1UNBOIKMN9YFmEPbBE8pC9zL","balance_transactions":[{"available_on":1791331200,"created":1791204793,"net":-2500,"currency":"usd","source":"du_1UNBOHKMN9YFmEPb3cLJ7Uhs","reporting_category":"dispute","fee_details":[{"application":null,"amount":1500,"type":"stripe_fee","description":"Dispute fee","currency":"usd"}],"amount":-1000,"status":"pending","balance_type":"payments","object":"balance_transaction","id":"txn_1UNBOIKMN9YFmEPbBE8pC9zL","exchange_rate":null,"type":"adjustment","description":"Chargeback withdrawal for ch_3UNBOFKMN9YFmEPb0P8XvlDX","fee":1500}],"charge":"ch_3UNBOFKMN9YFmEPb0P8XvlDX","created":1791204793,"currency":"usd","enhanced_eligibility_types":[],"evidence":{"access_activity_log":null,"billing_address":null,"cancellation_policy":null,"cancellation_policy_disclosure":null,"cancellation_rebuttal":null,"customer_communication":null,"customer_email_address":null,"customer_name":null,"customer_purchase_ip":null,"customer_signature":null,"duplicate_charge_documentation":null,"duplicate_charge_explanation":null,"duplicate_charge_id":null,"enhanced_evidence":{},"product_description":null,"receipt":null,"refund_policy":null,"refund_policy_disclosure":null,"refund_refusal_explanation":null,"service_date":null,"service_documentation":null,"shipping_address":null,"shipping_carrier":null,"shipping_date":null,"shipping_documentation":null,"shipping_tracking_number":null,"uncategorized_file":null,"uncategorized_text":null},"evidence_details":{"due_by":1791935999,"enhanced_eligibility":{},"has_evidence":false,"past_due":false,"submission_count":0},"is_charge_refundable":false,"livemode":false,"metadata":{},"payment_intent":"pi_3UNBOFKMN9YFmEPb00WexzTQ","payment_method_details":{"card":{"brand":"visa","case_type":"chargeback","network":"visa","network_reason_code":"10.4"},"type":"card"},"reason":"fraudulent","status":"needs_response"}},"livemode":false,"pending_webhooks":2,"request":{"id":"req_gSJPUEqu7Hgkr6","idempotency_key":"03f4c5e3-c655-4a8e-bbc0-6e17d421c7e2"},"type":"charge.dispute.funds_withdrawn"}"#;
+
     fn event(event_type: &str, object: serde_json::Value) -> Vec<u8> {
         serde_json::to_vec(&json!({
             "id": "evt_1Pxyz",
@@ -3556,30 +3561,155 @@ mod external_refund_tests {
         );
     }
 
+    fn dispute_with_status(status: &str) -> serde_json::Value {
+        let mut dispute = dispute_object();
+        dispute["status"] = json!(status);
+        dispute
+    }
+
     #[test]
-    fn dispute_events_keep_their_mapping() {
-        for (event_type, expected) in [
-            (
-                "charge.dispute.created",
-                IncomingWebhookEvent::DisputeOpened,
-            ),
-            (
-                "charge.dispute.closed",
-                IncomingWebhookEvent::DisputeCancelled,
-            ),
-            (
-                "charge.dispute.funds_withdrawn",
-                IncomingWebhookEvent::DisputeLost,
-            ),
-            (
-                "charge.dispute.funds_reinstated",
-                IncomingWebhookEvent::DisputeWon,
-            ),
+    fn dispute_events_follow_the_dispute_status_not_the_event_name() {
+        use IncomingWebhookEvent::{
+            DisputeCancelled, DisputeChallenged, DisputeLost, DisputeOpened, DisputeWon,
+        };
+        let statuses = [
+            ("warning_needs_response", DisputeOpened),
+            ("needs_response", DisputeOpened),
+            ("warning_under_review", DisputeChallenged),
+            ("under_review", DisputeChallenged),
+            ("won", DisputeWon),
+            ("lost", DisputeLost),
+            ("warning_closed", DisputeCancelled),
+            ("prevented", DisputeCancelled),
+        ];
+        for event_type in [
+            "charge.dispute.created",
+            "charge.dispute.updated",
+            "charge.dispute.closed",
+            "charge.dispute.funds_withdrawn",
+            "charge.dispute.funds_reinstated",
         ] {
-            let body = event(event_type, dispute_object());
-            assert_eq!(event_type_of(&body), expected, "{event_type}");
-            assert_syncs_parent_payment(reference_of(&body));
+            for (status, expected) in &statuses {
+                let body = event(event_type, dispute_with_status(status));
+                assert_eq!(event_type_of(&body), *expected, "{event_type}/{status}");
+                assert_syncs_parent_payment(reference_of(&body));
+            }
         }
+    }
+
+    #[test]
+    fn dispute_events_with_an_unknown_status_fall_back_without_a_final_outcome() {
+        for status in ["charge_refunded", "something_new"] {
+            for (event_type, expected) in [
+                (
+                    "charge.dispute.created",
+                    IncomingWebhookEvent::DisputeOpened,
+                ),
+                (
+                    "charge.dispute.closed",
+                    IncomingWebhookEvent::DisputeCancelled,
+                ),
+                (
+                    "charge.dispute.updated",
+                    IncomingWebhookEvent::EventNotSupported,
+                ),
+                (
+                    "charge.dispute.funds_withdrawn",
+                    IncomingWebhookEvent::DisputeOpened,
+                ),
+                (
+                    "charge.dispute.funds_reinstated",
+                    IncomingWebhookEvent::DisputeOpened,
+                ),
+            ] {
+                let body = event(event_type, dispute_with_status(status));
+                assert_eq!(event_type_of(&body), expected, "{event_type}/{status}");
+            }
+        }
+        // No status at all behaves like an unknown one.
+        let mut dispute = dispute_object();
+        dispute.as_object_mut().unwrap().remove("status");
+        let body = event("charge.dispute.funds_withdrawn", dispute);
+        assert_eq!(event_type_of(&body), IncomingWebhookEvent::DisputeOpened);
+    }
+
+    #[test]
+    fn dispute_status_is_still_reported_as_the_connector_status() {
+        for (status, reported) in [
+            ("needs_response", "NeedsResponse"),
+            ("under_review", "UnderReview"),
+            ("won", "Won"),
+            ("lost", "Lost"),
+        ] {
+            let body = event(
+                "charge.dispute.funds_withdrawn",
+                dispute_with_status(status),
+            );
+            let details = with_request(&body, |request| {
+                Stripe::new().get_dispute_details(request).unwrap()
+            });
+            assert_eq!(details.connector_status, reported);
+        }
+    }
+
+    #[test]
+    fn real_charge_refunded_syncs_the_parent_payment_and_is_not_signature_verified() {
+        let body = REAL_CHARGE_REFUNDED.as_bytes();
+        assert_eq!(
+            event_type_of(body),
+            IncomingWebhookEvent::PaymentIntentProcessing
+        );
+        match reference_of(body) {
+            ObjectReferenceId::PaymentId(PaymentIdType::ConnectorTransactionId(id)) => {
+                assert_eq!(id, "pi_3UNBOCKMN9YFmEPb0UTbEvFd")
+            }
+            other => panic!("expected the parent payment intent, got {other:?}"),
+        }
+        // A valid HMAC would verify a regular event; this one never does, so core syncs live.
+        let secret = b"whsec_test";
+        let message = b"1791204791.body";
+        let signature = crypto::HmacSha256.sign_message(secret, message).unwrap();
+        let verified = with_request(body, |request| {
+            Stripe::new()
+                .get_webhook_source_verification_algorithm(request)
+                .unwrap()
+                .verify_signature(secret, &signature, message)
+                .unwrap()
+        });
+        assert!(!verified);
+    }
+
+    #[test]
+    fn real_dispute_created_opens_the_dispute_and_parses_its_details() {
+        let body = REAL_DISPUTE_CREATED.as_bytes();
+        assert_eq!(event_type_of(body), IncomingWebhookEvent::DisputeOpened);
+        match reference_of(body) {
+            ObjectReferenceId::PaymentId(PaymentIdType::ConnectorTransactionId(id)) => {
+                assert_eq!(id, "pi_3UNBOFKMN9YFmEPb00WexzTQ")
+            }
+            other => panic!("expected the parent payment intent, got {other:?}"),
+        }
+        let details = with_request(body, |request| {
+            Stripe::new().get_dispute_details(request).unwrap()
+        });
+        assert_eq!(details.amount.to_string(), "1000");
+        assert_eq!(details.currency, common_enums::Currency::USD);
+        assert_eq!(details.connector_dispute_id, "du_1UNBOHKMN9YFmEPb3cLJ7Uhs");
+        assert_eq!(details.connector_status, "NeedsResponse");
+        assert_eq!(details.connector_reason.as_deref(), Some("fraudulent"));
+    }
+
+    #[test]
+    fn real_dispute_funds_withdrawn_does_not_report_a_lost_dispute() {
+        // Stripe withdraws the funds when the dispute opens, in the same second as
+        // `charge.dispute.created`, while the dispute is still `needs_response`.
+        let body = REAL_DISPUTE_FUNDS_WITHDRAWN.as_bytes();
+        assert_eq!(event_type_of(body), IncomingWebhookEvent::DisputeOpened);
+        let details = with_request(body, |request| {
+            Stripe::new().get_dispute_details(request).unwrap()
+        });
+        assert_eq!(details.connector_dispute_id, "du_1UNBOHKMN9YFmEPb3cLJ7Uhs");
+        assert_eq!(details.connector_status, "NeedsResponse");
     }
 
     #[test]
