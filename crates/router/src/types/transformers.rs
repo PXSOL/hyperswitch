@@ -297,7 +297,8 @@ impl ForeignFrom<api_enums::PaymentMethodType> for api_enums::PaymentMethod {
             | api_enums::PaymentMethodType::RevolutPay
             | api_enums::PaymentMethodType::Bluecode
             | api_enums::PaymentMethodType::MercadoPago
-            | api_enums::PaymentMethodType::Wompi => Self::Wallet,
+            | api_enums::PaymentMethodType::Wompi
+            | api_enums::PaymentMethodType::StripeCheckout => Self::Wallet,
             api_enums::PaymentMethodType::Affirm
             | api_enums::PaymentMethodType::Alma
             | api_enums::PaymentMethodType::AfterpayClearpay

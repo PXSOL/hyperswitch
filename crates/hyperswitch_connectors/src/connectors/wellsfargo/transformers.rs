@@ -240,6 +240,7 @@ impl TryFrom<&SetupMandateRouterData> for WellsfargoZeroMandateRequest {
                 | WalletData::RevolutPay(_)
                 | WalletData::MercadoPagoSdk(_)
                 | WalletData::WompiCheckout {}
+                | WalletData::StripeCheckout {}
                 | WalletData::MercadoPagoCheckoutPro {} => {
                     Err(errors::ConnectorError::NotImplemented(
                         utils::get_unimplemented_payment_method_error_message("Wellsfargo"),
@@ -1334,6 +1335,7 @@ impl TryFrom<&WellsfargoRouterData<&PaymentsAuthorizeRouterData>> for Wellsfargo
                         | WalletData::RevolutPay(_)
                         | WalletData::MercadoPagoSdk(_)
                         | WalletData::WompiCheckout {}
+                        | WalletData::StripeCheckout {}
                         | WalletData::MercadoPagoCheckoutPro {} => {
                             Err(errors::ConnectorError::NotImplemented(
                                 utils::get_unimplemented_payment_method_error_message("Wellsfargo"),

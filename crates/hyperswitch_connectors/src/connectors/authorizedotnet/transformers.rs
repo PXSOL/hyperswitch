@@ -545,6 +545,7 @@ impl TryFrom<&SetupMandateRouterData> for CreateCustomerPaymentProfileRequest {
                 | WalletData::RevolutPay(_)
                 | WalletData::MercadoPagoSdk(_)
                 | WalletData::WompiCheckout {}
+                | WalletData::StripeCheckout {}
                 | WalletData::MercadoPagoCheckoutPro {} => {
                     Err(errors::ConnectorError::NotImplemented(
                         utils::get_unimplemented_payment_method_error_message("authorizedotnet"),
@@ -2261,6 +2262,7 @@ fn get_wallet_data(
         | WalletData::RevolutPay(_)
         | WalletData::MercadoPagoSdk(_)
         | WalletData::WompiCheckout {}
+        | WalletData::StripeCheckout {}
         | WalletData::MercadoPagoCheckoutPro {} => Err(errors::ConnectorError::NotImplemented(
             utils::get_unimplemented_payment_method_error_message("authorizedotnet"),
         ))?,

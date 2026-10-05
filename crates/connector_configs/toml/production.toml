@@ -3258,6 +3258,8 @@ payment_method_type = "apple_pay"
 payment_method_type = "google_pay"
 [[stripe.wallet]]
 payment_method_type = "revolut_pay"
+[[stripe.wallet]]
+  payment_method_type = "stripe_checkout"
 is_verifiable = true
 [stripe.connector_auth.HeaderKey]
 api_key = "Secret Key"

@@ -897,7 +897,8 @@ impl TryFrom<enums::PaymentMethodType> for StripePaymentMethodType {
             | enums::PaymentMethodType::Mifinity
             | enums::PaymentMethodType::Breadpay
             | enums::PaymentMethodType::MercadoPago
-            | enums::PaymentMethodType::Wompi => Err(ConnectorError::NotImplemented(
+            | enums::PaymentMethodType::Wompi
+            | enums::PaymentMethodType::StripeCheckout => Err(ConnectorError::NotImplemented(
                 get_unimplemented_payment_method_error_message("stripe"),
             )
             .into()),
@@ -1214,6 +1215,7 @@ fn get_stripe_payment_method_type_from_wallet_data(
         | WalletData::Mifinity(_)
         | WalletData::MercadoPagoSdk(_)
         | WalletData::WompiCheckout {}
+        | WalletData::StripeCheckout {}
         | WalletData::MercadoPagoCheckoutPro {} => Err(ConnectorError::NotImplemented(
             get_unimplemented_payment_method_error_message("stripe"),
         )),
@@ -1696,6 +1698,7 @@ impl TryFrom<(&WalletData, Option<PaymentMethodToken>)> for StripePaymentMethodD
             | WalletData::Mifinity(_)
             | WalletData::MercadoPagoSdk(_)
             | WalletData::WompiCheckout {}
+            | WalletData::StripeCheckout {}
             | WalletData::MercadoPagoCheckoutPro {} => Err(ConnectorError::NotImplemented(
                 get_unimplemented_payment_method_error_message("stripe"),
             )
@@ -4780,6 +4783,423 @@ where
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stripe hosted Checkout (Checkout Sessions, redirect)
+// ---------------------------------------------------------------------------
+
+/// Prefix of a Checkout Session id (`cs_test_…` / `cs_live_…`). A session id is held as the
+/// attempt's connector transaction id until the buyer pays; PSync then promotes the
+/// PaymentIntent id (`pi_…`) so refunds and webhooks work on the usual PaymentIntent.
+pub const CHECKOUT_SESSION_ID_PREFIX: &str = "cs_";
+
+/// `object` value of a Checkout Session in Stripe's payloads.
+pub const CHECKOUT_SESSION_OBJECT: &str = "checkout.session";
+
+/// Stripe requires `expires_at` to be between 30 minutes and 24 hours after creation; 35
+/// minutes leaves room for the request latency. The platform's pending-payment cron waits
+/// longer than this before reconciling and cancelling, so that last check is definitive.
+const CHECKOUT_SESSION_TTL_SECS: i64 = 35 * 60;
+
+/// Stripe caps `product_data.name` at 250 characters.
+const CHECKOUT_PRODUCT_NAME_MAX_CHARS: usize = 250;
+
+pub fn is_checkout_session_id(connector_transaction_id: &str) -> bool {
+    connector_transaction_id.starts_with(CHECKOUT_SESSION_ID_PREFIX)
+}
+
+/// Minimal view of a Stripe object, used to tell a Checkout Session from a PaymentIntent
+/// (a webhook-driven sync hands the PaymentIntent event object to the session's attempt).
+#[derive(Debug, Deserialize)]
+pub struct StripeObjectKind {
+    pub object: Option<String>,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+pub struct StripeCheckoutSessionRequest {
+    pub mode: &'static str,
+    #[serde(rename = "line_items[0][price_data][currency]")]
+    pub currency: String,
+    #[serde(rename = "line_items[0][price_data][unit_amount]")]
+    pub unit_amount: MinorUnit,
+    #[serde(rename = "line_items[0][price_data][product_data][name]")]
+    pub product_name: String,
+    #[serde(rename = "line_items[0][quantity]")]
+    pub quantity: u8,
+    pub success_url: String,
+    pub cancel_url: String,
+    pub client_reference_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub customer_email: Option<Email>,
+    #[serde(
+        rename = "payment_intent_data[description]",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub description: Option<String>,
+    #[serde(
+        rename = "payment_intent_data[statement_descriptor_suffix]",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub statement_descriptor_suffix: Option<String>,
+    pub expires_at: i64,
+    #[serde(flatten)]
+    pub metadata: HashMap<String, String>,
+}
+
+/// Plain inputs of a Checkout Session, extracted from the router data so the request can be
+/// built (and tested) without it.
+pub struct StripeCheckoutSessionParams {
+    pub amount: MinorUnit,
+    pub currency: String,
+    pub description: Option<String>,
+    pub return_url: String,
+    pub order_id: String,
+    pub email: Option<Email>,
+    pub statement_descriptor_suffix: Option<String>,
+    pub merchant_metadata: Option<Secret<Value>>,
+    pub now_unix_timestamp: i64,
+}
+
+impl From<StripeCheckoutSessionParams> for StripeCheckoutSessionRequest {
+    fn from(params: StripeCheckoutSessionParams) -> Self {
+        let product_name = params
+            .description
+            .clone()
+            .filter(|description| !description.trim().is_empty())
+            .unwrap_or_else(|| format!("Payment {}", params.order_id))
+            .chars()
+            .take(CHECKOUT_PRODUCT_NAME_MAX_CHARS)
+            .collect();
+
+        // The PaymentIntent that Checkout creates carries the same metadata as the direct
+        // PaymentIntent flow (`order_id` + merchant metadata), so webhooks resolve the attempt.
+        let metadata = get_transaction_metadata(params.merchant_metadata, params.order_id.clone())
+            .into_iter()
+            .map(|(key, value)| {
+                let key = key
+                    .strip_prefix("metadata")
+                    .map(|rest| format!("payment_intent_data[metadata]{rest}"))
+                    .unwrap_or(key);
+                (key, value)
+            })
+            .collect();
+
+        Self {
+            mode: "payment",
+            currency: params.currency.to_lowercase(),
+            unit_amount: params.amount,
+            product_name,
+            quantity: 1,
+            success_url: params.return_url.clone(),
+            cancel_url: params.return_url,
+            client_reference_id: params.order_id,
+            customer_email: params.email,
+            description: params.description,
+            statement_descriptor_suffix: params.statement_descriptor_suffix,
+            expires_at: params.now_unix_timestamp + CHECKOUT_SESSION_TTL_SECS,
+            metadata,
+        }
+    }
+}
+
+impl TryFrom<(&PaymentsAuthorizeRouterData, MinorUnit)> for StripeCheckoutSessionRequest {
+    type Error = error_stack::Report<ConnectorError>;
+    fn try_from(data: (&PaymentsAuthorizeRouterData, MinorUnit)) -> Result<Self, Self::Error> {
+        let (item, amount) = data;
+
+        match item.request.capture_method {
+            None
+            | Some(enums::CaptureMethod::Automatic)
+            | Some(enums::CaptureMethod::SequentialAutomatic) => {}
+            Some(_) => Err(ConnectorError::NotSupported {
+                message: "Manual capture for Stripe Checkout".to_string(),
+                connector: "Stripe",
+            })?,
+        }
+        if item.request.split_payments.is_some() {
+            Err(ConnectorError::NotSupported {
+                message: "Split payments for Stripe Checkout".to_string(),
+                connector: "Stripe",
+            })?
+        }
+        let return_url =
+            item.request
+                .router_return_url
+                .clone()
+                .ok_or(ConnectorError::MissingRequiredField {
+                    field_name: "return_url",
+                })?;
+
+        Ok(Self::from(StripeCheckoutSessionParams {
+            amount,
+            currency: item.request.currency.to_string(),
+            description: item.description.clone(),
+            return_url,
+            order_id: item.connector_request_reference_id.clone(),
+            email: item
+                .request
+                .email
+                .clone()
+                .or_else(|| item.get_optional_billing_email()),
+            statement_descriptor_suffix: item.request.statement_descriptor_suffix.clone(),
+            merchant_metadata: item.request.metadata.clone().map(Into::into),
+            now_unix_timestamp: time::OffsetDateTime::now_utc().unix_timestamp(),
+        }))
+    }
+}
+
+/// Body of `POST /v1/checkout/sessions/{id}/expire`, which takes no parameters.
+#[derive(Debug, Default, Serialize)]
+pub struct StripeEmptyRequest {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StripeCheckoutSessionStatus {
+    Open,
+    Complete,
+    Expired,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum StripeCheckoutPaymentIntent {
+    Id(String),
+    Object(Box<PaymentIntentSyncResponse>),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StripeCheckoutSessionResponse {
+    pub id: String,
+    pub status: StripeCheckoutSessionStatus,
+    pub url: Option<String>,
+    pub payment_intent: Option<StripeCheckoutPaymentIntent>,
+    pub amount_total: Option<MinorUnit>,
+    pub currency: Option<String>,
+}
+
+impl StripeCheckoutSessionResponse {
+    /// Amount and currency to check against the request: the expanded PaymentIntent's when
+    /// present (what the PaymentIntent sync checks), else the session's own total.
+    pub fn amount_and_currency(&self) -> Option<(MinorUnit, String)> {
+        match &self.payment_intent {
+            Some(StripeCheckoutPaymentIntent::Object(payment_intent)) => {
+                Some((payment_intent.amount, payment_intent.currency.clone()))
+            }
+            _ => self.amount_total.zip(self.currency.clone()),
+        }
+    }
+}
+
+/// Response of expiring a Checkout Session (the void of an unpaid session).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StripeCheckoutSessionVoidResponse(pub StripeCheckoutSessionResponse);
+
+/// Page that sends the buyer to the Checkout URL. Stripe's URL carries a mandatory `#fragment`
+/// (the session's client-side key). `RedirectForm::Form` would put it in a form `action` and
+/// rebuild the navigation through the form machinery; navigating with `location.replace` on the
+/// verbatim, JSON-escaped URL keeps the fragment untouched.
+pub fn build_checkout_redirect_form(checkout_url: &str) -> RedirectForm {
+    let js_url = serde_json::to_string(checkout_url)
+        .unwrap_or_else(|_| "\"\"".to_string())
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026");
+    let href = checkout_url
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    RedirectForm::Html {
+        html_data: format!(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+             <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+             <title>Stripe Checkout</title></head><body>\
+             <noscript><a href=\"{href}\">Continue to Stripe Checkout</a></noscript>\
+             <script>window.location.replace({js_url});</script></body></html>"
+        ),
+    }
+}
+
+/// `GET` URL that reads a Checkout Session together with its PaymentIntent.
+pub fn checkout_session_sync_url(base_url: &str, session_id: &str) -> String {
+    format!("{base_url}v1/checkout/sessions/{session_id}?expand[0]=payment_intent")
+}
+
+/// `POST` URL that expires an unpaid Checkout Session.
+pub fn checkout_session_expire_url(base_url: &str, session_id: &str) -> String {
+    format!("{base_url}v1/checkout/sessions/{session_id}/expire")
+}
+
+fn checkout_session_error(
+    session: &StripeCheckoutSessionResponse,
+    http_code: u16,
+    code: &str,
+    message: &str,
+    attempt_status: AttemptStatus,
+) -> hyperswitch_domain_models::router_data::ErrorResponse {
+    hyperswitch_domain_models::router_data::ErrorResponse {
+        code: code.to_string(),
+        message: message.to_string(),
+        reason: Some(message.to_string()),
+        status_code: http_code,
+        attempt_status: Some(attempt_status),
+        connector_transaction_id: Some(session.id.clone()),
+        network_advice_code: None,
+        network_decline_code: None,
+        network_error_message: None,
+        connector_metadata: None,
+    }
+}
+
+fn checkout_session_transaction_response(
+    session: &StripeCheckoutSessionResponse,
+    resource_id: ResponseId,
+    redirection_data: Option<RedirectForm>,
+) -> PaymentsResponseData {
+    PaymentsResponseData::TransactionResponse {
+        resource_id,
+        redirection_data: Box::new(redirection_data),
+        mandate_reference: Box::new(None),
+        connector_metadata: None,
+        network_txn_id: None,
+        connector_response_reference_id: Some(session.id.clone()),
+        incremental_authorization_allowed: None,
+        charges: None,
+    }
+}
+
+/// Maps a Checkout Session (authorize or PSync) to the router data.
+///
+/// - `open`: still waiting for the buyer, keeps the session id and the redirect.
+/// - `complete`: the PaymentIntent (expanded on PSync) decides, through the existing
+///   PaymentIntent mapping, and its `pi_…` id replaces the session id.
+/// - `expired`: terminal failure, the buyer can no longer pay.
+///
+/// An unknown session status (the serde catch-all) is treated like `open`.
+impl<F, T> TryFrom<ResponseRouterData<F, StripeCheckoutSessionResponse, T, PaymentsResponseData>>
+    for RouterData<F, T, PaymentsResponseData>
+where
+    T: SplitPaymentData,
+{
+    type Error = error_stack::Report<ConnectorError>;
+    fn try_from(
+        item: ResponseRouterData<F, StripeCheckoutSessionResponse, T, PaymentsResponseData>,
+    ) -> Result<Self, Self::Error> {
+        let ResponseRouterData {
+            response: mut session,
+            data,
+            http_code,
+            ..
+        } = item;
+
+        match session.status {
+            StripeCheckoutSessionStatus::Open | StripeCheckoutSessionStatus::Unknown => {
+                let redirection_data = session.url.as_deref().map(build_checkout_redirect_form);
+                let response = checkout_session_transaction_response(
+                    &session,
+                    ResponseId::ConnectorTransactionId(session.id.clone()),
+                    redirection_data,
+                );
+                Ok(Self {
+                    status: AttemptStatus::AuthenticationPending,
+                    response: Ok(response),
+                    ..data
+                })
+            }
+            StripeCheckoutSessionStatus::Complete => match session.payment_intent.take() {
+                Some(StripeCheckoutPaymentIntent::Object(payment_intent)) => {
+                    Self::try_from(ResponseRouterData {
+                        response: *payment_intent,
+                        data,
+                        http_code,
+                    })
+                }
+                // The PaymentIntent was not expanded: promote its id and let the next sync
+                // (now a PaymentIntent sync) report the real status.
+                Some(StripeCheckoutPaymentIntent::Id(payment_intent_id)) => {
+                    let response = checkout_session_transaction_response(
+                        &session,
+                        ResponseId::ConnectorTransactionId(payment_intent_id),
+                        None,
+                    );
+                    Ok(Self {
+                        status: AttemptStatus::Pending,
+                        response: Ok(response),
+                        ..data
+                    })
+                }
+                None => {
+                    let response = checkout_session_transaction_response(
+                        &session,
+                        ResponseId::ConnectorTransactionId(session.id.clone()),
+                        None,
+                    );
+                    Ok(Self {
+                        status: AttemptStatus::Pending,
+                        response: Ok(response),
+                        ..data
+                    })
+                }
+            },
+            StripeCheckoutSessionStatus::Expired => {
+                let error = checkout_session_error(
+                    &session,
+                    http_code,
+                    "checkout_session_expired",
+                    "The Stripe Checkout session expired before it was paid",
+                    AttemptStatus::Failure,
+                );
+                Ok(Self {
+                    status: AttemptStatus::Failure,
+                    response: Err(error),
+                    ..data
+                })
+            }
+        }
+    }
+}
+
+/// Maps the result of `POST /v1/checkout/sessions/{id}/expire`: an expired session is a voided
+/// payment (the buyer can no longer pay it).
+impl<F, T>
+    TryFrom<ResponseRouterData<F, StripeCheckoutSessionVoidResponse, T, PaymentsResponseData>>
+    for RouterData<F, T, PaymentsResponseData>
+{
+    type Error = error_stack::Report<ConnectorError>;
+    fn try_from(
+        item: ResponseRouterData<F, StripeCheckoutSessionVoidResponse, T, PaymentsResponseData>,
+    ) -> Result<Self, Self::Error> {
+        let session = item.response.0;
+        if session.status == StripeCheckoutSessionStatus::Expired {
+            let response = checkout_session_transaction_response(
+                &session,
+                ResponseId::ConnectorTransactionId(session.id.clone()),
+                None,
+            );
+            Ok(Self {
+                status: AttemptStatus::Voided,
+                response: Ok(response),
+                ..item.data
+            })
+        } else {
+            let error = checkout_session_error(
+                &session,
+                item.http_code,
+                "checkout_session_not_expired",
+                "The Stripe Checkout session could not be expired",
+                AttemptStatus::VoidFailed,
+            );
+            Ok(Self {
+                status: AttemptStatus::VoidFailed,
+                response: Err(error),
+                ..item.data
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod test_validate_shipping_address_against_payment_method {
     #![allow(clippy::unwrap_used)]
@@ -4938,6 +5358,524 @@ mod test_validate_shipping_address_against_payment_method {
             line2: Some(Secret::new(String::from("line2"))),
             state: Some(Secret::new(String::from("state"))),
             phone: Some(Secret::new(String::from("pbone number"))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod test_stripe_checkout {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    use std::str::FromStr;
+
+    use super::*;
+
+    const CHECKOUT_URL: &str =
+        "https://checkout.stripe.com/c/pay/cs_test_a1B2c3#fidkdWxOYHwnPyd1blpxYHZxWjA0";
+
+    fn test_auth() -> ConnectorAuthType {
+        ConnectorAuthType::HeaderKey {
+            api_key: Secret::new("sk_test_x".to_string()),
+        }
+    }
+
+    fn params(description: Option<&str>) -> StripeCheckoutSessionParams {
+        StripeCheckoutSessionParams {
+            amount: MinorUnit::new(12345),
+            currency: "USD".to_string(),
+            description: description.map(str::to_string),
+            return_url: "https://pay.example.com/return?a=1&b=2".to_string(),
+            order_id: "attempt_123".to_string(),
+            email: Some(Email::from_str("buyer@example.com").unwrap()),
+            statement_descriptor_suffix: Some("PXSOL".to_string()),
+            merchant_metadata: Some(Secret::new(serde_json::json!({"booking": "B-9"}))),
+            now_unix_timestamp: 1_800_000_000,
+        }
+    }
+
+    fn encoded(request: &StripeCheckoutSessionRequest) -> HashMap<String, String> {
+        let body = serde_urlencoded::to_string(request).unwrap();
+        serde_urlencoded::from_str(&body).unwrap()
+    }
+
+    #[test]
+    fn session_request_is_encoded_as_a_one_line_item_payment() {
+        let form = encoded(&StripeCheckoutSessionRequest::from(params(Some(
+            "Room 101",
+        ))));
+
+        assert_eq!(form["mode"], "payment");
+        assert_eq!(form["line_items[0][price_data][currency]"], "usd");
+        assert_eq!(form["line_items[0][price_data][unit_amount]"], "12345");
+        assert_eq!(
+            form["line_items[0][price_data][product_data][name]"],
+            "Room 101"
+        );
+        assert_eq!(form["line_items[0][quantity]"], "1");
+        assert_eq!(
+            form["success_url"],
+            "https://pay.example.com/return?a=1&b=2"
+        );
+        assert_eq!(form["cancel_url"], form["success_url"]);
+        assert_eq!(form["client_reference_id"], "attempt_123");
+        assert_eq!(form["customer_email"], "buyer@example.com");
+        assert_eq!(form["payment_intent_data[description]"], "Room 101");
+        assert_eq!(
+            form["payment_intent_data[statement_descriptor_suffix]"],
+            "PXSOL"
+        );
+        assert_eq!(
+            form["payment_intent_data[metadata][order_id]"],
+            "attempt_123"
+        );
+        assert!(form["payment_intent_data[metadata][booking]"].contains("B-9"));
+        // Every payment method enabled in the Stripe dashboard is offered.
+        assert!(form
+            .keys()
+            .all(|key| !key.starts_with("payment_method_types")));
+    }
+
+    #[test]
+    fn session_request_falls_back_to_a_non_empty_product_name_and_skips_empty_fields() {
+        let mut input = params(None);
+        input.email = None;
+        input.statement_descriptor_suffix = None;
+        input.merchant_metadata = None;
+        let form = encoded(&StripeCheckoutSessionRequest::from(input));
+        assert_eq!(
+            form["line_items[0][price_data][product_data][name]"],
+            "Payment attempt_123"
+        );
+        assert!(!form.contains_key("customer_email"));
+        assert!(!form.contains_key("payment_intent_data[description]"));
+        assert!(!form.contains_key("payment_intent_data[statement_descriptor_suffix]"));
+
+        let blank = encoded(&StripeCheckoutSessionRequest::from(params(Some("   "))));
+        assert_eq!(
+            blank["line_items[0][price_data][product_data][name]"],
+            "Payment attempt_123"
+        );
+    }
+
+    #[test]
+    fn session_request_truncates_a_long_product_name() {
+        let long = "x".repeat(400);
+        let request = StripeCheckoutSessionRequest::from(params(Some(&long)));
+        assert_eq!(request.product_name.chars().count(), 250);
+    }
+
+    #[test]
+    fn session_expires_inside_the_window_stripe_accepts() {
+        let request = StripeCheckoutSessionRequest::from(params(Some("Room")));
+        let ttl = request.expires_at - 1_800_000_000;
+        // Stripe: at least 30 minutes and at most 24 hours after creation.
+        assert!(ttl >= 30 * 60 && ttl <= 24 * 60 * 60, "ttl was {ttl}");
+    }
+
+    #[test]
+    fn authorize_requires_return_url_and_automatic_capture_without_splits() {
+        let request = |return_url: Option<String>| {
+            authorize_request_data(
+                PaymentMethodData::Wallet(WalletData::StripeCheckout {}),
+                enums::Currency::USD,
+                12345,
+                None,
+                return_url,
+            )
+        };
+
+        let router_data = authorize_router_data(request(None), "attempt_123");
+        let error = StripeCheckoutSessionRequest::try_from((&router_data, MinorUnit::new(12345)))
+            .unwrap_err();
+        assert!(matches!(
+            error.current_context(),
+            ConnectorError::MissingRequiredField {
+                field_name: "return_url"
+            }
+        ));
+
+        let router_data = authorize_router_data(
+            request(Some("https://pay.example.com/return".to_string())),
+            "attempt_123",
+        );
+        let built =
+            StripeCheckoutSessionRequest::try_from((&router_data, MinorUnit::new(12345))).unwrap();
+        assert_eq!(built.client_reference_id, "attempt_123");
+        assert_eq!(built.success_url, "https://pay.example.com/return");
+        assert_eq!(built.currency, "usd");
+
+        let mut manual = authorize_router_data(
+            request(Some("https://pay.example.com/return".to_string())),
+            "attempt_123",
+        );
+        manual.request.capture_method = Some(enums::CaptureMethod::Manual);
+        assert!(matches!(
+            StripeCheckoutSessionRequest::try_from((&manual, MinorUnit::new(12345)))
+                .unwrap_err()
+                .current_context(),
+            ConnectorError::NotSupported { .. }
+        ));
+    }
+
+    #[test]
+    fn redirect_keeps_the_checkout_url_and_its_fragment_verbatim() {
+        let RedirectForm::Html { html_data } = build_checkout_redirect_form(CHECKOUT_URL) else {
+            panic!("expected an Html redirect form");
+        };
+        let expected = format!("window.location.replace(\"{CHECKOUT_URL}\")");
+        assert!(html_data.contains(&expected), "{html_data}");
+        assert!(html_data.contains("#fidkdWxOYHwnPyd1blpxYHZxWjA0"));
+    }
+
+    #[test]
+    fn redirect_escapes_markup_in_the_url() {
+        let RedirectForm::Html { html_data } =
+            build_checkout_redirect_form("https://checkout.stripe.com/c/pay/cs_test_x?a=1&b=<\"#f")
+        else {
+            panic!("expected an Html redirect form");
+        };
+        // Neither the script nor the fallback link can be broken out of.
+        assert!(html_data.contains("\\u003c"));
+        assert!(html_data.contains("a=1\\u0026b="));
+        assert!(html_data.contains("&amp;b=&lt;&quot;#f"));
+    }
+
+    #[test]
+    fn session_and_payment_intent_ids_are_told_apart() {
+        assert!(is_checkout_session_id("cs_test_a1B2c3"));
+        assert!(is_checkout_session_id("cs_live_a1B2c3"));
+        assert!(!is_checkout_session_id("pi_3Abc"));
+        assert!(!is_checkout_session_id("seti_1Abc"));
+    }
+
+    #[test]
+    fn sync_and_void_urls_target_the_checkout_session() {
+        assert_eq!(
+            checkout_session_sync_url("https://api.stripe.com/", "cs_test_a1"),
+            "https://api.stripe.com/v1/checkout/sessions/cs_test_a1?expand[0]=payment_intent"
+        );
+        assert_eq!(
+            checkout_session_expire_url("https://api.stripe.com/", "cs_test_a1"),
+            "https://api.stripe.com/v1/checkout/sessions/cs_test_a1/expire"
+        );
+    }
+
+    fn session_json(status: &str, payment_intent: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": "cs_test_a1B2c3",
+            "object": "checkout.session",
+            "status": status,
+            "payment_status": if status == "complete" { "paid" } else { "unpaid" },
+            "url": if status == "open" { serde_json::json!(CHECKOUT_URL) } else { serde_json::Value::Null },
+            "payment_intent": payment_intent,
+            "amount_total": 12345,
+            "currency": "usd"
+        })
+    }
+
+    fn payment_intent_json(status: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "pi_3Abc",
+            "object": "payment_intent",
+            "amount": 12345,
+            "amount_received": 12345,
+            "currency": "usd",
+            "status": status,
+            "created": 1_800_000_100,
+            "metadata": {"order_id": "attempt_123"},
+            "latest_charge": "ch_3Abc"
+        })
+    }
+
+    fn map(
+        session: serde_json::Value,
+    ) -> Result<PaymentsAuthorizeRouterData, error_stack::Report<ConnectorError>> {
+        let response: StripeCheckoutSessionResponse = serde_json::from_value(session).unwrap();
+        let data = authorize_router_data(
+            authorize_request_data(
+                PaymentMethodData::Wallet(WalletData::StripeCheckout {}),
+                enums::Currency::USD,
+                12345,
+                None,
+                Some("https://pay.example.com/return".to_string()),
+            ),
+            "attempt_123",
+        );
+        RouterData::try_from(ResponseRouterData {
+            response,
+            data,
+            http_code: 200,
+        })
+    }
+
+    #[test]
+    fn open_session_waits_for_the_buyer_with_the_session_id_and_redirect() {
+        let mapped = map(session_json("open", serde_json::Value::Null)).unwrap();
+        assert_eq!(mapped.status, AttemptStatus::AuthenticationPending);
+        let Ok(PaymentsResponseData::TransactionResponse {
+            resource_id,
+            redirection_data,
+            ..
+        }) = mapped.response
+        else {
+            panic!("expected a transaction response");
+        };
+        assert!(matches!(
+            &resource_id,
+            ResponseId::ConnectorTransactionId(id) if id == "cs_test_a1B2c3"
+        ));
+        let Some(RedirectForm::Html { html_data }) = *redirection_data else {
+            panic!("expected an Html redirect form");
+        };
+        assert!(html_data.contains(CHECKOUT_URL));
+    }
+
+    #[test]
+    fn completed_session_promotes_the_payment_intent_and_its_status() {
+        let mapped = map(session_json("complete", payment_intent_json("succeeded"))).unwrap();
+        assert_eq!(mapped.status, AttemptStatus::Charged);
+        let Ok(PaymentsResponseData::TransactionResponse { resource_id, .. }) = mapped.response
+        else {
+            panic!("expected a transaction response");
+        };
+        assert!(matches!(
+            &resource_id,
+            ResponseId::ConnectorTransactionId(id) if id == "pi_3Abc"
+        ));
+
+        let processing = map(session_json("complete", payment_intent_json("processing"))).unwrap();
+        assert_eq!(processing.status, AttemptStatus::Authorizing);
+    }
+
+    #[test]
+    fn completed_session_with_an_unexpanded_payment_intent_promotes_its_id() {
+        let mapped = map(session_json("complete", serde_json::json!("pi_3Abc"))).unwrap();
+        assert_eq!(mapped.status, AttemptStatus::Pending);
+        let Ok(PaymentsResponseData::TransactionResponse { resource_id, .. }) = mapped.response
+        else {
+            panic!("expected a transaction response");
+        };
+        assert!(matches!(
+            &resource_id,
+            ResponseId::ConnectorTransactionId(id) if id == "pi_3Abc"
+        ));
+    }
+
+    #[test]
+    fn expired_session_is_a_terminal_failure() {
+        let mapped = map(session_json("expired", serde_json::Value::Null)).unwrap();
+        assert_eq!(mapped.status, AttemptStatus::Failure);
+        let error = mapped.response.unwrap_err();
+        assert_eq!(error.code, "checkout_session_expired");
+        assert_eq!(error.attempt_status, Some(AttemptStatus::Failure));
+        assert_eq!(
+            error.connector_transaction_id.as_deref(),
+            Some("cs_test_a1B2c3")
+        );
+    }
+
+    #[test]
+    fn expiring_a_session_voids_the_payment() {
+        let response: StripeCheckoutSessionVoidResponse =
+            serde_json::from_value(session_json("expired", serde_json::Value::Null)).unwrap();
+        let data = authorize_router_data(
+            authorize_request_data(
+                PaymentMethodData::Wallet(WalletData::StripeCheckout {}),
+                enums::Currency::USD,
+                12345,
+                None,
+                None,
+            ),
+            "attempt_123",
+        );
+        let voided = PaymentsAuthorizeRouterData::try_from(ResponseRouterData {
+            response,
+            data,
+            http_code: 200,
+        })
+        .unwrap();
+        assert_eq!(voided.status, AttemptStatus::Voided);
+    }
+
+    #[test]
+    fn integrity_amount_prefers_the_payment_intent_then_the_session_total() {
+        let with_intent: StripeCheckoutSessionResponse =
+            serde_json::from_value(session_json("complete", payment_intent_json("succeeded")))
+                .unwrap();
+        assert_eq!(
+            with_intent.amount_and_currency(),
+            Some((MinorUnit::new(12345), "usd".to_string()))
+        );
+
+        let mut value = session_json("complete", serde_json::json!("pi_3Abc"));
+        value["amount_total"] = serde_json::json!(999);
+        let without: StripeCheckoutSessionResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            without.amount_and_currency(),
+            Some((MinorUnit::new(999), "usd".to_string()))
+        );
+
+        let mut value = session_json("open", serde_json::Value::Null);
+        value["amount_total"] = serde_json::Value::Null;
+        let none: StripeCheckoutSessionResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(none.amount_and_currency(), None);
+    }
+
+    #[test]
+    fn void_of_a_session_that_is_not_expired_fails() {
+        let response: StripeCheckoutSessionVoidResponse =
+            serde_json::from_value(session_json("complete", serde_json::json!("pi_3Abc"))).unwrap();
+        let data = authorize_router_data(
+            authorize_request_data(
+                PaymentMethodData::Wallet(WalletData::StripeCheckout {}),
+                enums::Currency::USD,
+                12345,
+                None,
+                None,
+            ),
+            "attempt_123",
+        );
+        let result = PaymentsAuthorizeRouterData::try_from(ResponseRouterData {
+            response,
+            data,
+            http_code: 200,
+        })
+        .unwrap();
+        assert_eq!(result.status, AttemptStatus::VoidFailed);
+        let error = result.response.unwrap_err();
+        assert_eq!(error.code, "checkout_session_not_expired");
+        assert_eq!(error.attempt_status, Some(AttemptStatus::VoidFailed));
+    }
+
+    #[test]
+    fn object_kind_distinguishes_a_session_from_a_payment_intent() {
+        let session: StripeObjectKind =
+            serde_json::from_value(session_json("open", serde_json::Value::Null)).unwrap();
+        assert_eq!(session.object.as_deref(), Some(CHECKOUT_SESSION_OBJECT));
+        let intent: StripeObjectKind =
+            serde_json::from_value(payment_intent_json("succeeded")).unwrap();
+        assert_ne!(intent.object.as_deref(), Some(CHECKOUT_SESSION_OBJECT));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_request_data(
+        payment_method_data: PaymentMethodData,
+        currency: enums::Currency,
+        amount_minor: i64,
+        email: Option<common_utils::pii::Email>,
+        router_return_url: Option<String>,
+    ) -> PaymentsAuthorizeData {
+        PaymentsAuthorizeData {
+            payment_method_data,
+            amount: amount_minor,
+            minor_amount: MinorUnit::new(amount_minor),
+            order_tax_amount: None,
+            email,
+            customer_name: None,
+            currency,
+            confirm: true,
+            statement_descriptor_suffix: None,
+            statement_descriptor: None,
+            capture_method: Some(enums::CaptureMethod::Automatic),
+            router_return_url,
+            webhook_url: None,
+            complete_authorize_url: None,
+            setup_future_usage: None,
+            mandate_id: None,
+            off_session: None,
+            customer_acceptance: None,
+            setup_mandate_details: None,
+            browser_info: None,
+            order_details: None,
+            order_category: None,
+            session_token: None,
+            enrolled_for_3ds: false,
+            related_transaction_id: None,
+            payment_experience: None,
+            payment_method_type: None,
+            surcharge_details: None,
+            customer_id: None,
+            request_incremental_authorization: false,
+            metadata: None,
+            authentication_data: None,
+            request_extended_authorization: None,
+            split_payments: None,
+            merchant_order_reference_id: None,
+            integrity_object: None,
+            shipping_cost: None,
+            additional_payment_method_data: None,
+            merchant_account_id: None,
+            merchant_config_currency: None,
+            connector_testing_data: None,
+            order_id: None,
+            locale: None,
+            payment_channel: None,
+            enable_partial_authorization: None,
+            enable_overcapture: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_router_data(
+        request: PaymentsAuthorizeData,
+        reference: &str,
+    ) -> PaymentsAuthorizeRouterData {
+        RouterData {
+            flow: std::marker::PhantomData,
+            merchant_id: common_utils::id_type::MerchantId::try_from(std::borrow::Cow::from(
+                "stripe",
+            ))
+            .unwrap(),
+            customer_id: None,
+            connector_customer: None,
+            connector: "stripe".to_string(),
+            payment_id: reference.to_string(),
+            attempt_id: reference.to_string(),
+            tenant_id: common_utils::id_type::TenantId::try_from_string("public".to_string())
+                .unwrap(),
+            status: enums::AttemptStatus::default(),
+            payment_method: enums::PaymentMethod::Card,
+            connector_auth_type: test_auth(),
+            description: None,
+            address: hyperswitch_domain_models::payment_address::PaymentAddress::default(),
+            auth_type: enums::AuthenticationType::NoThreeDs,
+            connector_meta_data: None,
+            connector_wallets_details: None,
+            amount_captured: None,
+            access_token: None,
+            session_token: None,
+            reference_id: None,
+            payment_method_token: None,
+            recurring_mandate_payment_data: None,
+            preprocessing_id: None,
+            payment_method_balance: None,
+            connector_api_version: None,
+            request,
+            response: Err(hyperswitch_domain_models::router_data::ErrorResponse::default()),
+            connector_request_reference_id: reference.to_string(),
+            #[cfg(feature = "payouts")]
+            payout_method_data: None,
+            #[cfg(feature = "payouts")]
+            quote_id: None,
+            test_mode: Some(true),
+            connector_http_status_code: None,
+            external_latency: None,
+            apple_pay_flow: None,
+            frm_metadata: None,
+            dispute_id: None,
+            refund_id: None,
+            connector_response: None,
+            payment_method_status: None,
+            minor_amount_captured: None,
+            minor_amount_capturable: None,
+            integrity_check: Ok(()),
+            additional_merchant_data: None,
+            header_payload: None,
+            connector_mandate_request_reference_id: None,
+            l2_l3_data: None,
+            authentication_id: None,
+            psd2_sca_exemption_type: None,
+            raw_connector_response: None,
+            is_payment_id_from_merchant: None,
         }
     }
 }

@@ -652,6 +652,7 @@ impl TryFrom<(&PaymentMethodData, Option<&PaymentsAuthorizeRouterData>)> for Pay
                 | WalletData::RevolutPay(_)
                 | WalletData::MercadoPagoSdk(_)
                 | WalletData::WompiCheckout {}
+                | WalletData::StripeCheckout {}
                 | WalletData::MercadoPagoCheckoutPro {} => {
                     Err(report!(ConnectorError::NotImplemented(
                         get_unimplemented_payment_method_error_message("nmi"),

@@ -1886,6 +1886,7 @@ impl From<PaymentMethodType> for PaymentMethod {
             PaymentMethodType::Walley => Self::PayLater,
             PaymentMethodType::WeChatPay => Self::Wallet,
             PaymentMethodType::Wompi => Self::Wallet,
+            PaymentMethodType::StripeCheckout => Self::Wallet,
             PaymentMethodType::TouchNGo => Self::Wallet,
             PaymentMethodType::Atome => Self::PayLater,
             PaymentMethodType::Boleto => Self::Voucher,
