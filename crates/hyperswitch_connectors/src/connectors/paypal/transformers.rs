@@ -28,7 +28,7 @@ use hyperswitch_domain_models::{
         VerifyWebhookSourceResponseData, VerifyWebhookStatus,
     },
     types::{
-        PaymentsAuthorizeRouterData, PaymentsCaptureRouterData,
+        OrderDetailsWithAmount, PaymentsAuthorizeRouterData, PaymentsCaptureRouterData,
         PaymentsIncrementalAuthorizationRouterData, PaymentsPostSessionTokensRouterData,
         RefreshTokenRouterData, RefundsRouterData, SdkSessionUpdateRouterData,
         SetupMandateRouterData, VerifyWebhookSourceRouterData,
@@ -261,11 +261,45 @@ pub struct PurchaseUnitRequest {
     payee: Option<Payee>,
     shipping: Option<ShippingAddress>,
     items: Vec<ItemDetails>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
 }
 
 #[derive(Default, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct Payee {
     merchant_id: Secret<String>,
+}
+
+/// Maximum length PayPal accepts for an item name and a purchase unit description.
+const PAYPAL_MAX_TEXT_LENGTH: usize = 127;
+
+/// Truncates to PayPal's limit counting characters, so multi-byte characters are never split.
+fn truncate_to_paypal_limit(text: &str) -> String {
+    text.chars().take(PAYPAL_MAX_TEXT_LENGTH).collect()
+}
+
+/// Item name for the order created through post session tokens: the first product name when the
+/// merchant provided one, otherwise the generic invoice text.
+fn get_post_session_tokens_item_name(
+    order_details: Option<&[OrderDetailsWithAmount]>,
+    connector_request_reference_id: &str,
+) -> String {
+    order_details
+        .and_then(|details| details.first())
+        .map(|detail| detail.product_name.trim())
+        .filter(|name| !name.is_empty())
+        .map(truncate_to_paypal_limit)
+        .unwrap_or_else(|| format!("Payment for invoice {connector_request_reference_id}"))
+}
+
+/// Without a shipping address there is nothing to ship (e.g. a hotel booking), so PayPal must not
+/// ask the buyer for one. With an address, keep letting PayPal use the buyer's file as before.
+fn get_shipping_preference(has_shipping_address: bool) -> ShippingPreference {
+    if has_shipping_address {
+        ShippingPreference::GetFromFile
+    } else {
+        ShippingPreference::NoShipping
+    }
 }
 
 #[derive(Default, Debug, Serialize, Eq, PartialEq)]
@@ -299,9 +333,9 @@ impl TryFrom<&PaypalRouterData<&PaymentsPostSessionTokensRouterData>> for ItemDe
         item: &PaypalRouterData<&PaymentsPostSessionTokensRouterData>,
     ) -> Result<Self, Self::Error> {
         Ok(Self {
-            name: format!(
-                "Payment for invoice {}",
-                item.router_data.connector_request_reference_id
+            name: get_post_session_tokens_item_name(
+                item.router_data.request.order_details.as_deref(),
+                &item.router_data.connector_request_reference_id,
             ),
             quantity: ORDER_QUANTITY,
             unit_amount: OrderAmount {
@@ -476,7 +510,9 @@ pub struct RedirectRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ContextStruct {
+    #[serde(skip_serializing_if = "Option::is_none")]
     return_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     cancel_url: Option<String>,
     user_action: Option<UserAction>,
     shipping_preference: ShippingPreference,
@@ -494,6 +530,8 @@ pub enum ShippingPreference {
     SetProvidedAddress,
     #[serde(rename = "GET_FROM_FILE")]
     GetFromFile,
+    #[serde(rename = "NO_SHIPPING")]
+    NoShipping,
 }
 
 #[derive(Debug, Serialize)]
@@ -839,6 +877,7 @@ impl TryFrom<&PaypalRouterData<&PaymentsPostSessionTokensRouterData>> for Paypal
             item.router_data.connector_request_reference_id.clone();
 
         let shipping_address = ShippingAddress::from(item);
+        let has_shipping_address = item.router_data.get_optional_shipping_country().is_some();
         let item_details = vec![ItemDetails::try_from(item)?];
 
         let purchase_units = vec![PurchaseUnitRequest {
@@ -847,15 +886,26 @@ impl TryFrom<&PaypalRouterData<&PaymentsPostSessionTokensRouterData>> for Paypal
             invoice_id: Some(connector_request_reference_id),
             amount,
             payee,
-            shipping: Some(shipping_address),
+            shipping: has_shipping_address.then_some(shipping_address),
             items: item_details,
+            description: item
+                .router_data
+                .request
+                .description
+                .as_deref()
+                .map(str::trim)
+                .filter(|description| !description.is_empty())
+                .map(truncate_to_paypal_limit),
         }];
         let payment_source = Some(PaymentSourceItem::Paypal(
             PaypalRedirectionRequest::PaypalRedirectionStruct(PaypalRedirectionStruct {
                 experience_context: ContextStruct {
-                    return_url: item.router_data.request.router_return_url.clone(),
-                    cancel_url: item.router_data.request.router_return_url.clone(),
-                    shipping_preference: ShippingPreference::GetFromFile,
+                    // The order is approved in the JS SDK popup, which hands control back to the
+                    // Smart Button (onApprove). With a return_url PayPal treats it as a redirect
+                    // flow and navigates the popup there instead, so onApprove never runs.
+                    return_url: None,
+                    cancel_url: None,
+                    shipping_preference: get_shipping_preference(has_shipping_address),
                     user_action: Some(UserAction::PayNow),
                 },
                 attributes: match item.router_data.request.setup_future_usage {
@@ -943,6 +993,7 @@ impl TryFrom<&PaypalRouterData<&PaymentsAuthorizeRouterData>> for PaypalPayments
             payee,
             shipping: Some(shipping_address),
             items: item_details,
+            description: None,
         }];
 
         match item.router_data.request.payment_method_data {
@@ -3589,5 +3640,121 @@ impl From<ErrorDetails> for utils::ErrorCodeAndMessage {
             error_code: error.issue.to_string(),
             error_message: error.issue.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn order_detail(product_name: &str) -> OrderDetailsWithAmount {
+        OrderDetailsWithAmount {
+            product_name: product_name.to_string(),
+            quantity: 1,
+            amount: common_utils::types::MinorUnit::new(1000),
+            requires_shipping: None,
+            product_img_link: None,
+            product_id: None,
+            category: None,
+            sub_category: None,
+            brand: None,
+            product_type: None,
+            product_tax_code: None,
+            tax_rate: None,
+            total_tax_amount: None,
+            description: None,
+            sku: None,
+            unit_of_measure: None,
+            total_amount: None,
+            unit_discount_amount: None,
+            commodity_code: None,
+            upc: None,
+        }
+    }
+
+    #[test]
+    fn item_name_uses_first_product_name() {
+        let details = vec![order_detail("Habitación doble"), order_detail("Desayuno")];
+        assert_eq!(
+            get_post_session_tokens_item_name(Some(&details), "pay_1_1"),
+            "Habitación doble"
+        );
+    }
+
+    #[test]
+    fn item_name_falls_back_to_invoice_text() {
+        assert_eq!(
+            get_post_session_tokens_item_name(None, "pay_1_1"),
+            "Payment for invoice pay_1_1"
+        );
+        assert_eq!(
+            get_post_session_tokens_item_name(Some(&[]), "pay_1_1"),
+            "Payment for invoice pay_1_1"
+        );
+        let blank = vec![order_detail("   ")];
+        assert_eq!(
+            get_post_session_tokens_item_name(Some(&blank), "pay_1_1"),
+            "Payment for invoice pay_1_1"
+        );
+    }
+
+    #[test]
+    fn truncation_counts_characters_not_bytes() {
+        let long = "ñ".repeat(200);
+        let truncated = truncate_to_paypal_limit(&long);
+        assert_eq!(truncated.chars().count(), PAYPAL_MAX_TEXT_LENGTH);
+        assert!(truncated.len() > PAYPAL_MAX_TEXT_LENGTH);
+        assert_eq!(truncate_to_paypal_limit("short"), "short");
+        let details = vec![order_detail(&"á".repeat(300))];
+        assert_eq!(
+            get_post_session_tokens_item_name(Some(&details), "x")
+                .chars()
+                .count(),
+            PAYPAL_MAX_TEXT_LENGTH
+        );
+    }
+
+    #[test]
+    fn shipping_preference_depends_on_shipping_address() {
+        assert!(matches!(
+            get_shipping_preference(true),
+            ShippingPreference::GetFromFile
+        ));
+        assert!(matches!(
+            get_shipping_preference(false),
+            ShippingPreference::NoShipping
+        ));
+    }
+
+    #[test]
+    fn no_shipping_preference_serializes_as_paypal_expects() {
+        assert_eq!(
+            serde_json::to_value(ShippingPreference::NoShipping).unwrap(),
+            serde_json::json!("NO_SHIPPING")
+        );
+    }
+
+    #[test]
+    fn purchase_unit_omits_missing_description() {
+        let mut unit = PurchaseUnitRequest::default();
+        let value = serde_json::to_value(&unit).unwrap();
+        assert!(value.get("description").is_none());
+        unit.description = Some("Reserva".to_string());
+        let value = serde_json::to_value(&unit).unwrap();
+        assert_eq!(value["description"], "Reserva");
+    }
+
+    #[test]
+    fn sdk_experience_context_omits_return_and_cancel_urls() {
+        let context = ContextStruct {
+            return_url: None,
+            cancel_url: None,
+            user_action: Some(UserAction::PayNow),
+            shipping_preference: ShippingPreference::NoShipping,
+        };
+        assert_eq!(
+            serde_json::to_value(&context).unwrap(),
+            serde_json::json!({"user_action": "PAY_NOW", "shipping_preference": "NO_SHIPPING"})
+        );
     }
 }
