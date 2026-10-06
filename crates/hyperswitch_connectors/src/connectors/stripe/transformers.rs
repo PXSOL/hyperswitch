@@ -1216,7 +1216,6 @@ fn get_stripe_payment_method_type_from_wallet_data(
         | WalletData::MercadoPagoSdk(_)
         | WalletData::WompiCheckout {}
         | WalletData::IzipayCheckout {}
-        | WalletData::IzipayPaymentLink {}
         | WalletData::MercadoPagoCheckoutPro {} => Err(ConnectorError::NotImplemented(
             get_unimplemented_payment_method_error_message("stripe"),
         )),
@@ -1700,7 +1699,6 @@ impl TryFrom<(&WalletData, Option<PaymentMethodToken>)> for StripePaymentMethodD
             | WalletData::MercadoPagoSdk(_)
             | WalletData::WompiCheckout {}
             | WalletData::IzipayCheckout {}
-            | WalletData::IzipayPaymentLink {}
             | WalletData::MercadoPagoCheckoutPro {} => Err(ConnectorError::NotImplemented(
                 get_unimplemented_payment_method_error_message("stripe"),
             )

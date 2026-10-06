@@ -2893,9 +2893,7 @@ impl GetPaymentMethodType for WalletData {
                 api_enums::PaymentMethodType::MercadoPago
             }
             Self::WompiCheckout {} => api_enums::PaymentMethodType::Wompi,
-            Self::IzipayCheckout {} | Self::IzipayPaymentLink {} => {
-                api_enums::PaymentMethodType::Izipay
-            }
+            Self::IzipayCheckout {} => api_enums::PaymentMethodType::Izipay,
             Self::Paze(_) => api_enums::PaymentMethodType::Paze,
             Self::SamsungPay(_) => api_enums::PaymentMethodType::SamsungPay,
             Self::TwintRedirect {} => api_enums::PaymentMethodType::Twint,
@@ -3914,9 +3912,6 @@ pub enum WalletData {
     /// The wallet data for Izipay's hosted checkout redirect (Izipay Peru)
     #[schema(title = "IzipayCheckout")]
     IzipayCheckout {},
-    /// The wallet data for Izipay payment links (hosted link page, Izipay Peru)
-    #[schema(title = "IzipayPaymentLink")]
-    IzipayPaymentLink {},
     /// The wallet data for Paysera
     #[schema(title = "Paysera")]
     Paysera(PayseraData),
@@ -4000,7 +3995,6 @@ impl GetAddressFromPaymentMethodData for WalletData {
             | Self::MercadoPagoCheckoutPro {}
             | Self::WompiCheckout {}
             | Self::IzipayCheckout {}
-            | Self::IzipayPaymentLink {}
             | Self::Paze(_)
             | Self::SamsungPay(_)
             | Self::TwintRedirect {}

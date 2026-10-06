@@ -436,7 +436,6 @@ impl TryFrom<&PaymentMethodData> for SalePaymentMethod {
                 | WalletData::MercadoPagoSdk(_)
                 | WalletData::WompiCheckout {}
                 | WalletData::IzipayCheckout {}
-                | WalletData::IzipayPaymentLink {}
                 | WalletData::MercadoPagoCheckoutPro {} => {
                     Err(errors::ConnectorError::NotSupported {
                         message: "Wallet".to_string(),

@@ -653,7 +653,6 @@ impl TryFrom<(&PaymentMethodData, Option<&PaymentsAuthorizeRouterData>)> for Pay
                 | WalletData::MercadoPagoSdk(_)
                 | WalletData::WompiCheckout {}
                 | WalletData::IzipayCheckout {}
-                | WalletData::IzipayPaymentLink {}
                 | WalletData::MercadoPagoCheckoutPro {} => {
                     Err(report!(ConnectorError::NotImplemented(
                         get_unimplemented_payment_method_error_message("nmi"),
