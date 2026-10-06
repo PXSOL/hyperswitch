@@ -200,6 +200,10 @@ pub struct PaymentsPostSessionTokensData {
     pub shipping_cost: Option<MinorUnit>,
     pub setup_future_usage: Option<storage_enums::FutureUsage>,
     pub router_return_url: Option<String>,
+    /// Description of the payment, as provided by the merchant
+    pub description: Option<String>,
+    /// Order details (products) of the payment, as provided by the merchant
+    pub order_details: Option<Vec<OrderDetailsWithAmount>>,
 }
 
 #[derive(Debug, Clone)]

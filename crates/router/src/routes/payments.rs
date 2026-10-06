@@ -775,12 +775,31 @@ pub async fn payments_post_session_tokens(
 
     let locking_action = payload.get_locking_input(flow.clone());
 
+    // The `client_secret` is part of the body in both cases (and is validated by the operation), so
+    // the auth is picked from the key type instead of `check_client_secret_and_get_auth`, which
+    // rejects a `client_secret` sent together with a merchant API key.
+    let (auth_type, auth_flow): (Box<dyn auth::AuthenticateAndFetch<_, _>>, _) =
+        match auth::get_api_key(req.headers()) {
+            Ok(api_key) if api_key.starts_with("pk_") => (
+                Box::new(auth::HeaderAuth(auth::PublishableKeyAuth)),
+                api::AuthFlow::Client,
+            ),
+            Ok(_) => (
+                Box::new(auth::HeaderAuth(auth::ApiKeyAuth {
+                    is_connected_allowed: false,
+                    is_platform_allowed: true,
+                })),
+                api::AuthFlow::Merchant,
+            ),
+            Err(err) => return api::log_and_return_error_response(err),
+        };
+
     Box::pin(api::server_wrap(
         flow,
         state,
         &req,
         payload,
-        |state, auth, req, req_state| {
+        |state, auth: auth::AuthenticationData, req, req_state| {
             let merchant_context = domain::MerchantContext::NormalMerchant(Box::new(
                 domain::Context(auth.merchant_account, auth.key_store),
             ));
@@ -798,13 +817,13 @@ pub async fn payments_post_session_tokens(
                 auth.profile_id,
                 payments::PaymentPostSessionTokens,
                 req,
-                api::AuthFlow::Client,
+                auth_flow,
                 payments::CallConnectorAction::Trigger,
                 None,
                 header_payload.clone(),
             )
         },
-        &auth::PublishableKeyAuth,
+        &*auth_type,
         locking_action,
     ))
     .await
