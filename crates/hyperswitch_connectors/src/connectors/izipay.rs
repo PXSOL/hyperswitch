@@ -333,28 +333,18 @@ impl ConnectorIntegration<AccessTokenAuth, AccessTokenRequestData, AccessToken> 
 }
 
 // ============================================================================
-// Authorize, checkout mode: POST /security/v1/Token/Generate bound to the order number and
-// amount. The response is turned into the page that opens Izipay's hosted checkout (Web SDK,
-// redirect mode). The access token the router fetched first is not used here.
-// Authorize, payment link mode: POST /paymentlink/api/v1/process/generate with the generic
-// session token; the response redirects the buyer to the Izipay link page.
+// Authorize: POST /security/v1/Token/Generate bound to the order number and amount. The
+// response is turned into the page that opens Izipay's hosted checkout (Web SDK, redirect
+// mode). The access token the router fetched first is not used here.
 // ============================================================================
 
 impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData> for Izipay {
     fn get_headers(
         &self,
-        req: &PaymentsAuthorizeRouterData,
+        _req: &PaymentsAuthorizeRouterData,
         _connectors: &Connectors,
     ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
-        if izipay::is_payment_link_request(req) {
-            // The generic ecommerce session token the router fetched before Authorize.
-            self.session_headers(
-                req.access_token.as_ref(),
-                izipay::IzipayTokenKind::Ecommerce,
-            )
-        } else {
-            Ok(self.token_generate_headers())
-        }
+        Ok(self.token_generate_headers())
     }
 
     fn get_content_type(&self) -> &'static str {
@@ -367,11 +357,7 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         connectors: &Connectors,
     ) -> CustomResult<String, errors::ConnectorError> {
         let base_url = get_izipay_base_url(connectors, req.test_mode)?;
-        if izipay::is_payment_link_request(req) {
-            Ok(format!("{base_url}/paymentlink/api/v1/process/generate"))
-        } else {
-            Ok(format!("{base_url}/security/v1/Token/Generate"))
-        }
+        Ok(format!("{base_url}/security/v1/Token/Generate"))
     }
 
     fn get_request_body(
@@ -385,10 +371,6 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
             req.request.currency,
         )?;
         let connector_router_data = izipay::IzipayRouterData::from((amount, req));
-        if izipay::is_payment_link_request(req) {
-            let connector_req = izipay::IzipayLinkRequest::try_from(&connector_router_data)?;
-            return Ok(RequestContent::Json(Box::new(connector_req)));
-        }
         let connector_req = izipay::IzipayTokenRequest::try_from(&connector_router_data)?;
         Ok(RequestContent::Json(Box::new(connector_req)))
     }
@@ -417,15 +399,6 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         event_builder: Option<&mut ConnectorEvent>,
         res: Response,
     ) -> CustomResult<PaymentsAuthorizeRouterData, errors::ConnectorError> {
-        if izipay::is_payment_link_request(data) {
-            let response: izipay::IzipayLinkResponse = res
-                .response
-                .parse_struct("IzipayLinkResponse")
-                .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
-            event_builder.map(|i| i.set_response_body(&response));
-            router_env::logger::info!(connector_response=?response);
-            return izipay::link_authorize_response(response, data.clone(), res.status_code);
-        }
         let response: izipay::IzipayTokenResponse = res
             .response
             .parse_struct("IzipayTokenResponse")
@@ -451,8 +424,7 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
 }
 
 // ============================================================================
-// PSync: POST /orderinfo/v1/Transaction/Search by order number; for a payment link payment
-// (connector metadata `mode: payment_link`) POST /paymentlink/api/payment-links/{id}/transactions/search
+// PSync: POST /orderinfo/v1/Transaction/Search by order number
 // ============================================================================
 
 impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Izipay {
@@ -477,15 +449,7 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Izi
         connectors: &Connectors,
     ) -> CustomResult<String, errors::ConnectorError> {
         let base_url = get_izipay_base_url(connectors, req.test_mode)?;
-        if izipay::is_payment_link_meta(req.request.connector_meta.as_ref()) {
-            let payment_link_id = izipay::link_payment_id(req)?;
-            Ok(format!(
-                "{base_url}/paymentlink/api/payment-links/{}/transactions/search",
-                urlencoding::encode(&payment_link_id)
-            ))
-        } else {
-            Ok(format!("{base_url}/orderinfo/v1/Transaction/Search"))
-        }
+        Ok(format!("{base_url}/orderinfo/v1/Transaction/Search"))
     }
 
     fn get_request_body(
@@ -493,10 +457,6 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Izi
         req: &PaymentsSyncRouterData,
         _connectors: &Connectors,
     ) -> CustomResult<RequestContent, errors::ConnectorError> {
-        if izipay::is_payment_link_meta(req.request.connector_meta.as_ref()) {
-            let connector_req = izipay::IzipayLinkTransactionsRequest::try_from(req)?;
-            return Ok(RequestContent::Json(Box::new(connector_req)));
-        }
         let connector_req = izipay::IzipaySearchRequest::try_from(req)?;
         Ok(RequestContent::Json(Box::new(connector_req)))
     }
@@ -523,11 +483,9 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Izi
         event_builder: Option<&mut ConnectorEvent>,
         res: Response,
     ) -> CustomResult<PaymentsSyncRouterData, errors::ConnectorError> {
-        // The transactions of a link, or an order Search response: the verified notification
-        // payload has that shape and can reach the sync of a link payment too.
-        let response: izipay::IzipayPaymentsSyncResponse = res
+        let response: izipay::IzipaySearchResponse = res
             .response
-            .parse_struct("IzipayPaymentsSyncResponse")
+            .parse_struct("IzipaySearchResponse")
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
@@ -735,25 +693,16 @@ impl IncomingWebhook for Izipay {
             .headers
             .get("Signature")
             .and_then(|value| value.to_str().ok());
-        let signature_is_valid =
-            izipay::verify_webhook_signature(request.body, header_signature, &auth.hash_key)?;
-        // A reference taken from the unsigned part of the body is not covered by the signature:
-        // report the notification as unverified so the router asks Izipay for the real state.
-        if signature_is_valid && izipay::webhook_reference_is_unsigned(request.body) {
-            return Ok(false);
-        }
-        Ok(signature_is_valid)
+        izipay::verify_webhook_signature(request.body, header_signature, &auth.hash_key)
     }
 
     fn get_webhook_object_reference_id(
         &self,
         request: &IncomingWebhookRequestDetails<'_>,
     ) -> CustomResult<api_models::webhooks::ObjectReferenceId, errors::ConnectorError> {
-        // The signed payload first; a payment link id found only in the unsigned part of the
-        // body is accepted too, but `verify_webhook_source` then reports it as unverified.
         let payload = izipay::parse_signed_payload(request.body)
             .change_context(errors::ConnectorError::WebhookReferenceIdNotFound)?;
-        let (reference, _) = izipay::webhook_reference_with_source(request.body, &payload)
+        let reference = izipay::webhook_reference(&payload)
             .ok_or(errors::ConnectorError::WebhookReferenceIdNotFound)?;
         Ok(api_models::webhooks::ObjectReferenceId::PaymentId(
             api_models::payments::PaymentIdType::ConnectorTransactionId(reference),
@@ -786,8 +735,7 @@ static IZIPAY_SUPPORTED_PAYMENT_METHODS: LazyLock<SupportedPaymentMethods> = Laz
     let mut supported_payment_methods = SupportedPaymentMethods::new();
 
     // Hosted checkout (redirect), which offers every method enabled for the merchant (cards,
-    // Yape, Plin, QR, Apple Pay), and the payment link mode (`IzipayPaymentLink`) share this
-    // entry. Payments are captured automatically.
+    // Yape, Plin, QR, Apple Pay). Payments are captured automatically.
     supported_payment_methods.add(
         enums::PaymentMethod::Wallet,
         enums::PaymentMethodType::Izipay,
