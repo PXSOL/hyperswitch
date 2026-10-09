@@ -4377,6 +4377,8 @@ payment_method_type = "ali_pay"
 payment_method_type = "cashapp"
 [[stripe.wallet]]
 payment_method_type = "revolut_pay"
+[[stripe.wallet]]
+  payment_method_type = "stripe_checkout"
 is_verifiable = true
 [stripe.connector_auth.HeaderKey]
 api_key = "Secret Key"

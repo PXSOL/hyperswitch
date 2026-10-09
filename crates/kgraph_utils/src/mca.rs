@@ -179,6 +179,7 @@ fn get_dir_value_payment_method(
         api_enums::PaymentMethodType::RevolutPay => Ok(dirval!(WalletType = RevolutPay)),
         api_enums::PaymentMethodType::MercadoPago => Ok(dirval!(WalletType = MercadoPago)),
         api_enums::PaymentMethodType::Wompi => Ok(dirval!(WalletType = Wompi)),
+        api_enums::PaymentMethodType::StripeCheckout => Ok(dirval!(WalletType = StripeCheckout)),
     }
 }
 

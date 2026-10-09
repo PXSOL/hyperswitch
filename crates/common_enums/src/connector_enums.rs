@@ -611,6 +611,15 @@ impl Connector {
         )
     }
 
+    /// Whether every access token this connector issues can be spent only once,
+    /// so it must never be cached and reused across payments.
+    /// Wompi's access token carries its presigned acceptance tokens, and Wompi
+    /// production rejects a reused one ("El token de aceptación ya fue usado"):
+    /// a cached token only works for the first payment that spends it.
+    pub fn issues_single_use_access_tokens(self) -> bool {
+        matches!(self, Self::Wompi)
+    }
+
     /// Validates if dummy connector can be created
     /// Dummy connectors can be created only if dummy_connector feature is enabled in the configs
     #[cfg(feature = "dummy_connector")]
@@ -908,5 +917,18 @@ impl TryFrom<Connector> for RoutableConnectors {
             | Connector::Vgs
             | Connector::CtpVisa => Err("Invalid conversion. Not a routable connector"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_wompi_issues_single_use_access_tokens() {
+        assert!(Connector::Wompi.issues_single_use_access_tokens());
+        // Connectors whose access tokens are reusable bearer tokens keep the cache.
+        assert!(!Connector::Paypal.issues_single_use_access_tokens());
+        assert!(!Connector::Mercadopago.issues_single_use_access_tokens());
     }
 }

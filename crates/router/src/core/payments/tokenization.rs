@@ -1374,7 +1374,11 @@ pub fn update_router_data_with_payment_method_token_result<F: Clone, T>(
                 } else {
                     logger::debug!(payment_method_tokenization_error=?err);
 
-                    const CONNECTORS_THAT_FAIL_ON_TOKENIZATION_ERROR: &[&str] = &["payway", "mercadopago"];
+                    // These connectors cannot authorize without the token, so going on would
+                    // replace the connector's decline (e.g. Wompi rejecting a card brand it does
+                    // not accept) with a generic missing `payment_method_token` error.
+                    const CONNECTORS_THAT_FAIL_ON_TOKENIZATION_ERROR: &[&str] =
+                        &["payway", "mercadopago", "wompi"];
 
                     if CONNECTORS_THAT_FAIL_ON_TOKENIZATION_ERROR
                         .contains(&router_data.connector.as_str())

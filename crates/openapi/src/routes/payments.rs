@@ -989,7 +989,7 @@ pub fn payments_dynamic_tax_calculation() {}
     ),
     tag = "Payments",
     operation_id = "Create Post Session Tokens for a Payment",
-    security(("publishable_key" = []))
+    security(("api_key" = []), ("publishable_key" = []))
 )]
 
 pub fn payments_post_session_tokens() {}

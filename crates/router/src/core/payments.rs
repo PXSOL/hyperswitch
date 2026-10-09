@@ -7637,11 +7637,22 @@ where
                             common_enums::connector_enums::Connector::syncs_refunds_and_disputes_on_payment_sync,
                         ))
         }
-        "PaymentCancel" => matches!(
-            payment_data.get_payment_intent().status,
-            storage_enums::IntentStatus::RequiresCapture
-                | storage_enums::IntentStatus::PartiallyCapturedAndCapturable
-        ),
+        "PaymentCancel" => {
+            matches!(
+                payment_data.get_payment_intent().status,
+                storage_enums::IntentStatus::RequiresCapture
+                    | storage_enums::IntentStatus::PartiallyCapturedAndCapturable
+            )
+                // A Stripe Checkout session stays payable on Stripe's page until it is
+                // expired there, so cancelling it only in Hyperswitch would let the buyer
+                // pay a cancelled payment. The connector's void expires the session (and
+                // fails if the buyer already paid).
+                || (matches!(
+                    payment_data.get_payment_intent().status,
+                    storage_enums::IntentStatus::RequiresCustomerAction
+                ) && payment_data.get_payment_attempt().payment_method_type
+                    == Some(storage_enums::PaymentMethodType::StripeCheckout))
+        }
         "PaymentCancelPostCapture" => matches!(
             payment_data.get_payment_intent().status,
             storage_enums::IntentStatus::Succeeded
