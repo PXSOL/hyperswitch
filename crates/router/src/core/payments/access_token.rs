@@ -80,11 +80,19 @@ pub async fn add_access_token<
             .or(creds_identifier.map(|id| id.to_string()))
             .unwrap_or(connector.connector_name.to_string());
 
-        let old_access_token = store
-            .get_access_token(merchant_id, &merchant_connector_id_or_connector_name)
-            .await
-            .change_context(errors::ApiErrorResponse::InternalServerError)
-            .attach_printable("DB error when accessing the access token")?;
+        // A single-use token is already spent by the payment that used it, so it is
+        // neither read from nor written to the cache: every flow fetches a fresh one.
+        let is_single_use_token = connector.connector_name.issues_single_use_access_tokens();
+
+        let old_access_token = if is_single_use_token {
+            None
+        } else {
+            store
+                .get_access_token(merchant_id, &merchant_connector_id_or_connector_name)
+                .await
+                .change_context(errors::ApiErrorResponse::InternalServerError)
+                .attach_printable("DB error when accessing the access token")?
+        };
 
         let res = match old_access_token {
             Some(access_token) => {
@@ -166,6 +174,10 @@ pub async fn add_access_token<
                         access_token_expiry_after_modification =
                             modified_access_token_with_expiry.expires
                     );
+
+                    if is_single_use_token {
+                        return Some(modified_access_token_with_expiry);
+                    }
 
                     if let Err(access_token_set_error) = store
                         .set_access_token(
