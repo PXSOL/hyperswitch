@@ -4741,6 +4741,12 @@ impl transformers::ForeignTryFrom<common_enums::PaymentMethodType>
             common_enums::PaymentMethodType::Wero => Err(error_stack::report!(
                 UnifiedConnectorServiceError::NotImplemented("Wero".to_string())
             )),
+            // Fork-only hosted checkouts, unknown to the Unified Connector Service.
+            common_enums::PaymentMethodType::MercadoPago
+            | common_enums::PaymentMethodType::Wompi
+            | common_enums::PaymentMethodType::StripeCheckout => Err(error_stack::report!(
+                UnifiedConnectorServiceError::NotImplemented(value.to_string())
+            )),
         }
     }
 }

@@ -4165,7 +4165,7 @@ mod external_refund_tests {
 
     fn event_type_of(body: &[u8]) -> IncomingWebhookEvent {
         with_request(body, |request| {
-            Stripe::new().get_webhook_event_type(request).unwrap()
+            Stripe::new().get_webhook_event_type(request, None).unwrap()
         })
     }
 
@@ -4343,7 +4343,7 @@ mod external_refund_tests {
                 dispute_with_status(status),
             );
             let details = with_request(&body, |request| {
-                Stripe::new().get_dispute_details(request).unwrap()
+                Stripe::new().get_dispute_details(request, None).unwrap()
             });
             assert_eq!(details.connector_status, reported);
         }
@@ -4387,7 +4387,7 @@ mod external_refund_tests {
             other => panic!("expected the parent payment intent, got {other:?}"),
         }
         let details = with_request(body, |request| {
-            Stripe::new().get_dispute_details(request).unwrap()
+            Stripe::new().get_dispute_details(request, None).unwrap()
         });
         assert_eq!(details.amount.to_string(), "1000");
         assert_eq!(details.currency, common_enums::Currency::USD);
@@ -4403,7 +4403,7 @@ mod external_refund_tests {
         let body = REAL_DISPUTE_FUNDS_WITHDRAWN.as_bytes();
         assert_eq!(event_type_of(body), IncomingWebhookEvent::DisputeOpened);
         let details = with_request(body, |request| {
-            Stripe::new().get_dispute_details(request).unwrap()
+            Stripe::new().get_dispute_details(request, None).unwrap()
         });
         assert_eq!(details.connector_dispute_id, "du_1UNBOHKMN9YFmEPb3cLJ7Uhs");
         assert_eq!(details.connector_status, "NeedsResponse");

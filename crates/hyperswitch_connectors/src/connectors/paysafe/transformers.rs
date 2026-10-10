@@ -690,6 +690,10 @@ impl TryFrom<&PaysafeRouterData<&TokenizationRouterData>> for PaysafePaymentHand
                     | WalletData::SwishQr(_)
                     | WalletData::WeChatPayQr(_)
                     | WalletData::RevolutPay(_)
+                    | WalletData::MercadoPagoSdk(_)
+                    | WalletData::MercadoPagoCheckoutPro {}
+                    | WalletData::WompiCheckout {}
+                    | WalletData::StripeCheckout {}
                     | WalletData::Mifinity(_) => Err(errors::ConnectorError::NotImplemented(
                         utils::get_unimplemented_payment_method_error_message("Paysafe"),
                     ))?,

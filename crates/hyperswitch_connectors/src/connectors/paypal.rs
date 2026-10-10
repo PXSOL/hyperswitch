@@ -32,8 +32,8 @@ use hyperswitch_domain_models::{
         PaymentsAuthorizeData, PaymentsCancelData, PaymentsCaptureData,
         PaymentsExtendAuthorizationData, PaymentsIncrementalAuthorizationData,
         PaymentsPostAuthenticateData, PaymentsPostSessionTokensData, PaymentsSessionData,
-        PaymentsSyncData, RefundsData, SdkPaymentsSessionUpdateData, SetupMandateRequestData,
-        VerifyWebhookSourceRequestData,
+        PaymentsSyncData, RefundsData, ResponseId, SdkPaymentsSessionUpdateData,
+        SetupMandateRequestData, VerifyWebhookSourceRequestData,
     },
     router_response_types::{
         ConnectorInfo, PaymentMethodDetails, PaymentsResponseData, RefundsResponseData,
@@ -3035,7 +3035,9 @@ mod external_refund_tests {
                 if id == "1JU08902781691411"
         ));
         assert_eq!(
-            Paypal::new().get_webhook_event_type(&request).unwrap(),
+            Paypal::new()
+                .get_webhook_event_type(&request, None)
+                .unwrap(),
             api_models::webhooks::IncomingWebhookEvent::RefundSuccess
         );
     }
@@ -3096,10 +3098,12 @@ mod external_refund_tests {
                 if id == "3C679366HH908993F"
         ));
         assert_eq!(
-            Paypal::new().get_webhook_event_type(&request).unwrap(),
+            Paypal::new()
+                .get_webhook_event_type(&request, None)
+                .unwrap(),
             api_models::webhooks::IncomingWebhookEvent::DisputeOpened
         );
-        let payload = Paypal::new().get_dispute_details(&request).unwrap();
+        let payload = Paypal::new().get_dispute_details(&request, None).unwrap();
         assert_eq!(payload.connector_dispute_id, "PP-D-27803");
         assert_eq!(payload.currency, enums::Currency::USD);
     }

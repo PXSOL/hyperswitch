@@ -1157,10 +1157,15 @@ fn extract_browser_field(
     let value = payload
         .get(field_name)
         .and_then(|value| value.as_str())
-        .ok_or(errors::ConnectorError::MissingRequiredField { field_name })?;
+        .ok_or(errors::ConnectorError::MissingRequiredField {
+            field_name: field_name.into(),
+        })?;
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.chars().count() > MAX_BROWSER_FIELD_LEN {
-        return Err(errors::ConnectorError::InvalidDataFormat { field_name }.into());
+        return Err(errors::ConnectorError::InvalidDataFormat {
+            field_name: field_name.into(),
+        }
+        .into());
     }
     Ok(trimmed.to_string())
 }
@@ -3439,6 +3444,10 @@ mod tests {
             nick_name: None,
             card_holder_name: Some(Secret::new("PXSOL TEST".to_string())),
             co_badged_card_data: None,
+            card_subtype: None,
+            card_segment_type: None,
+            funding_source: None,
+            card_issuing_country_code: None,
         }
     }
 
@@ -3459,8 +3468,6 @@ mod tests {
             customer_name: None,
             currency,
             confirm: true,
-            statement_descriptor_suffix: None,
-            statement_descriptor: None,
             capture_method: Some(enums::CaptureMethod::Automatic),
             router_return_url,
             webhook_url: None,
@@ -3497,6 +3504,20 @@ mod tests {
             payment_channel: None,
             enable_partial_authorization: None,
             enable_overcapture: None,
+            ucs_authentication_data: None,
+            force_3ds_challenge: None,
+            guest_customer: None,
+            is_stored_credential: None,
+            mit_category: None,
+            billing_descriptor: None,
+            tokenization: None,
+            partner_merchant_identifier_details: None,
+            feature_metadata: None,
+            installment_details: None,
+            connector_intent_metadata: None,
+            is_account_funded_transaction: None,
+            recipient_details: None,
+            business_country: None,
         }
     }
 
@@ -3569,6 +3590,15 @@ mod tests {
             psd2_sca_exemption_type: None,
             raw_connector_response: None,
             is_payment_id_from_merchant: None,
+            payment_method_type: None,
+            payout_id: None,
+            authorized_amount: None,
+            accept_amount_mismatch: None,
+            customer_document_details: None,
+            customer_date_of_birth: None,
+            feature_data: None,
+            sender_payment_instrument_id: None,
+            connector_returned_payment_method_details: None,
         }
     }
 
@@ -3860,6 +3890,7 @@ mod tests {
             merchant_config_currency: None,
             capture_method: None,
             additional_payment_method_data: None,
+            payment_connector_request_reference_id: None,
         }
     }
 
@@ -3921,6 +3952,15 @@ mod tests {
             psd2_sca_exemption_type: None,
             raw_connector_response: None,
             is_payment_id_from_merchant: None,
+            payment_method_type: None,
+            payout_id: None,
+            authorized_amount: None,
+            accept_amount_mismatch: None,
+            customer_document_details: None,
+            customer_date_of_birth: None,
+            feature_data: None,
+            sender_payment_instrument_id: None,
+            connector_returned_payment_method_details: None,
         }
     }
 
@@ -4374,6 +4414,20 @@ mod tests {
             merchant_account_id: None,
             merchant_config_currency: None,
             threeds_method_comp_ind: None,
+            request_incremental_authorization: false,
+            authentication_data: None,
+            payment_method_type: None,
+            is_stored_credential: None,
+            tokenization: None,
+            router_return_url: None,
+            merchant_order_reference_id: None,
+            is_account_funded_transaction: None,
+            recipient_details: None,
+            business_country: None,
+            connector_intent_metadata: None,
+            order_id: None,
+            force_3ds_challenge: None,
+            enable_overcapture: None,
         };
 
         RouterData {
@@ -4433,6 +4487,15 @@ mod tests {
             psd2_sca_exemption_type: None,
             raw_connector_response: None,
             is_payment_id_from_merchant: None,
+            payment_method_type: None,
+            payout_id: None,
+            authorized_amount: None,
+            accept_amount_mismatch: None,
+            customer_document_details: None,
+            customer_date_of_birth: None,
+            feature_data: None,
+            sender_payment_instrument_id: None,
+            connector_returned_payment_method_details: None,
         }
     }
 

@@ -4859,6 +4859,15 @@ mod external_refund_sync_tests {
             psd2_sca_exemption_type: None,
             raw_connector_response: None,
             is_payment_id_from_merchant: None,
+            payment_method_type: None,
+            payout_id: None,
+            authorized_amount: None,
+            accept_amount_mismatch: None,
+            customer_document_details: None,
+            customer_date_of_birth: None,
+            feature_data: None,
+            sender_payment_instrument_id: None,
+            connector_returned_payment_method_details: None,
         }
     }
 
@@ -4878,6 +4887,10 @@ mod external_refund_sync_tests {
             integrity_object: None,
             connector_reference_id: None,
             setup_future_usage: None,
+            feature_metadata: None,
+            connector_mandate_id: None,
+            enable_partial_authorization: None,
+            is_overcapture_enabled: None,
         }
     }
 
@@ -5174,6 +5187,7 @@ mod external_refund_sync_tests {
             merchant_config_currency: None,
             capture_method: Some(enums::CaptureMethod::Automatic),
             additional_payment_method_data: None,
+            payment_connector_request_reference_id: None,
         });
         let executed =
             RefundsRouterData::<Execute>::try_from(RefundsResponseRouterData::<Execute, _> {
@@ -5288,6 +5302,9 @@ mod tests {
             unit_discount_amount: None,
             commodity_code: None,
             upc: None,
+            discount_name: None,
+            discount_percentage: None,
+            discount_type: None,
         }
     }
 

@@ -19,7 +19,6 @@ use common_utils::{
 };
 use error_stack::{report, ResultExt};
 use hyperswitch_domain_models::{
-    payment_method_data::PaymentMethodData,
     router_data::{AccessToken, ErrorResponse, RouterData},
     router_flow_types::{
         access_token_auth::AccessTokenAuth,
@@ -232,10 +231,11 @@ impl Fiservemea {
         &self,
         req: &RouterData<Flow, Req, Res>,
         payload: &str,
-    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
-        let timestamp = OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
+        let timestamp = common_utils::date_time::now_unix_timestamp_millis();
         let auth = fiservemea::FiservemeaAuthType::try_from(&req.connector_auth_type)?;
-        let client_request_id = Uuid::new_v4().to_string();
+        let client_request_id = common_utils::generate_uuid_v4().to_string();
         let hmac = self
             .generate_authorization_signature(auth.clone(), &client_request_id, payload, timestamp)
             .change_context(errors::ConnectorError::RequestEncodingFailed)?;
@@ -245,7 +245,10 @@ impl Fiservemea {
                 self.common_get_content_type().to_string().into(),
             ),
             ("Client-Request-Id".to_string(), client_request_id.into()),
-            (headers::API_KEY.to_string(), auth.api_key.expose().into_masked()),
+            (
+                headers::API_KEY.to_string(),
+                auth.api_key.expose().into_masked(),
+            ),
             (headers::TIMESTAMP.to_string(), timestamp.to_string().into()),
             (headers::MESSAGE_SIGNATURE.to_string(), hmac.into_masked()),
         ])
@@ -279,7 +282,8 @@ impl ConnectorIntegration<SetupMandate, SetupMandateRequestData, PaymentsRespons
         &self,
         req: &RouterData<SetupMandate, SetupMandateRequestData, PaymentsResponseData>,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.build_headers(req, connectors)
     }
 
@@ -365,7 +369,8 @@ impl ConnectorIntegration<PaymentMethodToken, PaymentMethodTokenizationData, Pay
         &self,
         req: &TokenizationRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.build_headers(req, connectors)
     }
 
@@ -734,7 +739,8 @@ impl ConnectorIntegration<CompleteAuthorize, CompleteAuthorizeData, PaymentsResp
         &self,
         req: &PaymentsCompleteAuthorizeRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.build_headers(req, connectors)
     }
 
@@ -1630,10 +1636,10 @@ mod tests {
             payment_method: enums::PaymentMethod::Card,
             connector_auth_type:
                 hyperswitch_domain_models::router_data::ConnectorAuthType::SignatureKey {
-                api_key: hyperswitch_masking::Secret::new("apikey".to_string()),
-                key1: hyperswitch_masking::Secret::new("5926072901".to_string()),
-                api_secret: hyperswitch_masking::Secret::new("apisecret".to_string()),
-            },
+                    api_key: hyperswitch_masking::Secret::new("apikey".to_string()),
+                    key1: hyperswitch_masking::Secret::new("5926072901".to_string()),
+                    api_secret: hyperswitch_masking::Secret::new("apisecret".to_string()),
+                },
             description: None,
             address: hyperswitch_domain_models::payment_address::PaymentAddress::default(),
             auth_type: enums::AuthenticationType::NoThreeDs,
@@ -1677,6 +1683,15 @@ mod tests {
             psd2_sca_exemption_type: None,
             raw_connector_response: None,
             is_payment_id_from_merchant: None,
+            payment_method_type: None,
+            payout_id: None,
+            authorized_amount: None,
+            accept_amount_mismatch: None,
+            customer_document_details: None,
+            customer_date_of_birth: None,
+            feature_data: None,
+            sender_payment_instrument_id: None,
+            connector_returned_payment_method_details: None,
         }
     }
 
@@ -1688,13 +1703,12 @@ mod tests {
             ..Default::default()
         });
         let connector = Fiservemea::new();
-        let url =
-            ConnectorIntegration::<Void, PaymentsCancelData, PaymentsResponseData>::get_url(
-                connector,
-                &req,
-                &cert_connectors(),
-            )
-            .unwrap();
+        let url = ConnectorIntegration::<Void, PaymentsCancelData, PaymentsResponseData>::get_url(
+            connector,
+            &req,
+            &cert_connectors(),
+        )
+        .unwrap();
         assert_eq!(
             url,
             "https://cert.api.firstdata.com/gateway/v2/payments/84667286296"
@@ -1730,6 +1744,7 @@ mod tests {
             merchant_config_currency: None,
             capture_method: Some(enums::CaptureMethod::Automatic),
             additional_payment_method_data: None,
+            payment_connector_request_reference_id: None,
         }
     }
 
@@ -1815,12 +1830,14 @@ mod tests {
             connector_transaction_id: "84667286296".to_string(),
             ..Default::default()
         });
-        assert!(ConnectorIntegration::<Void, PaymentsCancelData, PaymentsResponseData>::get_url(
-            Fiservemea::new(),
-            &req,
-            &connectors
-        )
-        .is_err());
+        assert!(
+            ConnectorIntegration::<Void, PaymentsCancelData, PaymentsResponseData>::get_url(
+                Fiservemea::new(),
+                &req,
+                &connectors
+            )
+            .is_err()
+        );
     }
 
     #[test]

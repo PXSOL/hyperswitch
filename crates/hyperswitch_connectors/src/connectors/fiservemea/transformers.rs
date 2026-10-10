@@ -5,6 +5,7 @@ use common_utils::{
     request::Method,
     types::{FloatMajorUnit, StringMajorUnit},
 };
+use error_stack::ResultExt;
 use hyperswitch_domain_models::{
     payment_method_data::PaymentMethodData,
     router_data::{
@@ -26,7 +27,6 @@ use hyperswitch_domain_models::{
         PaymentsCompleteAuthorizeRouterData, RefundsRouterData, TokenizationRouterData,
     },
 };
-use error_stack::ResultExt;
 use hyperswitch_interfaces::{consts, errors};
 use hyperswitch_masking::{ExposeInterface, PeekInterface, Secret};
 use serde::{Deserialize, Serialize};
@@ -34,8 +34,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     types::{RefundsResponseRouterData, ResponseRouterData},
     utils::{
-        CardData as _, CardIssuer, NetworkTokenData as _,
-        PaymentsAuthorizeRequestData as _, RouterData as _,
+        CardData as _, CardIssuer, NetworkTokenData as _, PaymentsAuthorizeRequestData as _,
+        RouterData as _,
     },
 };
 
@@ -680,7 +680,10 @@ fn validate_challenge_field(
     if allowed.contains(&value) {
         Ok(value.to_string())
     } else {
-        Err(errors::ConnectorError::InvalidDataFormat { field_name }.into())
+        Err(errors::ConnectorError::InvalidDataFormat {
+            field_name: field_name.into(),
+        }
+        .into())
     }
 }
 
@@ -857,13 +860,17 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
             fiservemea_meta
                 .tax_refund_legal_framework
                 .map(|legal_framework| FiservemeaAdditionalDetails {
-                    tax_refund_request_data: Some(FiservemeaTaxRefundRequestData { legal_framework }),
+                    tax_refund_request_data: Some(FiservemeaTaxRefundRequestData {
+                        legal_framework,
+                    }),
                 });
-        let soft_descriptor = fiservemea_meta.dynamic_merchant_name.clone().map(|name| {
-            FiservemeaSoftDescriptor {
-                dynamic_merchant_name: Secret::new(name),
-            }
-        });
+        let soft_descriptor =
+            fiservemea_meta
+                .dynamic_merchant_name
+                .clone()
+                .map(|name| FiservemeaSoftDescriptor {
+                    dynamic_merchant_name: Secret::new(name),
+                });
         let mut order = FiservemeaOrder {
             order_id: item.router_data.connector_request_reference_id.clone(),
             installment_options,
@@ -916,8 +923,10 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
             }
             // El network token sí declara la marca.
             PaymentMethodData::NetworkToken(token) => {
-                matches!(token.card_network, Some(common_enums::CardNetwork::Mastercard))
-                    || matches!(token.get_card_issuer(), Ok(CardIssuer::Master))
+                matches!(
+                    token.card_network,
+                    Some(common_enums::CardNetwork::Mastercard)
+                ) || matches!(token.get_card_issuer(), Ok(CardIssuer::Master))
             }
             _ => fiservemea_meta.card_network_is_mastercard.unwrap_or(false),
         };
@@ -1071,7 +1080,8 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
                             .contains(&cryptogram.peek().chars().count())
                         {
                             return Err(errors::ConnectorError::InvalidDataFormat {
-                                field_name: "payment_method_data.network_token.token_cryptogram".into(),
+                                field_name: "payment_method_data.network_token.token_cryptogram"
+                                    .into(),
                             }
                             .into());
                         }
@@ -1087,7 +1097,7 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
                 }
 
                 let card = FiservemeaPaymentCard {
-                    number: token_data.get_network_token(),
+                    number: token_data.get_network_token().into(),
                     expiry_date: FiservemeaExpiryDate {
                         month: token_data.get_network_token_expiry_month(),
                         year: token_data.get_token_expiry_year_2_digit()?,
@@ -1753,9 +1763,10 @@ fn map_status(
     // cuando trae un valor que conocemos. Un valor no contemplado ahí no debe tapar al
     // `transactionResult`, que es el campo vigente y suele venir en la misma respuesta.
     let from_status = match fiservemea_status {
-        Some(FiservemeaPaymentStatus::Approved) => {
-            Some(map_approved_status(transaction_type.as_ref(), transaction_state))
-        }
+        Some(FiservemeaPaymentStatus::Approved) => Some(map_approved_status(
+            transaction_type.as_ref(),
+            transaction_state,
+        )),
         Some(FiservemeaPaymentStatus::Waiting) => Some(common_enums::AttemptStatus::Pending),
         Some(FiservemeaPaymentStatus::Partial) => Some(common_enums::AttemptStatus::PartialCharged),
         Some(
@@ -2803,8 +2814,7 @@ mod tests {
 
     #[test]
     fn dynamic_merchant_name_truncated_to_25_chars() {
-        let metadata =
-            serde_json::json!({ "dynamic_merchant_name": "PXSOL_SUPER_LONG_STORE_NAME_1234567890" });
+        let metadata = serde_json::json!({ "dynamic_merchant_name": "PXSOL_SUPER_LONG_STORE_NAME_1234567890" });
         let meta = FiservemeaMetadataObject::from_sources(Some(&metadata), None);
         let name = meta.dynamic_merchant_name.expect("should extract");
         assert_eq!(name.chars().count(), 25);
@@ -2823,7 +2833,10 @@ mod tests {
             token_cryptogram: None,
         };
         let json = serde_json::to_value(&order).unwrap();
-        assert_eq!(json["softDescriptor"]["dynamicMerchantName"], "PXSOL*Reservas");
+        assert_eq!(
+            json["softDescriptor"]["dynamicMerchantName"],
+            "PXSOL*Reservas"
+        );
     }
 
     /// Metadata del comercio a partir de un objeto JSON, sin `frm_metadata`.
@@ -3039,19 +3052,26 @@ mod tests {
         // `50738 "Invalid Message Category"` (verificado contra cert). Si el comercio deja la
         // bandera como default global, sus ventas Visa tienen que seguir andando por 3DS
         // normal en vez de fallar todas.
-        let json = auth_request_json_for_brand(
-            serde_json::json!({ "three_ds_data_only": true }),
-            false,
-        );
+        let json =
+            auth_request_json_for_brand(serde_json::json!({ "three_ds_data_only": true }), false);
         assert_eq!(json["authenticationType"], FISERVEMEA_AUTH_TYPE_SECURE3D21);
         assert!(json.get("messageCategory").is_none());
-        assert_eq!(json["challengeIndicator"], FISERVEMEA_DEFAULT_CHALLENGE_INDICATOR);
+        assert_eq!(
+            json["challengeIndicator"],
+            FISERVEMEA_DEFAULT_CHALLENGE_INDICATOR
+        );
 
         // Y con Mastercard sí sale Data Only, con la clase base y sin campos de desafío.
         let json =
             auth_request_json_for_brand(serde_json::json!({ "three_ds_data_only": true }), true);
-        assert_eq!(json["authenticationType"], FISERVEMEA_AUTH_TYPE_SECURE3D_BASE);
-        assert_eq!(json["messageCategory"], FISERVEMEA_MESSAGE_CATEGORY_DATA_ONLY);
+        assert_eq!(
+            json["authenticationType"],
+            FISERVEMEA_AUTH_TYPE_SECURE3D_BASE
+        );
+        assert_eq!(
+            json["messageCategory"],
+            FISERVEMEA_MESSAGE_CATEGORY_DATA_ONLY
+        );
         assert!(json.get("challengeIndicator").is_none());
         assert!(json.get("challengeWindowSize").is_none());
     }
@@ -4202,7 +4222,9 @@ mod tests {
         // mandaba un PreAuth y dejaba la retención sin capturar.
         assert!(is_auto_capture(None));
         assert!(is_auto_capture(Some(enums::CaptureMethod::Automatic)));
-        assert!(is_auto_capture(Some(enums::CaptureMethod::SequentialAutomatic)));
+        assert!(is_auto_capture(Some(
+            enums::CaptureMethod::SequentialAutomatic
+        )));
         assert!(!is_auto_capture(Some(enums::CaptureMethod::Manual)));
     }
 
@@ -4229,7 +4251,10 @@ mod tests {
             )
         );
         // Formatos que no son `X:código:texto` no deben inventar un código.
-        assert_eq!(split_approval_code(Some("Y:683316")), (Some("683316".to_string()), None));
+        assert_eq!(
+            split_approval_code(Some("Y:683316")),
+            (Some("683316".to_string()), None)
+        );
         assert_eq!(split_approval_code(Some("")), (None, None));
         assert_eq!(split_approval_code(None), (None, None));
     }
@@ -5056,6 +5081,15 @@ mod tests {
             psd2_sca_exemption_type: None,
             raw_connector_response: None,
             is_payment_id_from_merchant: None,
+            payment_method_type: None,
+            payout_id: None,
+            authorized_amount: None,
+            accept_amount_mismatch: None,
+            customer_document_details: None,
+            customer_date_of_birth: None,
+            feature_data: None,
+            sender_payment_instrument_id: None,
+            connector_returned_payment_method_details: None,
         }
     }
 
@@ -5073,8 +5107,6 @@ mod tests {
             customer_name: None,
             currency,
             confirm: true,
-            statement_descriptor_suffix: None,
-            statement_descriptor: None,
             // La homologación mandó ventas (`PaymentCardSaleTransaction`), o sea captura
             // automática.
             capture_method: Some(common_enums::CaptureMethod::Automatic),
@@ -5114,13 +5146,30 @@ mod tests {
             payment_channel: None,
             enable_partial_authorization: None,
             enable_overcapture: None,
+            ucs_authentication_data: None,
+            force_3ds_challenge: None,
+            guest_customer: None,
+            is_stored_credential: None,
+            mit_category: None,
+            billing_descriptor: None,
+            tokenization: None,
+            partner_merchant_identifier_details: None,
+            feature_metadata: None,
+            installment_details: None,
+            connector_intent_metadata: None,
+            is_account_funded_transaction: None,
+            recipient_details: None,
+            business_country: None,
         }
     }
 
     /// Serializa el request de Authorize por el mismo camino que `get_request_body`.
     fn authorize_payload(router_data: &PaymentsAuthorizeRouterData) -> serde_json::Value {
         let amount = StringMajorUnitForConnector
-            .convert(router_data.request.minor_amount, router_data.request.currency)
+            .convert(
+                router_data.request.minor_amount,
+                router_data.request.currency,
+            )
             .unwrap();
         let wrapped = FiservemeaRouterData::from((amount, router_data));
         let request = FiservemeaPaymentsRequest::try_from(&wrapped).unwrap();
@@ -5365,6 +5414,9 @@ mod tests {
                 setup_future_usage: None,
                 setup_mandate_details: None,
                 mandate_id: None,
+                payment_method_type: None,
+                router_return_url: None,
+                capture_method: None,
             },
         );
         let request = FiservemeaCreateTokenRequest::try_from(&router_data).unwrap();
@@ -5396,9 +5448,8 @@ mod tests {
                 SetupMandateRequestData {
                     currency: common_enums::Currency::ARS,
                     payment_method_data: cert_card_data(CERT_CARD),
-                    amount: Some(0),
+                    amount: 0,
                     confirm: true,
-                    statement_descriptor_suffix: None,
                     customer_acceptance: None,
                     mandate_id: None,
                     setup_future_usage: None,
@@ -5417,12 +5468,25 @@ mod tests {
                     capture_method: None,
                     enrolled_for_3ds: false,
                     related_transaction_id: None,
-                    minor_amount: Some(MinorUnit::new(0)),
+                    minor_amount: MinorUnit::new(0),
                     shipping_cost: None,
                     connector_testing_data: None,
                     customer_id: None,
                     enable_partial_authorization: None,
                     payment_channel: None,
+                    feature_metadata: None,
+                    is_stored_credential: None,
+                    billing_descriptor: None,
+                    split_payments: None,
+                    tokenization: None,
+                    partner_merchant_identifier_details: None,
+                    authentication_data: None,
+                    connector_intent_metadata: None,
+                    merchant_order_reference_id: None,
+                    mit_category: None,
+                    is_account_funded_transaction: None,
+                    recipient_details: None,
+                    business_country: None,
                 },
             );
         let request = FiservemeaPaymentsRequest::try_from(&router_data).unwrap();
@@ -5479,6 +5543,7 @@ mod tests {
                 merchant_config_currency: None,
                 capture_method: Some(common_enums::CaptureMethod::Automatic),
                 additional_payment_method_data: None,
+                payment_connector_request_reference_id: None,
             },
         );
         let amount = StringMajorUnitForConnector
@@ -5618,9 +5683,8 @@ mod tests {
                 SetupMandateRequestData {
                     currency: common_enums::Currency::ARS,
                     payment_method_data: cert_card_data(CERT_CARD),
-                    amount: Some(0),
+                    amount: 0,
                     confirm: true,
-                    statement_descriptor_suffix: None,
                     customer_acceptance: None,
                     mandate_id: None,
                     setup_future_usage: None,
@@ -5639,12 +5703,25 @@ mod tests {
                     capture_method: None,
                     enrolled_for_3ds: false,
                     related_transaction_id: None,
-                    minor_amount: Some(MinorUnit::new(0)),
+                    minor_amount: MinorUnit::new(0),
                     shipping_cost: None,
                     connector_testing_data: None,
                     customer_id: None,
                     enable_partial_authorization: None,
                     payment_channel: None,
+                    feature_metadata: None,
+                    is_stored_credential: None,
+                    billing_descriptor: None,
+                    split_payments: None,
+                    tokenization: None,
+                    partner_merchant_identifier_details: None,
+                    authentication_data: None,
+                    connector_intent_metadata: None,
+                    merchant_order_reference_id: None,
+                    mit_category: None,
+                    is_account_funded_transaction: None,
+                    recipient_details: None,
+                    business_country: None,
                 },
             );
         let request = FiservemeaPaymentsRequest::try_from(&zero_auth).unwrap();
@@ -6282,6 +6359,7 @@ mod tests {
                 merchant_config_currency: None,
                 capture_method: Some(common_enums::CaptureMethod::Automatic),
                 additional_payment_method_data: None,
+                payment_connector_request_reference_id: None,
             },
         );
         let executed =

@@ -336,12 +336,13 @@ impl PaymentAttempt {
     /// Usado por el endpoint de diagnóstico /diagnostic/hyperswitch/payment-attempt/health.
     #[cfg(feature = "v1")]
     pub async fn find_failures_in_window(
-        conn: &PgPooledConn,
+        conn: &DatabaseConnectionWithContext<'_>,
         window_minutes: i64,
         merchant_id_filter: Option<&str>,
         profile_id_filter: Option<&str>,
     ) -> StorageResult<Vec<Self>> {
         use diesel::query_dsl::methods::{FilterDsl, OrderDsl};
+
         use crate::query::utils::GetPrimaryKey;
 
         let now = common_utils::date_time::now();
@@ -367,7 +368,7 @@ impl PaymentAttempt {
         }
 
         query
-            .get_results_async(conn)
+            .get_results_async(conn.raw_connection())
             .await
             .change_context(DatabaseError::Others)
             .attach_printable("Error querying failed payment attempts for diagnostic")
@@ -376,7 +377,7 @@ impl PaymentAttempt {
     /// Cuenta payment attempts exitosos (Charged, PartialCharged) en la ventana temporal.
     #[cfg(feature = "v1")]
     pub async fn count_successes_in_window(
-        conn: &PgPooledConn,
+        conn: &DatabaseConnectionWithContext<'_>,
         window_minutes: i64,
         merchant_id_filter: Option<&str>,
         profile_id_filter: Option<&str>,
@@ -408,7 +409,7 @@ impl PaymentAttempt {
         }
 
         query
-            .get_result_async::<i64>(conn)
+            .get_result_async::<i64>(conn.raw_connection())
             .await
             .change_context(DatabaseError::Others)
             .attach_printable("Error counting successful payment attempts for diagnostic")

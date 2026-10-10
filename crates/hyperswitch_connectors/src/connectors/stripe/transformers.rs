@@ -6024,7 +6024,11 @@ impl TryFrom<(&PaymentsAuthorizeRouterData, MinorUnit)> for StripeCheckoutSessio
                 .email
                 .clone()
                 .or_else(|| item.get_optional_billing_email()),
-            statement_descriptor_suffix: item.request.statement_descriptor_suffix.clone(),
+            statement_descriptor_suffix: item
+                .request
+                .billing_descriptor
+                .as_ref()
+                .and_then(|descriptor| descriptor.statement_descriptor_suffix.clone()),
             merchant_metadata: item.request.metadata.clone().map(Into::into),
             now_unix_timestamp: time::OffsetDateTime::now_utc().unix_timestamp(),
         }))
@@ -6536,6 +6540,15 @@ mod external_refund_sync_tests {
             psd2_sca_exemption_type: None,
             raw_connector_response: None,
             is_payment_id_from_merchant: None,
+            payment_method_type: None,
+            payout_id: None,
+            authorized_amount: None,
+            accept_amount_mismatch: None,
+            customer_document_details: None,
+            customer_date_of_birth: None,
+            feature_data: None,
+            sender_payment_instrument_id: None,
+            connector_returned_payment_method_details: None,
         }
     }
 
@@ -6555,6 +6568,10 @@ mod external_refund_sync_tests {
             integrity_object: None,
             connector_reference_id: None,
             setup_future_usage: None,
+            feature_metadata: None,
+            connector_mandate_id: None,
+            enable_partial_authorization: None,
+            is_overcapture_enabled: None,
         }
     }
 
@@ -6865,6 +6882,7 @@ mod external_refund_sync_tests {
             merchant_config_currency: None,
             capture_method: Some(enums::CaptureMethod::Automatic),
             additional_payment_method_data: None,
+            payment_connector_request_reference_id: None,
         });
         let executed =
             RefundsRouterData::<Execute>::try_from(RefundsResponseRouterData::<Execute, _> {
@@ -7397,8 +7415,6 @@ mod test_stripe_checkout {
             customer_name: None,
             currency,
             confirm: true,
-            statement_descriptor_suffix: None,
-            statement_descriptor: None,
             capture_method: Some(enums::CaptureMethod::Automatic),
             router_return_url,
             webhook_url: None,
@@ -7435,6 +7451,20 @@ mod test_stripe_checkout {
             payment_channel: None,
             enable_partial_authorization: None,
             enable_overcapture: None,
+            ucs_authentication_data: None,
+            force_3ds_challenge: None,
+            guest_customer: None,
+            is_stored_credential: None,
+            mit_category: None,
+            billing_descriptor: None,
+            tokenization: None,
+            partner_merchant_identifier_details: None,
+            feature_metadata: None,
+            installment_details: None,
+            connector_intent_metadata: None,
+            is_account_funded_transaction: None,
+            recipient_details: None,
+            business_country: None,
         }
     }
 
@@ -7500,6 +7530,15 @@ mod test_stripe_checkout {
             psd2_sca_exemption_type: None,
             raw_connector_response: None,
             is_payment_id_from_merchant: None,
+            payment_method_type: None,
+            payout_id: None,
+            authorized_amount: None,
+            accept_amount_mismatch: None,
+            customer_document_details: None,
+            customer_date_of_birth: None,
+            feature_data: None,
+            sender_payment_instrument_id: None,
+            connector_returned_payment_method_details: None,
         }
     }
 }

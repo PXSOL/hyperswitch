@@ -550,7 +550,8 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
                 if fee > max_fee {
                     return Err(errors::ConnectorError::InvalidDataFormat {
                         field_name:
-                            "application_fee exceeds maximum allowed (0.7% of transaction_amount)",
+                            "application_fee exceeds maximum allowed (0.7% of transaction_amount)"
+                                .into(),
                     }
                     .into());
                 }
@@ -576,7 +577,11 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
             external_reference: router_data.connector_request_reference_id.clone(),
             binary_mode: Some(true),
             notification_url,
-            statement_descriptor: router_data.request.statement_descriptor.clone(),
+            statement_descriptor: router_data
+                .request
+                .billing_descriptor
+                .as_ref()
+                .and_then(|descriptor| descriptor.statement_descriptor.clone()),
             additional_info,
             application_fee,
         })
@@ -720,7 +725,8 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>>
                 if fee > max_fee {
                     return Err(errors::ConnectorError::InvalidDataFormat {
                         field_name:
-                            "application_fee exceeds maximum allowed (0.7% of transaction_amount)",
+                            "application_fee exceeds maximum allowed (0.7% of transaction_amount)"
+                                .into(),
                     }
                     .into());
                 }
@@ -807,7 +813,11 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>>
             back_urls,
             auto_return,
             notification_url,
-            statement_descriptor: router_data.request.statement_descriptor.clone(),
+            statement_descriptor: router_data
+                .request
+                .billing_descriptor
+                .as_ref()
+                .and_then(|descriptor| descriptor.statement_descriptor.clone()),
             binary_mode: checkout_pro.binary_mode,
             payment_methods,
             marketplace_fee,
