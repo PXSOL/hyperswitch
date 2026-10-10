@@ -7,7 +7,10 @@ use common_utils::{
 };
 use hyperswitch_domain_models::{
     payment_method_data::PaymentMethodData,
-    router_data::{ConnectorAuthType, ErrorResponse, PaymentMethodToken, RouterData},
+    router_data::{
+        ConnectorAuthType, ConnectorReportedActivity, ConnectorReportedRefund,
+        ConnectorResponseData, ErrorResponse, PaymentMethodToken, RouterData,
+    },
     router_flow_types::{
         payments::{self, SetupMandate},
         refunds::{Execute, RSync},
@@ -2065,6 +2068,231 @@ impl FiservemeaSyncResponse {
             }
         }
     }
+}
+
+/// Un intento ya cobrado (total o parcialmente) es el único que el PSync revisa en busca de
+/// devoluciones y anulaciones hechas por fuera de Hyperswitch (ver
+/// `Connector::syncs_refunds_and_disputes_on_payment_sync`).
+pub fn is_settled_attempt(status: common_enums::AttemptStatus) -> bool {
+    matches!(
+        status,
+        common_enums::AttemptStatus::Charged | common_enums::AttemptStatus::PartialCharged
+    )
+}
+
+/// Convierte las transacciones secundarias de una orden en reembolsos reportados.
+///
+/// Se reportan los `RETURN` (devoluciones, que es lo que genera el reembolso de Hyperswitch y
+/// también el panel de Fiserv) y el `VOID` de la venta. El `connector_refund_id` es el
+/// `ipgTransactionId` de esa transacción, el mismo valor que el flujo Execute/RSync guarda como
+/// `connector_refund_id`: así la conciliación reconoce como propios los reembolsos que
+/// Hyperswitch ya creó en vez de duplicarlos.
+///
+/// Reglas para no sobrestimar los reembolsos:
+/// - Un `VOID` sólo se reporta cuando la venta del intento figura `VOIDED` (`sale_is_voided`) y
+///   nunca más de uno: un VOID de otra cosa (por ejemplo de una devolución) no devolvió el dinero
+///   de la venta.
+/// - Un `RETURN` cuyo propio `transactionState` es `VOIDED` se omite: al anularse devolvió el
+///   dinero al comercio, así que ya no es un reembolso.
+///
+/// Una entrada que no se puede interpretar (sin id, sin importe o sin moneda, o con un importe
+/// que no convierte) se descarta con un aviso: una secundaria rara no puede tirar abajo la
+/// sincronización de un cobro aprobado. Devuelve `None` si no hay nada que reportar.
+fn reported_activity_from_transactions(
+    transactions: Vec<FiservemeaPaymentsResponse>,
+    sale_is_voided: bool,
+    amount_converter: &dyn common_utils::types::AmountConvertor<Output = FloatMajorUnit>,
+) -> Option<ConnectorReportedActivity> {
+    let mut sale_void_reported = false;
+    let refunds: Vec<ConnectorReportedRefund> = transactions
+        .into_iter()
+        .filter(|transaction| match transaction.transaction_type {
+            Some(FiservemeaTransactionType::Return) => {
+                let voided = map_transaction_state(transaction.transaction_state.as_deref())
+                    == Some(common_enums::AttemptStatus::Voided);
+                if voided {
+                    router_env::logger::info!(
+                        refund_id = ?transaction.ipg_transaction_id,
+                        "fiservemea: devolución anulada; no se reporta como reembolso"
+                    );
+                }
+                !voided
+            }
+            Some(FiservemeaTransactionType::Void) => {
+                let is_sale_void = sale_is_voided && !sale_void_reported;
+                if is_sale_void {
+                    sale_void_reported = true;
+                } else {
+                    router_env::logger::info!(
+                        void_id = ?transaction.ipg_transaction_id,
+                        sale_is_voided,
+                        "fiservemea: anulación que no es la de la venta del intento; no se reporta"
+                    );
+                }
+                is_sale_void
+            }
+            _ => false,
+        })
+        .filter_map(|transaction| {
+            let Some(connector_refund_id) = transaction.ipg_transaction_id.clone() else {
+                router_env::logger::warn!(
+                    "fiservemea: transacción secundaria sin ipgTransactionId; no se reporta"
+                );
+                return None;
+            };
+            // El importe de la transacción manda; `approvedAmount` sólo cubre que falte.
+            let amount_details = transaction
+                .transaction_amount
+                .as_ref()
+                .or(transaction.approved_amount.as_ref());
+            let (Some(total), Some(currency)) = (
+                amount_details.and_then(|details| details.total),
+                amount_details.and_then(|details| details.currency),
+            ) else {
+                router_env::logger::warn!(
+                    refund_id = %connector_refund_id,
+                    "fiservemea: transacción secundaria sin importe o moneda; no se reporta"
+                );
+                return None;
+            };
+            let amount = amount_converter
+                .convert_back(total, currency)
+                .map_err(|error| {
+                    router_env::logger::warn!(
+                        refund_id = %connector_refund_id,
+                        ?error,
+                        "fiservemea: importe de transacción secundaria no convertible; no se reporta"
+                    );
+                })
+                .ok()?;
+            Some(ConnectorReportedRefund {
+                amount_is_remaining_balance: false,
+                amount_is_cumulative_total: false,
+                connector_refund_id,
+                amount,
+                status: map_refund_status(
+                    transaction.transaction_status,
+                    transaction.transaction_result,
+                ),
+            })
+        })
+        .collect();
+    (!refunds.is_empty()).then_some(ConnectorReportedActivity {
+        refunds,
+        dispute: None,
+    })
+}
+
+impl FiservemeaSyncResponse {
+    /// Variante de `into_transaction` para un intento ya cobrado: además de la transacción del
+    /// intento devuelve lo que el resto de la orden informa como reembolsos.
+    ///
+    /// La transacción del intento es la que tiene el `ipgTransactionId` que Hyperswitch guardó
+    /// (con captura manual puede ser la POSTAUTH y no la primera de la orden); si ninguna
+    /// coincide se toma la primera, igual que `into_transaction`, y se avisa. De las demás
+    /// transacciones sólo se conservan los RETURN y los VOID, que se reducen a reembolsos
+    /// reportados según las reglas de `reported_activity_from_transactions`; el resto
+    /// (POSTAUTH, CREDIT...) se descarta.
+    ///
+    /// Si la venta del intento figura `VOIDED` (anulada desde el panel) se la reclasifica como
+    /// aprobada para que la respuesta se arme como el cobro que Hyperswitch tiene registrado;
+    /// la anulación sale como reembolso reportado y el pago sigue exitoso, igual que con Wompi.
+    pub fn into_settled_transaction(
+        self,
+        attempt_connector_transaction_id: Option<&str>,
+        amount_converter: &dyn common_utils::types::AmountConvertor<Output = FloatMajorUnit>,
+    ) -> Result<
+        (
+            FiservemeaPaymentsResponse,
+            Option<ConnectorReportedActivity>,
+        ),
+        error_stack::Report<errors::ConnectorError>,
+    > {
+        let (order_id, mut transactions) = match self {
+            Self::Transaction(transaction) => return Ok((*transaction, None)),
+            Self::Order(order) => (order.order_id, order.transactions),
+        };
+        let matched_position = attempt_connector_transaction_id.and_then(|id| {
+            transactions
+                .iter()
+                .position(|t| t.ipg_transaction_id.as_deref() == Some(id))
+        });
+        if matched_position.is_none() && !transactions.is_empty() {
+            // Se avisa en vez de callar: tomar la primera puede ser una transacción que no es
+            // la del intento (p. ej. con captura manual), y el log es la única pista.
+            router_env::logger::warn!(
+                order_id = ?order_id,
+                stored_transaction_id = ?attempt_connector_transaction_id,
+                "fiservemea: la transacción del intento no está en la orden; se usa la primera"
+            );
+        }
+        let attempt_position = matched_position.unwrap_or(0);
+        if attempt_position >= transactions.len() {
+            // Igual que `into_transaction`: sin transacciones no hay estado que decidir.
+            return Err(error_stack::Report::new(
+                errors::ConnectorError::MissingRequiredField {
+                    field_name: "transactions",
+                },
+            ));
+        }
+        let mut primary = transactions.remove(attempt_position);
+        let sale_is_voided = matches!(
+            primary.transaction_type,
+            Some(FiservemeaTransactionType::Sale | FiservemeaTransactionType::Postauth)
+        ) && map_transaction_state(primary.transaction_state.as_deref())
+            == Some(common_enums::AttemptStatus::Voided);
+        let activity =
+            reported_activity_from_transactions(transactions, sale_is_voided, amount_converter);
+        if sale_is_voided {
+            primary.transaction_state = None;
+        }
+        Ok((primary, activity))
+    }
+}
+
+/// Cierra el PSync de un intento ya cobrado.
+///
+/// Un intento `Charged`/`PartialCharged` nunca baja a un estado más débil (Voided, Failure,
+/// Pending, Authorizing...): lo que Fiserv informe de más (anulaciones, devoluciones) llega como
+/// reembolsos reportados y el pago sigue exitoso. Ante un estado desconocido, que `map_status`
+/// resuelve como `Pending`, se conserva el estado actual. Si la conversión produjo un error de
+/// transacción, se reemplaza por una respuesta exitosa con el mismo id para que el router no
+/// marque como fallido un cobro real.
+pub fn finish_settled_sync<F, T>(
+    mut router_data: RouterData<F, T, PaymentsResponseData>,
+    attempt_status: common_enums::AttemptStatus,
+    attempt_connector_transaction_id: &ResponseId,
+    activity: Option<ConnectorReportedActivity>,
+) -> RouterData<F, T, PaymentsResponseData> {
+    if !is_settled_attempt(router_data.status) {
+        router_env::logger::warn!(
+            reported_status = ?router_data.status,
+            "fiservemea: el gateway informó un estado más débil para un intento ya cobrado; se conserva el actual"
+        );
+        router_data.status = attempt_status;
+        if router_data.response.is_err() {
+            router_data.response = Ok(PaymentsResponseData::TransactionResponse {
+                resource_id: attempt_connector_transaction_id.clone(),
+                redirection_data: Box::new(None),
+                mandate_reference: Box::new(None),
+                connector_metadata: None,
+                network_txn_id: None,
+                connector_response_reference_id: None,
+                incremental_authorization_allowed: None,
+                charges: None,
+            });
+        }
+    }
+    if let Some(activity) = activity {
+        match router_data.connector_response.as_mut() {
+            Some(connector_response) => connector_response.set_reported_activity(activity),
+            None => {
+                router_data.connector_response =
+                    Some(ConnectorResponseData::with_reported_activity(activity));
+            }
+        }
+    }
+    router_data
 }
 
 impl<F, T> TryFrom<ResponseRouterData<F, FiservemeaPaymentsResponse, T, PaymentsResponseData>>
@@ -4720,7 +4948,9 @@ mod tests {
 
     use std::marker::PhantomData;
 
-    use common_utils::types::{AmountConvertor, MinorUnit, StringMajorUnitForConnector};
+    use common_utils::types::{
+        AmountConvertor, FloatMajorUnitForConnector, MinorUnit, StringMajorUnitForConnector,
+    };
     use hyperswitch_domain_models::{
         payment_address::PaymentAddress,
         payment_method_data::Card,
@@ -5488,4 +5718,589 @@ mod tests {
         );
     }
 
+    // =========================================================================================
+    //  PSync de un intento ya cobrado: reembolsos y anulaciones hechos fuera de Hyperswitch
+    // =========================================================================================
+
+    const SETTLED_SALE_ID: &str = "84667286296";
+
+    /// La SALE de la orden real de cert, tal como se ve antes de que alguien la anule.
+    fn settled_sale() -> serde_json::Value {
+        let mut order =
+            crate::connectors::fiservemea::cert_responses::sync_order_of_a_voided_sale();
+        let mut sale = order["transactions"][0].take();
+        sale["transactionState"] = serde_json::json!("CAPTURED");
+        sale
+    }
+
+    fn order_of(transactions: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({
+            "type": "orderResponse",
+            "orderId": "PX-1786053427-07-void",
+            "transactions": transactions
+        })
+    }
+
+    /// Transacción secundaria mínima (RETURN/VOID) con el importe y el resultado que se pidan.
+    fn secondary(kind: &str, id: &str, total: f64, result: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "transactionResponse",
+            "ipgTransactionId": id,
+            "transactionType": kind,
+            "transactionAmount": { "total": total, "currency": "ARS" },
+            "transactionStatus": result,
+            "transactionResult": result
+        })
+    }
+
+    /// Camino del PSync de un intento cobrado, igual que `handle_response`.
+    fn settled_psync(
+        raw: serde_json::Value,
+        attempt_status: common_enums::AttemptStatus,
+        attempt_id: &str,
+    ) -> RouterData<(), (), PaymentsResponseData> {
+        let sync: FiservemeaSyncResponse = serde_json::from_value(raw).unwrap();
+        let (response, activity) = sync
+            .into_settled_transaction(Some(attempt_id), &FloatMajorUnitForConnector)
+            .unwrap();
+        let mut data = cert_router_data::<(), (), PaymentsResponseData>(
+            CERT_STORE_AR,
+            "PX-1786053427-07-void",
+            (),
+        );
+        data.status = attempt_status;
+        let built: RouterData<(), (), PaymentsResponseData> =
+            RouterData::try_from(ResponseRouterData {
+                response,
+                data,
+                http_code: 200,
+            })
+            .unwrap();
+        finish_settled_sync(
+            built,
+            attempt_status,
+            &ResponseId::ConnectorTransactionId(attempt_id.to_string()),
+            activity,
+        )
+    }
+
+    fn reported(
+        data: &RouterData<(), (), PaymentsResponseData>,
+    ) -> Option<&ConnectorReportedActivity> {
+        data.connector_response
+            .as_ref()
+            .and_then(|response| response.get_reported_activity())
+    }
+
+    fn resource_id_of(data: &RouterData<(), (), PaymentsResponseData>) -> Option<String> {
+        match data.response.as_ref().unwrap() {
+            PaymentsResponseData::TransactionResponse {
+                resource_id: ResponseId::ConnectorTransactionId(id),
+                ..
+            } => Some(id.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn voided_sale_of_a_charged_attempt_stays_charged_and_reports_the_void_as_a_refund() {
+        // Orden real de cert: [SALE (state VOIDED), VOID]. Sin la regla de no debilitar un cobro, el
+        // PSync daría `Voided`.
+        let raw = crate::connectors::fiservemea::cert_responses::sync_order_of_a_voided_sale();
+        for attempt_status in [
+            common_enums::AttemptStatus::Charged,
+            common_enums::AttemptStatus::PartialCharged,
+        ] {
+            let data = settled_psync(raw.clone(), attempt_status, SETTLED_SALE_ID);
+            assert!(is_settled_attempt(data.status), "{:?}", data.status);
+            assert_eq!(resource_id_of(&data), Some(SETTLED_SALE_ID.to_string()));
+            let activity = reported(&data).expect("la anulación debe reportarse");
+            assert!(activity.dispute.is_none());
+            assert_eq!(activity.refunds.len(), 1);
+            assert_eq!(activity.refunds[0].connector_refund_id, "84667286297");
+            assert_eq!(activity.refunds[0].amount, MinorUnit::new(100_000));
+            assert_eq!(activity.refunds[0].status, enums::RefundStatus::Success);
+        }
+    }
+
+    #[test]
+    fn approved_return_of_a_charged_attempt_is_reported_as_one_succeeded_refund() {
+        let data = settled_psync(
+            order_of(vec![settled_sale(), real_cert_return()]),
+            common_enums::AttemptStatus::Charged,
+            SETTLED_SALE_ID,
+        );
+        assert_eq!(data.status, common_enums::AttemptStatus::Charged);
+        let activity = reported(&data).unwrap();
+        assert_eq!(activity.refunds.len(), 1);
+        assert_eq!(activity.refunds[0].connector_refund_id, "84667286299");
+        assert_eq!(activity.refunds[0].amount, MinorUnit::new(100_000));
+        assert_eq!(activity.refunds[0].status, enums::RefundStatus::Success);
+    }
+
+    #[test]
+    fn two_returns_are_two_reported_refunds_with_their_own_amounts() {
+        let data = settled_psync(
+            order_of(vec![
+                settled_sale(),
+                secondary("RETURN", "9001", 250.5, "APPROVED"),
+                secondary("RETURN", "9002", 100.0, "APPROVED"),
+            ]),
+            common_enums::AttemptStatus::Charged,
+            SETTLED_SALE_ID,
+        );
+        let refunds = &reported(&data).unwrap().refunds;
+        assert_eq!(refunds.len(), 2);
+        assert_eq!(refunds[0].connector_refund_id, "9001");
+        assert_eq!(refunds[0].amount, MinorUnit::new(25_050));
+        assert_eq!(refunds[1].connector_refund_id, "9002");
+        assert_eq!(refunds[1].amount, MinorUnit::new(10_000));
+    }
+
+    #[test]
+    fn return_status_follows_the_gateway_result() {
+        let data = settled_psync(
+            order_of(vec![
+                settled_sale(),
+                secondary("RETURN", "9001", 10.0, "DECLINED"),
+                secondary("RETURN", "9002", 10.0, "WAITING"),
+                secondary("RETURN", "9003", 10.0, "APPROVED"),
+            ]),
+            common_enums::AttemptStatus::Charged,
+            SETTLED_SALE_ID,
+        );
+        let statuses: Vec<_> = reported(&data)
+            .unwrap()
+            .refunds
+            .iter()
+            .map(|refund| refund.status)
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                enums::RefundStatus::Failure,
+                enums::RefundStatus::Pending,
+                enums::RefundStatus::Success
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_secondary_entries_are_skipped_without_failing_the_sync() {
+        let mut no_amount = secondary("RETURN", "9002", 10.0, "APPROVED");
+        no_amount["transactionAmount"] = serde_json::json!({});
+        let mut no_id = secondary("RETURN", "x", 10.0, "APPROVED");
+        no_id.as_object_mut().unwrap().remove("ipgTransactionId");
+        let data = settled_psync(
+            order_of(vec![
+                settled_sale(),
+                no_id,
+                no_amount,
+                secondary("RETURN", "9003", 5.0, "APPROVED"),
+            ]),
+            common_enums::AttemptStatus::Charged,
+            SETTLED_SALE_ID,
+        );
+        assert_eq!(data.status, common_enums::AttemptStatus::Charged);
+        let refunds = &reported(&data).unwrap().refunds;
+        assert_eq!(refunds.len(), 1);
+        assert_eq!(refunds[0].connector_refund_id, "9003");
+    }
+
+    #[test]
+    fn nothing_to_report_returns_no_activity() {
+        // Sólo la venta, y una orden con una transacción de otro tipo (POSTAUTH/CREDIT).
+        for secondary_transactions in [
+            vec![],
+            vec![secondary("POSTAUTH", "9001", 10.0, "APPROVED")],
+            vec![secondary("CREDIT", "9001", 10.0, "APPROVED")],
+        ] {
+            let mut transactions = vec![settled_sale()];
+            transactions.extend(secondary_transactions);
+            let data = settled_psync(
+                order_of(transactions),
+                common_enums::AttemptStatus::Charged,
+                SETTLED_SALE_ID,
+            );
+            assert_eq!(data.status, common_enums::AttemptStatus::Charged);
+            assert!(reported(&data).is_none());
+        }
+    }
+
+    #[test]
+    fn attempt_transaction_is_found_by_id_not_by_position() {
+        // Captura manual: el id guardado es el de la POSTAUTH, que no va primera en la orden.
+        let mut preauth = settled_sale();
+        preauth["ipgTransactionId"] = serde_json::json!("1000");
+        preauth["transactionType"] = serde_json::json!("PREAUTH");
+        let mut postauth = settled_sale();
+        postauth["ipgTransactionId"] = serde_json::json!("1001");
+        postauth["transactionType"] = serde_json::json!("POSTAUTH");
+        let data = settled_psync(
+            order_of(vec![preauth, postauth]),
+            common_enums::AttemptStatus::Charged,
+            "1001",
+        );
+        assert_eq!(data.status, common_enums::AttemptStatus::Charged);
+        assert_eq!(resource_id_of(&data), Some("1001".to_string()));
+        assert!(reported(&data).is_none());
+    }
+
+    #[test]
+    fn settled_attempt_never_reports_a_weaker_status() {
+        // Venta anulada, pero consultada por transacción: no hay VOID que reportar, y aun así
+        // el pago sigue siendo un cobro exitoso.
+        let mut voided_sale = settled_sale();
+        voided_sale["transactionState"] = serde_json::json!("VOIDED");
+        voided_sale["type"] = serde_json::json!("transactionResponse");
+        let data = settled_psync(
+            voided_sale,
+            common_enums::AttemptStatus::Charged,
+            SETTLED_SALE_ID,
+        );
+        assert_eq!(data.status, common_enums::AttemptStatus::Charged);
+        assert!(reported(&data).is_none());
+
+        // Rechazo, estado desconocido y pendiente: el estado actual se conserva y la respuesta
+        // sigue siendo exitosa (un `Err` marcaría el cobro como fallido en el router).
+        for (state, result) in [
+            ("DECLINED", "DECLINED"),
+            ("WAITING", "WAITING"),
+            ("CAPTURED", "REVIEW"),
+        ] {
+            let mut sale = settled_sale();
+            sale["type"] = serde_json::json!("transactionResponse");
+            sale["transactionState"] = serde_json::json!(state);
+            sale["transactionResult"] = serde_json::json!(result);
+            sale["transactionStatus"] = serde_json::json!(result);
+            for attempt_status in [
+                common_enums::AttemptStatus::Charged,
+                common_enums::AttemptStatus::PartialCharged,
+            ] {
+                let data = settled_psync(sale.clone(), attempt_status, SETTLED_SALE_ID);
+                assert_eq!(data.status, attempt_status, "{state}/{result}");
+                assert_eq!(resource_id_of(&data), Some(SETTLED_SALE_ID.to_string()));
+            }
+        }
+    }
+
+    // Respuestas REALES de cert del 2026-10-01 (forma de los GET: sin `transactionStatus`
+    // por entrada, importes enteros, sin `orderId`/`apiTraceId` por entrada).
+    const REAL_SALE_ID: &str = "84674273258";
+    const REAL_VOIDED_SALE_ID: &str = "84674273316";
+
+    fn refunds_of(
+        data: &RouterData<(), (), PaymentsResponseData>,
+    ) -> Vec<(String, MinorUnit, enums::RefundStatus)> {
+        reported(data)
+            .map(|activity| {
+                activity
+                    .refunds
+                    .iter()
+                    .map(|refund| {
+                        (
+                            refund.connector_refund_id.clone(),
+                            refund.amount,
+                            refund.status,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn real_order_with_partial_return_reports_one_succeeded_refund() {
+        let data = settled_psync(
+            crate::connectors::fiservemea::cert_responses::real_order_with_partial_return(),
+            common_enums::AttemptStatus::Charged,
+            REAL_SALE_ID,
+        );
+        assert_eq!(data.status, common_enums::AttemptStatus::Charged);
+        assert_eq!(resource_id_of(&data), Some(REAL_SALE_ID.to_string()));
+        assert_eq!(
+            refunds_of(&data),
+            vec![(
+                "84674273291".to_string(),
+                MinorUnit::new(40_000),
+                enums::RefundStatus::Success
+            )]
+        );
+    }
+
+    #[test]
+    fn real_order_with_full_return_in_two_parts_reports_both_refunds() {
+        let data = settled_psync(
+            crate::connectors::fiservemea::cert_responses::real_order_with_full_return_in_two_parts(
+            ),
+            common_enums::AttemptStatus::Charged,
+            REAL_SALE_ID,
+        );
+        // La SALE sigue CAPTURED aunque se haya devuelto todo: el pago no cambia de estado.
+        assert_eq!(data.status, common_enums::AttemptStatus::Charged);
+        assert_eq!(
+            refunds_of(&data),
+            vec![
+                (
+                    "84674273291".to_string(),
+                    MinorUnit::new(40_000),
+                    enums::RefundStatus::Success
+                ),
+                (
+                    "84674273298".to_string(),
+                    MinorUnit::new(60_000),
+                    enums::RefundStatus::Success
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn real_order_of_a_voided_sale_reports_the_void_as_a_refund() {
+        let data = settled_psync(
+            crate::connectors::fiservemea::cert_responses::real_order_of_a_voided_sale(),
+            common_enums::AttemptStatus::Charged,
+            REAL_VOIDED_SALE_ID,
+        );
+        assert_eq!(data.status, common_enums::AttemptStatus::Charged);
+        assert_eq!(
+            refunds_of(&data),
+            vec![(
+                "84674273319".to_string(),
+                MinorUnit::new(100_000),
+                enums::RefundStatus::Success
+            )]
+        );
+    }
+
+    #[test]
+    fn a_voided_return_is_not_reported_as_a_refund() {
+        // Variación de la orden real con devolución parcial: el RETURN quedó anulado, o sea
+        // que devolvió el dinero al comercio y ya no es un reembolso.
+        let mut order =
+            crate::connectors::fiservemea::cert_responses::real_order_with_partial_return();
+        order["transactions"][1]["transactionState"] = serde_json::json!("VOIDED");
+        let data = settled_psync(order, common_enums::AttemptStatus::Charged, REAL_SALE_ID);
+        assert_eq!(data.status, common_enums::AttemptStatus::Charged);
+        assert!(reported(&data).is_none());
+    }
+
+    #[test]
+    fn only_the_voided_returns_are_skipped_among_several() {
+        let mut order =
+            crate::connectors::fiservemea::cert_responses::real_order_with_full_return_in_two_parts(
+            );
+        order["transactions"][1]["transactionState"] = serde_json::json!("voided");
+        let data = settled_psync(order, common_enums::AttemptStatus::Charged, REAL_SALE_ID);
+        assert_eq!(
+            refunds_of(&data),
+            vec![(
+                "84674273298".to_string(),
+                MinorUnit::new(60_000),
+                enums::RefundStatus::Success
+            )]
+        );
+    }
+
+    #[test]
+    fn a_void_that_is_not_the_void_of_the_sale_is_not_reported() {
+        // Orden: [SALE captured, RETURN anulado, VOID del RETURN]. La venta sigue cobrada, así
+        // que ni el RETURN ni su VOID son reembolsos.
+        let mut order =
+            crate::connectors::fiservemea::cert_responses::real_order_with_partial_return();
+        order["transactions"][1]["transactionState"] = serde_json::json!("VOIDED");
+        let void_of_the_return =
+            crate::connectors::fiservemea::cert_responses::real_order_of_a_voided_sale()
+                ["transactions"][1]
+                .clone();
+        order["transactions"]
+            .as_array_mut()
+            .unwrap()
+            .push(void_of_the_return);
+        let data = settled_psync(order, common_enums::AttemptStatus::Charged, REAL_SALE_ID);
+        assert_eq!(data.status, common_enums::AttemptStatus::Charged);
+        assert!(reported(&data).is_none());
+
+        // Sin el RETURN, un VOID con la venta cobrada tampoco se reporta.
+        let void = crate::connectors::fiservemea::cert_responses::real_order_of_a_voided_sale()
+            ["transactions"][1]
+            .clone();
+        let data = settled_psync(
+            order_of(vec![settled_sale(), void]),
+            common_enums::AttemptStatus::Charged,
+            SETTLED_SALE_ID,
+        );
+        assert!(reported(&data).is_none());
+    }
+
+    #[test]
+    fn a_voided_sale_reports_one_void_even_if_the_order_lists_more() {
+        let mut order =
+            crate::connectors::fiservemea::cert_responses::real_order_of_a_voided_sale();
+        let mut second_void = order["transactions"][1].clone();
+        second_void["ipgTransactionId"] = serde_json::json!("84674273999");
+        order["transactions"]
+            .as_array_mut()
+            .unwrap()
+            .push(second_void);
+        let data = settled_psync(
+            order,
+            common_enums::AttemptStatus::Charged,
+            REAL_VOIDED_SALE_ID,
+        );
+        assert_eq!(data.status, common_enums::AttemptStatus::Charged);
+        assert_eq!(
+            refunds_of(&data),
+            vec![(
+                "84674273319".to_string(),
+                MinorUnit::new(100_000),
+                enums::RefundStatus::Success
+            )]
+        );
+    }
+
+    #[test]
+    fn a_voided_sale_with_an_approved_return_reports_both() {
+        let mut order =
+            crate::connectors::fiservemea::cert_responses::real_order_of_a_voided_sale();
+        let real_return =
+            crate::connectors::fiservemea::cert_responses::real_order_with_partial_return()
+                ["transactions"][1]
+                .clone();
+        order["transactions"]
+            .as_array_mut()
+            .unwrap()
+            .insert(1, real_return);
+        let data = settled_psync(
+            order,
+            common_enums::AttemptStatus::Charged,
+            REAL_VOIDED_SALE_ID,
+        );
+        let ids: Vec<_> = refunds_of(&data)
+            .into_iter()
+            .map(|refund| refund.0)
+            .collect();
+        assert_eq!(ids, vec!["84674273291", "84674273319"]);
+    }
+
+    #[test]
+    fn a_stored_id_missing_from_the_order_falls_back_to_the_first_transaction() {
+        // Se avisa en el log (orden e id guardado); el resultado es el de siempre.
+        let data = settled_psync(
+            crate::connectors::fiservemea::cert_responses::real_order_with_partial_return(),
+            common_enums::AttemptStatus::Charged,
+            "not-in-the-order",
+        );
+        assert_eq!(data.status, common_enums::AttemptStatus::Charged);
+        assert_eq!(resource_id_of(&data), Some(REAL_SALE_ID.to_string()));
+        assert_eq!(refunds_of(&data).len(), 1);
+    }
+
+    #[test]
+    fn real_payment_of_a_voided_sale_stays_charged_without_refunds() {
+        let data = settled_psync(
+            crate::connectors::fiservemea::cert_responses::real_payment_of_a_voided_sale(),
+            common_enums::AttemptStatus::Charged,
+            REAL_VOIDED_SALE_ID,
+        );
+        assert_eq!(data.status, common_enums::AttemptStatus::Charged);
+        assert!(reported(&data).is_none());
+    }
+
+    #[test]
+    fn real_orders_keep_the_previous_mapping_for_an_unsettled_attempt() {
+        use crate::connectors::fiservemea::cert_responses as real;
+        for (raw, expected) in [
+            (
+                real::real_order_with_partial_return(),
+                common_enums::AttemptStatus::Charged,
+            ),
+            (
+                real::real_order_with_full_return_in_two_parts(),
+                common_enums::AttemptStatus::Charged,
+            ),
+            (
+                real::real_order_of_a_voided_sale(),
+                common_enums::AttemptStatus::Voided,
+            ),
+        ] {
+            let sync: FiservemeaSyncResponse = serde_json::from_value(raw).unwrap();
+            let response = sync.into_transaction().unwrap();
+            let data: RouterData<(), (), PaymentsResponseData> =
+                RouterData::try_from(ResponseRouterData {
+                    response,
+                    data: cert_router_data::<(), (), PaymentsResponseData>(CERT_STORE_AR, "x", ()),
+                    http_code: 200,
+                })
+                .unwrap();
+            assert_eq!(data.status, expected);
+            assert!(reported(&data).is_none());
+        }
+    }
+
+    #[test]
+    fn order_without_transactions_still_fails_for_a_settled_attempt() {
+        let sync: FiservemeaSyncResponse = serde_json::from_value(order_of(vec![])).unwrap();
+        assert!(sync
+            .into_settled_transaction(Some(SETTLED_SALE_ID), &FloatMajorUnitForConnector)
+            .is_err());
+    }
+
+    #[test]
+    fn reported_refund_id_is_the_one_the_refund_flow_stores() {
+        // El RETURN que Hyperswitch crea (Execute) y el mismo RETURN visto en la orden por el
+        // PSync deben tener el mismo `connector_refund_id`: así la conciliación lo reconoce
+        // como propio y no crea un reembolso duplicado.
+        let refund_data: RefundsRouterData<Execute> = cert_router_data(
+            CERT_STORE_AR,
+            "PX-1786053430-08-rettot",
+            RefundsData {
+                refund_id: "ref_1".to_string(),
+                connector_transaction_id: SETTLED_SALE_ID.to_string(),
+                connector_refund_id: None,
+                currency: common_enums::Currency::ARS,
+                payment_amount: 100_000,
+                reason: None,
+                webhook_url: None,
+                refund_amount: 100_000,
+                connector_metadata: None,
+                refund_connector_metadata: None,
+                browser_info: None,
+                split_refunds: None,
+                minor_payment_amount: MinorUnit::new(100_000),
+                minor_refund_amount: MinorUnit::new(100_000),
+                integrity_object: None,
+                refund_status: common_enums::RefundStatus::Pending,
+                merchant_account_id: None,
+                merchant_config_currency: None,
+                capture_method: Some(common_enums::CaptureMethod::Automatic),
+                additional_payment_method_data: None,
+            },
+        );
+        let executed =
+            RefundsRouterData::<Execute>::try_from(RefundsResponseRouterData::<Execute, _> {
+                response: parse_response(real_cert_return()),
+                data: refund_data,
+                http_code: 200,
+            })
+            .unwrap();
+        let stored_by_refund_flow = executed.response.unwrap().connector_refund_id;
+
+        let data = settled_psync(
+            order_of(vec![settled_sale(), real_cert_return()]),
+            common_enums::AttemptStatus::Charged,
+            SETTLED_SALE_ID,
+        );
+        assert_eq!(
+            reported(&data).unwrap().refunds[0].connector_refund_id,
+            stored_by_refund_flow
+        );
+        assert_eq!(stored_by_refund_flow, "84667286299");
+    }
+
+    #[test]
+    fn fiservemea_syncs_refunds_on_payment_sync() {
+        assert!(common_enums::connector_enums::Connector::Fiservemea
+            .syncs_refunds_and_disputes_on_payment_sync());
+    }
 }

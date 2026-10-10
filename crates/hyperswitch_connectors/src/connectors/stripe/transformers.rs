@@ -21,8 +21,9 @@ use hyperswitch_domain_models::{
         PayLaterData, PaymentMethodData, VoucherData, WalletData,
     },
     router_data::{
-        AdditionalPaymentMethodConnectorResponse, ConnectorAuthType, ConnectorResponseData,
-        ExtendedAuthorizationResponseData, PaymentMethodToken, RouterData,
+        AdditionalPaymentMethodConnectorResponse, ConnectorAuthType, ConnectorReportedActivity,
+        ConnectorReportedRefund, ConnectorResponseData, ExtendedAuthorizationResponseData,
+        PaymentMethodToken, RouterData,
     },
     router_flow_types::{Execute, RSync},
     router_request_types::{
@@ -981,18 +982,23 @@ pub enum StripeBankNames {
     Boz,
 }
 
-// This is used only for Disputes
+// This is used only for Disputes. `EventNotSupported` means the status is not a dispute one.
 impl From<WebhookEventStatus> for api_models::webhooks::IncomingWebhookEvent {
     fn from(value: WebhookEventStatus) -> Self {
         match value {
-            WebhookEventStatus::WarningNeedsResponse => Self::DisputeOpened,
-            WebhookEventStatus::WarningClosed => Self::DisputeCancelled,
-            WebhookEventStatus::WarningUnderReview => Self::DisputeChallenged,
+            WebhookEventStatus::WarningNeedsResponse | WebhookEventStatus::NeedsResponse => {
+                Self::DisputeOpened
+            }
+            WebhookEventStatus::WarningUnderReview | WebhookEventStatus::UnderReview => {
+                Self::DisputeChallenged
+            }
+            // An inquiry closed without a chargeback, or a dispute stopped before it started.
+            WebhookEventStatus::WarningClosed | WebhookEventStatus::Prevented => {
+                Self::DisputeCancelled
+            }
             WebhookEventStatus::Won => Self::DisputeWon,
             WebhookEventStatus::Lost => Self::DisputeLost,
-            WebhookEventStatus::NeedsResponse
-            | WebhookEventStatus::UnderReview
-            | WebhookEventStatus::ChargeRefunded
+            WebhookEventStatus::ChargeRefunded
             | WebhookEventStatus::Succeeded
             | WebhookEventStatus::RequiresPaymentMethod
             | WebhookEventStatus::RequiresConfirmation
@@ -1005,6 +1011,29 @@ impl From<WebhookEventStatus> for api_models::webhooks::IncomingWebhookEvent {
             | WebhookEventStatus::Unknown => Self::EventNotSupported,
         }
     }
+}
+
+/// Hyperswitch event of a `charge.dispute.*` webhook. The dispute object's `status` decides,
+/// not the event name: Stripe withdraws the funds when a dispute OPENS
+/// (`charge.dispute.funds_withdrawn` carries a `needs_response` dispute), so reading that
+/// event as a lost dispute would claw the payment back while the merchant can still win it.
+/// Only when the status is missing or not a dispute one does the event name decide, and then
+/// never as a final outcome (`Won`/`Lost`) for the funds events.
+pub fn dispute_webhook_event(
+    event_type: &WebhookEventType,
+    status: Option<WebhookEventStatus>,
+) -> api_models::webhooks::IncomingWebhookEvent {
+    use api_models::webhooks::IncomingWebhookEvent;
+    status
+        .map(IncomingWebhookEvent::from)
+        .filter(|event| *event != IncomingWebhookEvent::EventNotSupported)
+        .unwrap_or(match event_type {
+            WebhookEventType::DisputeClosed => IncomingWebhookEvent::DisputeCancelled,
+            WebhookEventType::DisputeCreated
+            | WebhookEventType::ChargeDisputeFundsWithdrawn
+            | WebhookEventType::ChargeDisputeFundsReinstated => IncomingWebhookEvent::DisputeOpened,
+            _ => IncomingWebhookEvent::EventNotSupported,
+        })
 }
 
 impl TryFrom<&enums::BankNames> for StripeBankNames {
@@ -2652,6 +2681,153 @@ impl StripeChargeEnum {
 pub struct StripeCharge {
     pub id: String,
     pub payment_method_details: Option<StripePaymentMethodDetailsResponse>,
+    /// Only present when the sync expands `latest_charge.refunds`; since API version
+    /// 2022-11-15 a charge no longer lists its refunds by default.
+    #[serde(default)]
+    pub refunds: Option<StripeChargeRefunds>,
+    /// The fields below come with the charge without any expansion.
+    #[serde(default)]
+    pub amount_refunded: Option<MinorUnit>,
+    #[serde(default)]
+    pub refunded: Option<bool>,
+    #[serde(default)]
+    pub disputed: Option<bool>,
+}
+
+/// Stripe list object of the refunds of a charge (first page only).
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StripeChargeRefunds {
+    #[serde(default)]
+    pub data: Vec<StripeChargeRefund>,
+    #[serde(default)]
+    pub has_more: Option<bool>,
+}
+
+/// A refund as listed on a charge. Every field is optional so one odd entry cannot make the
+/// whole sync of a charged payment fail to parse; entries that miss what the reconciliation
+/// needs are skipped when the reported activity is built.
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StripeChargeRefund {
+    /// `re_...`: the same id the refund Execute/RSync flows store as `connector_refund_id`.
+    pub id: Option<String>,
+    pub amount: Option<MinorUnit>,
+    pub status: Option<String>,
+}
+
+/// Maps the status of a Stripe refund object to the Hyperswitch refund status. A status this
+/// connector does not know yet stays `Pending` instead of being reported as a final outcome.
+fn map_reported_refund_status(status: Option<&str>) -> enums::RefundStatus {
+    match status {
+        Some("succeeded") => enums::RefundStatus::Success,
+        Some("failed" | "canceled") => enums::RefundStatus::Failure,
+        Some("pending" | "requires_action") => enums::RefundStatus::Pending,
+        _ => enums::RefundStatus::Pending,
+    }
+}
+
+impl StripeChargeRefunds {
+    /// Refunds of the charge as reported activity, or `None` when there is nothing to report.
+    /// Only the first page of the list is read: when Stripe says there are more refunds the
+    /// remainder is not fetched (a charge with more than 10 refunds is rare) and a warning is
+    /// logged. Entries without an id or an amount are skipped with a warning.
+    fn reported_activity(&self) -> Option<ConnectorReportedActivity> {
+        if self.has_more == Some(true) {
+            router_env::logger::warn!(
+                "stripe: the charge has more refunds than the first page of the list; only the first page is reported"
+            );
+        }
+        let refunds: Vec<ConnectorReportedRefund> = self
+            .data
+            .iter()
+            .filter_map(|refund| {
+                let (Some(connector_refund_id), Some(amount)) =
+                    (refund.id.clone().filter(|id| !id.is_empty()), refund.amount)
+                else {
+                    router_env::logger::warn!(
+                        "stripe: refund of the charge without id or amount; not reported"
+                    );
+                    return None;
+                };
+                Some(ConnectorReportedRefund {
+                    amount_is_remaining_balance: false,
+                    amount_is_cumulative_total: false,
+                    connector_refund_id,
+                    amount,
+                    status: map_reported_refund_status(refund.status.as_deref()),
+                })
+            })
+            .collect();
+        (!refunds.is_empty()).then_some(ConnectorReportedActivity {
+            refunds,
+            dispute: None,
+        })
+    }
+}
+
+impl PaymentIntentSyncResponse {
+    /// Refunds made on the charge of the intent, including the ones made outside Hyperswitch.
+    /// Needs the sync to expand `latest_charge.refunds`; a bare charge id or a charge without
+    /// the expansion reports nothing.
+    pub fn reported_activity(&self) -> Option<ConnectorReportedActivity> {
+        match self.latest_charge.as_ref()? {
+            StripeChargeEnum::ChargeObject(charge) => charge.refunds.as_ref()?.reported_activity(),
+            StripeChargeEnum::ChargeId(_) => None,
+        }
+    }
+}
+
+/// A charged (fully or partially) attempt is the only one the sync reads for refunds made
+/// outside Hyperswitch (see `Connector::syncs_refunds_and_disputes_on_payment_sync`).
+pub fn is_settled_attempt(status: AttemptStatus) -> bool {
+    matches!(
+        status,
+        AttemptStatus::Charged | AttemptStatus::PartialCharged
+    )
+}
+
+/// Closes the payment intent sync of an attempt: attaches the reported refunds and keeps a
+/// settled attempt from moving to a weaker status.
+///
+/// An intent normally stays `succeeded` after refunds and disputes, but a `Charged` or
+/// `PartialCharged` attempt must never be downgraded by a sync, so if Stripe reports anything
+/// weaker the current status is kept (the refunds still reach the reconciliation). A failure
+/// response of such a sync is replaced by a successful one with the same id so the router does
+/// not mark a real charge as failed.
+pub fn finish_payment_intent_sync<F, T>(
+    mut router_data: RouterData<F, T, PaymentsResponseData>,
+    attempt_status: AttemptStatus,
+    attempt_connector_transaction_id: &ResponseId,
+    activity: Option<ConnectorReportedActivity>,
+) -> RouterData<F, T, PaymentsResponseData> {
+    if is_settled_attempt(attempt_status) && !is_settled_attempt(router_data.status) {
+        router_env::logger::warn!(
+            reported_status = ?router_data.status,
+            "stripe: weaker status reported for a charged attempt; keeping the current one"
+        );
+        router_data.status = attempt_status;
+        if router_data.response.is_err() {
+            router_data.response = Ok(PaymentsResponseData::TransactionResponse {
+                resource_id: attempt_connector_transaction_id.clone(),
+                redirection_data: Box::new(None),
+                mandate_reference: Box::new(None),
+                connector_metadata: None,
+                network_txn_id: None,
+                connector_response_reference_id: None,
+                incremental_authorization_allowed: None,
+                charges: None,
+            });
+        }
+    }
+    if let Some(activity) = activity {
+        match router_data.connector_response.as_mut() {
+            Some(connector_response) => connector_response.set_reported_activity(activity),
+            None => {
+                router_data.connector_response =
+                    Some(ConnectorResponseData::with_reported_activity(activity));
+            }
+        }
+    }
+    router_data
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq, Serialize)]
@@ -4224,6 +4400,18 @@ pub struct WebhookEventData {
     pub event_object: WebhookEventObjectData,
 }
 
+impl WebhookEventTypeBody {
+    /// A `charge.refunded` event whose parent payment intent is known. Such an event is only a
+    /// signal that the refunds of the payment changed: it is routed to a sync of the parent
+    /// payment, which reads them from Stripe (see `Stripe::get_webhook_event_type`). Without
+    /// the parent intent there is nothing to sync. `charge.refund.updated` is not included: it
+    /// keeps the refund-id routing, which updates a known refund directly.
+    pub fn is_charge_refunded_on_known_payment(&self) -> bool {
+        matches!(self.event_type, WebhookEventType::ChargeRefunded)
+            && self.event_data.event_object.payment_intent.is_some()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct WebhookStatusData {
     #[serde(rename = "object")]
@@ -4234,6 +4422,8 @@ pub struct WebhookStatusData {
 pub struct WebhookStatusObjectData {
     pub status: Option<WebhookEventStatus>,
     pub payment_method_details: Option<WebhookPaymentMethodDetails>,
+    /// Parent payment intent of a charge or refund object, when it has one.
+    pub payment_intent: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4341,6 +4531,7 @@ pub enum WebhookEventStatus {
     Lost,
     NeedsResponse,
     UnderReview,
+    Prevented,
     ChargeRefunded,
     Succeeded,
     RequiresPaymentMethod,
@@ -5359,6 +5550,542 @@ mod test_validate_shipping_address_against_payment_method {
             state: Some(Secret::new(String::from("state"))),
             phone: Some(Secret::new(String::from("pbone number"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod external_refund_sync_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
+
+    use std::marker::PhantomData;
+
+    use hyperswitch_domain_models::{
+        payment_address::PaymentAddress,
+        router_flow_types::PSync,
+        router_request_types::{PaymentsSyncData, RefundsData, SyncRequestType},
+    };
+    use serde_json::json;
+
+    use super::*;
+
+    const PI_ID: &str = "pi_3PxyzABCDEF";
+
+    /// Real Stripe TEST payment intent 2026-10-05 (secrets redacted): succeeded, one dashboard-style partial refund of 300.
+    const PI1_EXPANDED: &str = r#"{"id":"pi_3UNBOCKMN9YFmEPb0UTbEvFd","object":"payment_intent","allowed_payment_method_types":null,"amount":1000,"amount_capturable":0,"amount_details":{"tip":{}},"amount_received":1000,"application":null,"application_fee_amount":null,"automatic_payment_methods":null,"canceled_at":null,"cancellation_reason":null,"capture_method":"automatic","client_secret":"REDACTED","confirmation_method":"automatic","created":1791204788,"currency":"usd","customer":null,"customer_account":null,"description":null,"excluded_payment_method_types":null,"invoice":null,"last_payment_error":null,"latest_charge":{"id":"ch_3UNBOCKMN9YFmEPb0Nnv369X","object":"charge","amount":1000,"amount_captured":1000,"amount_refunded":300,"amount_updates":[],"application":null,"application_fee":null,"application_fee_amount":null,"balance_transaction":"txn_3UNBOCKMN9YFmEPb0EX62ia9","billing_details":{"address":{"city":null,"country":null,"line1":null,"line2":null,"postal_code":null,"state":null},"email":null,"name":null,"phone":null,"tax_id":null},"calculated_statement_descriptor":"PXSOL USA, INC.","captured":true,"created":1791204788,"currency":"usd","customer":null,"description":null,"destination":null,"dispute":null,"disputed":false,"failure_balance_transaction":null,"failure_code":null,"failure_message":null,"fraud_details":{},"invoice":null,"livemode":false,"metadata":{},"on_behalf_of":null,"order":null,"outcome":{"advice_code":null,"network_advice_code":null,"network_decline_code":null,"network_status":"approved_by_network","reason":null,"risk_level":"normal","risk_score":17,"seller_message":"Payment complete.","type":"authorized"},"paid":true,"payment_intent":"pi_3UNBOCKMN9YFmEPb0UTbEvFd","payment_method":"pm_1UNBOCKMN9YFmEPblrcIGABf","payment_method_details":{"card":{"amount_authorized":1000,"authorization_code":"464928","brand":"visa","checks":{"address_line1_check":null,"address_postal_code_check":null,"cvc_check":"pass"},"country":"US","electronic_commerce_indicator":"07","exp_month":10,"exp_year":2027,"extended_authorization":{"status":"disabled"},"fingerprint":"YBHgZOgYQ2qL2HRG","funding":"credit","incremental_authorization":{"status":"unavailable"},"installments":null,"last4":"4242","mandate":null,"multicapture":{"status":"unavailable"},"network":"visa","network_token":{"used":false},"network_transaction_id":"896672103907910","overcapture":{"maximum_amount_capturable":1000,"status":"unavailable"},"regulated_status":"unregulated","three_d_secure":null,"transaction_link_id":null,"wallet":null},"type":"card"},"radar_options":{},"receipt_email":null,"receipt_number":null,"receipt_url":"https://pay.stripe.com/receipts/REDACTED","refunded":false,"refunds":{"object":"list","data":[{"id":"re_3UNBOCKMN9YFmEPb0o33PHHw","object":"refund","amount":300,"balance_transaction":"txn_3UNBOCKMN9YFmEPb0UG5x1hj","charge":"ch_3UNBOCKMN9YFmEPb0Nnv369X","created":1791204790,"currency":"usd","customer":null,"customer_account":null,"destination_details":{"card":{"reference":"9716644176774460","reference_status":"available","reference_type":"acquirer_reference_number","type":"refund"},"type":"card"},"metadata":{},"payment_intent":"pi_3UNBOCKMN9YFmEPb0UTbEvFd","payment_method":"pm_1UNBOCKMN9YFmEPblrcIGABf","reason":null,"receipt_number":null,"source_transfer_reversal":null,"status":"succeeded","transfer_reversal":null}],"has_more":false,"total_count":1,"url":"/v1/charges/ch_3UNBOCKMN9YFmEPb0Nnv369X/refunds"},"review":null,"shipping":null,"source":null,"source_transfer":null,"statement_descriptor":null,"statement_descriptor_suffix":null,"status":"succeeded","transfer_data":null,"transfer_group":null},"livemode":false,"managed_payments":{"enabled":false},"metadata":{},"next_action":null,"on_behalf_of":null,"payment_method":"pm_1UNBOCKMN9YFmEPblrcIGABf","payment_method_configuration_details":null,"payment_method_options":{"card":{"installments":null,"mandate_options":null,"network":null,"request_three_d_secure":"automatic"}},"payment_method_types":["card"],"payment_record":null,"processing":null,"receipt_email":null,"review":null,"setup_future_usage":null,"shared_payment_granted_token":null,"shipping":null,"source":null,"statement_descriptor":null,"statement_descriptor_suffix":null,"status":"succeeded","transfer_data":null,"transfer_group":null}"#;
+
+    /// Real Stripe TEST payment intent 2026-10-05 (secrets redacted): disputed, no refunds.
+    const PI2_EXPANDED: &str = r#"{"id":"pi_3UNBOFKMN9YFmEPb00WexzTQ","object":"payment_intent","allowed_payment_method_types":null,"amount":1000,"amount_capturable":0,"amount_details":{"tip":{}},"amount_received":1000,"application":null,"application_fee_amount":null,"automatic_payment_methods":null,"canceled_at":null,"cancellation_reason":null,"capture_method":"automatic","client_secret":"REDACTED","confirmation_method":"automatic","created":1791204791,"currency":"usd","customer":null,"customer_account":null,"description":null,"excluded_payment_method_types":null,"invoice":null,"last_payment_error":null,"latest_charge":{"id":"ch_3UNBOFKMN9YFmEPb0P8XvlDX","object":"charge","amount":1000,"amount_captured":1000,"amount_refunded":0,"amount_updates":[],"application":null,"application_fee":null,"application_fee_amount":null,"balance_transaction":"txn_3UNBOFKMN9YFmEPb0YgQcVZR","billing_details":{"address":{"city":null,"country":null,"line1":null,"line2":null,"postal_code":null,"state":null},"email":null,"name":null,"phone":null,"tax_id":null},"calculated_statement_descriptor":"PXSOL USA, INC.","captured":true,"created":1791204791,"currency":"usd","customer":null,"description":null,"destination":null,"dispute":"du_1UNBOHKMN9YFmEPb3cLJ7Uhs","disputed":true,"failure_balance_transaction":null,"failure_code":null,"failure_message":null,"fraud_details":{},"invoice":null,"livemode":false,"metadata":{},"on_behalf_of":null,"order":null,"outcome":{"advice_code":null,"network_advice_code":null,"network_decline_code":null,"network_status":"approved_by_network","reason":null,"risk_level":"normal","risk_score":47,"seller_message":"Payment complete.","type":"authorized"},"paid":true,"payment_intent":"pi_3UNBOFKMN9YFmEPb00WexzTQ","payment_method":"pm_1UNBOFKMN9YFmEPbktGIqWU7","payment_method_details":{"card":{"amount_authorized":1000,"authorization_code":"210532","brand":"visa","checks":{"address_line1_check":null,"address_postal_code_check":null,"cvc_check":"pass"},"country":"US","electronic_commerce_indicator":"07","exp_month":10,"exp_year":2027,"extended_authorization":{"status":"disabled"},"fingerprint":"AdVjHaIeBVJGlzpP","funding":"credit","incremental_authorization":{"status":"unavailable"},"installments":null,"last4":"0259","mandate":null,"multicapture":{"status":"unavailable"},"network":"visa","network_token":{"used":false},"network_transaction_id":"651008610672977","overcapture":{"maximum_amount_capturable":1000,"status":"unavailable"},"regulated_status":"unregulated","three_d_secure":null,"transaction_link_id":null,"wallet":null},"type":"card"},"radar_options":{},"receipt_email":null,"receipt_number":null,"receipt_url":"https://pay.stripe.com/receipts/REDACTED","refunded":false,"refunds":{"object":"list","data":[],"has_more":false,"total_count":0,"url":"/v1/charges/ch_3UNBOFKMN9YFmEPb0P8XvlDX/refunds"},"review":null,"shipping":null,"source":null,"source_transfer":null,"statement_descriptor":null,"statement_descriptor_suffix":null,"status":"succeeded","transfer_data":null,"transfer_group":null},"livemode":false,"managed_payments":{"enabled":false},"metadata":{},"next_action":null,"on_behalf_of":null,"payment_method":"pm_1UNBOFKMN9YFmEPbktGIqWU7","payment_method_configuration_details":null,"payment_method_options":{"card":{"installments":null,"mandate_options":null,"network":null,"request_three_d_secure":"automatic"}},"payment_method_types":["card"],"payment_record":null,"processing":null,"receipt_email":null,"review":null,"setup_future_usage":null,"shared_payment_granted_token":null,"shipping":null,"source":null,"statement_descriptor":null,"statement_descriptor_suffix":null,"status":"succeeded","transfer_data":null,"transfer_group":null}"#;
+
+    fn router_data<Flow, Req, Res>(request: Req) -> RouterData<Flow, Req, Res> {
+        RouterData {
+            flow: PhantomData,
+            merchant_id: common_utils::id_type::MerchantId::default(),
+            customer_id: None,
+            connector_customer: None,
+            connector: "stripe".to_string(),
+            payment_id: "pay_1".to_string(),
+            attempt_id: "pay_1_1".to_string(),
+            tenant_id: common_utils::id_type::TenantId::try_from_string("public".to_string())
+                .unwrap(),
+            status: AttemptStatus::Charged,
+            payment_method: enums::PaymentMethod::Card,
+            connector_auth_type: ConnectorAuthType::HeaderKey {
+                api_key: Secret::new("sk_test".to_string()),
+            },
+            description: None,
+            address: PaymentAddress::default(),
+            auth_type: enums::AuthenticationType::NoThreeDs,
+            connector_meta_data: None,
+            connector_wallets_details: None,
+            amount_captured: None,
+            access_token: None,
+            session_token: None,
+            reference_id: None,
+            payment_method_token: None,
+            recurring_mandate_payment_data: None,
+            preprocessing_id: None,
+            payment_method_balance: None,
+            connector_api_version: None,
+            request,
+            response: Err(hyperswitch_domain_models::router_data::ErrorResponse::default()),
+            connector_request_reference_id: "pay_1_1".to_string(),
+            #[cfg(feature = "payouts")]
+            payout_method_data: None,
+            #[cfg(feature = "payouts")]
+            quote_id: None,
+            test_mode: Some(true),
+            connector_http_status_code: None,
+            external_latency: None,
+            apple_pay_flow: None,
+            frm_metadata: None,
+            dispute_id: None,
+            refund_id: None,
+            connector_response: None,
+            payment_method_status: None,
+            minor_amount_captured: None,
+            minor_amount_capturable: None,
+            integrity_check: Ok(()),
+            additional_merchant_data: None,
+            header_payload: None,
+            connector_mandate_request_reference_id: None,
+            l2_l3_data: None,
+            authentication_id: None,
+            psd2_sca_exemption_type: None,
+            raw_connector_response: None,
+            is_payment_id_from_merchant: None,
+        }
+    }
+
+    fn sync_request() -> PaymentsSyncData {
+        PaymentsSyncData {
+            connector_transaction_id: ResponseId::ConnectorTransactionId(PI_ID.to_string()),
+            encoded_data: None,
+            capture_method: None,
+            connector_meta: None,
+            sync_type: SyncRequestType::SinglePaymentSync,
+            mandate_id: None,
+            payment_method_type: None,
+            currency: enums::Currency::USD,
+            payment_experience: None,
+            split_payments: None,
+            amount: MinorUnit::new(10_000),
+            integrity_object: None,
+            connector_reference_id: None,
+            setup_future_usage: None,
+        }
+    }
+
+    /// A payment intent as `GET /v1/payment_intents/{id}?expand[]=latest_charge...` returns it.
+    fn payment_intent_json(status: &str, latest_charge: Value) -> Value {
+        json!({
+            "id": PI_ID,
+            "object": "payment_intent",
+            "amount": 10000,
+            "amount_received": 10000,
+            "currency": "usd",
+            "status": status,
+            "created": 1_700_000_000,
+            "metadata": {},
+            "latest_charge": latest_charge
+        })
+    }
+
+    fn payment_intent(status: &str, latest_charge: Value) -> PaymentIntentSyncResponse {
+        serde_json::from_value(payment_intent_json(status, latest_charge)).unwrap()
+    }
+
+    fn refund(id: &str, amount: i64, status: &str) -> Value {
+        json!({
+            "id": id,
+            "object": "refund",
+            "amount": amount,
+            "balance_transaction": "txn_1",
+            "charge": "ch_3Pxyz",
+            "created": 1_700_000_100,
+            "currency": "usd",
+            "payment_intent": PI_ID,
+            "reason": null,
+            "status": status
+        })
+    }
+
+    fn charge_with(refunds: Vec<Value>, has_more: bool) -> Value {
+        json!({
+            "id": "ch_3Pxyz",
+            "object": "charge",
+            "amount": 10000,
+            "amount_refunded": 2500,
+            "refunded": false,
+            "disputed": false,
+            "payment_intent": PI_ID,
+            "refunds": {
+                "object": "list",
+                "data": refunds,
+                "has_more": has_more,
+                "url": "/v1/charges/ch_3Pxyz/refunds"
+            }
+        })
+    }
+
+    fn activity_of(
+        response: &PaymentIntentSyncResponse,
+    ) -> Vec<(String, i64, enums::RefundStatus)> {
+        response
+            .reported_activity()
+            .map(|activity| {
+                assert!(activity.dispute.is_none());
+                activity
+                    .refunds
+                    .into_iter()
+                    .map(|refund| {
+                        (
+                            refund.connector_refund_id,
+                            refund.amount.get_amount_as_i64(),
+                            refund.status,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn sync(
+        response: PaymentIntentSyncResponse,
+        attempt_status: AttemptStatus,
+    ) -> RouterData<PSync, PaymentsSyncData, PaymentsResponseData> {
+        let reported = response.reported_activity();
+        let mut data = router_data::<PSync, PaymentsSyncData, PaymentsResponseData>(sync_request());
+        data.status = attempt_status;
+        let built = RouterData::try_from(ResponseRouterData {
+            response,
+            data,
+            http_code: 200,
+        })
+        .unwrap();
+        finish_payment_intent_sync(
+            built,
+            attempt_status,
+            &ResponseId::ConnectorTransactionId(PI_ID.to_string()),
+            reported,
+        )
+    }
+
+    #[test]
+    fn external_refund_on_a_charged_payment_is_reported_and_the_payment_stays_charged() {
+        let response = payment_intent(
+            "succeeded",
+            charge_with(vec![refund("re_3PxyzDashboard", 2500, "succeeded")], false),
+        );
+        let data = sync(response, AttemptStatus::Charged);
+        assert_eq!(data.status, AttemptStatus::Charged);
+        let activity = data
+            .connector_response
+            .as_ref()
+            .and_then(|response| response.get_reported_activity())
+            .expect("the refund must be reported");
+        assert_eq!(activity.refunds.len(), 1);
+        assert_eq!(activity.refunds[0].connector_refund_id, "re_3PxyzDashboard");
+        assert_eq!(activity.refunds[0].amount, MinorUnit::new(2500));
+        assert_eq!(activity.refunds[0].status, enums::RefundStatus::Success);
+        assert!(activity.dispute.is_none());
+    }
+
+    #[test]
+    fn refund_statuses_map_and_unknown_ones_stay_pending() {
+        let response = payment_intent(
+            "succeeded",
+            charge_with(
+                vec![
+                    refund("re_ok", 1000, "succeeded"),
+                    refund("re_pending", 500, "pending"),
+                    refund("re_action", 300, "requires_action"),
+                    refund("re_failed", 200, "failed"),
+                    refund("re_canceled", 100, "canceled"),
+                    refund("re_new_status", 50, "something_stripe_adds_later"),
+                ],
+                false,
+            ),
+        );
+        assert_eq!(
+            activity_of(&response),
+            vec![
+                ("re_ok".to_string(), 1000, enums::RefundStatus::Success),
+                ("re_pending".to_string(), 500, enums::RefundStatus::Pending),
+                ("re_action".to_string(), 300, enums::RefundStatus::Pending),
+                ("re_failed".to_string(), 200, enums::RefundStatus::Failure),
+                ("re_canceled".to_string(), 100, enums::RefundStatus::Failure),
+                (
+                    "re_new_status".to_string(),
+                    50,
+                    enums::RefundStatus::Pending
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn charge_without_a_refund_list_reports_nothing_and_still_parses() {
+        // `latest_charge` as a bare id (not expanded).
+        let bare = payment_intent("succeeded", json!("ch_3Pxyz"));
+        assert!(matches!(
+            bare.latest_charge,
+            Some(StripeChargeEnum::ChargeId(_))
+        ));
+        assert!(bare.reported_activity().is_none());
+
+        // Expanded charge that has no `refunds` (older payload, or nothing expanded).
+        let no_refunds = payment_intent(
+            "succeeded",
+            json!({"id": "ch_3Pxyz", "object": "charge", "amount": 10000}),
+        );
+        assert!(matches!(
+            no_refunds.latest_charge,
+            Some(StripeChargeEnum::ChargeObject(_))
+        ));
+        assert!(no_refunds.reported_activity().is_none());
+
+        // Expanded charge with the refund list present but empty.
+        let empty = payment_intent("succeeded", charge_with(vec![], false));
+        assert!(empty.reported_activity().is_none());
+
+        // No charge at all (setup-intent style / not yet charged).
+        let none: PaymentIntentSyncResponse = serde_json::from_value(json!({
+            "id": PI_ID, "object": "payment_intent", "amount": 10000,
+            "currency": "usd", "status": "requires_payment_method",
+            "created": 1_700_000_000, "metadata": {}
+        }))
+        .unwrap();
+        assert!(none.reported_activity().is_none());
+    }
+
+    #[test]
+    fn has_more_still_reports_the_first_page() {
+        let response = payment_intent(
+            "succeeded",
+            charge_with(vec![refund("re_first_page", 700, "succeeded")], true),
+        );
+        assert_eq!(
+            activity_of(&response),
+            vec![(
+                "re_first_page".to_string(),
+                700,
+                enums::RefundStatus::Success
+            )]
+        );
+    }
+
+    #[test]
+    fn malformed_refund_entries_are_skipped_not_fatal() {
+        let response = payment_intent(
+            "succeeded",
+            charge_with(
+                vec![
+                    json!({"object": "refund", "amount": 100, "status": "succeeded"}),
+                    json!({"id": "re_no_amount", "object": "refund", "status": "succeeded"}),
+                    json!({"id": "", "amount": 100, "status": "succeeded"}),
+                    refund("re_good", 400, "succeeded"),
+                ],
+                false,
+            ),
+        );
+        assert_eq!(
+            activity_of(&response),
+            vec![("re_good".to_string(), 400, enums::RefundStatus::Success)]
+        );
+    }
+
+    #[test]
+    fn a_weaker_status_never_downgrades_a_charged_attempt() {
+        // The intent normally stays `succeeded`; if Stripe ever reports anything else the
+        // attempt keeps its status, the response is not turned into an error, and the
+        // refunds are still reported.
+        for weaker in [
+            "canceled",
+            "requires_payment_method",
+            "processing",
+            "failed",
+        ] {
+            for attempt_status in [AttemptStatus::Charged, AttemptStatus::PartialCharged] {
+                let response = payment_intent(
+                    weaker,
+                    charge_with(vec![refund("re_1", 100, "succeeded")], false),
+                );
+                let data = sync(response, attempt_status);
+                assert_eq!(data.status, attempt_status, "{weaker}");
+                assert!(data.response.is_ok(), "{weaker}");
+                assert!(data
+                    .connector_response
+                    .as_ref()
+                    .and_then(|response| response.get_reported_activity())
+                    .is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn unsettled_attempts_keep_the_status_stripe_reports() {
+        for (attempt_status, stripe_status, expected) in [
+            (
+                AttemptStatus::Authorized,
+                "succeeded",
+                AttemptStatus::Charged,
+            ),
+            (AttemptStatus::Pending, "canceled", AttemptStatus::Voided),
+            (
+                AttemptStatus::AuthenticationPending,
+                "requires_capture",
+                AttemptStatus::Authorized,
+            ),
+        ] {
+            let response = payment_intent(stripe_status, json!("ch_3Pxyz"));
+            let data = sync(response, attempt_status);
+            assert_eq!(data.status, expected, "{attempt_status:?}/{stripe_status}");
+            assert!(data.connector_response.is_none());
+        }
+    }
+
+    #[test]
+    fn reported_refund_id_is_the_one_the_refund_flow_stores() {
+        // The refund Hyperswitch creates (Execute) and the same refund seen on the charge by
+        // the payment sync must carry the same `connector_refund_id` (`re_...`), so the
+        // reconciliation recognizes the own refund instead of creating a duplicate.
+        let refund_object = json!({
+            "id": "re_3PxyzOwn",
+            "object": "refund",
+            "amount": 4000,
+            "currency": "usd",
+            "metadata": {"order_id": "ref_1", "is_refund_id_as_reference": "true"},
+            "payment_intent": PI_ID,
+            "status": "succeeded",
+            "failure_reason": null
+        });
+        let refund_response: RefundResponse =
+            serde_json::from_value(refund_object.clone()).unwrap();
+        let refund_data: RefundsRouterData<Execute> = router_data(RefundsData {
+            refund_id: "ref_1".to_string(),
+            connector_transaction_id: PI_ID.to_string(),
+            connector_refund_id: None,
+            currency: enums::Currency::USD,
+            payment_amount: 10_000,
+            reason: None,
+            webhook_url: None,
+            refund_amount: 4000,
+            connector_metadata: None,
+            refund_connector_metadata: None,
+            browser_info: None,
+            split_refunds: None,
+            minor_payment_amount: MinorUnit::new(10_000),
+            minor_refund_amount: MinorUnit::new(4000),
+            integrity_object: None,
+            refund_status: enums::RefundStatus::Pending,
+            merchant_account_id: None,
+            merchant_config_currency: None,
+            capture_method: Some(enums::CaptureMethod::Automatic),
+            additional_payment_method_data: None,
+        });
+        let executed =
+            RefundsRouterData::<Execute>::try_from(RefundsResponseRouterData::<Execute, _> {
+                response: refund_response,
+                data: refund_data,
+                http_code: 200,
+            })
+            .unwrap();
+        let stored = executed.response.unwrap();
+
+        let response = payment_intent("succeeded", charge_with(vec![refund_object], false));
+        let reported = response.reported_activity().unwrap();
+        assert_eq!(
+            reported.refunds[0].connector_refund_id,
+            stored.connector_refund_id
+        );
+        assert_eq!(stored.connector_refund_id, "re_3PxyzOwn");
+        assert_eq!(reported.refunds[0].amount, MinorUnit::new(4000));
+        assert_eq!(reported.refunds[0].status, stored.refund_status);
+    }
+
+    #[test]
+    fn stripe_syncs_refunds_on_payment_sync() {
+        assert!(common_enums::connector_enums::Connector::Stripe
+            .syncs_refunds_and_disputes_on_payment_sync());
+    }
+
+    /// The real payment sync of the connector: parse, map, integrity object and reported
+    /// refunds, as the router runs it.
+    fn connector_sync(
+        attempt_status: AttemptStatus,
+        body: Value,
+    ) -> RouterData<PSync, PaymentsSyncData, PaymentsResponseData> {
+        use hyperswitch_interfaces::{api::ConnectorIntegration, types::Response};
+
+        let mut data = router_data::<PSync, PaymentsSyncData, PaymentsResponseData>(sync_request());
+        data.status = attempt_status;
+        ConnectorIntegration::<PSync, PaymentsSyncData, PaymentsResponseData>::handle_response(
+            crate::connectors::Stripe::new(),
+            &data,
+            None,
+            Response {
+                headers: None,
+                response: bytes::Bytes::from(body.to_string()),
+                status_code: 200,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_connector_sync_reports_a_dashboard_refund_of_a_charged_payment() {
+        let data = connector_sync(
+            AttemptStatus::Charged,
+            payment_intent_json(
+                "succeeded",
+                charge_with(vec![refund("re_3PxyzDashboard", 2500, "succeeded")], false),
+            ),
+        );
+        assert_eq!(data.status, AttemptStatus::Charged);
+        assert!(data.request.integrity_object.is_some());
+        let activity = data
+            .connector_response
+            .as_ref()
+            .and_then(|response| response.get_reported_activity())
+            .expect("the refund must be reported");
+        assert_eq!(activity.refunds.len(), 1);
+        assert_eq!(activity.refunds[0].connector_refund_id, "re_3PxyzDashboard");
+        assert_eq!(activity.refunds[0].amount, MinorUnit::new(2500));
+        assert_eq!(activity.refunds[0].status, enums::RefundStatus::Success);
+
+        // A weaker status reported for the charged attempt keeps the attempt status.
+        let weaker = connector_sync(
+            AttemptStatus::Charged,
+            payment_intent_json(
+                "canceled",
+                charge_with(vec![refund("re_3PxyzDashboard", 2500, "succeeded")], false),
+            ),
+        );
+        assert_eq!(weaker.status, AttemptStatus::Charged);
+        assert!(weaker.response.is_ok());
+        assert!(weaker
+            .connector_response
+            .as_ref()
+            .and_then(|response| response.get_reported_activity())
+            .is_some());
+    }
+
+    #[test]
+    fn real_stripe_payment_intent_with_a_partial_refund_is_charged_and_reports_it() {
+        let body: Value = serde_json::from_str(PI1_EXPANDED).unwrap();
+        let data = connector_sync(AttemptStatus::Charged, body);
+        assert_eq!(data.status, AttemptStatus::Charged);
+        let activity = data
+            .connector_response
+            .as_ref()
+            .and_then(|response| response.get_reported_activity())
+            .expect("the refund of the charge must be reported");
+        assert_eq!(activity.refunds.len(), 1);
+        assert_eq!(
+            activity.refunds[0].connector_refund_id,
+            "re_3UNBOCKMN9YFmEPb0o33PHHw"
+        );
+        assert_eq!(activity.refunds[0].amount, MinorUnit::new(300));
+        assert_eq!(activity.refunds[0].status, enums::RefundStatus::Success);
+        assert!(activity.dispute.is_none());
+    }
+
+    #[test]
+    fn real_stripe_disputed_payment_intent_is_charged_and_reports_no_refund() {
+        let body: Value = serde_json::from_str(PI2_EXPANDED).unwrap();
+        let data = connector_sync(AttemptStatus::Charged, body);
+        assert_eq!(data.status, AttemptStatus::Charged);
+        // The dispute itself arrives by webhook, the sync reports no activity for it.
+        assert!(data
+            .connector_response
+            .as_ref()
+            .and_then(|response| response.get_reported_activity())
+            .is_none());
     }
 }
 

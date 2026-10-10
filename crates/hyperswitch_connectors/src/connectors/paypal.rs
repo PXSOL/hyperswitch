@@ -1503,50 +1503,13 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Pay
         connectors: &Connectors,
     ) -> CustomResult<String, errors::ConnectorError> {
         let paypal_meta: PaypalMeta = to_connector_meta(req.request.connector_meta.clone())?;
-        match req.payment_method {
-            enums::PaymentMethod::Wallet | enums::PaymentMethod::BankRedirect => Ok(format!(
-                "{}v2/checkout/orders/{}",
-                self.base_url(connectors),
-                req.request
-                    .connector_transaction_id
-                    .get_connector_transaction_id()
-                    .change_context(errors::ConnectorError::MissingConnectorTransactionID)?
-            )),
-            _ => {
-                let psync_url = match paypal_meta.psync_flow {
-                    transformers::PaypalPaymentIntent::Authorize => {
-                        let authorize_id = paypal_meta.authorize_id.ok_or(
-                            errors::ConnectorError::RequestEncodingFailedWithReason(
-                                "Missing Authorize id".to_string(),
-                            ),
-                        )?;
-                        format!("v2/payments/authorizations/{authorize_id}")
-                    }
-                    transformers::PaypalPaymentIntent::Capture => {
-                        let capture_id = paypal_meta.capture_id.ok_or(
-                            errors::ConnectorError::RequestEncodingFailedWithReason(
-                                "Missing Capture id".to_string(),
-                            ),
-                        )?;
-                        format!("v2/payments/captures/{capture_id}")
-                    }
-                    // only set when payment is done through card 3DS
-                    //because no authorize or capture id is generated during payment authorize call for card 3DS
-                    transformers::PaypalPaymentIntent::Authenticate => {
-                        format!(
-                            "v2/checkout/orders/{}",
-                            req.request
-                                .connector_transaction_id
-                                .get_connector_transaction_id()
-                                .change_context(
-                                    errors::ConnectorError::MissingConnectorTransactionID
-                                )?
-                        )
-                    }
-                };
-                Ok(format!("{}{psync_url}", self.base_url(connectors)))
-            }
-        }
+        psync_url(
+            self.base_url(connectors),
+            req.payment_method,
+            req.status,
+            &req.request.connector_transaction_id,
+            paypal_meta,
+        )
     }
 
     fn build_request(
@@ -1575,13 +1538,35 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Pay
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
-        RouterData::foreign_try_from((
+        // Built from the response BEFORE it is consumed below. Only the orders endpoint lists
+        // refunds, and it includes the ones made outside Hyperswitch (PayPal dashboard).
+        let reported_activity = match &response {
+            paypal::PaypalSyncResponse::PaypalOrdersSyncResponse(order) => {
+                order.reported_activity(data.request.currency, self.amount_converter)
+            }
+            paypal::PaypalSyncResponse::PaypalThreeDsSyncResponse(_)
+            | paypal::PaypalSyncResponse::PaypalRedirectSyncResponse(_)
+            | paypal::PaypalSyncResponse::PaypalPaymentsSyncResponse(_) => None,
+        };
+        let orders_sync_of_card = settled_card_sync_uses_orders(
+            data.payment_method,
+            data.status,
+            &data.request.connector_transaction_id,
+        );
+        let router_data = RouterData::foreign_try_from((
             ResponseRouterData {
                 response,
                 data: data.clone(),
                 http_code: res.status_code,
             },
             data.request.payment_experience,
+        ))?;
+        Ok(paypal::finish_payment_sync(
+            router_data,
+            data.status,
+            &data.request.connector_transaction_id,
+            reported_activity,
+            orders_sync_of_card,
         ))
     }
 
@@ -1591,6 +1576,78 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Pay
         event_builder: Option<&mut ConnectorEvent>,
     ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
         self.build_error_response(res, event_builder)
+    }
+}
+
+/// A settled card attempt is synced through the orders endpoint, the only one that lists the
+/// refunds of the order (the captures and authorizations endpoints do not), so a refund made on
+/// the PayPal dashboard becomes visible. Wallet and bank redirect attempts already sync through
+/// the orders endpoint. The order id is the connector transaction id of the attempt for every
+/// PayPal card flow (authorize, capture and the captures sync all keep it); an attempt without
+/// one keeps the URL it always had.
+fn settled_card_sync_uses_orders(
+    payment_method: enums::PaymentMethod,
+    attempt_status: enums::AttemptStatus,
+    connector_transaction_id: &ResponseId,
+) -> bool {
+    !matches!(
+        payment_method,
+        enums::PaymentMethod::Wallet | enums::PaymentMethod::BankRedirect
+    ) && paypal::is_settled_attempt(attempt_status)
+        && connector_transaction_id
+            .get_connector_transaction_id()
+            .is_ok()
+}
+
+fn psync_url(
+    base_url: &str,
+    payment_method: enums::PaymentMethod,
+    attempt_status: enums::AttemptStatus,
+    connector_transaction_id: &ResponseId,
+    paypal_meta: PaypalMeta,
+) -> CustomResult<String, errors::ConnectorError> {
+    let orders_url = || -> CustomResult<String, errors::ConnectorError> {
+        Ok(format!(
+            "{base_url}v2/checkout/orders/{}",
+            connector_transaction_id
+                .get_connector_transaction_id()
+                .change_context(errors::ConnectorError::MissingConnectorTransactionID)?
+        ))
+    };
+    match payment_method {
+        enums::PaymentMethod::Wallet | enums::PaymentMethod::BankRedirect => orders_url(),
+        _ if settled_card_sync_uses_orders(
+            payment_method,
+            attempt_status,
+            connector_transaction_id,
+        ) =>
+        {
+            orders_url()
+        }
+        _ => {
+            let psync_url = match paypal_meta.psync_flow {
+                transformers::PaypalPaymentIntent::Authorize => {
+                    let authorize_id = paypal_meta.authorize_id.ok_or(
+                        errors::ConnectorError::RequestEncodingFailedWithReason(
+                            "Missing Authorize id".to_string(),
+                        ),
+                    )?;
+                    format!("{base_url}v2/payments/authorizations/{authorize_id}")
+                }
+                transformers::PaypalPaymentIntent::Capture => {
+                    let capture_id = paypal_meta.capture_id.ok_or(
+                        errors::ConnectorError::RequestEncodingFailedWithReason(
+                            "Missing Capture id".to_string(),
+                        ),
+                    )?;
+                    format!("{base_url}v2/payments/captures/{capture_id}")
+                }
+                // only set when payment is done through card 3DS
+                //because no authorize or capture id is generated during payment authorize call for card 3DS
+                transformers::PaypalPaymentIntent::Authenticate => orders_url()?,
+            };
+            Ok(psync_url)
+        }
     }
 }
 
@@ -2063,14 +2120,28 @@ impl IncomingWebhook for Paypal {
                 ))
             }
             paypal::PaypalResource::PaypalDisputeWebhooks(resource) => {
-                Ok(api_models::webhooks::ObjectReferenceId::PaymentId(
-                    api_models::payments::PaymentIdType::ConnectorTransactionId(
-                        resource
-                            .disputed_transactions
-                            .first()
-                            .map(|transaction| transaction.seller_transaction_id.clone())
-                            .ok_or(errors::ConnectorError::WebhookReferenceIdNotFound)?,
+                let transaction = resource
+                    .disputed_transactions
+                    .first()
+                    .ok_or(errors::ConnectorError::WebhookReferenceIdNotFound)?;
+                // `seller_transaction_id` is the capture id, while Hyperswitch stores the order id
+                // as the connector transaction id, so it never finds the payment. The invoice
+                // number is the order's `invoice_id`, i.e. the attempt reference Hyperswitch sent.
+                //
+                // Assumption: that reference is the default one, the attempt id. A merchant
+                // with `payment_id_as_connector_request_id` sends the payment id instead, which
+                // does not resolve as an attempt id and ends in the webhook error path. Orders
+                // created outside Hyperswitch never matched a payment through either id.
+                let payment_id = match transaction.invoice_number.clone() {
+                    Some(invoice_number) => {
+                        api_models::payments::PaymentIdType::PaymentAttemptId(invoice_number)
+                    }
+                    None => api_models::payments::PaymentIdType::ConnectorTransactionId(
+                        transaction.seller_transaction_id.clone(),
                     ),
+                };
+                Ok(api_models::webhooks::ObjectReferenceId::PaymentId(
+                    payment_id,
                 ))
             }
             #[cfg(feature = "payouts")]
@@ -2495,5 +2566,260 @@ impl ConnectorSpecifications for Paypal {
 
     fn get_supported_webhook_flows(&self) -> Option<&'static [enums::EventClass]> {
         Some(&PAYPAL_SUPPORTED_WEBHOOK_FLOWS)
+    }
+}
+
+#[cfg(test)]
+mod external_refund_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
+
+    use api_models::webhooks::{ObjectReferenceId, RefundIdType};
+    use serde_json::json;
+
+    use super::*;
+
+    const BASE: &str = "https://api-m.sandbox.paypal.com/";
+    const ORDER_ID: &str = "5O190127TN364715T";
+
+    fn meta(flow: transformers::PaypalPaymentIntent) -> PaypalMeta {
+        PaypalMeta {
+            authorize_id: Some("AUTH1".to_string()),
+            capture_id: Some("CAP1".to_string()),
+            incremental_authorization_id: None,
+            psync_flow: flow,
+            next_action: None,
+            order_id: None,
+        }
+    }
+
+    fn url(
+        payment_method: enums::PaymentMethod,
+        status: enums::AttemptStatus,
+        id: &ResponseId,
+        flow: transformers::PaypalPaymentIntent,
+    ) -> String {
+        psync_url(BASE, payment_method, status, id, meta(flow)).unwrap()
+    }
+
+    fn order_id() -> ResponseId {
+        ResponseId::ConnectorTransactionId(ORDER_ID.to_string())
+    }
+
+    fn orders_url() -> String {
+        format!("{BASE}v2/checkout/orders/{ORDER_ID}")
+    }
+
+    #[test]
+    fn settled_card_attempts_sync_through_the_orders_endpoint() {
+        use transformers::PaypalPaymentIntent::{Authenticate, Authorize, Capture};
+        for status in [
+            enums::AttemptStatus::Charged,
+            enums::AttemptStatus::PartialCharged,
+        ] {
+            for flow in [Capture, Authorize, Authenticate] {
+                assert_eq!(
+                    url(enums::PaymentMethod::Card, status, &order_id(), flow),
+                    orders_url()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_settled_attempts_keep_their_url() {
+        use transformers::PaypalPaymentIntent::{Authenticate, Authorize, Capture};
+        for status in [
+            enums::AttemptStatus::Authorized,
+            enums::AttemptStatus::Pending,
+            enums::AttemptStatus::AuthenticationPending,
+            enums::AttemptStatus::Voided,
+            enums::AttemptStatus::Failure,
+        ] {
+            assert_eq!(
+                url(enums::PaymentMethod::Card, status, &order_id(), Capture),
+                format!("{BASE}v2/payments/captures/CAP1")
+            );
+            assert_eq!(
+                url(enums::PaymentMethod::Card, status, &order_id(), Authorize),
+                format!("{BASE}v2/payments/authorizations/AUTH1")
+            );
+            assert_eq!(
+                url(
+                    enums::PaymentMethod::Card,
+                    status,
+                    &order_id(),
+                    Authenticate
+                ),
+                orders_url()
+            );
+        }
+    }
+
+    #[test]
+    fn a_settled_attempt_without_an_order_id_keeps_its_url() {
+        assert_eq!(
+            url(
+                enums::PaymentMethod::Card,
+                enums::AttemptStatus::Charged,
+                &ResponseId::NoResponseId,
+                transformers::PaypalPaymentIntent::Capture
+            ),
+            format!("{BASE}v2/payments/captures/CAP1")
+        );
+    }
+
+    #[test]
+    fn wallet_and_bank_redirect_always_use_the_orders_endpoint() {
+        for payment_method in [
+            enums::PaymentMethod::Wallet,
+            enums::PaymentMethod::BankRedirect,
+        ] {
+            for status in [
+                enums::AttemptStatus::Charged,
+                enums::AttemptStatus::Authorized,
+                enums::AttemptStatus::Pending,
+            ] {
+                assert_eq!(
+                    url(
+                        payment_method,
+                        status,
+                        &order_id(),
+                        transformers::PaypalPaymentIntent::Capture
+                    ),
+                    orders_url()
+                );
+            }
+        }
+    }
+
+    fn details<'a>(
+        headers: &'a actix_web::http::header::HeaderMap,
+        body: &'a [u8],
+    ) -> IncomingWebhookRequestDetails<'a> {
+        IncomingWebhookRequestDetails {
+            method: actix_web::http::Method::POST,
+            uri: "/webhooks/paypal".parse().expect("valid test uri"),
+            headers,
+            body,
+            query_params: String::new(),
+        }
+    }
+
+    /// `PAYMENT.CAPTURE.REFUNDED` as PayPal documents it: the refund resource carries the
+    /// capture only as `links[rel=up]`, no `supplementary_data` and no order id.
+    fn refund_webhook() -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "id": "WH-1",
+            "event_version": "1.0",
+            "create_time": "2026-09-30T10:00:00.000Z",
+            "resource_type": "refund",
+            "event_type": "PAYMENT.CAPTURE.REFUNDED",
+            "resource": {
+                "seller_payable_breakdown": {
+                    "gross_amount": {"currency_code": "USD", "value": "25.00"},
+                    "paypal_fee": {"currency_code": "USD", "value": "0.00"},
+                    "net_amount": {"currency_code": "USD", "value": "25.00"},
+                    "total_refunded_amount": {"currency_code": "USD", "value": "25.00"}
+                },
+                "amount": {"currency_code": "USD", "value": "25.00"},
+                "update_time": "2026-09-30T10:00:00-07:00",
+                "create_time": "2026-09-30T10:00:00-07:00",
+                "links": [
+                    {"href": "https://api.paypal.com/v2/payments/refunds/1JU08902781691411", "rel": "self", "method": "GET"},
+                    {"href": "https://api.paypal.com/v2/payments/captures/3C679366HH908993F", "rel": "up", "method": "GET"}
+                ],
+                "id": "1JU08902781691411",
+                "status": "COMPLETED"
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn refund_webhooks_keep_the_refund_id_routing_because_the_parent_order_is_not_in_them() {
+        let headers = actix_web::http::header::HeaderMap::new();
+        let body = refund_webhook();
+        let request = details(&headers, &body);
+        let reference = Paypal::new()
+            .get_webhook_object_reference_id(&request)
+            .unwrap();
+        assert!(matches!(
+            reference,
+            ObjectReferenceId::RefundId(RefundIdType::ConnectorRefundId(ref id))
+                if id == "1JU08902781691411"
+        ));
+        assert_eq!(
+            Paypal::new().get_webhook_event_type(&request).unwrap(),
+            api_models::webhooks::IncomingWebhookEvent::RefundSuccess
+        );
+    }
+
+    #[test]
+    fn dispute_webhooks_resolve_by_the_invoice_number_when_paypal_sends_it() {
+        let headers = actix_web::http::header::HeaderMap::new();
+        let body = serde_json::to_vec(&json!({
+            "id": "WH-3",
+            "event_type": "CUSTOMER.DISPUTE.CREATED",
+            "resource": {
+                "dispute_id": "PP-D-27804",
+                "disputed_transactions": [{
+                    "seller_transaction_id": "3C679366HH908993F",
+                    "invoice_number": "pay_7XKpQ1wGqVzM3_1"
+                }],
+                "dispute_amount": {"currency_code": "USD", "value": "10.00"},
+                "dispute_life_cycle_stage": "CHARGEBACK",
+                "status": "OPEN",
+                "reason": "MERCHANDISE_OR_SERVICE_NOT_RECEIVED"
+            }
+        }))
+        .unwrap();
+        let request = details(&headers, &body);
+        let reference = Paypal::new()
+            .get_webhook_object_reference_id(&request)
+            .unwrap();
+        assert!(matches!(
+            reference,
+            ObjectReferenceId::PaymentId(api_models::payments::PaymentIdType::PaymentAttemptId(ref id))
+                if id == "pay_7XKpQ1wGqVzM3_1"
+        ));
+    }
+
+    #[test]
+    fn dispute_webhooks_still_resolve_by_the_seller_transaction() {
+        let headers = actix_web::http::header::HeaderMap::new();
+        let body = serde_json::to_vec(&json!({
+            "id": "WH-2",
+            "event_type": "CUSTOMER.DISPUTE.CREATED",
+            "resource": {
+                "dispute_id": "PP-D-27803",
+                "disputed_transactions": [{"seller_transaction_id": "3C679366HH908993F"}],
+                "dispute_amount": {"currency_code": "USD", "value": "10.00"},
+                "dispute_life_cycle_stage": "CHARGEBACK",
+                "status": "OPEN",
+                "reason": "MERCHANDISE_OR_SERVICE_NOT_RECEIVED"
+            }
+        }))
+        .unwrap();
+        let request = details(&headers, &body);
+        let reference = Paypal::new()
+            .get_webhook_object_reference_id(&request)
+            .unwrap();
+        assert!(matches!(
+            reference,
+            ObjectReferenceId::PaymentId(api_models::payments::PaymentIdType::ConnectorTransactionId(ref id))
+                if id == "3C679366HH908993F"
+        ));
+        assert_eq!(
+            Paypal::new().get_webhook_event_type(&request).unwrap(),
+            api_models::webhooks::IncomingWebhookEvent::DisputeOpened
+        );
+        let payload = Paypal::new().get_dispute_details(&request).unwrap();
+        assert_eq!(payload.connector_dispute_id, "PP-D-27803");
+        assert_eq!(payload.currency, enums::Currency::USD);
     }
 }

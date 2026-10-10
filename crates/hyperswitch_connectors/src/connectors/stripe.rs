@@ -777,13 +777,7 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Str
                 "v1/setup_intents",
                 x,
             )),
-            Ok(x) => Ok(format!(
-                "{}{}/{}{}",
-                self.base_url(connectors),
-                "v1/payment_intents",
-                x,
-                "?expand[0]=latest_charge" //updated payment_id(if present) reside inside latest_charge field
-            )),
+            Ok(x) => Ok(payment_intent_sync_url(self.base_url(connectors), &x)),
             x => x.change_context(ConnectorError::MissingConnectorTransactionID),
         }
     }
@@ -872,6 +866,11 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Str
                 event_builder.map(|i| i.set_response_body(&response));
                 router_env::logger::info!(connector_response=?response);
 
+                // Built from the response BEFORE it is consumed by `try_from` below. The
+                // charge refunds come with the `latest_charge.refunds` expansion of the sync
+                // URL and include the refunds made outside Hyperswitch (Stripe dashboard).
+                let reported_activity = response.reported_activity();
+
                 let new_router_data = RouterData::try_from(ResponseRouterData {
                     response,
                     data: data.clone(),
@@ -879,7 +878,12 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Str
                 });
                 new_router_data.map(|mut router_data| {
                     router_data.request.integrity_object = Some(response_integrity_object);
-                    router_data
+                    stripe::finish_payment_intent_sync(
+                        router_data,
+                        data.status,
+                        &data.request.connector_transaction_id,
+                        reported_activity,
+                    )
                 })
             }
             Err(err) => Err(err).change_context(ConnectorError::MissingConnectorTransactionID),
@@ -2319,6 +2323,38 @@ impl ConnectorIntegration<Evidence, SubmitEvidenceRequestData, SubmitEvidenceRes
     }
 }
 
+/// URL of the payment intent sync. `latest_charge` is expanded for the updated payment id and
+/// the payment method details; `latest_charge.refunds` is expanded too because since API
+/// version 2022-11-15 a charge no longer lists its refunds by default, and they are how a
+/// refund made outside Hyperswitch (Stripe dashboard) is discovered.
+fn payment_intent_sync_url(base_url: &str, payment_intent_id: &str) -> String {
+    format!(
+        "{base_url}v1/payment_intents/{payment_intent_id}?expand[0]=latest_charge&expand[1]=latest_charge.refunds"
+    )
+}
+
+/// Signature check that never succeeds.
+///
+/// Used for the `charge.refunded` events that are routed to a sync of the parent payment. When
+/// the signature verifies, core consumes the webhook body as if it were the payment sync
+/// response, but the body of these events is a charge, not a payment intent, and it carries
+/// no refund list. Reporting the webhook as unverified makes core run a live
+/// payment sync against Stripe instead, and that sync is the source of truth: the event only
+/// tells that something changed, so an unauthenticated one can at worst cause one extra read
+/// with the merchant's own credentials (same rule as Mercado Pago).
+struct UnverifiedWebhook;
+
+impl crypto::VerifySignature for UnverifiedWebhook {
+    fn verify_signature(
+        &self,
+        _secret: &[u8],
+        _signature: &[u8],
+        _msg: &[u8],
+    ) -> CustomResult<bool, common_utils::errors::CryptoError> {
+        Ok(false)
+    }
+}
+
 fn get_signature_elements_from_header(
     headers: &actix_web::http::header::HeaderMap,
 ) -> CustomResult<HashMap<String, Vec<u8>>, ConnectorError> {
@@ -2350,8 +2386,15 @@ fn get_signature_elements_from_header(
 impl IncomingWebhook for Stripe {
     fn get_webhook_source_verification_algorithm(
         &self,
-        _request: &IncomingWebhookRequestDetails<'_>,
+        request: &IncomingWebhookRequestDetails<'_>,
     ) -> CustomResult<Box<dyn crypto::VerifySignature + Send>, ConnectorError> {
+        let resyncs_parent_payment = request
+            .body
+            .parse_struct::<stripe::WebhookEventTypeBody>("WebhookEventTypeBody")
+            .is_ok_and(|details| details.is_charge_refunded_on_known_payment());
+        if resyncs_parent_payment {
+            return Ok(Box::new(UnverifiedWebhook));
+        }
         Ok(Box::new(crypto::HmacSha256))
     }
 
@@ -2534,6 +2577,22 @@ impl IncomingWebhook for Stripe {
                     IncomingWebhookEvent::EventNotSupported
                 }
             }
+            // `charge.refunded` of a known payment is routed to a sync of that payment, which
+            // reads the refunds of the charge from Stripe: it creates the refunds made outside
+            // Hyperswitch (Stripe dashboard) and updates the ones Hyperswitch already has.
+            // `PaymentIntentProcessing` is only a routing label for the payments webhook flow,
+            // it does not decide any outcome: the sync derives everything from Stripe and the
+            // attempt, and the outgoing webhook comes from the resulting payment status.
+            // Unlike `PaymentIntentSuccess` it triggers no mandate update.
+            //
+            // `charge.refund.updated` keeps the refund-id routing below on purpose: it updates
+            // a refund Hyperswitch knows directly, whereas a payment sync only sees the first
+            // page of `latest_charge.refunds` and would never update one beyond it.
+            stripe::WebhookEventType::ChargeRefunded
+                if details.is_charge_refunded_on_known_payment() =>
+            {
+                IncomingWebhookEvent::PaymentIntentProcessing
+            }
             stripe::WebhookEventType::ChargeRefundUpdated => details
                 .event_data
                 .event_object
@@ -2545,25 +2604,21 @@ impl IncomingWebhook for Stripe {
                 })
                 .unwrap_or(IncomingWebhookEvent::EventNotSupported),
             stripe::WebhookEventType::SourceChargeable => IncomingWebhookEvent::SourceChargeable,
-            stripe::WebhookEventType::DisputeCreated => IncomingWebhookEvent::DisputeOpened,
-            stripe::WebhookEventType::DisputeClosed => IncomingWebhookEvent::DisputeCancelled,
-            stripe::WebhookEventType::DisputeUpdated => details
-                .event_data
-                .event_object
-                .status
-                .map(Into::into)
-                .unwrap_or(IncomingWebhookEvent::EventNotSupported),
             stripe::WebhookEventType::PaymentIntentPartiallyFunded => {
                 IncomingWebhookEvent::PaymentIntentPartiallyFunded
             }
             stripe::WebhookEventType::PaymentIntentRequiresAction => {
                 IncomingWebhookEvent::PaymentActionRequired
             }
-            stripe::WebhookEventType::ChargeDisputeFundsWithdrawn => {
-                IncomingWebhookEvent::DisputeLost
-            }
-            stripe::WebhookEventType::ChargeDisputeFundsReinstated => {
-                IncomingWebhookEvent::DisputeWon
+            stripe::WebhookEventType::DisputeCreated
+            | stripe::WebhookEventType::DisputeClosed
+            | stripe::WebhookEventType::DisputeUpdated
+            | stripe::WebhookEventType::ChargeDisputeFundsWithdrawn
+            | stripe::WebhookEventType::ChargeDisputeFundsReinstated => {
+                stripe::dispute_webhook_event(
+                    &details.event_type,
+                    details.event_data.event_object.status,
+                )
             }
             stripe::WebhookEventType::Unknown
             | stripe::WebhookEventType::ChargeCaptured
@@ -3438,5 +3493,415 @@ impl ConnectorSpecifications for Stripe {
 
     fn get_supported_webhook_flows(&self) -> Option<&'static [common_enums::EventClass]> {
         Some(&STRIPE_SUPPORTED_WEBHOOK_FLOWS)
+    }
+}
+
+#[cfg(test)]
+mod external_refund_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
+
+    use api_models::{
+        payments::PaymentIdType,
+        webhooks::{ObjectReferenceId, RefundIdType},
+    };
+    use common_utils::crypto::SignMessage;
+    use hyperswitch_interfaces::webhooks::IncomingWebhook;
+    use serde_json::json;
+
+    use super::*;
+
+    const PI_ID: &str = "pi_3PxyzABCDEF";
+
+    /// Real Stripe TEST `charge.refunded` delivery body, 2026-10-05.
+    const REAL_CHARGE_REFUNDED: &str = r#"{"id":"evt_3UNBOCKMN9YFmEPb0WakgDBB","object":"event","api_version":"2022-11-15","created":1791204790,"data":{"object":{"id":"ch_3UNBOCKMN9YFmEPb0Nnv369X","object":"charge","amount":1000,"amount_captured":1000,"amount_refunded":300,"amount_updates":[],"application":null,"application_fee":null,"application_fee_amount":null,"balance_transaction":"txn_3UNBOCKMN9YFmEPb0EX62ia9","billing_details":{"address":{"city":null,"country":null,"line1":null,"line2":null,"postal_code":null,"state":null},"email":null,"name":null,"phone":null,"tax_id":null},"calculated_statement_descriptor":"PXSOL USA, INC.","captured":true,"created":1791204788,"currency":"usd","customer":null,"description":null,"destination":null,"dispute":null,"disputed":false,"failure_balance_transaction":null,"failure_code":null,"failure_message":null,"fraud_details":{},"invoice":null,"livemode":false,"metadata":{},"on_behalf_of":null,"order":null,"outcome":{"advice_code":null,"network_advice_code":null,"network_decline_code":null,"network_status":"approved_by_network","reason":null,"risk_level":"normal","risk_score":17,"seller_message":"Payment complete.","type":"authorized"},"paid":true,"payment_intent":"pi_3UNBOCKMN9YFmEPb0UTbEvFd","payment_method":"pm_1UNBOCKMN9YFmEPblrcIGABf","payment_method_details":{"card":{"amount_authorized":1000,"authorization_code":"464928","brand":"visa","checks":{"address_line1_check":null,"address_postal_code_check":null,"cvc_check":"pass"},"country":"US","electronic_commerce_indicator":"07","exp_month":10,"exp_year":2027,"extended_authorization":{"status":"disabled"},"fingerprint":"YBHgZOgYQ2qL2HRG","funding":"credit","incremental_authorization":{"status":"unavailable"},"installments":null,"last4":"4242","mandate":null,"multicapture":{"status":"unavailable"},"network":"visa","network_token":{"used":false},"network_transaction_id":"896672103907910","overcapture":{"maximum_amount_capturable":1000,"status":"unavailable"},"regulated_status":"unregulated","three_d_secure":null,"transaction_link_id":null,"wallet":null},"type":"card"},"radar_options":{},"receipt_email":null,"receipt_number":null,"receipt_url":"https://pay.stripe.com/receipts/REDACTED","refunded":false,"review":null,"shipping":null,"source":null,"source_transfer":null,"statement_descriptor":null,"statement_descriptor_suffix":null,"status":"succeeded","transfer_data":null,"transfer_group":null},"previous_attributes":{"amount_refunded":0,"receipt_url":"https://pay.stripe.com/receipts/REDACTED"}},"livemode":false,"pending_webhooks":4,"request":{"id":"req_D50QhO2NZoQSAX","idempotency_key":"f1356da8-3a23-4998-ab0c-7f76da16cb43"},"type":"charge.refunded"}"#;
+
+    /// Real Stripe TEST `charge.dispute.created` delivery body, 2026-10-05.
+    const REAL_DISPUTE_CREATED: &str = r#"{"id":"evt_1UNBOIKMN9YFmEPblvjH0obP","object":"event","api_version":"2022-11-15","created":1791204794,"data":{"object":{"id":"du_1UNBOHKMN9YFmEPb3cLJ7Uhs","object":"dispute","amount":1000,"balance_transaction":"txn_1UNBOIKMN9YFmEPbBE8pC9zL","balance_transactions":[{"available_on":1791331200,"created":1791204793,"net":-2500,"currency":"usd","source":"du_1UNBOHKMN9YFmEPb3cLJ7Uhs","reporting_category":"dispute","fee_details":[{"application":null,"amount":1500,"type":"stripe_fee","description":"Dispute fee","currency":"usd"}],"amount":-1000,"status":"pending","balance_type":"payments","object":"balance_transaction","id":"txn_1UNBOIKMN9YFmEPbBE8pC9zL","exchange_rate":null,"type":"adjustment","description":"Chargeback withdrawal for ch_3UNBOFKMN9YFmEPb0P8XvlDX","fee":1500}],"charge":"ch_3UNBOFKMN9YFmEPb0P8XvlDX","created":1791204793,"currency":"usd","enhanced_eligibility_types":[],"evidence":{"access_activity_log":null,"billing_address":null,"cancellation_policy":null,"cancellation_policy_disclosure":null,"cancellation_rebuttal":null,"customer_communication":null,"customer_email_address":null,"customer_name":null,"customer_purchase_ip":null,"customer_signature":null,"duplicate_charge_documentation":null,"duplicate_charge_explanation":null,"duplicate_charge_id":null,"enhanced_evidence":{},"product_description":null,"receipt":null,"refund_policy":null,"refund_policy_disclosure":null,"refund_refusal_explanation":null,"service_date":null,"service_documentation":null,"shipping_address":null,"shipping_carrier":null,"shipping_date":null,"shipping_documentation":null,"shipping_tracking_number":null,"uncategorized_file":null,"uncategorized_text":null},"evidence_details":{"due_by":1791935999,"enhanced_eligibility":{},"has_evidence":false,"past_due":false,"submission_count":0},"is_charge_refundable":false,"livemode":false,"metadata":{},"payment_intent":"pi_3UNBOFKMN9YFmEPb00WexzTQ","payment_method_details":{"card":{"brand":"visa","case_type":"chargeback","network":"visa","network_reason_code":"10.4"},"type":"card"},"reason":"fraudulent","status":"needs_response"}},"livemode":false,"pending_webhooks":6,"request":{"id":"req_gSJPUEqu7Hgkr6","idempotency_key":"03f4c5e3-c655-4a8e-bbc0-6e17d421c7e2"},"type":"charge.dispute.created"}"#;
+
+    /// Real Stripe TEST `charge.dispute.funds_withdrawn` delivery body, 2026-10-05: same second as the creation, the dispute is still `needs_response`.
+    const REAL_DISPUTE_FUNDS_WITHDRAWN: &str = r#"{"id":"evt_1UNBOIKMN9YFmEPbW3wvcwcY","object":"event","api_version":"2022-11-15","created":1791204794,"data":{"object":{"id":"du_1UNBOHKMN9YFmEPb3cLJ7Uhs","object":"dispute","amount":1000,"balance_transaction":"txn_1UNBOIKMN9YFmEPbBE8pC9zL","balance_transactions":[{"available_on":1791331200,"created":1791204793,"net":-2500,"currency":"usd","source":"du_1UNBOHKMN9YFmEPb3cLJ7Uhs","reporting_category":"dispute","fee_details":[{"application":null,"amount":1500,"type":"stripe_fee","description":"Dispute fee","currency":"usd"}],"amount":-1000,"status":"pending","balance_type":"payments","object":"balance_transaction","id":"txn_1UNBOIKMN9YFmEPbBE8pC9zL","exchange_rate":null,"type":"adjustment","description":"Chargeback withdrawal for ch_3UNBOFKMN9YFmEPb0P8XvlDX","fee":1500}],"charge":"ch_3UNBOFKMN9YFmEPb0P8XvlDX","created":1791204793,"currency":"usd","enhanced_eligibility_types":[],"evidence":{"access_activity_log":null,"billing_address":null,"cancellation_policy":null,"cancellation_policy_disclosure":null,"cancellation_rebuttal":null,"customer_communication":null,"customer_email_address":null,"customer_name":null,"customer_purchase_ip":null,"customer_signature":null,"duplicate_charge_documentation":null,"duplicate_charge_explanation":null,"duplicate_charge_id":null,"enhanced_evidence":{},"product_description":null,"receipt":null,"refund_policy":null,"refund_policy_disclosure":null,"refund_refusal_explanation":null,"service_date":null,"service_documentation":null,"shipping_address":null,"shipping_carrier":null,"shipping_date":null,"shipping_documentation":null,"shipping_tracking_number":null,"uncategorized_file":null,"uncategorized_text":null},"evidence_details":{"due_by":1791935999,"enhanced_eligibility":{},"has_evidence":false,"past_due":false,"submission_count":0},"is_charge_refundable":false,"livemode":false,"metadata":{},"payment_intent":"pi_3UNBOFKMN9YFmEPb00WexzTQ","payment_method_details":{"card":{"brand":"visa","case_type":"chargeback","network":"visa","network_reason_code":"10.4"},"type":"card"},"reason":"fraudulent","status":"needs_response"}},"livemode":false,"pending_webhooks":2,"request":{"id":"req_gSJPUEqu7Hgkr6","idempotency_key":"03f4c5e3-c655-4a8e-bbc0-6e17d421c7e2"},"type":"charge.dispute.funds_withdrawn"}"#;
+
+    fn event(event_type: &str, object: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "id": "evt_1Pxyz",
+            "object": "event",
+            "api_version": "2022-11-15",
+            "created": 1_700_000_200,
+            "type": event_type,
+            "data": {"object": object}
+        }))
+        .unwrap()
+    }
+
+    fn charge_object(with_payment_intent: bool) -> serde_json::Value {
+        let mut charge = json!({
+            "id": "ch_3Pxyz",
+            "object": "charge",
+            "amount": 10000,
+            "amount_captured": 10000,
+            "amount_refunded": 2500,
+            "currency": "usd",
+            "created": 1_700_000_000,
+            "metadata": {},
+            "refunded": false,
+            "status": "succeeded"
+        });
+        if with_payment_intent {
+            charge["payment_intent"] = json!(PI_ID);
+        }
+        charge
+    }
+
+    fn refund_object(with_payment_intent: bool, status: &str) -> serde_json::Value {
+        let mut refund = json!({
+            "id": "re_3PxyzDashboard",
+            "object": "refund",
+            "amount": 2500,
+            "charge": "ch_3Pxyz",
+            "created": 1_700_000_100,
+            "currency": "usd",
+            "metadata": {},
+            "status": status
+        });
+        if with_payment_intent {
+            refund["payment_intent"] = json!(PI_ID);
+        }
+        refund
+    }
+
+    fn dispute_object() -> serde_json::Value {
+        json!({
+            "id": "dp_1Pxyz",
+            "object": "dispute",
+            "amount": 10000,
+            "charge": "ch_3Pxyz",
+            "created": 1_700_000_000,
+            "currency": "usd",
+            "payment_intent": PI_ID,
+            "reason": "fraudulent",
+            "status": "needs_response",
+            "evidence_details": {"due_by": 1_700_900_000}
+        })
+    }
+
+    fn with_request<T>(
+        body: &[u8],
+        check: impl FnOnce(&IncomingWebhookRequestDetails<'_>) -> T,
+    ) -> T {
+        let headers = actix_web::http::header::HeaderMap::new();
+        let request = IncomingWebhookRequestDetails {
+            method: actix_web::http::Method::POST,
+            uri: "/webhooks/stripe".parse().expect("valid test uri"),
+            headers: &headers,
+            body,
+            query_params: String::new(),
+        };
+        check(&request)
+    }
+
+    fn event_type_of(body: &[u8]) -> IncomingWebhookEvent {
+        with_request(body, |request| {
+            Stripe::new().get_webhook_event_type(request).unwrap()
+        })
+    }
+
+    fn reference_of(body: &[u8]) -> ObjectReferenceId {
+        with_request(body, |request| {
+            Stripe::new()
+                .get_webhook_object_reference_id(request)
+                .unwrap()
+        })
+    }
+
+    fn assert_syncs_parent_payment(reference: ObjectReferenceId) {
+        match reference {
+            ObjectReferenceId::PaymentId(PaymentIdType::ConnectorTransactionId(id)) => {
+                assert_eq!(id, PI_ID)
+            }
+            other => panic!("expected the parent payment intent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn payment_intent_sync_url_expands_the_charge_and_its_refunds() {
+        let url = payment_intent_sync_url("https://api.stripe.com/", PI_ID);
+        assert_eq!(
+            url,
+            "https://api.stripe.com/v1/payment_intents/pi_3PxyzABCDEF?expand[0]=latest_charge&expand[1]=latest_charge.refunds"
+        );
+    }
+
+    #[test]
+    fn charge_refunded_syncs_the_parent_payment() {
+        let body = event("charge.refunded", charge_object(true));
+        assert_eq!(
+            event_type_of(&body),
+            IncomingWebhookEvent::PaymentIntentProcessing
+        );
+        assert_syncs_parent_payment(reference_of(&body));
+        // The event must land in the payments flow.
+        assert!(matches!(
+            api_models::webhooks::WebhookFlow::from(event_type_of(&body)),
+            api_models::webhooks::WebhookFlow::Payment
+        ));
+    }
+
+    #[test]
+    fn charge_refund_updated_keeps_the_refund_id_routing_with_or_without_a_payment_intent() {
+        // A refund beyond the first page of `latest_charge.refunds` would never be updated
+        // through a payment sync, so the event updates the known refund directly.
+        for with_payment_intent in [false, true] {
+            let body = event(
+                "charge.refund.updated",
+                refund_object(with_payment_intent, "succeeded"),
+            );
+            assert_eq!(event_type_of(&body), IncomingWebhookEvent::RefundSuccess);
+            match reference_of(&body) {
+                ObjectReferenceId::RefundId(RefundIdType::ConnectorRefundId(id)) => {
+                    assert_eq!(id, "re_3PxyzDashboard")
+                }
+                other => panic!("expected the refund id, got {other:?}"),
+            }
+            assert!(matches!(
+                api_models::webhooks::WebhookFlow::from(event_type_of(&body)),
+                api_models::webhooks::WebhookFlow::Refund
+            ));
+            let failed = event(
+                "charge.refund.updated",
+                refund_object(with_payment_intent, "failed"),
+            );
+            assert_eq!(event_type_of(&failed), IncomingWebhookEvent::RefundFailure);
+            for status in ["pending", "requires_action"] {
+                let other = event(
+                    "charge.refund.updated",
+                    refund_object(with_payment_intent, status),
+                );
+                assert_eq!(
+                    event_type_of(&other),
+                    IncomingWebhookEvent::EventNotSupported,
+                    "{status}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_charge_refunded_without_a_payment_intent_has_nothing_to_sync() {
+        let charge = event("charge.refunded", charge_object(false));
+        assert_eq!(
+            event_type_of(&charge),
+            IncomingWebhookEvent::EventNotSupported
+        );
+    }
+
+    fn dispute_with_status(status: &str) -> serde_json::Value {
+        let mut dispute = dispute_object();
+        dispute["status"] = json!(status);
+        dispute
+    }
+
+    #[test]
+    fn dispute_events_follow_the_dispute_status_not_the_event_name() {
+        use IncomingWebhookEvent::{
+            DisputeCancelled, DisputeChallenged, DisputeLost, DisputeOpened, DisputeWon,
+        };
+        let statuses = [
+            ("warning_needs_response", DisputeOpened),
+            ("needs_response", DisputeOpened),
+            ("warning_under_review", DisputeChallenged),
+            ("under_review", DisputeChallenged),
+            ("won", DisputeWon),
+            ("lost", DisputeLost),
+            ("warning_closed", DisputeCancelled),
+            ("prevented", DisputeCancelled),
+        ];
+        for event_type in [
+            "charge.dispute.created",
+            "charge.dispute.updated",
+            "charge.dispute.closed",
+            "charge.dispute.funds_withdrawn",
+            "charge.dispute.funds_reinstated",
+        ] {
+            for (status, expected) in &statuses {
+                let body = event(event_type, dispute_with_status(status));
+                assert_eq!(event_type_of(&body), *expected, "{event_type}/{status}");
+                assert_syncs_parent_payment(reference_of(&body));
+            }
+        }
+    }
+
+    #[test]
+    fn dispute_events_with_an_unknown_status_fall_back_without_a_final_outcome() {
+        for status in ["charge_refunded", "something_new"] {
+            for (event_type, expected) in [
+                (
+                    "charge.dispute.created",
+                    IncomingWebhookEvent::DisputeOpened,
+                ),
+                (
+                    "charge.dispute.closed",
+                    IncomingWebhookEvent::DisputeCancelled,
+                ),
+                (
+                    "charge.dispute.updated",
+                    IncomingWebhookEvent::EventNotSupported,
+                ),
+                (
+                    "charge.dispute.funds_withdrawn",
+                    IncomingWebhookEvent::DisputeOpened,
+                ),
+                (
+                    "charge.dispute.funds_reinstated",
+                    IncomingWebhookEvent::DisputeOpened,
+                ),
+            ] {
+                let body = event(event_type, dispute_with_status(status));
+                assert_eq!(event_type_of(&body), expected, "{event_type}/{status}");
+            }
+        }
+        // No status at all behaves like an unknown one.
+        let mut dispute = dispute_object();
+        dispute.as_object_mut().unwrap().remove("status");
+        let body = event("charge.dispute.funds_withdrawn", dispute);
+        assert_eq!(event_type_of(&body), IncomingWebhookEvent::DisputeOpened);
+    }
+
+    #[test]
+    fn dispute_status_is_still_reported_as_the_connector_status() {
+        for (status, reported) in [
+            ("needs_response", "NeedsResponse"),
+            ("under_review", "UnderReview"),
+            ("won", "Won"),
+            ("lost", "Lost"),
+        ] {
+            let body = event(
+                "charge.dispute.funds_withdrawn",
+                dispute_with_status(status),
+            );
+            let details = with_request(&body, |request| {
+                Stripe::new().get_dispute_details(request).unwrap()
+            });
+            assert_eq!(details.connector_status, reported);
+        }
+    }
+
+    #[test]
+    fn real_charge_refunded_syncs_the_parent_payment_and_is_not_signature_verified() {
+        let body = REAL_CHARGE_REFUNDED.as_bytes();
+        assert_eq!(
+            event_type_of(body),
+            IncomingWebhookEvent::PaymentIntentProcessing
+        );
+        match reference_of(body) {
+            ObjectReferenceId::PaymentId(PaymentIdType::ConnectorTransactionId(id)) => {
+                assert_eq!(id, "pi_3UNBOCKMN9YFmEPb0UTbEvFd")
+            }
+            other => panic!("expected the parent payment intent, got {other:?}"),
+        }
+        // A valid HMAC would verify a regular event; this one never does, so core syncs live.
+        let secret = b"whsec_test";
+        let message = b"1791204791.body";
+        let signature = crypto::HmacSha256.sign_message(secret, message).unwrap();
+        let verified = with_request(body, |request| {
+            Stripe::new()
+                .get_webhook_source_verification_algorithm(request)
+                .unwrap()
+                .verify_signature(secret, &signature, message)
+                .unwrap()
+        });
+        assert!(!verified);
+    }
+
+    #[test]
+    fn real_dispute_created_opens_the_dispute_and_parses_its_details() {
+        let body = REAL_DISPUTE_CREATED.as_bytes();
+        assert_eq!(event_type_of(body), IncomingWebhookEvent::DisputeOpened);
+        match reference_of(body) {
+            ObjectReferenceId::PaymentId(PaymentIdType::ConnectorTransactionId(id)) => {
+                assert_eq!(id, "pi_3UNBOFKMN9YFmEPb00WexzTQ")
+            }
+            other => panic!("expected the parent payment intent, got {other:?}"),
+        }
+        let details = with_request(body, |request| {
+            Stripe::new().get_dispute_details(request).unwrap()
+        });
+        assert_eq!(details.amount.to_string(), "1000");
+        assert_eq!(details.currency, common_enums::Currency::USD);
+        assert_eq!(details.connector_dispute_id, "du_1UNBOHKMN9YFmEPb3cLJ7Uhs");
+        assert_eq!(details.connector_status, "NeedsResponse");
+        assert_eq!(details.connector_reason.as_deref(), Some("fraudulent"));
+    }
+
+    #[test]
+    fn real_dispute_funds_withdrawn_does_not_report_a_lost_dispute() {
+        // Stripe withdraws the funds when the dispute opens, in the same second as
+        // `charge.dispute.created`, while the dispute is still `needs_response`.
+        let body = REAL_DISPUTE_FUNDS_WITHDRAWN.as_bytes();
+        assert_eq!(event_type_of(body), IncomingWebhookEvent::DisputeOpened);
+        let details = with_request(body, |request| {
+            Stripe::new().get_dispute_details(request).unwrap()
+        });
+        assert_eq!(details.connector_dispute_id, "du_1UNBOHKMN9YFmEPb3cLJ7Uhs");
+        assert_eq!(details.connector_status, "NeedsResponse");
+    }
+
+    #[test]
+    fn payment_intent_events_keep_their_mapping() {
+        let payment_intent = json!({
+            "id": PI_ID,
+            "object": "payment_intent",
+            "amount": 10000,
+            "currency": "usd",
+            "created": 1_700_000_000,
+            "metadata": {},
+            "status": "succeeded"
+        });
+        let body = event("payment_intent.succeeded", payment_intent);
+        assert_eq!(
+            event_type_of(&body),
+            IncomingWebhookEvent::PaymentIntentSuccess
+        );
+        assert_syncs_parent_payment(reference_of(&body));
+    }
+
+    #[test]
+    fn only_the_parent_payment_sync_events_skip_the_signature_check() {
+        // A valid HMAC signs the message: the regular events verify, `charge.refunded` of a
+        // known payment never does, so core runs a live payment sync instead of consuming the
+        // webhook body as a payment sync response.
+        let secret = b"whsec_test";
+        let message = b"1700000000.body";
+        let signature = crypto::HmacSha256.sign_message(secret, message).unwrap();
+        let verifies = |body: Vec<u8>| {
+            with_request(&body, |request| {
+                Stripe::new()
+                    .get_webhook_source_verification_algorithm(request)
+                    .unwrap()
+                    .verify_signature(secret, &signature, message)
+                    .unwrap()
+            })
+        };
+        assert!(verifies(event(
+            "payment_intent.succeeded",
+            charge_object(true)
+        )));
+        assert!(verifies(event("charge.dispute.created", dispute_object())));
+        assert!(verifies(event(
+            "charge.refund.updated",
+            refund_object(false, "succeeded")
+        )));
+        // `charge.refund.updated` keeps the HMAC verification, with or without the intent.
+        assert!(verifies(event(
+            "charge.refund.updated",
+            refund_object(true, "succeeded")
+        )));
+        assert!(!verifies(event("charge.refunded", charge_object(true))));
+        // Without a payment intent there is nothing to sync, so it verifies as usual.
+        assert!(verifies(event("charge.refunded", charge_object(false))));
     }
 }

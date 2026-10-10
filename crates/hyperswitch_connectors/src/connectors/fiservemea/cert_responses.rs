@@ -967,7 +967,7 @@ fn sync_order_response() -> serde_json::Value {
 /// Dos transacciones: primero la SALE, después el VOID. La SALE llega
 /// `transactionResult: APPROVED` / `transactionType: SALE` y el único campo que dice que la plata
 /// se liberó es `transactionState: VOIDED`.
-fn sync_order_of_a_voided_sale() -> serde_json::Value {
+pub(super) fn sync_order_of_a_voided_sale() -> serde_json::Value {
     json!({
         "type": "orderResponse",
         "clientRequestId": "0233f9b0-2dfc-4ad9-9eea-04bdc5e46d82",
@@ -1092,6 +1092,521 @@ fn sync_order_of_a_voided_sale() -> serde_json::Value {
         ]
     })
 }
+
+/// `GET /orders/{orderId}?storeId=...` de una venta de 1000 ARS con una devolución parcial de 400 ARS.
+///
+/// Traído en vivo del gateway de cert el 2026-10-01 (`apiTraceId` ar6NPK6OincseNhO5_t51AAAAwc; credenciales y PAN redactados). Prueba la forma real de un
+/// GET: las entradas no traen `transactionStatus` ni `orderId`/`clientRequestId`/`apiTraceId` propios, los importes son enteros JSON y la SALE sigue `CAPTURED`.
+pub(super) fn real_order_with_partial_return() -> serde_json::Value {
+    json!({
+        "type": "orderResponse",
+        "clientRequestId": "6be5fce1-6fdc-47fb-a3e1-6ed8dd9edd88",
+        "apiTraceId": "ar6NPK6OincseNhO5_t51AAAAwc",
+        "orderId": "pxsol-extact-1790872882-a",
+        "transactions": [
+            {
+                "type": "transactionResponse",
+                "ipgTransactionId": "84674273258",
+                "transactionType": "SALE",
+                "paymentToken": {
+                    "last4": "0008",
+                    "brand": "MASTERCARD"
+                },
+                "transactionOrigin": "ECOM",
+                "paymentMethodDetails": {
+                    "paymentCard": {
+                        "expiryDate": {
+                            "month": "12",
+                            "year": "2029"
+                        },
+                        "cardFunction": "CREDIT",
+                        "bin": "516585",
+                        "last4": "0008",
+                        "brand": "MASTERCARD"
+                    },
+                    "paymentMethodType": "PAYMENT_CARD",
+                    "paymentMethodBrand": "MASTERCARD"
+                },
+                "country": "Argentina",
+                "terminalId": "98000001",
+                "merchantId": "00000014",
+                "merchantTransactionId": "pxsol-extact-1790872882-a",
+                "transactionTime": 1790872883,
+                "approvedAmount": {
+                    "total": 1000,
+                    "currency": "ARS",
+                    "components": {
+                        "subtotal": 1000
+                    }
+                },
+                "transactionAmount": {
+                    "total": 1000,
+                    "currency": "ARS",
+                    "components": {
+                        "subtotal": 1000
+                    }
+                },
+                "transactionResult": "APPROVED",
+                "approvalCode": "Y:047416:4674273258:PPXX:2584890583",
+                "transactionState": "CAPTURED",
+                "processor": {
+                    "referenceNumber": "000000009404",
+                    "authorizationCode": "47416",
+                    "responseCode": "00",
+                    "responseMessage": "Function performed error-free",
+                    "avsResponse": {
+                        "streetMatch": "NO_INPUT_DATA",
+                        "postalCodeMatch": "NO_INPUT_DATA"
+                    },
+                    "securityCodeResponse": "NOT_CHECKED"
+                },
+                "globallyUniqueIdentifier": "b8eafa16-ccad-4d1c-bbc7-44ec48e76c86"
+            },
+            {
+                "type": "transactionResponse",
+                "ipgTransactionId": "84674273291",
+                "transactionType": "RETURN",
+                "paymentToken": {
+                    "last4": "0008",
+                    "brand": "MASTERCARD"
+                },
+                "transactionOrigin": "ECOM",
+                "paymentMethodDetails": {
+                    "paymentCard": {
+                        "expiryDate": {
+                            "month": "12",
+                            "year": "2029"
+                        },
+                        "cardFunction": "CREDIT",
+                        "bin": "516585",
+                        "last4": "0008",
+                        "brand": "MASTERCARD"
+                    },
+                    "paymentMethodType": "PAYMENT_CARD",
+                    "paymentMethodBrand": "MASTERCARD"
+                },
+                "country": "Argentina",
+                "terminalId": "98000001",
+                "merchantId": "00000014",
+                "transactionTime": 1790872888,
+                "approvedAmount": {
+                    "total": 400,
+                    "currency": "ARS",
+                    "components": {
+                        "subtotal": 400
+                    }
+                },
+                "transactionAmount": {
+                    "total": 400,
+                    "currency": "ARS",
+                    "components": {
+                        "subtotal": 400
+                    }
+                },
+                "transactionResult": "APPROVED",
+                "approvalCode": "Y:460569:4674273291:PPXX:2584950584",
+                "transactionState": "CAPTURED",
+                "processor": {
+                    "referenceNumber": "000000009406",
+                    "authorizationCode": "460569",
+                    "responseCode": "00",
+                    "responseMessage": "Function performed error-free",
+                    "avsResponse": {
+                        "streetMatch": "NO_INPUT_DATA",
+                        "postalCodeMatch": "NO_INPUT_DATA"
+                    },
+                    "securityCodeResponse": "NOT_CHECKED"
+                },
+                "globallyUniqueIdentifier": "753109ea-54ad-4746-b0e8-9213b6471016"
+            }
+        ]
+    })
+}
+
+/// `GET /orders/{orderId}?storeId=...` de una venta de 1000 ARS devuelta por completo en dos RETURN (400 + 600).
+///
+/// Traído en vivo del gateway de cert el 2026-10-01 (`apiTraceId` ar6NRQQCQzcofALr-EXCIgAAAJw; credenciales y PAN redactados). Prueba que una devolución total no cambia el
+/// estado de la SALE (sigue `CAPTURED`) y que cada RETURN llega como entrada propia con su `ipgTransactionId`.
+pub(super) fn real_order_with_full_return_in_two_parts() -> serde_json::Value {
+    json!({
+        "type": "orderResponse",
+        "clientRequestId": "494a67a5-03dd-4d42-aa51-939fb4350152",
+        "apiTraceId": "ar6NRQQCQzcofALr-EXCIgAAAJw",
+        "orderId": "pxsol-extact-1790872882-a",
+        "transactions": [
+            {
+                "type": "transactionResponse",
+                "ipgTransactionId": "84674273258",
+                "transactionType": "SALE",
+                "paymentToken": {
+                    "last4": "0008",
+                    "brand": "MASTERCARD"
+                },
+                "transactionOrigin": "ECOM",
+                "paymentMethodDetails": {
+                    "paymentCard": {
+                        "expiryDate": {
+                            "month": "12",
+                            "year": "2029"
+                        },
+                        "cardFunction": "CREDIT",
+                        "bin": "516585",
+                        "last4": "0008",
+                        "brand": "MASTERCARD"
+                    },
+                    "paymentMethodType": "PAYMENT_CARD",
+                    "paymentMethodBrand": "MASTERCARD"
+                },
+                "country": "Argentina",
+                "terminalId": "98000001",
+                "merchantId": "00000014",
+                "merchantTransactionId": "pxsol-extact-1790872882-a",
+                "transactionTime": 1790872883,
+                "approvedAmount": {
+                    "total": 1000,
+                    "currency": "ARS",
+                    "components": {
+                        "subtotal": 1000
+                    }
+                },
+                "transactionAmount": {
+                    "total": 1000,
+                    "currency": "ARS",
+                    "components": {
+                        "subtotal": 1000
+                    }
+                },
+                "transactionResult": "APPROVED",
+                "approvalCode": "Y:047416:4674273258:PPXX:2584890583",
+                "transactionState": "CAPTURED",
+                "processor": {
+                    "referenceNumber": "000000009404",
+                    "authorizationCode": "47416",
+                    "responseCode": "00",
+                    "responseMessage": "Function performed error-free",
+                    "avsResponse": {
+                        "streetMatch": "NO_INPUT_DATA",
+                        "postalCodeMatch": "NO_INPUT_DATA"
+                    },
+                    "securityCodeResponse": "NOT_CHECKED"
+                },
+                "globallyUniqueIdentifier": "b8eafa16-ccad-4d1c-bbc7-44ec48e76c86"
+            },
+            {
+                "type": "transactionResponse",
+                "ipgTransactionId": "84674273291",
+                "transactionType": "RETURN",
+                "paymentToken": {
+                    "last4": "0008",
+                    "brand": "MASTERCARD"
+                },
+                "transactionOrigin": "ECOM",
+                "paymentMethodDetails": {
+                    "paymentCard": {
+                        "expiryDate": {
+                            "month": "12",
+                            "year": "2029"
+                        },
+                        "cardFunction": "CREDIT",
+                        "bin": "516585",
+                        "last4": "0008",
+                        "brand": "MASTERCARD"
+                    },
+                    "paymentMethodType": "PAYMENT_CARD",
+                    "paymentMethodBrand": "MASTERCARD"
+                },
+                "country": "Argentina",
+                "terminalId": "98000001",
+                "merchantId": "00000014",
+                "transactionTime": 1790872888,
+                "approvedAmount": {
+                    "total": 400,
+                    "currency": "ARS",
+                    "components": {
+                        "subtotal": 400
+                    }
+                },
+                "transactionAmount": {
+                    "total": 400,
+                    "currency": "ARS",
+                    "components": {
+                        "subtotal": 400
+                    }
+                },
+                "transactionResult": "APPROVED",
+                "approvalCode": "Y:460569:4674273291:PPXX:2584950584",
+                "transactionState": "CAPTURED",
+                "processor": {
+                    "referenceNumber": "000000009406",
+                    "authorizationCode": "460569",
+                    "responseCode": "00",
+                    "responseMessage": "Function performed error-free",
+                    "avsResponse": {
+                        "streetMatch": "NO_INPUT_DATA",
+                        "postalCodeMatch": "NO_INPUT_DATA"
+                    },
+                    "securityCodeResponse": "NOT_CHECKED"
+                },
+                "globallyUniqueIdentifier": "753109ea-54ad-4746-b0e8-9213b6471016"
+            },
+            {
+                "type": "transactionResponse",
+                "ipgTransactionId": "84674273298",
+                "transactionType": "RETURN",
+                "paymentToken": {
+                    "last4": "0008",
+                    "brand": "MASTERCARD"
+                },
+                "transactionOrigin": "ECOM",
+                "paymentMethodDetails": {
+                    "paymentCard": {
+                        "expiryDate": {
+                            "month": "12",
+                            "year": "2029"
+                        },
+                        "cardFunction": "CREDIT",
+                        "bin": "516585",
+                        "last4": "0008",
+                        "brand": "MASTERCARD"
+                    },
+                    "paymentMethodType": "PAYMENT_CARD",
+                    "paymentMethodBrand": "MASTERCARD"
+                },
+                "country": "Argentina",
+                "terminalId": "98000001",
+                "merchantId": "00000014",
+                "transactionTime": 1790872898,
+                "approvedAmount": {
+                    "total": 600,
+                    "currency": "ARS",
+                    "components": {
+                        "subtotal": 600
+                    }
+                },
+                "transactionAmount": {
+                    "total": 600,
+                    "currency": "ARS",
+                    "components": {
+                        "subtotal": 600
+                    }
+                },
+                "transactionResult": "APPROVED",
+                "approvalCode": "Y:526685:4674273298:PPXX:2585090585",
+                "transactionState": "CAPTURED",
+                "processor": {
+                    "referenceNumber": "000000009407",
+                    "authorizationCode": "526685",
+                    "responseCode": "00",
+                    "responseMessage": "Function performed error-free",
+                    "avsResponse": {
+                        "streetMatch": "NO_INPUT_DATA",
+                        "postalCodeMatch": "NO_INPUT_DATA"
+                    },
+                    "securityCodeResponse": "NOT_CHECKED"
+                },
+                "globallyUniqueIdentifier": "dbd3d1c4-ad36-4fe1-ace2-d41082ca6541"
+            }
+        ]
+    })
+}
+
+/// `GET /orders/{orderId}?storeId=...` de una venta de 1000 ARS anulada: SALE `VOIDED` + entrada VOID.
+///
+/// Traído en vivo del gateway de cert el 2026-10-01 (credenciales y PAN redactados). Es la
+/// versión con la forma real de un GET de la anulación (sin `transactionStatus`, importes enteros).
+pub(super) fn real_order_of_a_voided_sale() -> serde_json::Value {
+    json!({
+        "type": "orderResponse",
+        "clientRequestId": "5329d932-0ef2-4636-a1f1-e939f006e8dd",
+        "apiTraceId": "ar6NUgQCQzcofALr-EXCUAAAAKU",
+        "orderId": "pxsol-extact-1790872904-b",
+        "transactions": [
+            {
+                "type": "transactionResponse",
+                "ipgTransactionId": "84674273316",
+                "transactionType": "SALE",
+                "paymentToken": {
+                    "last4": "0008",
+                    "brand": "MASTERCARD"
+                },
+                "transactionOrigin": "ECOM",
+                "paymentMethodDetails": {
+                    "paymentCard": {
+                        "expiryDate": {
+                            "month": "12",
+                            "year": "2029"
+                        },
+                        "cardFunction": "CREDIT",
+                        "bin": "516585",
+                        "last4": "0008",
+                        "brand": "MASTERCARD"
+                    },
+                    "paymentMethodType": "PAYMENT_CARD",
+                    "paymentMethodBrand": "MASTERCARD"
+                },
+                "country": "Argentina",
+                "terminalId": "98000003",
+                "merchantId": "00000014",
+                "merchantTransactionId": "pxsol-extact-1790872904-b",
+                "transactionTime": 1790872904,
+                "approvedAmount": {
+                    "total": 1000,
+                    "currency": "ARS",
+                    "components": {
+                        "subtotal": 1000
+                    }
+                },
+                "transactionAmount": {
+                    "total": 1000,
+                    "currency": "ARS",
+                    "components": {
+                        "subtotal": 1000
+                    }
+                },
+                "transactionResult": "APPROVED",
+                "approvalCode": "Y:248120:4674273316:PPXX:2585238716",
+                "transactionState": "VOIDED",
+                "processor": {
+                    "referenceNumber": "000000009409",
+                    "authorizationCode": "248120",
+                    "responseCode": "00",
+                    "responseMessage": "Function performed error-free",
+                    "avsResponse": {
+                        "streetMatch": "NO_INPUT_DATA",
+                        "postalCodeMatch": "NO_INPUT_DATA"
+                    },
+                    "securityCodeResponse": "NOT_CHECKED"
+                },
+                "globallyUniqueIdentifier": "0e664d3e-1856-4d9b-9709-19453cad3048"
+            },
+            {
+                "type": "transactionResponse",
+                "ipgTransactionId": "84674273319",
+                "transactionType": "VOID",
+                "paymentToken": {
+                    "last4": "0008",
+                    "brand": "MASTERCARD"
+                },
+                "transactionOrigin": "ECOM",
+                "paymentMethodDetails": {
+                    "paymentCard": {
+                        "expiryDate": {
+                            "month": "12",
+                            "year": "2029"
+                        },
+                        "cardFunction": "CREDIT",
+                        "bin": "516585",
+                        "last4": "0008",
+                        "brand": "MASTERCARD"
+                    },
+                    "paymentMethodType": "PAYMENT_CARD",
+                    "paymentMethodBrand": "MASTERCARD"
+                },
+                "country": "Argentina",
+                "terminalId": "98000003",
+                "merchantId": "00000014",
+                "transactionTime": 1790872908,
+                "approvedAmount": {
+                    "total": 1000,
+                    "currency": "ARS",
+                    "components": {
+                        "subtotal": 1000
+                    }
+                },
+                "transactionAmount": {
+                    "total": 1000,
+                    "currency": "ARS",
+                    "components": {
+                        "subtotal": 1000
+                    }
+                },
+                "transactionResult": "APPROVED",
+                "approvalCode": "Y:749402:4674273316:PPXX:2585298717",
+                "transactionState": "VOIDED",
+                "processor": {
+                    "referenceNumber": "000000009410",
+                    "authorizationCode": "749402",
+                    "responseCode": "00",
+                    "responseMessage": "Function performed error-free",
+                    "avsResponse": {
+                        "streetMatch": "NO_INPUT_DATA",
+                        "postalCodeMatch": "NO_INPUT_DATA"
+                    },
+                    "securityCodeResponse": "NOT_CHECKED"
+                },
+                "globallyUniqueIdentifier": "3b30f42a-510c-4199-bca7-9651cd550d23"
+            }
+        ]
+    })
+}
+
+/// `GET /payments/{id}?storeId=...` de la venta anulada de `real_order_of_a_voided_sale`.
+///
+/// Traído en vivo del gateway de cert el 2026-10-01 (credenciales y PAN redactados). Por id solo se ve la SALE con `transactionState: VOIDED`: no hay rastro del VOID ni de devoluciones.
+pub(super) fn real_payment_of_a_voided_sale() -> serde_json::Value {
+    json!({
+        "type": "transactionResponse",
+        "clientRequestId": "8e2fc3e9-f6a8-4bfc-9be4-7e1469a7bc75",
+        "apiTraceId": "ar6NVLbF6GzaUXob7fEzmgAAAM4",
+        "ipgTransactionId": "84674273316",
+        "orderId": "pxsol-extact-1790872904-b",
+        "transactionType": "SALE",
+        "paymentToken": {
+            "last4": "0008",
+            "brand": "MASTERCARD"
+        },
+        "transactionOrigin": "ECOM",
+        "paymentMethodDetails": {
+            "paymentCard": {
+                "expiryDate": {
+                    "month": "12",
+                    "year": "2029"
+                },
+                "cardFunction": "CREDIT",
+                "bin": "516585",
+                "last4": "0008",
+                "brand": "MASTERCARD"
+            },
+            "paymentMethodType": "PAYMENT_CARD",
+            "paymentMethodBrand": "MASTERCARD"
+        },
+        "country": "Argentina",
+        "terminalId": "98000003",
+        "merchantId": "00000014",
+        "merchantTransactionId": "pxsol-extact-1790872904-b",
+        "transactionTime": 1790872904,
+        "approvedAmount": {
+            "total": 1000,
+            "currency": "ARS",
+            "components": {
+                "subtotal": 1000
+            }
+        },
+        "transactionAmount": {
+            "total": 1000,
+            "currency": "ARS",
+            "components": {
+                "subtotal": 1000
+            }
+        },
+        "transactionResult": "APPROVED",
+        "approvalCode": "Y:248120:4674273316:PPXX:2585238716",
+        "transactionState": "VOIDED",
+        "processor": {
+            "referenceNumber": "000000009409",
+            "authorizationCode": "248120",
+            "responseCode": "00",
+            "responseMessage": "Function performed error-free",
+            "avsResponse": {
+                "streetMatch": "NO_INPUT_DATA",
+                "postalCodeMatch": "NO_INPUT_DATA"
+            },
+            "securityCodeResponse": "NOT_CHECKED"
+        },
+        "globallyUniqueIdentifier": "0e664d3e-1856-4d9b-9709-19453cad3048"
+    })
+}
+
 
 /// `GET /payments/84667286296?storeId=...` — consulta de la venta ANULADA por su propio id.
 ///

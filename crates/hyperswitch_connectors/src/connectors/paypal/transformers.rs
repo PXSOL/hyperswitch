@@ -5,14 +5,22 @@ use base64::Engine;
 use common_enums::enums as storage_enums;
 #[cfg(feature = "payouts")]
 use common_utils::pii::Email;
-use common_utils::{consts, errors::CustomResult, request::Method, types::StringMajorUnit};
+use common_utils::{
+    consts,
+    errors::CustomResult,
+    request::Method,
+    types::{AmountConvertor, StringMajorUnit},
+};
 use error_stack::ResultExt;
 use hyperswitch_domain_models::{
     payment_method_data::{
         BankDebitData, BankRedirectData, BankTransferData, CardRedirectData, GiftCardData,
         PayLaterData, PaymentMethodData, VoucherData, WalletData,
     },
-    router_data::{AccessToken, ConnectorAuthType, RouterData},
+    router_data::{
+        AccessToken, ConnectorAuthType, ConnectorReportedActivity, ConnectorReportedRefund,
+        ConnectorResponseData, RouterData,
+    },
     router_flow_types::{
         payments::{Authorize, PostSessionTokens},
         refunds::{Execute, RSync},
@@ -1784,6 +1792,182 @@ pub struct PaymentsCollectionItem {
 pub struct PaymentsCollection {
     authorizations: Option<Vec<PaymentsCollectionItem>>,
     captures: Option<Vec<PaymentsCollectionItem>>,
+    /// Only listed by the orders endpoint (`GET v2/checkout/orders/{id}`); the captures and
+    /// authorizations endpoints do not return refunds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refunds: Option<Vec<PaymentsRefundItem>>,
+}
+
+/// A refund of the order as `purchase_units[].payments.refunds[]` lists it. Every field is
+/// optional so one odd entry cannot make the sync of a charged payment fail to parse; entries
+/// that miss what the reconciliation needs are skipped when the reported activity is built.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaymentsRefundItem {
+    /// The same id the refund Execute/RSync flows store as `connector_refund_id`.
+    id: Option<String>,
+    /// CANCELLED, FAILED, PENDING or COMPLETED; kept as text so a new value cannot break parsing.
+    status: Option<String>,
+    amount: Option<PaymentsRefundAmount>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaymentsRefundAmount {
+    currency_code: Option<String>,
+    /// Major units as text, e.g. "25.00".
+    value: Option<StringMajorUnit>,
+}
+
+/// Maps the status of a PayPal refund to the Hyperswitch refund status. A status this
+/// connector does not know yet stays `Pending` instead of being reported as a final outcome.
+fn map_reported_refund_status(status: Option<&str>) -> storage_enums::RefundStatus {
+    match status {
+        Some("COMPLETED") => storage_enums::RefundStatus::Success,
+        Some("FAILED" | "CANCELLED") => storage_enums::RefundStatus::Failure,
+        Some("PENDING") => storage_enums::RefundStatus::Pending,
+        _ => storage_enums::RefundStatus::Pending,
+    }
+}
+
+impl PaymentsRefundItem {
+    /// `None` (with a warning) when the entry lacks an id or an amount, or when the amount is
+    /// not in the currency of the payment.
+    fn to_reported_refund(
+        &self,
+        currency: storage_enums::Currency,
+        amount_converter: &dyn AmountConvertor<Output = StringMajorUnit>,
+    ) -> Option<ConnectorReportedRefund> {
+        let connector_refund_id = self.id.clone().filter(|id| !id.is_empty());
+        let amount = self.amount.as_ref();
+        let (Some(connector_refund_id), Some(value)) = (
+            connector_refund_id,
+            amount.and_then(|amount| amount.value.clone()),
+        ) else {
+            router_env::logger::warn!(
+                "paypal: refund of the order without id or amount; not reported"
+            );
+            return None;
+        };
+        let currency_matches = amount
+            .and_then(|amount| amount.currency_code.as_deref())
+            .map_or(true, |code| {
+                code.eq_ignore_ascii_case(&currency.to_string())
+            });
+        if !currency_matches {
+            router_env::logger::warn!(
+                "paypal: refund of the order in a different currency than the payment; not reported"
+            );
+            return None;
+        }
+        let amount = utils::convert_back_amount_to_minor_units(amount_converter, value, currency)
+            .inspect_err(|_| {
+                router_env::logger::warn!(
+                    "paypal: refund amount of the order could not be converted; not reported"
+                );
+            })
+            .ok()?;
+        Some(ConnectorReportedRefund {
+            amount_is_remaining_balance: false,
+            amount_is_cumulative_total: false,
+            connector_refund_id,
+            amount,
+            status: map_reported_refund_status(self.status.as_deref()),
+        })
+    }
+}
+
+impl PaypalOrdersResponse {
+    /// Refunds of the order as reported activity, including the ones made outside Hyperswitch
+    /// (PayPal dashboard), or `None` when there is nothing to report. The reconciliation matches
+    /// the ones Hyperswitch already has by `connector_refund_id`.
+    pub fn reported_activity(
+        &self,
+        currency: storage_enums::Currency,
+        amount_converter: &dyn AmountConvertor<Output = StringMajorUnit>,
+    ) -> Option<ConnectorReportedActivity> {
+        let refunds: Vec<ConnectorReportedRefund> = self
+            .purchase_units
+            .iter()
+            .filter_map(|unit| unit.payments.refunds.as_ref())
+            .flatten()
+            .filter_map(|refund| refund.to_reported_refund(currency, amount_converter))
+            .collect();
+        (!refunds.is_empty()).then_some(ConnectorReportedActivity {
+            refunds,
+            dispute: None,
+        })
+    }
+}
+
+/// A charged (fully or partially) attempt is the only one the sync reads through the orders
+/// endpoint to find refunds made outside Hyperswitch (see
+/// `Connector::syncs_refunds_and_disputes_on_payment_sync`).
+pub fn is_settled_attempt(status: storage_enums::AttemptStatus) -> bool {
+    matches!(
+        status,
+        storage_enums::AttemptStatus::Charged | storage_enums::AttemptStatus::PartialCharged
+    )
+}
+
+/// Closes the payment sync of an attempt: attaches the reported refunds and keeps a settled
+/// attempt from moving to a weaker status.
+///
+/// A `Charged` or `PartialCharged` attempt must never be downgraded by a sync, so if PayPal
+/// reports anything weaker the current status is kept (the refunds still reach the
+/// reconciliation). A failure response of such a sync is replaced by a successful one with the
+/// same id so the router does not mark a real charge as failed.
+///
+/// `orders_sync_of_card` is true when a settled card attempt was synced through the orders
+/// endpoint instead of the captures or authorizations one. That response is richer than the
+/// one those return, so the connector metadata and the mandate reference it builds are dropped
+/// to leave what the attempt already stores exactly as it was (the orders response of an
+/// authorize-intent order would otherwise rewrite `capture_id` and `psync_flow`).
+pub fn finish_payment_sync<F, T>(
+    mut router_data: RouterData<F, T, PaymentsResponseData>,
+    attempt_status: storage_enums::AttemptStatus,
+    attempt_connector_transaction_id: &ResponseId,
+    activity: Option<ConnectorReportedActivity>,
+    orders_sync_of_card: bool,
+) -> RouterData<F, T, PaymentsResponseData> {
+    if is_settled_attempt(attempt_status) && !is_settled_attempt(router_data.status) {
+        router_env::logger::warn!(
+            reported_status = ?router_data.status,
+            "paypal: weaker status reported for a charged attempt; keeping the current one"
+        );
+        router_data.status = attempt_status;
+        if router_data.response.is_err() {
+            router_data.response = Ok(PaymentsResponseData::TransactionResponse {
+                resource_id: attempt_connector_transaction_id.clone(),
+                redirection_data: Box::new(None),
+                mandate_reference: Box::new(None),
+                connector_metadata: None,
+                network_txn_id: None,
+                connector_response_reference_id: None,
+                incremental_authorization_allowed: None,
+                charges: None,
+            });
+        }
+    }
+    if orders_sync_of_card {
+        if let Ok(PaymentsResponseData::TransactionResponse {
+            connector_metadata,
+            mandate_reference,
+            ..
+        }) = router_data.response.as_mut()
+        {
+            *connector_metadata = None;
+            **mandate_reference = None;
+        }
+    }
+    if let Some(activity) = activity {
+        match router_data.connector_response.as_mut() {
+            Some(connector_response) => connector_response.set_reported_activity(activity),
+            None => {
+                router_data.connector_response =
+                    Some(ConnectorResponseData::with_reported_activity(activity));
+            }
+        }
+    }
+    router_data
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
@@ -2784,6 +2968,8 @@ pub enum PaypalPaymentStatus {
     Expired,
     PartiallyCaptured,
     Refunded,
+    /// Capture status after a partial refund; the order itself stays COMPLETED.
+    PartiallyRefunded,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2802,7 +2988,8 @@ impl From<PaypalPaymentStatus> for storage_enums::AttemptStatus {
             PaypalPaymentStatus::Created => Self::Authorized,
             PaypalPaymentStatus::Completed
             | PaypalPaymentStatus::Captured
-            | PaypalPaymentStatus::Refunded => Self::Charged,
+            | PaypalPaymentStatus::Refunded
+            | PaypalPaymentStatus::PartiallyRefunded => Self::Charged,
             PaypalPaymentStatus::Declined => Self::Failure,
             PaypalPaymentStatus::Failed => Self::CaptureFailed,
             PaypalPaymentStatus::Pending => Self::Pending,
@@ -3164,6 +3351,15 @@ pub struct PaypalDisputeWebhooks {
 #[derive(Deserialize, Debug, Serialize)]
 pub struct DisputeTransaction {
     pub seller_transaction_id: String,
+    /// The purchase unit's `invoice_id`, which Hyperswitch sets to the attempt's
+    /// `connector_request_reference_id` when it creates the order.
+    ///
+    /// The dispute webhook resolves it as a `PaymentAttemptId`, which assumes the default
+    /// request reference (the attempt id): with `payment_id_as_connector_request_id` it
+    /// would not resolve and the webhook falls into the error path. Orders created outside
+    /// Hyperswitch never matched a payment anyway.
+    #[serde(default)]
+    pub invoice_number: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Debug, strum::Display, Serialize)]
@@ -3640,6 +3836,492 @@ impl From<ErrorDetails> for utils::ErrorCodeAndMessage {
             error_code: error.issue.to_string(),
             error_message: error.issue.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod external_refund_sync_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
+
+    use std::marker::PhantomData;
+
+    use common_utils::types::{MinorUnit, StringMajorUnitForConnector};
+    use hyperswitch_domain_models::{
+        payment_address::PaymentAddress,
+        router_flow_types::PSync,
+        router_request_types::{RefundsData, SyncRequestType},
+        types::RefundsRouterData,
+    };
+    use serde_json::json;
+
+    use super::*;
+
+    const ORDER_ID: &str = "5O190127TN364715T";
+    const CAPTURE_ID: &str = "3C679366HH908993F";
+    const REFUND_ID: &str = "1JU08902781691411";
+
+    fn router_data<Flow, Req, Res>(request: Req) -> RouterData<Flow, Req, Res> {
+        RouterData {
+            flow: PhantomData,
+            merchant_id: common_utils::id_type::MerchantId::default(),
+            customer_id: None,
+            connector_customer: None,
+            connector: "paypal".to_string(),
+            payment_id: "pay_1".to_string(),
+            attempt_id: "pay_1_1".to_string(),
+            tenant_id: common_utils::id_type::TenantId::try_from_string("public".to_string())
+                .unwrap(),
+            status: storage_enums::AttemptStatus::Charged,
+            payment_method: enums::PaymentMethod::Card,
+            connector_auth_type: ConnectorAuthType::HeaderKey {
+                api_key: Secret::new("token".to_string()),
+            },
+            description: None,
+            address: PaymentAddress::default(),
+            auth_type: enums::AuthenticationType::NoThreeDs,
+            connector_meta_data: None,
+            connector_wallets_details: None,
+            amount_captured: None,
+            access_token: None,
+            session_token: None,
+            reference_id: None,
+            payment_method_token: None,
+            recurring_mandate_payment_data: None,
+            preprocessing_id: None,
+            payment_method_balance: None,
+            connector_api_version: None,
+            request,
+            response: Err(hyperswitch_domain_models::router_data::ErrorResponse::default()),
+            connector_request_reference_id: "pay_1_1".to_string(),
+            #[cfg(feature = "payouts")]
+            payout_method_data: None,
+            #[cfg(feature = "payouts")]
+            quote_id: None,
+            test_mode: Some(true),
+            connector_http_status_code: None,
+            external_latency: None,
+            apple_pay_flow: None,
+            frm_metadata: None,
+            dispute_id: None,
+            refund_id: None,
+            connector_response: None,
+            payment_method_status: None,
+            minor_amount_captured: None,
+            minor_amount_capturable: None,
+            integrity_check: Ok(()),
+            additional_merchant_data: None,
+            header_payload: None,
+            connector_mandate_request_reference_id: None,
+            l2_l3_data: None,
+            authentication_id: None,
+            psd2_sca_exemption_type: None,
+            raw_connector_response: None,
+            is_payment_id_from_merchant: None,
+        }
+    }
+
+    fn sync_request() -> PaymentsSyncData {
+        PaymentsSyncData {
+            connector_transaction_id: ResponseId::ConnectorTransactionId(ORDER_ID.to_string()),
+            encoded_data: None,
+            capture_method: None,
+            connector_meta: None,
+            sync_type: SyncRequestType::SinglePaymentSync,
+            mandate_id: None,
+            payment_method_type: None,
+            currency: enums::Currency::USD,
+            payment_experience: None,
+            split_payments: None,
+            amount: MinorUnit::new(10_000),
+            integrity_object: None,
+            connector_reference_id: None,
+            setup_future_usage: None,
+        }
+    }
+
+    fn refund(id: &str, value: &str, status: &str) -> serde_json::Value {
+        json!({
+            "id": id,
+            "status": status,
+            "amount": {"currency_code": "USD", "value": value},
+            "create_time": "2026-09-30T10:00:00Z",
+            "links": [{"href": "https://api.paypal.com/v2/payments/refunds/x", "rel": "self", "method": "GET"}]
+        })
+    }
+
+    /// `GET v2/checkout/orders/{id}` of a card order paid with intent CAPTURE.
+    fn order(capture_status: &str, refunds: Option<Vec<serde_json::Value>>) -> serde_json::Value {
+        let mut payments = json!({
+            "captures": [{
+                "id": CAPTURE_ID,
+                "status": capture_status,
+                "amount": {"currency_code": "USD", "value": "100.00"},
+                "final_capture": true,
+                "seller_protection": {"status": "ELIGIBLE"},
+                "create_time": "2026-09-30T09:00:00Z"
+            }]
+        });
+        if let Some(refunds) = refunds {
+            payments["refunds"] = json!(refunds);
+        }
+        json!({
+            "id": ORDER_ID,
+            "intent": "CAPTURE",
+            "status": "COMPLETED",
+            "payment_source": {"card": {"last_digits": "1111", "brand": "VISA"}},
+            "purchase_units": [{
+                "reference_id": "default",
+                "invoice_id": "pay_1_1",
+                "amount": {"currency_code": "USD", "value": "100.00"},
+                "payments": payments
+            }],
+            "create_time": "2026-09-30T09:00:00Z"
+        })
+    }
+
+    fn parse(order: serde_json::Value) -> PaypalSyncResponse {
+        serde_json::from_value(order).unwrap()
+    }
+
+    fn activity_of(
+        response: &PaypalSyncResponse,
+    ) -> Vec<(String, i64, storage_enums::RefundStatus)> {
+        let PaypalSyncResponse::PaypalOrdersSyncResponse(order) = response else {
+            panic!("not an orders response");
+        };
+        order
+            .reported_activity(enums::Currency::USD, &StringMajorUnitForConnector)
+            .map(|activity| {
+                assert!(activity.dispute.is_none());
+                activity
+                    .refunds
+                    .into_iter()
+                    .map(|refund| {
+                        (
+                            refund.connector_refund_id,
+                            refund.amount.get_amount_as_i64(),
+                            refund.status,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn sync(
+        order: serde_json::Value,
+        attempt_status: storage_enums::AttemptStatus,
+        orders_sync_of_card: bool,
+    ) -> RouterData<PSync, PaymentsSyncData, PaymentsResponseData> {
+        let response = parse(order);
+        let reported = match &response {
+            PaypalSyncResponse::PaypalOrdersSyncResponse(order) => {
+                order.reported_activity(enums::Currency::USD, &StringMajorUnitForConnector)
+            }
+            _ => None,
+        };
+        let mut data = router_data::<PSync, PaymentsSyncData, PaymentsResponseData>(sync_request());
+        data.status = attempt_status;
+        let built = RouterData::foreign_try_from((
+            ResponseRouterData {
+                response,
+                data,
+                http_code: 200,
+            },
+            None,
+        ))
+        .unwrap();
+        finish_payment_sync(
+            built,
+            attempt_status,
+            &ResponseId::ConnectorTransactionId(ORDER_ID.to_string()),
+            reported,
+            orders_sync_of_card,
+        )
+    }
+
+    #[test]
+    fn external_refund_on_a_charged_order_is_reported_and_the_payment_stays_charged() {
+        let data = sync(
+            order(
+                "PARTIALLY_REFUNDED",
+                Some(vec![refund(REFUND_ID, "25.00", "COMPLETED")]),
+            ),
+            storage_enums::AttemptStatus::Charged,
+            true,
+        );
+        assert_eq!(data.status, storage_enums::AttemptStatus::Charged);
+        let activity = data
+            .connector_response
+            .as_ref()
+            .and_then(|response| response.get_reported_activity())
+            .expect("the refund must be reported");
+        assert_eq!(activity.refunds.len(), 1);
+        assert_eq!(activity.refunds[0].connector_refund_id, REFUND_ID);
+        assert_eq!(activity.refunds[0].amount, MinorUnit::new(2500));
+        assert_eq!(
+            activity.refunds[0].status,
+            storage_enums::RefundStatus::Success
+        );
+        assert!(activity.dispute.is_none());
+    }
+
+    #[test]
+    fn a_fully_refunded_capture_inside_a_completed_order_stays_charged() {
+        let data = sync(
+            order(
+                "REFUNDED",
+                Some(vec![refund(REFUND_ID, "100.00", "COMPLETED")]),
+            ),
+            storage_enums::AttemptStatus::Charged,
+            true,
+        );
+        assert_eq!(data.status, storage_enums::AttemptStatus::Charged);
+        let response = parse(order("REFUNDED", None));
+        assert!(matches!(
+            response,
+            PaypalSyncResponse::PaypalOrdersSyncResponse(_)
+        ));
+    }
+
+    #[test]
+    fn refund_statuses_map_amounts_convert_and_unknown_ones_stay_pending() {
+        let response = parse(order(
+            "PARTIALLY_REFUNDED",
+            Some(vec![
+                refund("R_OK", "10.00", "COMPLETED"),
+                refund("R_PENDING", "5.50", "PENDING"),
+                refund("R_FAILED", "2.00", "FAILED"),
+                refund("R_CANCELLED", "1.00", "CANCELLED"),
+                refund("R_NEW", "0.25", "SOMETHING_NEW"),
+            ]),
+        ));
+        assert_eq!(
+            activity_of(&response),
+            vec![
+                (
+                    "R_OK".to_string(),
+                    1000,
+                    storage_enums::RefundStatus::Success
+                ),
+                (
+                    "R_PENDING".to_string(),
+                    550,
+                    storage_enums::RefundStatus::Pending
+                ),
+                (
+                    "R_FAILED".to_string(),
+                    200,
+                    storage_enums::RefundStatus::Failure
+                ),
+                (
+                    "R_CANCELLED".to_string(),
+                    100,
+                    storage_enums::RefundStatus::Failure
+                ),
+                (
+                    "R_NEW".to_string(),
+                    25,
+                    storage_enums::RefundStatus::Pending
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_refund_entries_are_skipped() {
+        let response = parse(order(
+            "PARTIALLY_REFUNDED",
+            Some(vec![
+                json!({"status": "COMPLETED", "amount": {"currency_code": "USD", "value": "1.00"}}),
+                json!({"id": "R_NO_AMOUNT", "status": "COMPLETED"}),
+                json!({"id": "R_NO_VALUE", "amount": {"currency_code": "USD"}}),
+                json!({"id": "R_EMPTY_ID", "status": "COMPLETED"}),
+                json!({"id": "", "amount": {"currency_code": "USD", "value": "1.00"}}),
+                json!({"id": "R_EUR", "amount": {"currency_code": "EUR", "value": "1.00"}}),
+                json!({"id": "R_BAD_VALUE", "amount": {"currency_code": "USD", "value": "abc"}}),
+                refund("R_GOOD", "3.00", "COMPLETED"),
+            ]),
+        ));
+        assert_eq!(
+            activity_of(&response),
+            vec![(
+                "R_GOOD".to_string(),
+                300,
+                storage_enums::RefundStatus::Success
+            )]
+        );
+    }
+
+    #[test]
+    fn orders_without_refunds_still_parse_and_report_nothing() {
+        for refunds in [None, Some(vec![])] {
+            let response = parse(order("COMPLETED", refunds));
+            assert!(activity_of(&response).is_empty());
+            let data = sync(
+                order("COMPLETED", None),
+                storage_enums::AttemptStatus::Charged,
+                true,
+            );
+            assert_eq!(data.status, storage_enums::AttemptStatus::Charged);
+            assert!(data
+                .connector_response
+                .as_ref()
+                .and_then(|response| response.get_reported_activity())
+                .is_none());
+        }
+        // The other shapes of the sync response keep parsing as before.
+        let three_ds: PaypalSyncResponse = serde_json::from_value(json!({
+            "id": ORDER_ID,
+            "status": "PAYER_ACTION_REQUIRED",
+            "payment_source": {"card": {"last_digits": "1111"}}
+        }))
+        .unwrap();
+        assert!(matches!(
+            three_ds,
+            PaypalSyncResponse::PaypalThreeDsSyncResponse(_)
+        ));
+        let capture: PaypalSyncResponse = serde_json::from_value(json!({
+            "id": CAPTURE_ID,
+            "status": "COMPLETED",
+            "amount": {"currency_code": "USD", "value": "100.00"},
+            "supplementary_data": {"related_ids": {"order_id": ORDER_ID}}
+        }))
+        .unwrap();
+        assert!(matches!(
+            capture,
+            PaypalSyncResponse::PaypalPaymentsSyncResponse(_)
+        ));
+    }
+
+    #[test]
+    fn serializing_an_order_without_refunds_adds_no_refunds_field() {
+        let response = parse(order("COMPLETED", None));
+        let value = serde_json::to_value(&response).unwrap();
+        assert!(value["purchase_units"][0]["payments"]
+            .get("refunds")
+            .is_none());
+        // and the webhook path, which re-serializes the order, still round-trips.
+        assert!(serde_json::from_value::<PaypalSyncResponse>(value).is_ok());
+    }
+
+    #[test]
+    fn reported_refund_id_is_the_one_the_refund_flow_stores() {
+        // POST v2/payments/captures/{id}/refund answers with the refund object; the order
+        // lists the very same object under `payments.refunds[]`.
+        let object = refund(REFUND_ID, "25.00", "COMPLETED");
+        let refund_response: RefundResponse = serde_json::from_value(object.clone()).unwrap();
+        let refund_data: RefundsRouterData<Execute> = router_data(RefundsData {
+            refund_id: "ref_1".to_string(),
+            connector_transaction_id: ORDER_ID.to_string(),
+            connector_refund_id: None,
+            currency: enums::Currency::USD,
+            payment_amount: 10_000,
+            reason: None,
+            webhook_url: None,
+            refund_amount: 2500,
+            connector_metadata: None,
+            refund_connector_metadata: None,
+            browser_info: None,
+            split_refunds: None,
+            minor_payment_amount: MinorUnit::new(10_000),
+            minor_refund_amount: MinorUnit::new(2500),
+            integrity_object: None,
+            refund_status: enums::RefundStatus::Pending,
+            merchant_account_id: None,
+            merchant_config_currency: None,
+            capture_method: Some(enums::CaptureMethod::Automatic),
+            additional_payment_method_data: None,
+        });
+        let executed =
+            RefundsRouterData::<Execute>::try_from(RefundsResponseRouterData::<Execute, _> {
+                response: refund_response,
+                data: refund_data,
+                http_code: 201,
+            })
+            .unwrap();
+        let stored = executed.response.unwrap();
+
+        let response = parse(order("PARTIALLY_REFUNDED", Some(vec![object])));
+        let reported = activity_of(&response);
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].0, stored.connector_refund_id);
+        assert_eq!(reported[0].2, stored.refund_status);
+        assert_eq!(reported[0].1, 2500);
+    }
+
+    #[test]
+    fn a_weaker_status_never_downgrades_a_settled_attempt_and_an_error_becomes_ok() {
+        let data = sync(
+            order("PENDING", None),
+            storage_enums::AttemptStatus::Charged,
+            true,
+        );
+        assert_eq!(data.status, storage_enums::AttemptStatus::Charged);
+        assert!(data.response.is_ok());
+
+        let mut built =
+            router_data::<PSync, PaymentsSyncData, PaymentsResponseData>(sync_request());
+        built.status = storage_enums::AttemptStatus::Failure;
+        let finished = finish_payment_sync(
+            built,
+            storage_enums::AttemptStatus::PartialCharged,
+            &ResponseId::ConnectorTransactionId(ORDER_ID.to_string()),
+            None,
+            true,
+        );
+        assert_eq!(
+            finished.status,
+            storage_enums::AttemptStatus::PartialCharged
+        );
+        match finished.response {
+            Ok(PaymentsResponseData::TransactionResponse { resource_id, .. }) => {
+                assert_eq!(
+                    resource_id.get_connector_transaction_id().unwrap(),
+                    ORDER_ID
+                );
+            }
+            other => panic!("unexpected response {other:?}"),
+        }
+
+        // A non-settled attempt keeps whatever PayPal says.
+        let data = sync(
+            order("PENDING", None),
+            storage_enums::AttemptStatus::Pending,
+            false,
+        );
+        assert_eq!(data.status, storage_enums::AttemptStatus::Pending);
+    }
+
+    #[test]
+    fn orders_sync_of_a_card_keeps_the_stored_metadata_untouched() {
+        let kept = |orders_sync_of_card| {
+            let data = sync(
+                order("COMPLETED", None),
+                storage_enums::AttemptStatus::Charged,
+                orders_sync_of_card,
+            );
+            match data.response {
+                Ok(PaymentsResponseData::TransactionResponse {
+                    connector_metadata,
+                    mandate_reference,
+                    ..
+                }) => (connector_metadata, *mandate_reference),
+                other => panic!("unexpected response {other:?}"),
+            }
+        };
+        let (metadata, mandate) = kept(true);
+        assert!(metadata.is_none());
+        assert!(mandate.is_none());
+        // Wallet and bank redirect syncs (orders endpoint all along) keep their behavior.
+        let (metadata, mandate) = kept(false);
+        assert!(metadata.is_some());
+        assert!(mandate.is_some());
     }
 }
 

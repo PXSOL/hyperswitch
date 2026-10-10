@@ -134,6 +134,16 @@ fn build_sync_url(
         _ => return Err(errors::ConnectorError::MissingConnectorTransactionID.into()),
     };
 
+    build_collection_url(base_url, collection, id, store_id)
+}
+
+/// Arma `{base}/{collection}/{id}?storeId=...` con el escape que corresponde a cada parte.
+fn build_collection_url(
+    base_url: &str,
+    collection: &str,
+    id: &str,
+    store_id: &str,
+) -> CustomResult<String, errors::ConnectorError> {
     let mut url = url::Url::parse(base_url)
         .change_context(errors::ConnectorError::FailedToObtainIntegrationUrl)?;
     url.path_segments_mut()
@@ -143,6 +153,33 @@ fn build_sync_url(
         .push(id);
     url.query_pairs_mut().append_pair("storeId", store_id);
     Ok(url.into())
+}
+
+/// URL del PSync según el estado actual del intento.
+///
+/// Un intento ya cobrado se consulta siempre por **orden** (`GET /orders/{orderId}?storeId=`):
+/// la consulta por transacción sólo muestra esa transacción, mientras que la orden lista
+/// también los `VOID` y `RETURN` hechos después, que es lo que permite descubrir devoluciones
+/// y anulaciones hechas por fuera de Hyperswitch. El `orderId` es el
+/// `connector_request_reference_id`, el mismo que se mandó en `order.orderId` al autorizar.
+/// Cualquier otro estado conserva la elección de `build_sync_url`, igual que sin esta rama.
+fn build_psync_url(
+    base_url: &str,
+    attempt_status: enums::AttemptStatus,
+    connector_transaction_id: &ResponseId,
+    connector_request_reference_id: &str,
+    store_id: &str,
+) -> CustomResult<String, errors::ConnectorError> {
+    if fiservemea::is_settled_attempt(attempt_status) && !connector_request_reference_id.is_empty()
+    {
+        return build_collection_url(base_url, "orders", connector_request_reference_id, store_id);
+    }
+    build_sync_url(
+        base_url,
+        connector_transaction_id,
+        connector_request_reference_id,
+        store_id,
+    )
 }
 
 #[derive(Clone)]
@@ -888,8 +925,9 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Fis
         // El `orderId` con el que se consulta es el mismo `connector_request_reference_id` que
         // se mandó en `order.orderId` al autorizar (ver `FiservemeaOrder`), así que la orden
         // existe aunque la venta haya fallado antes de devolver el `ipgTransactionId`.
-        build_sync_url(
+        build_psync_url(
             &determine_endpoint(connectors, req.test_mode)?,
+            req.status,
             &req.request.connector_transaction_id,
             &req.connector_request_reference_id,
             auth.store_id.peek(),
@@ -926,7 +964,21 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Fis
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         event_builder.map(|i| i.set_response_body(&sync_response));
         router_env::logger::info!(connector_response=?sync_response);
-        let response = sync_response.into_transaction()?;
+        // Un intento ya cobrado se consulta por orden (ver `build_psync_url`): además de su
+        // transacción se leen los VOID/RETURN de la orden como reembolsos reportados.
+        let attempt_is_settled = fiservemea::is_settled_attempt(data.status);
+        let (response, reported_activity) = if attempt_is_settled {
+            let attempt_connector_transaction_id = match &data.request.connector_transaction_id {
+                ResponseId::ConnectorTransactionId(id) if !id.is_empty() => Some(id.as_str()),
+                _ => None,
+            };
+            sync_response.into_settled_transaction(
+                attempt_connector_transaction_id,
+                self.amount_converter_to_float_major_unit,
+            )?
+        } else {
+            (sync_response.into_transaction()?, None)
+        };
 
         let integrity_object = response
             .settlement_amount()
@@ -945,6 +997,14 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Fis
             http_code: res.status_code,
         })?;
         router_data.request.integrity_object = integrity_object;
+        if attempt_is_settled {
+            router_data = fiservemea::finish_settled_sync(
+                router_data,
+                data.status,
+                &data.request.connector_transaction_id,
+                reported_activity,
+            );
+        }
         Ok(router_data)
     }
 
@@ -1771,5 +1831,65 @@ mod tests {
             &connectors
         )
         .is_err());
+    }
+
+    #[test]
+    fn settled_attempts_sync_by_order_even_with_a_transaction_id() {
+        // Un intento cobrado se consulta por orden para ver los VOID/RETURN posteriores.
+        for status in [
+            enums::AttemptStatus::Charged,
+            enums::AttemptStatus::PartialCharged,
+        ] {
+            let url = build_psync_url(
+                BASE,
+                status,
+                &ResponseId::ConnectorTransactionId("84667286296".to_string()),
+                "PX-1786053427-07-void",
+                "5926072901",
+            )
+            .unwrap();
+            assert_eq!(
+                url,
+                "https://cert.api.firstdata.com/gateway/v2/orders/PX-1786053427-07-void?storeId=5926072901"
+            );
+        }
+    }
+
+    #[test]
+    fn unsettled_attempts_keep_the_previous_sync_url_choice() {
+        for status in [
+            enums::AttemptStatus::Pending,
+            enums::AttemptStatus::AuthenticationPending,
+            enums::AttemptStatus::Authorized,
+            enums::AttemptStatus::Voided,
+            enums::AttemptStatus::Failure,
+        ] {
+            for transaction_id in [
+                ResponseId::ConnectorTransactionId("84667286296".to_string()),
+                ResponseId::NoResponseId,
+            ] {
+                assert_eq!(
+                    build_psync_url(BASE, status, &transaction_id, "PX-ref", "5926072901").unwrap(),
+                    build_sync_url(BASE, &transaction_id, "PX-ref", "5926072901").unwrap(),
+                    "{status:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn settled_attempt_without_a_reference_falls_back_to_the_transaction_url() {
+        let url = build_psync_url(
+            BASE,
+            enums::AttemptStatus::Charged,
+            &ResponseId::ConnectorTransactionId("84667286296".to_string()),
+            "",
+            "5926072901",
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "https://cert.api.firstdata.com/gateway/v2/payments/84667286296?storeId=5926072901"
+        );
     }
 }
