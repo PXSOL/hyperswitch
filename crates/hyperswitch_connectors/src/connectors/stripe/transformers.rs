@@ -7201,20 +7201,20 @@ mod test_stripe_checkout {
         );
     }
 
-    fn session_json(status: &str, payment_intent: serde_json::Value) -> serde_json::Value {
+    fn session_json(status: &str, payment_intent: Value) -> Value {
         serde_json::json!({
             "id": "cs_test_a1B2c3",
             "object": "checkout.session",
             "status": status,
             "payment_status": if status == "complete" { "paid" } else { "unpaid" },
-            "url": if status == "open" { serde_json::json!(CHECKOUT_URL) } else { serde_json::Value::Null },
+            "url": if status == "open" { serde_json::json!(CHECKOUT_URL) } else { Value::Null },
             "payment_intent": payment_intent,
             "amount_total": 12345,
             "currency": "usd"
         })
     }
 
-    fn payment_intent_json(status: &str) -> serde_json::Value {
+    fn payment_intent_json(status: &str) -> Value {
         serde_json::json!({
             "id": "pi_3Abc",
             "object": "payment_intent",
@@ -7229,7 +7229,7 @@ mod test_stripe_checkout {
     }
 
     fn map(
-        session: serde_json::Value,
+        session: Value,
     ) -> Result<PaymentsAuthorizeRouterData, error_stack::Report<ConnectorError>> {
         let response: StripeCheckoutSessionResponse = serde_json::from_value(session).unwrap();
         let data = authorize_router_data(
@@ -7251,7 +7251,7 @@ mod test_stripe_checkout {
 
     #[test]
     fn open_session_waits_for_the_buyer_with_the_session_id_and_redirect() {
-        let mapped = map(session_json("open", serde_json::Value::Null)).unwrap();
+        let mapped = map(session_json("open", Value::Null)).unwrap();
         assert_eq!(mapped.status, AttemptStatus::AuthenticationPending);
         let Ok(PaymentsResponseData::TransactionResponse {
             resource_id,
@@ -7304,7 +7304,7 @@ mod test_stripe_checkout {
 
     #[test]
     fn expired_session_is_a_terminal_failure() {
-        let mapped = map(session_json("expired", serde_json::Value::Null)).unwrap();
+        let mapped = map(session_json("expired", Value::Null)).unwrap();
         assert_eq!(mapped.status, AttemptStatus::Failure);
         let error = mapped.response.unwrap_err();
         assert_eq!(error.code, "checkout_session_expired");
@@ -7318,7 +7318,7 @@ mod test_stripe_checkout {
     #[test]
     fn expiring_a_session_voids_the_payment() {
         let response: StripeCheckoutSessionVoidResponse =
-            serde_json::from_value(session_json("expired", serde_json::Value::Null)).unwrap();
+            serde_json::from_value(session_json("expired", Value::Null)).unwrap();
         let data = authorize_router_data(
             authorize_request_data(
                 PaymentMethodData::Wallet(WalletData::StripeCheckout {}),
@@ -7356,8 +7356,8 @@ mod test_stripe_checkout {
             Some((MinorUnit::new(999), "usd".to_string()))
         );
 
-        let mut value = session_json("open", serde_json::Value::Null);
-        value["amount_total"] = serde_json::Value::Null;
+        let mut value = session_json("open", Value::Null);
+        value["amount_total"] = Value::Null;
         let none: StripeCheckoutSessionResponse = serde_json::from_value(value).unwrap();
         assert_eq!(none.amount_and_currency(), None);
     }
@@ -7391,7 +7391,7 @@ mod test_stripe_checkout {
     #[test]
     fn object_kind_distinguishes_a_session_from_a_payment_intent() {
         let session: StripeObjectKind =
-            serde_json::from_value(session_json("open", serde_json::Value::Null)).unwrap();
+            serde_json::from_value(session_json("open", Value::Null)).unwrap();
         assert_eq!(session.object.as_deref(), Some(CHECKOUT_SESSION_OBJECT));
         let intent: StripeObjectKind =
             serde_json::from_value(payment_intent_json("succeeded")).unwrap();
@@ -7403,7 +7403,7 @@ mod test_stripe_checkout {
         payment_method_data: PaymentMethodData,
         currency: enums::Currency,
         amount_minor: i64,
-        email: Option<common_utils::pii::Email>,
+        email: Option<Email>,
         router_return_url: Option<String>,
     ) -> PaymentsAuthorizeData {
         PaymentsAuthorizeData {
@@ -7486,7 +7486,7 @@ mod test_stripe_checkout {
             attempt_id: reference.to_string(),
             tenant_id: common_utils::id_type::TenantId::try_from_string("public".to_string())
                 .unwrap(),
-            status: enums::AttemptStatus::default(),
+            status: AttemptStatus::default(),
             payment_method: enums::PaymentMethod::Card,
             connector_auth_type: test_auth(),
             description: None,

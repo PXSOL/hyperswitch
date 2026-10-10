@@ -4833,7 +4833,7 @@ mod external_refund_sync_tests {
             payment_method_balance: None,
             connector_api_version: None,
             request,
-            response: Err(hyperswitch_domain_models::router_data::ErrorResponse::default()),
+            response: Err(ErrorResponse::default()),
             connector_request_reference_id: "pay_1_1".to_string(),
             #[cfg(feature = "payouts")]
             payout_method_data: None,

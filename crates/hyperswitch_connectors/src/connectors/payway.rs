@@ -1094,7 +1094,7 @@ mod payment_sync_tests {
                 currency: enums::Currency::ARS,
                 payment_experience: None,
                 split_payments: None,
-                amount: common_utils::types::MinorUnit::new(12050),
+                amount: MinorUnit::new(12050),
                 integrity_object: None,
                 connector_reference_id: None,
                 setup_future_usage: None,
