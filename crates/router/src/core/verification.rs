@@ -2,7 +2,7 @@ pub mod utils;
 use api_models::verifications::{self, ApplepayMerchantResponse};
 use common_utils::{errors::CustomResult, request::RequestContent};
 use error_stack::ResultExt;
-use masking::ExposeInterface;
+use hyperswitch_masking::ExposeInterface;
 
 use crate::{core::errors, headers, logger, routes::SessionState, services};
 
@@ -49,6 +49,7 @@ pub async fn verify_merchant_creds_for_applepay(
         &state,
         apple_pay_merch_verification_req,
         "verify_merchant_creds_for_applepay",
+        None,
     )
     .await;
     utils::log_applepay_verification_response_if_error(&response);
@@ -93,20 +94,14 @@ pub async fn get_verified_apple_domains_with_mid_mca_id(
     errors::ApiErrorResponse,
 > {
     let db = state.store.as_ref();
-    let key_manager_state = &(&state).into();
     let key_store = db
-        .get_merchant_key_store_by_merchant_id(
-            key_manager_state,
-            &merchant_id,
-            &db.get_master_key().to_vec().into(),
-        )
+        .get_merchant_key_store_by_merchant_id(&merchant_id, &db.get_master_key().to_vec().into())
         .await
         .change_context(errors::ApiErrorResponse::MerchantAccountNotFound)?;
 
     #[cfg(feature = "v1")]
     let verified_domains = db
         .find_by_merchant_connector_account_merchant_id_merchant_connector_id(
-            key_manager_state,
             &merchant_id,
             &merchant_connector_id,
             &key_store,
@@ -118,11 +113,7 @@ pub async fn get_verified_apple_domains_with_mid_mca_id(
 
     #[cfg(feature = "v2")]
     let verified_domains = db
-        .find_merchant_connector_account_by_id(
-            key_manager_state,
-            &merchant_connector_id,
-            &key_store,
-        )
+        .find_merchant_connector_account_by_id(&merchant_connector_id, &key_store)
         .await
         .change_context(errors::ApiErrorResponse::ResourceIdNotFound)?
         .applepay_verified_domains

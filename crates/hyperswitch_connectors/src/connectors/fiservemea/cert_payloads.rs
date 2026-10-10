@@ -34,7 +34,7 @@ use hyperswitch_domain_models::{
     },
     router_response_types::PaymentsResponseData,
 };
-use masking::{ExposeInterface, Secret};
+use hyperswitch_masking::{ExposeInterface, Secret};
 use serde_json::json;
 
 use super::transformers as fiservemea;

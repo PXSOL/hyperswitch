@@ -28,7 +28,7 @@ use hyperswitch_domain_models::{
 };
 use error_stack::ResultExt;
 use hyperswitch_interfaces::{consts, errors};
-use masking::{ExposeInterface, PeekInterface, Secret};
+use hyperswitch_masking::{ExposeInterface, PeekInterface, Secret};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -483,7 +483,7 @@ fn build_three_ds_callback_url(
 ) -> Result<String, error_stack::Report<errors::ConnectorError>> {
     let mut url = url::Url::parse(complete_authorize_url).change_context(
         errors::ConnectorError::InvalidDataFormat {
-            field_name: "complete_authorize_url",
+            field_name: "complete_authorize_url".into(),
         },
     )?;
     url.query_pairs_mut()
@@ -1012,7 +1012,7 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
                         .complete_authorize_url
                         .clone()
                         .ok_or(errors::ConnectorError::MissingRequiredField {
-                            field_name: "complete_authorize_url",
+                            field_name: "complete_authorize_url".into(),
                         })?;
                     // Las dos URLs tienen que ser distinguibles: la notificación del ACS llega
                     // dentro del iframe oculto y no puede continuar la autenticación; el retorno
@@ -1071,7 +1071,7 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
                             .contains(&cryptogram.peek().chars().count())
                         {
                             return Err(errors::ConnectorError::InvalidDataFormat {
-                                field_name: "payment_method_data.network_token.token_cryptogram",
+                                field_name: "payment_method_data.network_token.token_cryptogram".into(),
                             }
                             .into());
                         }
@@ -1080,7 +1080,7 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
                     None if es_repeat => {}
                     None => {
                         return Err(errors::ConnectorError::MissingRequiredField {
-                            field_name: "payment_method_data.network_token.token_cryptogram",
+                            field_name: "payment_method_data.network_token.token_cryptogram".into(),
                         }
                         .into())
                     }
@@ -1408,7 +1408,7 @@ impl TryFrom<&PaymentsCompleteAuthorizeRouterData> for FiservemeaCompleteAuthori
         let auth = FiservemeaAuthType::try_from(&item.connector_auth_type)?;
         let redirect_response = item.request.redirect_response.as_ref().ok_or(
             errors::ConnectorError::MissingRequiredField {
-                field_name: "redirect_response",
+                field_name: "redirect_response".into(),
             },
         )?;
 
@@ -2062,7 +2062,7 @@ impl FiservemeaSyncResponse {
                     // Una orden sin transacciones no permite decidir ningún estado: es
                     // preferible que el PSync falle a inventar un `Pending` o un `Failure`.
                     error_stack::Report::new(errors::ConnectorError::MissingRequiredField {
-                        field_name: "transactions",
+                        field_name: "transactions".into(),
                     })
                 })
             }
@@ -2231,7 +2231,7 @@ impl FiservemeaSyncResponse {
             // Igual que `into_transaction`: sin transacciones no hay estado que decidir.
             return Err(error_stack::Report::new(
                 errors::ConnectorError::MissingRequiredField {
-                    field_name: "transactions",
+                    field_name: "transactions".into(),
                 },
             ));
         }
@@ -2280,6 +2280,9 @@ pub fn finish_settled_sync<F, T>(
                 connector_response_reference_id: None,
                 incremental_authorization_allowed: None,
                 charges: None,
+                network_txn_link_id: None,
+                payment_account_reference: None,
+                authentication_data: None,
             });
         }
     }
@@ -2396,6 +2399,7 @@ impl<F, T> TryFrom<ResponseRouterData<F, FiservemeaPaymentsResponse, T, Payments
                     network_advice_code: network.advice_code,
                     network_error_message: network.error_message,
                     connector_metadata: connector_metadata.map(Secret::new),
+                    connector_response_reference_id: None,
                 }),
                 ..item.data
             });
@@ -2433,9 +2437,12 @@ impl<F, T> TryFrom<ResponseRouterData<F, FiservemeaPaymentsResponse, T, Payments
                 // recurrente. Hyperswitch lo persiste como `network_txn_id`; antes se parseaba
                 // de la respuesta y se descartaba, así que la recurrencia Visa no se podía armar.
                 network_txn_id: item.response.scheme_transaction_id.clone(),
+                network_txn_link_id: None,
                 connector_response_reference_id: item.response.order_id,
                 incremental_authorization_allowed: None,
+                authentication_data: None,
                 charges: None,
+                payment_account_reference: None,
             }),
             ..item.data
         })
@@ -2597,7 +2604,7 @@ impl TryFrom<RefundsResponseRouterData<Execute, FiservemeaPaymentsResponse>>
                 // faltó, que es accionable, en vez de con un error de deserialización opaco.
                 connector_refund_id: item.response.ipg_transaction_id.ok_or(
                     errors::ConnectorError::MissingRequiredField {
-                        field_name: "ipgTransactionId",
+                        field_name: "ipgTransactionId".into(),
                     },
                 )?,
                 refund_status: map_refund_status(
@@ -2622,7 +2629,7 @@ impl TryFrom<RefundsResponseRouterData<RSync, FiservemeaPaymentsResponse>>
                 // Ver la nota del flujo Execute: el id del reembolso no admite fallback.
                 connector_refund_id: item.response.ipg_transaction_id.ok_or(
                     errors::ConnectorError::MissingRequiredField {
-                        field_name: "ipgTransactionId",
+                        field_name: "ipgTransactionId".into(),
                     },
                 )?,
                 refund_status: map_refund_status(

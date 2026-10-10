@@ -1,5 +1,5 @@
 use common_utils::types::StringMinorUnit;
-use masking::Secret;
+use hyperswitch_masking::Secret;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize)]
@@ -285,13 +285,6 @@ pub enum UsageMode {
     UseCardNumber,
     /// When using the payment method token to transaction process, this indicates to use the network token instead of the card number if both are available.
     UseNetworkToken,
-}
-
-#[derive(Default, Debug, Serialize, Deserialize)]
-pub struct GlobalPayPayer {
-    /// Unique identifier for the Payer on the Global Payments system.
-    #[serde(rename = "id", skip_serializing_if = "Option::is_none")]
-    pub payer_id: Option<String>,
 }
 
 #[derive(Default, Debug, Serialize)]

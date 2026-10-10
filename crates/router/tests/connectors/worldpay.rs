@@ -1,3 +1,4 @@
+use common_enums::GooglePayCardFundingSource;
 use futures::future::OptionFuture;
 use router::types::{self, domain, storage::enums};
 use serde_json::json;
@@ -70,11 +71,13 @@ async fn should_authorize_gpay_payment() {
                             card_network: "VISA".to_string(),
                             card_details: "1234".to_string(),
                             assurance_details: None,
+                            card_funding_source: Some(GooglePayCardFundingSource::Unknown),
                         },
                         tokenization_data: common_types::payments::GpayTokenizationData::Encrypted(
                             common_types::payments::GpayEcryptedTokenizationData {
                                 token_type: "worldpay".to_string(),
                                 token: "someToken".to_string(),
+                                auth_method: None,
                             },
                         ),
                     }),

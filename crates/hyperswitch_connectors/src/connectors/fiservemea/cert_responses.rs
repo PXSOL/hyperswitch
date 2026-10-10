@@ -32,7 +32,7 @@ use hyperswitch_domain_models::{
     router_response_types::{PaymentsResponseData, RedirectForm},
 };
 use hyperswitch_interfaces::{api::ConnectorCommon, types::Response};
-use masking::{PeekInterface, Secret};
+use hyperswitch_masking::{PeekInterface, Secret};
 use serde_json::json;
 
 use super::transformers as fiservemea;

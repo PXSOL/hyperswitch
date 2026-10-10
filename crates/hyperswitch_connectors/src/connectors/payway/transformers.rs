@@ -19,7 +19,7 @@ use hyperswitch_domain_models::{
     types::{PaymentsAuthorizeRouterData, RefundsRouterData},
 };
 use hyperswitch_interfaces::{consts, errors};
-use masking::{PeekInterface, Secret};
+use hyperswitch_masking::{PeekInterface, Secret};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -158,7 +158,7 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
             meta.bill_to
                 .as_ref()
                 .ok_or(errors::ConnectorError::MissingRequiredField {
-                    field_name: "metadata.bill_to",
+                    field_name: "metadata.bill_to".into(),
                 })?;
 
         let device_id = item.router_data.connector_request_reference_id.clone();
@@ -188,7 +188,7 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
             }
             _ => {
                 return Err(errors::ConnectorError::MissingRequiredField {
-                    field_name: "payment_method_token",
+                    field_name: "payment_method_token".into(),
                 }
                 .into())
             }
@@ -204,7 +204,7 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
             PaymentMethodData::Card(card) => card.card_number.get_card_isin(),
             _ => {
                 return Err(errors::ConnectorError::MissingRequiredField {
-                    field_name: "payment_method_data.card",
+                    field_name: "payment_method_data.card".into(),
                 }
                 .into())
             }
@@ -275,7 +275,7 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
         let payment_method_id =
             meta.payment_method_id
                 .ok_or(errors::ConnectorError::MissingRequiredField {
-                    field_name: "metadata.payment_method_id",
+                    field_name: "metadata.payment_method_id".into(),
                 })?;
 
         Ok(Self {
@@ -530,6 +530,7 @@ impl PaywayPaymentsResponse {
                 reason_description
             }),
             connector_metadata: None,
+            connector_response_reference_id: None,
         }
     }
 
@@ -638,6 +639,9 @@ impl<F, T> TryFrom<ResponseRouterData<F, PaywayPaymentsResponse, T, PaymentsResp
                 connector_response_reference_id: item.response.site_transaction_id.clone(),
                 incremental_authorization_allowed: None,
                 charges: None,
+                network_txn_link_id: None,
+                payment_account_reference: None,
+                authentication_data: None,
             })
         };
         Ok(Self {
@@ -684,6 +688,9 @@ pub fn finish_payment_sync<F, T>(
             connector_response_reference_id: None,
             incremental_authorization_allowed: None,
             charges: None,
+            network_txn_link_id: None,
+            payment_account_reference: None,
+            authentication_data: None,
         });
     }
     if let Some(activity) = response.reported_activity(router_data.status, Some(original_amount)) {
@@ -934,6 +941,9 @@ impl<F, T> TryFrom<ResponseRouterData<F, PaywayAuthorizeResponse, T, PaymentsRes
                 connector_response_reference_id: item.response.site_transaction_id.clone(),
                 incremental_authorization_allowed: None,
                 charges: None,
+                network_txn_link_id: None,
+                payment_account_reference: None,
+                authentication_data: None,
             }),
             ..item.data
         })

@@ -31,7 +31,7 @@ use hyperswitch_domain_models::{
     router_request_types::{CompleteAuthorizeData, RefundsData},
 };
 use hyperswitch_interfaces::errors;
-use masking::{ExposeInterface, PeekInterface, Secret};
+use hyperswitch_masking::{ExposeInterface, PeekInterface, Secret};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -191,13 +191,13 @@ pub(super) fn extract_installments(
             .or_else(|| value.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
             .and_then(|n| i32::try_from(n).ok())
             .ok_or(errors::ConnectorError::InvalidDataFormat {
-                field_name: "metadata.installments",
+                field_name: "metadata.installments".into(),
             })?,
     };
 
     if !(1..=MAX_INSTALLMENTS).contains(&installments) {
         return Err(errors::ConnectorError::InvalidDataFormat {
-            field_name: "metadata.installments",
+            field_name: "metadata.installments".into(),
         }
         .into());
     }
@@ -389,7 +389,7 @@ impl TryFrom<&hyperswitch_domain_models::types::TokenizationRouterData> for Womp
             .clone()
             .or_else(|| item.get_optional_billing_full_name())
             .ok_or(errors::ConnectorError::MissingRequiredField {
-                field_name: "card_holder_name",
+                field_name: "card_holder_name".into(),
             })?;
 
         // Wompi rejects a card holder shorter than 5 characters. This is a value
@@ -397,7 +397,7 @@ impl TryFrom<&hyperswitch_domain_models::types::TokenizationRouterData> for Womp
         // `InvalidDataFormat` rather than `MissingRequiredField`.
         if card_holder.clone().expose().trim().chars().count() < 5 {
             return Err(errors::ConnectorError::InvalidDataFormat {
-                field_name: "card_holder_name",
+                field_name: "card_holder_name".into(),
             }
             .into());
         }
@@ -526,7 +526,7 @@ impl TryFrom<&WompiRouterData<&PaymentsAuthorizeRouterData>> for WompiTransactio
         if router_data.request.currency != enums::Currency::COP {
             return Err(errors::ConnectorError::CurrencyNotSupported {
                 message: router_data.request.currency.to_string(),
-                connector: "wompi",
+                connector: "wompi".into(),
             }
             .into());
         }
@@ -539,7 +539,7 @@ impl TryFrom<&WompiRouterData<&PaymentsAuthorizeRouterData>> for WompiTransactio
         if !router_data.request.is_auto_capture()? {
             return Err(errors::ConnectorError::NotSupported {
                 message: "manual capture".to_string(),
-                connector: "wompi",
+                connector: "wompi".into(),
             }
             .into());
         }
@@ -560,7 +560,7 @@ impl TryFrom<&WompiRouterData<&PaymentsAuthorizeRouterData>> for WompiTransactio
             Some(hyperswitch_domain_models::router_data::PaymentMethodToken::Token(token)) => token,
             _ => {
                 return Err(errors::ConnectorError::MissingRequiredField {
-                    field_name: "payment_method_token",
+                    field_name: "payment_method_token".into(),
                 }
                 .into())
             }
@@ -582,7 +582,7 @@ impl TryFrom<&WompiRouterData<&PaymentsAuthorizeRouterData>> for WompiTransactio
             .get_optional_email()
             .or_else(|| router_data.get_optional_billing_email())
             .ok_or(errors::ConnectorError::MissingRequiredField {
-                field_name: "email",
+                field_name: "email".into(),
             })?;
 
         let full_name = router_data.get_optional_billing_full_name();
@@ -817,6 +817,7 @@ pub(super) fn transaction_to_router_data<F, T>(
             network_decline_code: None,
             network_error_message: None,
             connector_metadata: None,
+            connector_response_reference_id: None,
         })
     } else {
         Ok(PaymentsResponseData::TransactionResponse {
@@ -828,6 +829,9 @@ pub(super) fn transaction_to_router_data<F, T>(
             connector_response_reference_id: Some(transaction.reference),
             incremental_authorization_allowed: None,
             charges: None,
+            network_txn_link_id: None,
+            payment_account_reference: None,
+            authentication_data: None,
         })
     };
 
@@ -877,7 +881,7 @@ impl
         if item.data.request.currency != enums::Currency::COP {
             return Err(errors::ConnectorError::CurrencyNotSupported {
                 message: item.data.request.currency.to_string(),
-                connector: "wompi",
+                connector: "wompi".into(),
             }
             .into());
         }
@@ -942,6 +946,9 @@ impl
                 connector_response_reference_id: Some(reference),
                 incremental_authorization_allowed: None,
                 charges: None,
+                network_txn_link_id: None,
+                payment_account_reference: None,
+                authentication_data: None,
             }),
             ..item.data
         })
@@ -1169,7 +1176,7 @@ pub(super) fn parse_browser_info_payload(
         .and_then(|redirect_response| redirect_response.payload.as_ref())
         .and_then(|payload| payload.peek().as_object().cloned())
         .ok_or(errors::ConnectorError::MissingRequiredField {
-            field_name: "redirect_response.payload",
+            field_name: "redirect_response.payload".into(),
         })?;
 
     Ok(WompiBrowserInfo {
@@ -1197,7 +1204,7 @@ pub(super) fn build_three_ds_transaction_request(
     if req.request.currency != enums::Currency::COP {
         return Err(errors::ConnectorError::CurrencyNotSupported {
             message: req.request.currency.to_string(),
-            connector: "wompi",
+            connector: "wompi".into(),
         }
         .into());
     }
@@ -1351,7 +1358,7 @@ pub(super) fn build_challenge_page(
 ) -> CustomResult<String, errors::ConnectorError> {
     let mut done_url = url::Url::parse(complete_authorize_url).change_context(
         errors::ConnectorError::InvalidDataFormat {
-            field_name: "complete_authorize_url",
+            field_name: "complete_authorize_url".into(),
         },
     )?;
     done_url
@@ -1495,6 +1502,9 @@ pub(super) fn three_ds_create_response<F, T>(
             connector_response_reference_id: Some(transaction.reference),
             incremental_authorization_allowed: None,
             charges: None,
+            network_txn_link_id: None,
+            payment_account_reference: None,
+            authentication_data: None,
         }),
         ..data
     })
@@ -1546,6 +1556,9 @@ pub(super) fn three_ds_poll_response<F, T>(
             connector_response_reference_id: Some(transaction.reference),
             incremental_authorization_allowed: None,
             charges: None,
+            network_txn_link_id: None,
+            payment_account_reference: None,
+            authentication_data: None,
         }),
         ..data
     })
@@ -1618,7 +1631,7 @@ pub(super) fn build_card_three_ds_authorize_response(
     if item.data.request.currency != enums::Currency::COP {
         return Err(errors::ConnectorError::CurrencyNotSupported {
             message: item.data.request.currency.to_string(),
-            connector: "wompi",
+            connector: "wompi".into(),
         }
         .into());
     }
@@ -1627,7 +1640,7 @@ pub(super) fn build_card_three_ds_authorize_response(
         Some(hyperswitch_domain_models::router_data::PaymentMethodToken::Token(token)) => token,
         _ => {
             return Err(errors::ConnectorError::MissingRequiredField {
-                field_name: "payment_method_token",
+                field_name: "payment_method_token".into(),
             }
             .into())
         }
@@ -1639,7 +1652,7 @@ pub(super) fn build_card_three_ds_authorize_response(
         .get_optional_email()
         .or_else(|| item.data.get_optional_billing_email())
         .ok_or(errors::ConnectorError::MissingRequiredField {
-            field_name: "email",
+            field_name: "email".into(),
         })?;
 
     let card_holder_name = match &item.data.request.payment_method_data {
@@ -1651,12 +1664,12 @@ pub(super) fn build_card_three_ds_authorize_response(
         .get_optional_billing_full_name()
         .or(card_holder_name)
         .ok_or(errors::ConnectorError::MissingRequiredField {
-            field_name: "billing.address.first_name",
+            field_name: "billing.address.first_name".into(),
         })?;
 
     let phone_number = build_customer_data_phone_number(&item.data).ok_or(
         errors::ConnectorError::MissingRequiredField {
-            field_name: "billing.phone.number",
+            field_name: "billing.phone.number".into(),
         },
     )?;
 
@@ -1674,7 +1687,7 @@ pub(super) fn build_card_three_ds_authorize_response(
 
     let complete_authorize_url = item.data.request.complete_authorize_url.clone().ok_or(
         errors::ConnectorError::MissingRequiredField {
-            field_name: "complete_authorize_url",
+            field_name: "complete_authorize_url".into(),
         },
     )?;
     let page = build_browser_info_collection_page(&complete_authorize_url);
@@ -1691,6 +1704,9 @@ pub(super) fn build_card_three_ds_authorize_response(
             connector_response_reference_id: Some(reference),
             incremental_authorization_allowed: None,
             charges: None,
+            network_txn_link_id: None,
+            payment_account_reference: None,
+            authentication_data: None,
         }),
         ..item.data
     })
@@ -1869,6 +1885,9 @@ pub(super) fn card_sync_by_reference_response<F, T>(
                 connector_response_reference_id: None,
                 incremental_authorization_allowed: None,
                 charges: None,
+                network_txn_link_id: None,
+                payment_account_reference: None,
+                authentication_data: None,
             }),
             ..data
         },
@@ -1923,6 +1942,9 @@ impl<F, T> TryFrom<ResponseRouterData<F, WompiSearchResponse, T, PaymentsRespons
                     connector_response_reference_id: Some(reference),
                     incremental_authorization_allowed: None,
                     charges: None,
+                    network_txn_link_id: None,
+                    payment_account_reference: None,
+                    authentication_data: None,
                 }),
             ),
             HostedSyncOutcome::Voided { id, reference } => (
@@ -1936,6 +1958,9 @@ impl<F, T> TryFrom<ResponseRouterData<F, WompiSearchResponse, T, PaymentsRespons
                     connector_response_reference_id: Some(reference),
                     incremental_authorization_allowed: None,
                     charges: None,
+                    network_txn_link_id: None,
+                    payment_account_reference: None,
+                    authentication_data: None,
                 }),
             ),
             HostedSyncOutcome::Pending { id } => (
@@ -1951,6 +1976,9 @@ impl<F, T> TryFrom<ResponseRouterData<F, WompiSearchResponse, T, PaymentsRespons
                     connector_response_reference_id: None,
                     incremental_authorization_allowed: None,
                     charges: None,
+                    network_txn_link_id: None,
+                    payment_account_reference: None,
+                    authentication_data: None,
                 }),
             ),
             HostedSyncOutcome::Failure {
@@ -1970,6 +1998,7 @@ impl<F, T> TryFrom<ResponseRouterData<F, WompiSearchResponse, T, PaymentsRespons
                     network_decline_code: None,
                     network_error_message: None,
                     connector_metadata: None,
+                    connector_response_reference_id: None,
                 }),
             ),
         };
@@ -2051,7 +2080,7 @@ pub(super) fn validate_void_refund(
     if currency != enums::Currency::COP {
         return Err(errors::ConnectorError::CurrencyNotSupported {
             message: currency.to_string(),
-            connector: "wompi",
+            connector: "wompi".into(),
         }
         .into());
     }
@@ -2059,7 +2088,7 @@ pub(super) fn validate_void_refund(
     if refund_amount != payment_amount {
         return Err(errors::ConnectorError::NotSupported {
             message: "partial refund".to_string(),
-            connector: "wompi",
+            connector: "wompi".into(),
         }
         .into());
     }
@@ -2072,7 +2101,7 @@ pub(super) fn validate_void_refund(
         if payment_method_type != "CARD" {
             return Err(errors::ConnectorError::NotSupported {
                 message: "refund of a non-card payment".to_string(),
-                connector: "wompi",
+                connector: "wompi".into(),
             }
             .into());
         }
@@ -2150,6 +2179,7 @@ impl<F> TryFrom<RefundsResponseRouterData<F, WompiVoidResponse>> for RefundsRout
                 network_decline_code: None,
                 network_error_message: None,
                 connector_metadata: None,
+                connector_response_reference_id: None,
             })
         } else {
             Ok(RefundsResponseData {
@@ -3607,9 +3637,8 @@ mod tests {
         let result = WompiTransactionsRequest::try_from(&wompi_router_data);
         assert!(matches!(
             result.unwrap_err().current_context(),
-            errors::ConnectorError::MissingRequiredField {
-                field_name: "email"
-            }
+            errors::ConnectorError::MissingRequiredField { field_name }
+                if field_name == "email"
         ));
     }
 
@@ -4431,9 +4460,8 @@ mod tests {
         let result = parse_browser_info_payload(Some(&redirect_response));
         assert!(matches!(
             result.unwrap_err().current_context(),
-            errors::ConnectorError::MissingRequiredField {
-                field_name: "browser_tz"
-            }
+            errors::ConnectorError::MissingRequiredField { field_name }
+                if field_name == "browser_tz"
         ));
     }
 
@@ -4445,9 +4473,8 @@ mod tests {
         let result = parse_browser_info_payload(Some(&redirect_response));
         assert!(matches!(
             result.unwrap_err().current_context(),
-            errors::ConnectorError::InvalidDataFormat {
-                field_name: "browser_user_agent"
-            }
+            errors::ConnectorError::InvalidDataFormat { field_name }
+                if field_name == "browser_user_agent"
         ));
     }
 
@@ -4869,6 +4896,7 @@ mod tests {
             network_decline_code: None,
             network_error_message: None,
             connector_metadata: None,
+            connector_response_reference_id: None,
         };
         assert!(is_duplicate_reference_error(&error));
     }
@@ -4886,6 +4914,7 @@ mod tests {
             network_decline_code: None,
             network_error_message: None,
             connector_metadata: None,
+            connector_response_reference_id: None,
         };
         assert!(!is_duplicate_reference_error(&error));
     }

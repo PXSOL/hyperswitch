@@ -43,7 +43,7 @@ use hyperswitch_interfaces::{
     types::{self, Response},
     webhooks,
 };
-use masking::{ExposeInterface, Mask};
+use hyperswitch_masking::{ExposeInterface, Mask};
 use transformers as payway;
 
 use crate::{
@@ -88,7 +88,7 @@ impl Payway {
     fn private_key_headers(
         &self,
         auth_type: &ConnectorAuthType,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
         let auth = payway::PaywayAuthType::try_from(auth_type)
             .change_context(errors::ConnectorError::FailedToObtainAuthType)?;
         Ok(vec![
@@ -122,7 +122,7 @@ impl ConnectorIntegration<PaymentMethodToken, PaymentMethodTokenizationData, Pay
         &self,
         req: &TokenizationRouterData,
         _connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
         let auth = payway::PaywayAuthType::try_from(&req.connector_auth_type)
             .change_context(errors::ConnectorError::FailedToObtainAuthType)?;
         Ok(vec![
@@ -217,7 +217,7 @@ where
         &self,
         req: &RouterData<Flow, Request, Response>,
         _connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
         let mut header = vec![(
             headers::CONTENT_TYPE.to_string(),
             self.get_content_type().to_string().into(),
@@ -248,7 +248,7 @@ impl ConnectorCommon for Payway {
     fn get_auth_header(
         &self,
         auth_type: &ConnectorAuthType,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
         let auth = payway::PaywayAuthType::try_from(auth_type)
             .change_context(errors::ConnectorError::FailedToObtainAuthType)?;
         Ok(vec![
@@ -281,6 +281,7 @@ impl ConnectorCommon for Payway {
                 network_decline_code: Some("500".to_string()),
                 network_error_message: Some("connector internal server error".to_string()),
                 connector_metadata: None,
+                connector_response_reference_id: None,
             });
         }
 
@@ -300,6 +301,7 @@ impl ConnectorCommon for Payway {
                 network_decline_code: Some("401".to_string()),
                 network_error_message: Some("invalid authentication credentials".to_string()),
                 connector_metadata: None,
+                connector_response_reference_id: None,
             });
         }
 
@@ -320,6 +322,7 @@ impl ConnectorCommon for Payway {
                 network_decline_code: Some("403".to_string()),
                 network_error_message: Some("invalid authentication credentials".to_string()),
                 connector_metadata: None,
+                connector_response_reference_id: None,
             });
         }
 
@@ -365,6 +368,7 @@ impl ConnectorCommon for Payway {
                         network_decline_code: Some(err_type.unwrap_or("400").to_string()),
                         network_error_message: Some(message),
                         connector_metadata: None,
+                        connector_response_reference_id: None,
                     });
                 }
             }
@@ -465,6 +469,7 @@ impl ConnectorCommon for Payway {
                         reason_desc
                     }),
                     connector_metadata: None,
+                    connector_response_reference_id: None,
                 });
             }
         }
@@ -488,25 +493,12 @@ impl ConnectorCommon for Payway {
             network_decline_code: Some("unknown".to_string()),
             network_error_message: Some("unknown error".to_string()),
             connector_metadata: None,
+            connector_response_reference_id: None,
         })
     }
 }
 
 impl ConnectorValidation for Payway {
-    fn validate_mandate_payment(
-        &self,
-        _pm_type: Option<enums::PaymentMethodType>,
-        pm_data: PaymentMethodData,
-    ) -> CustomResult<(), errors::ConnectorError> {
-        match pm_data {
-            PaymentMethodData::Card(_) => Err(errors::ConnectorError::NotImplemented(
-                "validate_mandate_payment does not support cards".to_string(),
-            )
-            .into()),
-            _ => Ok(()),
-        }
-    }
-
     fn validate_psync_reference_id(
         &self,
         _data: &PaymentsSyncData,
@@ -526,7 +518,7 @@ impl ConnectorIntegration<Session, PaymentsSessionData, PaymentsResponseData> fo
     ) -> CustomResult<Option<Request>, errors::ConnectorError> {
         Err(errors::ConnectorError::NotSupported {
             message: "Payment sessions not supported".to_string(),
-            connector: "Payway",
+            connector: "Payway".into(),
         }
         .into())
     }
@@ -541,7 +533,7 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         &self,
         req: &PaymentsAuthorizeRouterData,
         _connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
         self.private_key_headers(&req.connector_auth_type)
     }
 
@@ -631,7 +623,7 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Pay
         &self,
         req: &PaymentsSyncRouterData,
         _connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
         self.private_key_headers(&req.connector_auth_type)
     }
 
@@ -713,7 +705,7 @@ impl ConnectorIntegration<Capture, PaymentsCaptureData, PaymentsResponseData> fo
         &self,
         req: &PaymentsCaptureRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
         self.build_headers(req, connectors)
     }
 
@@ -792,7 +784,7 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Payway 
         &self,
         req: &RefundsRouterData<Execute>,
         _connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
         self.private_key_headers(&req.connector_auth_type)
     }
 
@@ -880,7 +872,7 @@ impl ConnectorIntegration<RSync, RefundsData, RefundsResponseData> for Payway {
         &self,
         req: &RefundSyncRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
         self.build_headers(req, connectors)
     }
 
@@ -954,6 +946,7 @@ impl webhooks::IncomingWebhook for Payway {
     fn get_webhook_event_type(
         &self,
         _request: &webhooks::IncomingWebhookRequestDetails<'_>,
+        _context: Option<&webhooks::WebhookContext>,
     ) -> CustomResult<api_models::webhooks::IncomingWebhookEvent, errors::ConnectorError> {
         Err(report!(errors::ConnectorError::WebhooksNotImplemented))
     }
@@ -961,7 +954,7 @@ impl webhooks::IncomingWebhook for Payway {
     fn get_webhook_resource_object(
         &self,
         _request: &webhooks::IncomingWebhookRequestDetails<'_>,
-    ) -> CustomResult<Box<dyn masking::ErasedMaskSerialize>, errors::ConnectorError> {
+    ) -> CustomResult<Box<dyn hyperswitch_masking::ErasedMaskSerialize>, errors::ConnectorError> {
         Err(report!(errors::ConnectorError::WebhooksNotImplemented))
     }
 }
@@ -1040,7 +1033,7 @@ mod payment_sync_tests {
         router_request_types::{ResponseId, SyncRequestType},
     };
     use hyperswitch_interfaces::consts;
-    use masking::Secret;
+    use hyperswitch_masking::Secret;
     use serde_json::json;
 
     use super::*;
@@ -1182,7 +1175,7 @@ mod payment_sync_tests {
     }
 
     /// Name and plain value of every header, in order.
-    fn plain(headers: Vec<(String, masking::Maskable<String>)>) -> Vec<(String, String)> {
+    fn plain(headers: Vec<(String, hyperswitch_masking::Maskable<String>)>) -> Vec<(String, String)> {
         headers
             .into_iter()
             .map(|(name, value)| (name, value.into_inner()))
