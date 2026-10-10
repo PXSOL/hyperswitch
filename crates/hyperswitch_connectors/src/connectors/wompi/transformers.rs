@@ -31,7 +31,7 @@ use hyperswitch_domain_models::{
     router_request_types::{CompleteAuthorizeData, RefundsData},
 };
 use hyperswitch_interfaces::errors;
-use masking::{ExposeInterface, PeekInterface, Secret};
+use hyperswitch_masking::{ExposeInterface, PeekInterface, Secret};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -191,13 +191,13 @@ pub(super) fn extract_installments(
             .or_else(|| value.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
             .and_then(|n| i32::try_from(n).ok())
             .ok_or(errors::ConnectorError::InvalidDataFormat {
-                field_name: "metadata.installments",
+                field_name: "metadata.installments".into(),
             })?,
     };
 
     if !(1..=MAX_INSTALLMENTS).contains(&installments) {
         return Err(errors::ConnectorError::InvalidDataFormat {
-            field_name: "metadata.installments",
+            field_name: "metadata.installments".into(),
         }
         .into());
     }
@@ -257,7 +257,7 @@ const ACCESS_TOKEN_TTL_MAX_SECONDS: i64 = 3600;
 /// reuse a cached token, so a non-positive TTL here simply is not cached, which is
 /// the correct outcome for a pair that is already (nearly) dead.
 fn access_token_ttl_seconds(acceptance_token: &str, personal_auth_token: &str) -> i64 {
-    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let now = common_utils::date_time::now_unix_timestamp();
     let min_exp = [
         decode_jwt_exp(acceptance_token),
         decode_jwt_exp(personal_auth_token),
@@ -389,7 +389,7 @@ impl TryFrom<&hyperswitch_domain_models::types::TokenizationRouterData> for Womp
             .clone()
             .or_else(|| item.get_optional_billing_full_name())
             .ok_or(errors::ConnectorError::MissingRequiredField {
-                field_name: "card_holder_name",
+                field_name: "card_holder_name".into(),
             })?;
 
         // Wompi rejects a card holder shorter than 5 characters. This is a value
@@ -397,7 +397,7 @@ impl TryFrom<&hyperswitch_domain_models::types::TokenizationRouterData> for Womp
         // `InvalidDataFormat` rather than `MissingRequiredField`.
         if card_holder.clone().expose().trim().chars().count() < 5 {
             return Err(errors::ConnectorError::InvalidDataFormat {
-                field_name: "card_holder_name",
+                field_name: "card_holder_name".into(),
             }
             .into());
         }
@@ -539,7 +539,7 @@ impl TryFrom<&WompiRouterData<&PaymentsAuthorizeRouterData>> for WompiTransactio
         if !router_data.request.is_auto_capture()? {
             return Err(errors::ConnectorError::NotSupported {
                 message: "manual capture".to_string(),
-                connector: "wompi",
+                connector: "wompi".into(),
             }
             .into());
         }
@@ -560,7 +560,7 @@ impl TryFrom<&WompiRouterData<&PaymentsAuthorizeRouterData>> for WompiTransactio
             Some(hyperswitch_domain_models::router_data::PaymentMethodToken::Token(token)) => token,
             _ => {
                 return Err(errors::ConnectorError::MissingRequiredField {
-                    field_name: "payment_method_token",
+                    field_name: "payment_method_token".into(),
                 }
                 .into())
             }
@@ -582,7 +582,7 @@ impl TryFrom<&WompiRouterData<&PaymentsAuthorizeRouterData>> for WompiTransactio
             .get_optional_email()
             .or_else(|| router_data.get_optional_billing_email())
             .ok_or(errors::ConnectorError::MissingRequiredField {
-                field_name: "email",
+                field_name: "email".into(),
             })?;
 
         let full_name = router_data.get_optional_billing_full_name();
@@ -817,6 +817,7 @@ pub(super) fn transaction_to_router_data<F, T>(
             network_decline_code: None,
             network_error_message: None,
             connector_metadata: None,
+            connector_response_reference_id: None,
         })
     } else {
         Ok(PaymentsResponseData::TransactionResponse {
@@ -828,6 +829,9 @@ pub(super) fn transaction_to_router_data<F, T>(
             connector_response_reference_id: Some(transaction.reference),
             incremental_authorization_allowed: None,
             charges: None,
+            network_txn_link_id: None,
+            payment_account_reference: None,
+            authentication_data: None,
         })
     };
 
@@ -942,6 +946,9 @@ impl
                 connector_response_reference_id: Some(reference),
                 incremental_authorization_allowed: None,
                 charges: None,
+                network_txn_link_id: None,
+                payment_account_reference: None,
+                authentication_data: None,
             }),
             ..item.data
         })
@@ -1150,10 +1157,15 @@ fn extract_browser_field(
     let value = payload
         .get(field_name)
         .and_then(|value| value.as_str())
-        .ok_or(errors::ConnectorError::MissingRequiredField { field_name })?;
+        .ok_or(errors::ConnectorError::MissingRequiredField {
+            field_name: field_name.into(),
+        })?;
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.chars().count() > MAX_BROWSER_FIELD_LEN {
-        return Err(errors::ConnectorError::InvalidDataFormat { field_name }.into());
+        return Err(errors::ConnectorError::InvalidDataFormat {
+            field_name: field_name.into(),
+        }
+        .into());
     }
     Ok(trimmed.to_string())
 }
@@ -1169,7 +1181,7 @@ pub(super) fn parse_browser_info_payload(
         .and_then(|redirect_response| redirect_response.payload.as_ref())
         .and_then(|payload| payload.peek().as_object().cloned())
         .ok_or(errors::ConnectorError::MissingRequiredField {
-            field_name: "redirect_response.payload",
+            field_name: "redirect_response.payload".into(),
         })?;
 
     Ok(WompiBrowserInfo {
@@ -1351,7 +1363,7 @@ pub(super) fn build_challenge_page(
 ) -> CustomResult<String, errors::ConnectorError> {
     let mut done_url = url::Url::parse(complete_authorize_url).change_context(
         errors::ConnectorError::InvalidDataFormat {
-            field_name: "complete_authorize_url",
+            field_name: "complete_authorize_url".into(),
         },
     )?;
     done_url
@@ -1495,6 +1507,9 @@ pub(super) fn three_ds_create_response<F, T>(
             connector_response_reference_id: Some(transaction.reference),
             incremental_authorization_allowed: None,
             charges: None,
+            network_txn_link_id: None,
+            payment_account_reference: None,
+            authentication_data: None,
         }),
         ..data
     })
@@ -1546,6 +1561,9 @@ pub(super) fn three_ds_poll_response<F, T>(
             connector_response_reference_id: Some(transaction.reference),
             incremental_authorization_allowed: None,
             charges: None,
+            network_txn_link_id: None,
+            payment_account_reference: None,
+            authentication_data: None,
         }),
         ..data
     })
@@ -1627,7 +1645,7 @@ pub(super) fn build_card_three_ds_authorize_response(
         Some(hyperswitch_domain_models::router_data::PaymentMethodToken::Token(token)) => token,
         _ => {
             return Err(errors::ConnectorError::MissingRequiredField {
-                field_name: "payment_method_token",
+                field_name: "payment_method_token".into(),
             }
             .into())
         }
@@ -1639,7 +1657,7 @@ pub(super) fn build_card_three_ds_authorize_response(
         .get_optional_email()
         .or_else(|| item.data.get_optional_billing_email())
         .ok_or(errors::ConnectorError::MissingRequiredField {
-            field_name: "email",
+            field_name: "email".into(),
         })?;
 
     let card_holder_name = match &item.data.request.payment_method_data {
@@ -1651,12 +1669,12 @@ pub(super) fn build_card_three_ds_authorize_response(
         .get_optional_billing_full_name()
         .or(card_holder_name)
         .ok_or(errors::ConnectorError::MissingRequiredField {
-            field_name: "billing.address.first_name",
+            field_name: "billing.address.first_name".into(),
         })?;
 
     let phone_number = build_customer_data_phone_number(&item.data).ok_or(
         errors::ConnectorError::MissingRequiredField {
-            field_name: "billing.phone.number",
+            field_name: "billing.phone.number".into(),
         },
     )?;
 
@@ -1674,7 +1692,7 @@ pub(super) fn build_card_three_ds_authorize_response(
 
     let complete_authorize_url = item.data.request.complete_authorize_url.clone().ok_or(
         errors::ConnectorError::MissingRequiredField {
-            field_name: "complete_authorize_url",
+            field_name: "complete_authorize_url".into(),
         },
     )?;
     let page = build_browser_info_collection_page(&complete_authorize_url);
@@ -1691,6 +1709,9 @@ pub(super) fn build_card_three_ds_authorize_response(
             connector_response_reference_id: Some(reference),
             incremental_authorization_allowed: None,
             charges: None,
+            network_txn_link_id: None,
+            payment_account_reference: None,
+            authentication_data: None,
         }),
         ..item.data
     })
@@ -1869,6 +1890,9 @@ pub(super) fn card_sync_by_reference_response<F, T>(
                 connector_response_reference_id: None,
                 incremental_authorization_allowed: None,
                 charges: None,
+                network_txn_link_id: None,
+                payment_account_reference: None,
+                authentication_data: None,
             }),
             ..data
         },
@@ -1904,7 +1928,7 @@ impl<F, T> TryFrom<ResponseRouterData<F, WompiSearchResponse, T, PaymentsRespons
     fn try_from(
         item: ResponseRouterData<F, WompiSearchResponse, T, PaymentsResponseData>,
     ) -> Result<Self, Self::Error> {
-        let now = time::OffsetDateTime::now_utc();
+        let now = common_utils::date_time::now().assume_utc();
         let outcome = select_hosted_transaction(item.response.data, now);
 
         let (status, response) = match outcome {
@@ -1923,6 +1947,9 @@ impl<F, T> TryFrom<ResponseRouterData<F, WompiSearchResponse, T, PaymentsRespons
                     connector_response_reference_id: Some(reference),
                     incremental_authorization_allowed: None,
                     charges: None,
+                    network_txn_link_id: None,
+                    payment_account_reference: None,
+                    authentication_data: None,
                 }),
             ),
             HostedSyncOutcome::Voided { id, reference } => (
@@ -1936,6 +1963,9 @@ impl<F, T> TryFrom<ResponseRouterData<F, WompiSearchResponse, T, PaymentsRespons
                     connector_response_reference_id: Some(reference),
                     incremental_authorization_allowed: None,
                     charges: None,
+                    network_txn_link_id: None,
+                    payment_account_reference: None,
+                    authentication_data: None,
                 }),
             ),
             HostedSyncOutcome::Pending { id } => (
@@ -1951,6 +1981,9 @@ impl<F, T> TryFrom<ResponseRouterData<F, WompiSearchResponse, T, PaymentsRespons
                     connector_response_reference_id: None,
                     incremental_authorization_allowed: None,
                     charges: None,
+                    network_txn_link_id: None,
+                    payment_account_reference: None,
+                    authentication_data: None,
                 }),
             ),
             HostedSyncOutcome::Failure {
@@ -1970,6 +2003,7 @@ impl<F, T> TryFrom<ResponseRouterData<F, WompiSearchResponse, T, PaymentsRespons
                     network_decline_code: None,
                     network_error_message: None,
                     connector_metadata: None,
+                    connector_response_reference_id: None,
                 }),
             ),
         };
@@ -2059,7 +2093,7 @@ pub(super) fn validate_void_refund(
     if refund_amount != payment_amount {
         return Err(errors::ConnectorError::NotSupported {
             message: "partial refund".to_string(),
-            connector: "wompi",
+            connector: "wompi".into(),
         }
         .into());
     }
@@ -2072,7 +2106,7 @@ pub(super) fn validate_void_refund(
         if payment_method_type != "CARD" {
             return Err(errors::ConnectorError::NotSupported {
                 message: "refund of a non-card payment".to_string(),
-                connector: "wompi",
+                connector: "wompi".into(),
             }
             .into());
         }
@@ -2150,6 +2184,7 @@ impl<F> TryFrom<RefundsResponseRouterData<F, WompiVoidResponse>> for RefundsRout
                 network_decline_code: None,
                 network_error_message: None,
                 connector_metadata: None,
+                connector_response_reference_id: None,
             })
         } else {
             Ok(RefundsResponseData {
@@ -2834,7 +2869,7 @@ mod tests {
 
     #[test]
     fn jwt_exp_claim_is_decoded() {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let now = common_utils::date_time::now_unix_timestamp();
         let token = make_jwt(now + 1000);
         assert_eq!(decode_jwt_exp(&token), Some(now + 1000));
     }
@@ -2846,7 +2881,7 @@ mod tests {
 
     #[test]
     fn access_token_ttl_uses_the_sooner_exp() {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let now = common_utils::date_time::now_unix_timestamp();
         let far_future = make_jwt(now + 100_000);
         let sooner = make_jwt(now + 2000);
         let ttl = access_token_ttl_seconds(&far_future, &sooner);
@@ -2856,7 +2891,7 @@ mod tests {
 
     #[test]
     fn access_token_ttl_clamps_down_to_maximum() {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let now = common_utils::date_time::now_unix_timestamp();
         let far_future = make_jwt(now + 100_000);
         let ttl = access_token_ttl_seconds(&far_future, &far_future);
         assert_eq!(ttl, ACCESS_TOKEN_TTL_MAX_SECONDS);
@@ -2864,7 +2899,7 @@ mod tests {
 
     #[test]
     fn access_token_ttl_never_clamps_an_expired_pair_up() {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let now = common_utils::date_time::now_unix_timestamp();
         // Already expired: raw TTL would be negative, and must stay 0 (never
         // cached) rather than being clamped up to a minimum that would cache a
         // dead pair.
@@ -3409,6 +3444,10 @@ mod tests {
             nick_name: None,
             card_holder_name: Some(Secret::new("PXSOL TEST".to_string())),
             co_badged_card_data: None,
+            card_subtype: None,
+            card_segment_type: None,
+            funding_source: None,
+            card_issuing_country_code: None,
         }
     }
 
@@ -3429,8 +3468,6 @@ mod tests {
             customer_name: None,
             currency,
             confirm: true,
-            statement_descriptor_suffix: None,
-            statement_descriptor: None,
             capture_method: Some(enums::CaptureMethod::Automatic),
             router_return_url,
             webhook_url: None,
@@ -3467,6 +3504,20 @@ mod tests {
             payment_channel: None,
             enable_partial_authorization: None,
             enable_overcapture: None,
+            ucs_authentication_data: None,
+            force_3ds_challenge: None,
+            guest_customer: None,
+            is_stored_credential: None,
+            mit_category: None,
+            billing_descriptor: None,
+            tokenization: None,
+            partner_merchant_identifier_details: None,
+            feature_metadata: None,
+            installment_details: None,
+            connector_intent_metadata: None,
+            is_account_funded_transaction: None,
+            recipient_details: None,
+            business_country: None,
         }
     }
 
@@ -3539,6 +3590,15 @@ mod tests {
             psd2_sca_exemption_type: None,
             raw_connector_response: None,
             is_payment_id_from_merchant: None,
+            payment_method_type: None,
+            payout_id: None,
+            authorized_amount: None,
+            accept_amount_mismatch: None,
+            customer_document_details: None,
+            customer_date_of_birth: None,
+            feature_data: None,
+            sender_payment_instrument_id: None,
+            connector_returned_payment_method_details: None,
         }
     }
 
@@ -3607,9 +3667,8 @@ mod tests {
         let result = WompiTransactionsRequest::try_from(&wompi_router_data);
         assert!(matches!(
             result.unwrap_err().current_context(),
-            errors::ConnectorError::MissingRequiredField {
-                field_name: "email"
-            }
+            errors::ConnectorError::MissingRequiredField { field_name }
+                if field_name == "email"
         ));
     }
 
@@ -3831,6 +3890,7 @@ mod tests {
             merchant_config_currency: None,
             capture_method: None,
             additional_payment_method_data: None,
+            payment_connector_request_reference_id: None,
         }
     }
 
@@ -3892,6 +3952,15 @@ mod tests {
             psd2_sca_exemption_type: None,
             raw_connector_response: None,
             is_payment_id_from_merchant: None,
+            payment_method_type: None,
+            payout_id: None,
+            authorized_amount: None,
+            accept_amount_mismatch: None,
+            customer_document_details: None,
+            customer_date_of_birth: None,
+            feature_data: None,
+            sender_payment_instrument_id: None,
+            connector_returned_payment_method_details: None,
         }
     }
 
@@ -4345,6 +4414,20 @@ mod tests {
             merchant_account_id: None,
             merchant_config_currency: None,
             threeds_method_comp_ind: None,
+            request_incremental_authorization: false,
+            authentication_data: None,
+            payment_method_type: None,
+            is_stored_credential: None,
+            tokenization: None,
+            router_return_url: None,
+            merchant_order_reference_id: None,
+            is_account_funded_transaction: None,
+            recipient_details: None,
+            business_country: None,
+            connector_intent_metadata: None,
+            order_id: None,
+            force_3ds_challenge: None,
+            enable_overcapture: None,
         };
 
         RouterData {
@@ -4404,6 +4487,15 @@ mod tests {
             psd2_sca_exemption_type: None,
             raw_connector_response: None,
             is_payment_id_from_merchant: None,
+            payment_method_type: None,
+            payout_id: None,
+            authorized_amount: None,
+            accept_amount_mismatch: None,
+            customer_document_details: None,
+            customer_date_of_birth: None,
+            feature_data: None,
+            sender_payment_instrument_id: None,
+            connector_returned_payment_method_details: None,
         }
     }
 
@@ -4431,9 +4523,8 @@ mod tests {
         let result = parse_browser_info_payload(Some(&redirect_response));
         assert!(matches!(
             result.unwrap_err().current_context(),
-            errors::ConnectorError::MissingRequiredField {
-                field_name: "browser_tz"
-            }
+            errors::ConnectorError::MissingRequiredField { field_name }
+                if field_name == "browser_tz"
         ));
     }
 
@@ -4445,9 +4536,8 @@ mod tests {
         let result = parse_browser_info_payload(Some(&redirect_response));
         assert!(matches!(
             result.unwrap_err().current_context(),
-            errors::ConnectorError::InvalidDataFormat {
-                field_name: "browser_user_agent"
-            }
+            errors::ConnectorError::InvalidDataFormat { field_name }
+                if field_name == "browser_user_agent"
         ));
     }
 
@@ -4869,6 +4959,7 @@ mod tests {
             network_decline_code: None,
             network_error_message: None,
             connector_metadata: None,
+            connector_response_reference_id: None,
         };
         assert!(is_duplicate_reference_error(&error));
     }
@@ -4886,6 +4977,7 @@ mod tests {
             network_decline_code: None,
             network_error_message: None,
             connector_metadata: None,
+            connector_response_reference_id: None,
         };
         assert!(!is_duplicate_reference_error(&error));
     }

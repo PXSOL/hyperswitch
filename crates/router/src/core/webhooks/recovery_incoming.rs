@@ -18,16 +18,18 @@ use hyperswitch_domain_models::{
     types as router_types,
 };
 use hyperswitch_interfaces::webhooks as interface_webhooks;
-use masking::{PeekInterface, Secret};
+use hyperswitch_masking::{PeekInterface, Secret};
 use router_env::{instrument, logger, tracing};
 use services::kafka;
 use storage::business_status;
 
 use crate::{
+    consts,
     core::{
         self, admin,
         errors::{self, CustomResult},
         payments::{self, helpers},
+        revenue_recovery::retry_stats,
     },
     db::{errors::RevenueRecoveryError, StorageInterface},
     routes::{app::ReqState, metrics, SessionState},
@@ -55,7 +57,7 @@ pub const REVENUE_RECOVERY: &str = "revenue_recovery";
 #[cfg(feature = "revenue_recovery")]
 pub async fn recovery_incoming_webhook_flow(
     state: SessionState,
-    merchant_context: domain::MerchantContext,
+    platform: domain::Platform,
     business_profile: domain::Profile,
     source_verified: bool,
     connector_enum: &connector_integration_interface::ConnectorEnum,
@@ -93,7 +95,7 @@ pub async fn recovery_incoming_webhook_flow(
         BillingConnectorPaymentsSyncResponseData::get_billing_connector_payment_details(
             should_billing_connector_payment_api_called,
             &state,
-            &merchant_context,
+            &platform,
             &billing_connector_account,
             connector_name,
             object_ref_id,
@@ -108,7 +110,7 @@ pub async fn recovery_incoming_webhook_flow(
         BillingConnectorInvoiceSyncResponseData::get_billing_connector_invoice_details(
             should_billing_connector_invoice_api_called,
             &state,
-            &merchant_context,
+            &platform,
             &billing_connector_account,
             connector_name,
             invoice_id,
@@ -122,38 +124,61 @@ pub async fn recovery_incoming_webhook_flow(
         billing_connector_invoice_details.as_ref(),
     )?;
 
+    let is_event_recovery_transaction_event = event_type.is_recovery_transaction_event();
+
+    // Resolve the gateway before persistence to avoid creating records for an unmapped account.
+    let resolved_transaction_details = if is_event_recovery_transaction_event {
+        let invoice_transaction_details =
+            RevenueRecoveryAttempt::get_recovery_invoice_transaction_details(
+                connector_enum,
+                request_details,
+                billing_connector_payment_details.as_ref(),
+                &invoice_details.0,
+            )?;
+
+        let payment_merchant_connector_account = invoice_transaction_details
+            .find_payment_merchant_connector_account(
+                &state,
+                platform.get_processor().get_key_store(),
+                &billing_connector_account,
+            )
+            .await?;
+
+        Some((
+            invoice_transaction_details,
+            payment_merchant_connector_account,
+        ))
+    } else {
+        None
+    };
+
     // Fetch the intent using merchant reference id, if not found create new intent.
     let payment_intent = invoice_details
-        .get_payment_intent(&state, &req_state, &merchant_context, &business_profile)
+        .get_payment_intent(&state, &req_state, &platform, &business_profile)
         .await
         .transpose()
         .async_unwrap_or_else(|| async {
             invoice_details
-                .create_payment_intent(&state, &req_state, &merchant_context, &business_profile)
+                .create_payment_intent(&state, &req_state, &platform, &business_profile)
                 .await
         })
         .await?;
 
-    let is_event_recovery_transaction_event = event_type.is_recovery_transaction_event();
     let (recovery_attempt_from_payment_attempt, recovery_intent_from_payment_attempt) =
         RevenueRecoveryAttempt::get_recovery_payment_attempt(
-            is_event_recovery_transaction_event,
+            resolved_transaction_details,
             &billing_connector_account,
             &state,
-            connector_enum,
             &req_state,
-            billing_connector_payment_details.as_ref(),
-            request_details,
-            &merchant_context,
+            &platform,
             &business_profile,
             &payment_intent,
-            &invoice_details.0,
         )
         .await?;
 
     // Publish event to Kafka
     if let Some(ref attempt) = recovery_attempt_from_payment_attempt {
-        // Passing `merchant_context` here
+        // Passing `platform` here
         let recovery_payment_tuple =
             &RecoveryPaymentTuple::new(&recovery_intent_from_payment_attempt, attempt);
         if let Err(e) = RecoveryPaymentTuple::publish_revenue_recovery_event_to_kafka(
@@ -178,24 +203,30 @@ pub async fn recovery_incoming_webhook_flow(
         action: RecoveryAction::get_action(event_type, attempt_triggered_by),
     };
 
+    if recovery_action.is_invalid_action() {
+        logger::info!("No recovery action needed for this event type");
+        return Ok(webhooks::WebhookResponseTracker::NoEffect);
+    }
+
     let mca_retry_threshold = billing_connector_account
         .get_retry_threshold()
         .ok_or(report!(
             errors::RevenueRecoveryError::BillingThresholdRetryCountFetchFailed
         ))?;
 
+    // Default to 0 for newly created payment intents that have no feature_metadata yet
     let intent_retry_count = recovery_intent_from_payment_attempt
         .feature_metadata
         .as_ref()
         .and_then(|metadata| metadata.get_retry_count())
-        .ok_or(report!(errors::RevenueRecoveryError::RetryCountFetchFailed))?;
+        .unwrap_or(0);
 
     logger::info!("Intent retry count: {:?}", intent_retry_count);
     recovery_action
         .handle_action(
             &state,
             &business_profile,
-            &merchant_context,
+            &platform,
             &billing_connector_account,
             mca_retry_threshold,
             intent_retry_count,
@@ -245,7 +276,7 @@ async fn handle_schedule_failed_payment(
     intent_retry_count: u16,
     mca_retry_threshold: u16,
     state: &SessionState,
-    merchant_context: &domain::MerchantContext,
+    platform: &domain::Platform,
     payment_attempt_with_recovery_intent: &(
         Option<revenue_recovery::RecoveryPaymentAttempt>,
         revenue_recovery::RecoveryPaymentIntent,
@@ -256,11 +287,11 @@ async fn handle_schedule_failed_payment(
     let (recovery_attempt_from_payment_attempt, recovery_intent_from_payment_attempt) =
         payment_attempt_with_recovery_intent;
 
-    // When intent_retry_count is less than or equal to threshold
-    (intent_retry_count <= mca_retry_threshold)
+    // When intent_retry_count is strictly less than threshold, billing connector didnt complete its configured retry attempts
+    (intent_retry_count < mca_retry_threshold)
         .then(|| {
-            logger::error!(
-                "Payment retry count {} is less than threshold {}",
+            logger::info!(
+                "Payment retry count {} is less than threshold {}, waiting for billing connector",
                 intent_retry_count,
                 mca_retry_threshold
             );
@@ -271,13 +302,16 @@ async fn handle_schedule_failed_payment(
             core::revenue_recovery::upsert_calculate_pcr_task(
                 billing_connector_account,
                 state,
-                merchant_context,
+                platform,
                 recovery_intent_from_payment_attempt,
                 business_profile,
                 intent_retry_count,
                 recovery_attempt_from_payment_attempt
                     .as_ref()
                     .map(|attempt| attempt.attempt_id.clone()),
+                recovery_attempt_from_payment_attempt
+                    .as_ref()
+                    .and_then(|attempt| attempt.standardised_error_code),
                 storage::ProcessTrackerRunner::PassiveRecoveryWorkflow,
                 revenue_recovery_retry,
             )
@@ -296,19 +330,19 @@ impl RevenueRecoveryInvoice {
         data: api_models::payments::RecoveryPaymentsCreate,
         state: &SessionState,
         req_state: &ReqState,
-        merchant_context: &domain::MerchantContext,
+        platform: &domain::Platform,
         profile: &domain::Profile,
     ) -> CustomResult<revenue_recovery::RecoveryPaymentIntent, errors::RevenueRecoveryError> {
         let recovery_intent = Self(revenue_recovery::RevenueRecoveryInvoiceData::foreign_from(
             data,
         ));
         recovery_intent
-            .get_payment_intent(state, req_state, merchant_context, profile)
+            .get_payment_intent(state, req_state, platform, profile)
             .await
             .transpose()
             .async_unwrap_or_else(|| async {
                 recovery_intent
-                    .create_payment_intent(state, req_state, merchant_context, profile)
+                    .create_payment_intent(state, req_state, platform, profile)
                     .await
             })
             .await
@@ -342,13 +376,13 @@ impl RevenueRecoveryInvoice {
         &self,
         state: &SessionState,
         req_state: &ReqState,
-        merchant_context: &domain::MerchantContext,
+        platform: &domain::Platform,
         profile: &domain::Profile,
     ) -> CustomResult<Option<revenue_recovery::RecoveryPaymentIntent>, errors::RevenueRecoveryError>
     {
         let payment_response = Box::pin(payments::payments_get_intent_using_merchant_reference(
             state.clone(),
-            merchant_context.clone(),
+            platform.clone(),
             profile.clone(),
             req_state.clone(),
             &self.0.merchant_reference_id,
@@ -360,7 +394,7 @@ impl RevenueRecoveryInvoice {
                 let payment_id = payments_response.id.clone();
                 let status = payments_response.status;
                 let feature_metadata = payments_response.feature_metadata;
-                let merchant_id = merchant_context.get_merchant_account().get_id().clone();
+                let merchant_id = platform.get_processor().get_account().get_id().clone();
                 let revenue_recovery_invoice_data = &self.0;
                 Ok(Some(revenue_recovery::RecoveryPaymentIntent {
                     payment_id,
@@ -398,7 +432,7 @@ impl RevenueRecoveryInvoice {
         &self,
         state: &SessionState,
         req_state: &ReqState,
-        merchant_context: &domain::MerchantContext,
+        platform: &domain::Platform,
         profile: &domain::Profile,
     ) -> CustomResult<revenue_recovery::RecoveryPaymentIntent, errors::RevenueRecoveryError> {
         let payload = api_payments::PaymentsCreateIntentRequest::from(&self.0);
@@ -415,7 +449,7 @@ impl RevenueRecoveryInvoice {
         >(
             state.clone(),
             req_state.clone(),
-            merchant_context.clone(),
+            platform.clone(),
             profile.clone(),
             payments::operations::PaymentIntentCreate,
             payload,
@@ -430,7 +464,7 @@ impl RevenueRecoveryInvoice {
             .change_context(errors::RevenueRecoveryError::PaymentIntentCreateFailed)
             .attach_printable("expected json response")?;
 
-        let merchant_id = merchant_context.get_merchant_account().get_id().clone();
+        let merchant_id = platform.get_processor().get_account().get_id().clone();
         let revenue_recovery_invoice_data = &self.0;
 
         Ok(revenue_recovery::RecoveryPaymentIntent {
@@ -454,7 +488,7 @@ impl RevenueRecoveryAttempt {
         data: api_models::payments::RecoveryPaymentsCreate,
         state: &SessionState,
         req_state: &ReqState,
-        merchant_context: &domain::MerchantContext,
+        platform: &domain::Platform,
         profile: &domain::Profile,
         payment_intent: revenue_recovery::RecoveryPaymentIntent,
         payment_merchant_connector_account: domain::MerchantConnectorAccount,
@@ -469,7 +503,7 @@ impl RevenueRecoveryAttempt {
             &data,
         ));
         recovery_attempt
-            .get_payment_attempt(state, req_state, merchant_context, profile, &payment_intent)
+            .get_payment_attempt(state, req_state, platform, profile, &payment_intent)
             .await
             .transpose()
             .async_unwrap_or_else(|| async {
@@ -477,7 +511,7 @@ impl RevenueRecoveryAttempt {
                     .record_payment_attempt(
                         state,
                         req_state,
-                        merchant_context,
+                        platform,
                         profile,
                         &payment_intent,
                         &data.billing_merchant_connector_id,
@@ -516,6 +550,46 @@ impl RevenueRecoveryAttempt {
             },
         )
     }
+    /// Billing connectors send the card bin but not the issuer level details of the card, those
+    /// have to be looked up locally from the `card_info` table using the bin. This enriches the
+    /// attempt's card info in place, so that every consumer built from it, the payment attempt,
+    /// the payment intent's feature metadata and the payment processor token in redis, sees the
+    /// same enriched data. Details already sent by the billing connector are left untouched, and
+    /// a webhook without a bin is left as is instead of being failed.
+    async fn enrich_card_info_using_card_bin(&mut self, state: &SessionState) {
+        let card_bin_info = self
+            .0
+            .card_info
+            .card_isin
+            .clone()
+            .async_and_then(|card_isin| async move {
+                state
+                    .store
+                    .get_card_info(card_isin.as_str())
+                    .await
+                    .map_err(|error| services::logger::warn!(card_info_error=?error))
+                    .ok()
+            })
+            .await
+            .flatten();
+
+        if let Some(card_bin_info) = card_bin_info {
+            let card_info = &mut self.0.card_info;
+            card_info.card_issuer = card_info.card_issuer.take().or(card_bin_info.card_issuer);
+            card_info.card_network = card_info.card_network.take().or(card_bin_info.card_network);
+            card_info.card_type = card_info.card_type.take().or(card_bin_info.card_type);
+            card_info.card_issuing_country = card_info
+                .card_issuing_country
+                .take()
+                .or(card_bin_info.card_issuing_country);
+            card_info.card_issuing_country_code = card_info
+                .card_issuing_country_code
+                .take()
+                .or(card_bin_info.country_code);
+            card_info.bank_code = card_info.bank_code.take().or(card_bin_info.bank_code);
+        }
+    }
+
     pub fn get_revenue_recovery_attempt(
         payment_intent: &domain_payments::PaymentIntent,
         revenue_recovery_metadata: &api_payments::PaymentRevenueRecoveryMetadata,
@@ -538,7 +612,7 @@ impl RevenueRecoveryAttempt {
         &self,
         state: &SessionState,
         req_state: &ReqState,
-        merchant_context: &domain::MerchantContext,
+        platform: &domain::Platform,
         profile: &domain::Profile,
         payment_intent: &revenue_recovery::RecoveryPaymentIntent,
     ) -> CustomResult<
@@ -560,7 +634,7 @@ impl RevenueRecoveryAttempt {
             >(
                 state.clone(),
                 req_state.clone(),
-                merchant_context.clone(),
+                platform.clone(),
                 profile.clone(),
                 payments::operations::PaymentGetListAttempts,
                 api_payments::PaymentAttemptListRequest {
@@ -591,20 +665,40 @@ impl RevenueRecoveryAttempt {
                                     )
                             })
                     });
-                let payment_attempt =
-                    final_attempt.map(|res| revenue_recovery::RecoveryPaymentAttempt {
-                        attempt_id: res.id.to_owned(),
-                        attempt_status: res.status.to_owned(),
-                        feature_metadata: res.feature_metadata.to_owned(),
-                        amount: res.amount.net_amount,
-                        network_advice_code: res.error.clone().and_then(|e| e.network_advice_code), // Placeholder, to be populated if available
-                        network_decline_code: res
-                            .error
-                            .clone()
-                            .and_then(|e| e.network_decline_code), // Placeholder, to be populated if available
-                        error_code: res.error.clone().map(|error| error.code),
-                        created_at: res.created_at,
-                    });
+                let payment_attempt = match final_attempt {
+                    Some(res) => {
+                        let standardised_error_code =
+                            retry_stats::events::resolve_standardised_error_code(
+                                state,
+                                res.connector.clone(),
+                                res.error.as_ref().map(|e| e.code.clone()),
+                                res.error.as_ref().map(|e| e.message.clone()),
+                                res.error
+                                    .as_ref()
+                                    .and_then(|e| e.network_decline_code.clone()),
+                                self.0.card_info.card_network.clone(),
+                            )
+                            .await;
+                        Some(revenue_recovery::RecoveryPaymentAttempt {
+                            attempt_id: res.id.to_owned(),
+                            attempt_status: res.status.to_owned(),
+                            feature_metadata: res.feature_metadata.to_owned(),
+                            amount: res.amount.net_amount,
+                            network_advice_code: res
+                                .error
+                                .clone()
+                                .and_then(|e| e.network_advice_code), // Placeholder, to be populated if available
+                            network_decline_code: res
+                                .error
+                                .clone()
+                                .and_then(|e| e.network_decline_code), // Placeholder, to be populated if available
+                            error_code: res.error.clone().map(|error| error.code),
+                            created_at: res.created_at,
+                            standardised_error_code,
+                        })
+                    }
+                    None => None,
+                };
                 // If we have an attempt, combine it with payment_intent in a tuple.
                 let res_with_payment_intent_and_attempt =
                     payment_attempt.map(|attempt| (attempt, (*payment_intent).clone()));
@@ -626,7 +720,7 @@ impl RevenueRecoveryAttempt {
         &self,
         state: &SessionState,
         req_state: &ReqState,
-        merchant_context: &domain::MerchantContext,
+        platform: &domain::Platform,
         profile: &domain::Profile,
         payment_intent: &revenue_recovery::RecoveryPaymentIntent,
         billing_connector_account_id: &id_type::MerchantConnectorAccountId,
@@ -654,7 +748,7 @@ impl RevenueRecoveryAttempt {
         let attempt_response = Box::pin(payments::record_attempt_core(
             state.clone(),
             req_state.clone(),
-            merchant_context.clone(),
+            platform.clone(),
             profile.clone(),
             request_payload,
             payment_intent.payment_id.clone(),
@@ -664,6 +758,26 @@ impl RevenueRecoveryAttempt {
 
         let (recovery_attempt, updated_recovery_intent) = match attempt_response {
             Ok(services::ApplicationResponse::JsonWithHeaders((attempt_response, _))) => {
+                let standardised_error_code = retry_stats::events::resolve_standardised_error_code(
+                    state,
+                    payment_connector_name
+                        .as_ref()
+                        .map(|connector| connector.to_string()),
+                    attempt_response
+                        .error_details
+                        .as_ref()
+                        .map(|error| error.code.clone()),
+                    attempt_response
+                        .error_details
+                        .as_ref()
+                        .map(|error| error.message.clone()),
+                    attempt_response
+                        .error_details
+                        .as_ref()
+                        .and_then(|error| error.network_decline_code.clone()),
+                    self.0.card_info.card_network.clone(),
+                )
+                .await;
                 Ok((
                     revenue_recovery::RecoveryPaymentAttempt {
                         attempt_id: attempt_response.id.clone(),
@@ -683,6 +797,7 @@ impl RevenueRecoveryAttempt {
                             .clone()
                             .map(|error| error.code),
                         created_at: attempt_response.created_at,
+                        standardised_error_code,
                     },
                     revenue_recovery::RecoveryPaymentIntent {
                         payment_id: payment_intent.payment_id.clone(),
@@ -699,9 +814,18 @@ impl RevenueRecoveryAttempt {
             }
             Ok(_) => Err(errors::RevenueRecoveryError::PaymentAttemptFetchFailed)
                 .attach_printable("Unexpected response from record attempt core"),
-            error @ Err(_) => {
+            Err(error) => {
                 logger::error!(?error);
-                Err(errors::RevenueRecoveryError::PaymentAttemptFetchFailed)
+                // Retrying cannot record another attempt after the invoice reaches a final state.
+                let recovery_error = match error.current_context() {
+                    errors::ApiErrorResponse::PaymentUnexpectedState { current_value, .. } => {
+                        errors::RevenueRecoveryError::PaymentAttemptRecordNotAllowed {
+                            status: current_value.clone(),
+                        }
+                    }
+                    _ => errors::RevenueRecoveryError::PaymentAttemptFetchFailed,
+                };
+                Err(recovery_error)
                     .attach_printable("failed to record attempt in recovery webhook flow")
             }
         }?;
@@ -805,43 +929,54 @@ impl RevenueRecoveryAttempt {
         state: &SessionState,
         key_store: &domain::MerchantKeyStore,
         billing_connector_account: &domain::MerchantConnectorAccount,
-    ) -> CustomResult<Option<domain::MerchantConnectorAccount>, errors::RevenueRecoveryError> {
+    ) -> CustomResult<domain::MerchantConnectorAccount, errors::RevenueRecoveryError> {
+        let connector_account_reference_id = &self.0.connector_account_reference_id;
+
         let payment_merchant_connector_account_id = billing_connector_account
             .get_payment_merchant_connector_account_id_using_account_reference_id(
-                self.0.connector_account_reference_id.clone(),
-            );
+                connector_account_reference_id.clone(),
+            )
+            .ok_or(report!(
+                errors::RevenueRecoveryError::PaymentMerchantConnectorAccountNotFound {
+                    id: connector_account_reference_id.clone()
+                }
+            ))
+            .attach_printable_lazy(|| {
+                format!(
+                    "no payment merchant connector account is mapped to account reference id \
+                     {connector_account_reference_id} in the feature metadata of billing connector \
+                     account {}",
+                    billing_connector_account.get_id().get_string_repr()
+                )
+            })?;
+
         let db = &*state.store;
-        let key_manager_state = &(state).into();
-        let payment_merchant_connector_account = payment_merchant_connector_account_id
-            .as_ref()
-            .async_map(|mca_id| async move {
-                db.find_merchant_connector_account_by_id(key_manager_state, mca_id, key_store)
-                    .await
-            })
+        db.find_merchant_connector_account_by_id(&payment_merchant_connector_account_id, key_store)
             .await
-            .transpose()
-            .change_context(errors::RevenueRecoveryError::PaymentMerchantConnectorAccountNotFound)
-            .attach_printable(
-                "failed to fetch payment merchant connector id using account reference id",
-            )?;
-        Ok(payment_merchant_connector_account)
+            .change_context(
+                errors::RevenueRecoveryError::PaymentMerchantConnectorAccountNotFound {
+                    id: payment_merchant_connector_account_id
+                        .get_string_repr()
+                        .to_string(),
+                },
+            )
+            .attach_printable_lazy(|| {
+                format!(
+                    "failed to fetch payment merchant connector account {} mapped to account \
+                     reference id {connector_account_reference_id}",
+                    payment_merchant_connector_account_id.get_string_repr()
+                )
+            })
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn get_recovery_payment_attempt(
-        is_recovery_transaction_event: bool,
+        resolved_transaction_details: Option<(Self, domain::MerchantConnectorAccount)>,
         billing_connector_account: &domain::MerchantConnectorAccount,
         state: &SessionState,
-        connector_enum: &connector_integration_interface::ConnectorEnum,
         req_state: &ReqState,
-        billing_connector_payment_details: Option<
-            &revenue_recovery_response::BillingConnectorPaymentsSyncResponse,
-        >,
-        request_details: &hyperswitch_interfaces::webhooks::IncomingWebhookRequestDetails<'_>,
-        merchant_context: &domain::MerchantContext,
+        platform: &domain::Platform,
         business_profile: &domain::Profile,
         payment_intent: &revenue_recovery::RecoveryPaymentIntent,
-        invoice_details: &revenue_recovery::RevenueRecoveryInvoiceData,
     ) -> CustomResult<
         (
             Option<revenue_recovery::RecoveryPaymentAttempt>,
@@ -849,29 +984,17 @@ impl RevenueRecoveryAttempt {
         ),
         errors::RevenueRecoveryError,
     > {
-        let payment_attempt_with_recovery_intent = match is_recovery_transaction_event {
-            true => {
-                let invoice_transaction_details = Self::get_recovery_invoice_transaction_details(
-                    connector_enum,
-                    request_details,
-                    billing_connector_payment_details,
-                    invoice_details,
-                )?;
-
-                // Find the payment merchant connector ID at the top level to avoid multiple DB calls.
-                let payment_merchant_connector_account = invoice_transaction_details
-                    .find_payment_merchant_connector_account(
-                        state,
-                        merchant_context.get_merchant_key_store(),
-                        billing_connector_account,
-                    )
-                    .await?;
+        let payment_attempt_with_recovery_intent = match resolved_transaction_details {
+            Some((mut invoice_transaction_details, payment_merchant_connector_account)) => {
+                // Boxed to keep this future off the enclosing state machine, the recovery webhook
+                // chain is deep enough that inlining it can overflow the worker thread's stack.
+                Box::pin(invoice_transaction_details.enrich_card_info_using_card_bin(state)).await;
 
                 let (payment_attempt, updated_payment_intent) = invoice_transaction_details
                     .get_payment_attempt(
                         state,
                         req_state,
-                        merchant_context,
+                        platform,
                         business_profile,
                         payment_intent,
                     )
@@ -882,11 +1005,11 @@ impl RevenueRecoveryAttempt {
                             .record_payment_attempt(
                                 state,
                                 req_state,
-                                merchant_context,
+                                platform,
                                 business_profile,
                                 payment_intent,
                                 &billing_connector_account.get_id(),
-                                payment_merchant_connector_account,
+                                Some(payment_merchant_connector_account),
                             )
                             .await
                     })
@@ -894,7 +1017,7 @@ impl RevenueRecoveryAttempt {
                 (Some(payment_attempt), updated_payment_intent)
             }
 
-            false => (None, payment_intent.clone()),
+            None => (None, payment_intent.clone()),
         };
 
         Ok(payment_attempt_with_recovery_intent)
@@ -908,6 +1031,7 @@ impl RevenueRecoveryAttempt {
         payment_connector_name: Option<common_enums::connector_enums::Connector>,
     ) -> CustomResult<(), errors::RevenueRecoveryError> {
         let revenue_recovery_attempt_data = &self.0;
+
         let error_code = revenue_recovery_attempt_data.error_code.clone();
         let error_message = revenue_recovery_attempt_data.error_message.clone();
         let connector_name = payment_connector_name
@@ -917,10 +1041,13 @@ impl RevenueRecoveryAttempt {
 
         let gsm_record = helpers::get_gsm_record(
             state,
+            connector_name,
+            REVENUE_RECOVERY,
+            consts::DEFAULT_SUBFLOW_STR,
             error_code.clone(),
             error_message,
-            connector_name,
-            REVENUE_RECOVERY.to_string(),
+            None, // issuer_error_code
+            None, // card_network
         )
         .await;
 
@@ -929,6 +1056,12 @@ impl RevenueRecoveryAttempt {
             .map(|category| category == common_enums::ErrorCategory::HardDecline)
             .unwrap_or(false);
 
+        let reference_time = time::PrimitiveDateTime::new(
+            recovery_attempt.created_at.date(),
+            time::Time::from_hms(recovery_attempt.created_at.hour(), 0, 0)
+                .unwrap_or(time::Time::MIDNIGHT),
+        );
+
         // Extract required fields from the revenue recovery attempt data
         let connector_customer_id = revenue_recovery_attempt_data.connector_customer_id.clone();
 
@@ -936,9 +1069,10 @@ impl RevenueRecoveryAttempt {
         let token_unit = PaymentProcessorTokenStatus {
             error_code,
             inserted_by_attempt_id: attempt_id.clone(),
-            daily_retry_history: HashMap::from([(recovery_attempt.created_at.date(), 1)]),
+            daily_retry_history: HashMap::from([(reference_time, 1)]),
             scheduled_at: None,
             is_hard_decline: Some(is_hard_decline),
+            modified_at: Some(recovery_attempt.created_at),
             payment_processor_token_details: PaymentProcessorTokenDetails {
                 payment_processor_token: revenue_recovery_attempt_data
                     .processor_payment_method_token
@@ -955,7 +1089,11 @@ impl RevenueRecoveryAttempt {
                 last_four_digits: revenue_recovery_attempt_data.card_info.last4.clone(),
                 card_network: revenue_recovery_attempt_data.card_info.card_network.clone(),
                 card_type: revenue_recovery_attempt_data.card_info.card_type.clone(),
+                card_isin: revenue_recovery_attempt_data.card_info.card_isin.clone(),
             },
+            is_active: Some(true), // Tokens created from recovery attempts are active by default
+            account_update_history: None, // No prior account update history exists for freshly ingested tokens
+            decision_threshold: None,
         };
 
         // Make the Redis call to store tokens
@@ -982,7 +1120,7 @@ pub struct BillingConnectorPaymentsSyncFlowRouterData(
 impl BillingConnectorPaymentsSyncResponseData {
     async fn handle_billing_connector_payment_sync_call(
         state: &SessionState,
-        merchant_context: &domain::MerchantContext,
+        platform: &domain::Platform,
         merchant_connector_account: &hyperswitch_domain_models::merchant_connector_account::MerchantConnectorAccount,
         connector_name: &str,
         id: &str,
@@ -1007,7 +1145,7 @@ impl BillingConnectorPaymentsSyncResponseData {
                 state,
                 connector_name,
                 merchant_connector_account,
-                merchant_context,
+                platform,
                 id,
             )
             .await
@@ -1043,7 +1181,7 @@ impl BillingConnectorPaymentsSyncResponseData {
     async fn get_billing_connector_payment_details(
         should_billing_connector_payment_api_called: bool,
         state: &SessionState,
-        merchant_context: &domain::MerchantContext,
+        platform: &domain::Platform,
         billing_connector_account: &hyperswitch_domain_models::merchant_connector_account::MerchantConnectorAccount,
         connector_name: &str,
         object_ref_id: &webhooks::ObjectReferenceId,
@@ -1063,7 +1201,7 @@ impl BillingConnectorPaymentsSyncResponseData {
                 let billing_connector_payment_details =
                     Self::handle_billing_connector_payment_sync_call(
                         state,
-                        merchant_context,
+                        platform,
                         billing_connector_account,
                         connector_name,
                         &billing_connector_transaction_id,
@@ -1087,7 +1225,7 @@ impl BillingConnectorPaymentsSyncFlowRouterData {
         state: &SessionState,
         connector_name: &str,
         merchant_connector_account: &hyperswitch_domain_models::merchant_connector_account::MerchantConnectorAccount,
-        merchant_context: &domain::MerchantContext,
+        platform: &domain::Platform,
         billing_connector_psync_id: &str,
     ) -> CustomResult<Self, errors::RevenueRecoveryError> {
         let auth_type: types::ConnectorAuthType = helpers::MerchantConnectorAccountType::DbVal(
@@ -1150,7 +1288,7 @@ pub struct BillingConnectorInvoiceSyncFlowRouterData(
 impl BillingConnectorInvoiceSyncResponseData {
     async fn handle_billing_connector_invoice_sync_call(
         state: &SessionState,
-        merchant_context: &domain::MerchantContext,
+        platform: &domain::Platform,
         merchant_connector_account: &hyperswitch_domain_models::merchant_connector_account::MerchantConnectorAccount,
         connector_name: &str,
         id: &str,
@@ -1175,7 +1313,7 @@ impl BillingConnectorInvoiceSyncResponseData {
                 state,
                 connector_name,
                 merchant_connector_account,
-                merchant_context,
+                platform,
                 id,
             )
             .await
@@ -1201,7 +1339,7 @@ impl BillingConnectorInvoiceSyncResponseData {
             Ok(response) => Ok(response),
             error @ Err(_) => {
                 logger::error!(?error);
-                Err(errors::RevenueRecoveryError::BillingConnectorPaymentsSyncFailed)
+                Err(errors::RevenueRecoveryError::BillingConnectorInvoiceSyncFailed)
                     .attach_printable("Failed while fetching billing connector Invoice details")
             }
         }?;
@@ -1211,7 +1349,7 @@ impl BillingConnectorInvoiceSyncResponseData {
     async fn get_billing_connector_invoice_details(
         should_billing_connector_invoice_api_called: bool,
         state: &SessionState,
-        merchant_context: &domain::MerchantContext,
+        platform: &domain::Platform,
         billing_connector_account: &hyperswitch_domain_models::merchant_connector_account::MerchantConnectorAccount,
         connector_name: &str,
         merchant_reference_id: Option<id_type::PaymentReferenceId>,
@@ -1229,7 +1367,7 @@ impl BillingConnectorInvoiceSyncResponseData {
                 let billing_connector_invoice_details =
                     Self::handle_billing_connector_invoice_sync_call(
                         state,
-                        merchant_context,
+                        platform,
                         billing_connector_account,
                         connector_name,
                         billing_connector_invoice_id,
@@ -1253,7 +1391,7 @@ impl BillingConnectorInvoiceSyncFlowRouterData {
         state: &SessionState,
         connector_name: &str,
         merchant_connector_account: &hyperswitch_domain_models::merchant_connector_account::MerchantConnectorAccount,
-        merchant_context: &domain::MerchantContext,
+        platform: &domain::Platform,
         billing_connector_invoice_id: &str,
     ) -> CustomResult<Self, errors::RevenueRecoveryError> {
         let auth_type: types::ConnectorAuthType = helpers::MerchantConnectorAccountType::DbVal(
@@ -1436,6 +1574,7 @@ impl RecoveryAction {
             | webhooks::IncomingWebhookEvent::SourceTransactionCreated
             | webhooks::IncomingWebhookEvent::RefundFailure
             | webhooks::IncomingWebhookEvent::RefundSuccess
+            | webhooks::IncomingWebhookEvent::RefundReview
             | webhooks::IncomingWebhookEvent::DisputeOpened
             | webhooks::IncomingWebhookEvent::DisputeExpired
             | webhooks::IncomingWebhookEvent::DisputeAccepted
@@ -1445,7 +1584,10 @@ impl RecoveryAction {
             | webhooks::IncomingWebhookEvent::DisputeLost
             | webhooks::IncomingWebhookEvent::MandateActive
             | webhooks::IncomingWebhookEvent::MandateRevoked
+            | webhooks::IncomingWebhookEvent::MandateActionRequired
             | webhooks::IncomingWebhookEvent::EndpointVerification
+            | webhooks::IncomingWebhookEvent::PaymentIntentExtendAuthorizationSuccess
+            | webhooks::IncomingWebhookEvent::PaymentIntentExtendAuthorizationFailure
             | webhooks::IncomingWebhookEvent::ExternalAuthenticationARes
             | webhooks::IncomingWebhookEvent::FrmApproved
             | webhooks::IncomingWebhookEvent::FrmRejected
@@ -1455,7 +1597,10 @@ impl RecoveryAction {
             | webhooks::IncomingWebhookEvent::PayoutCancelled
             | webhooks::IncomingWebhookEvent::PayoutCreated
             | webhooks::IncomingWebhookEvent::PayoutExpired
-            | webhooks::IncomingWebhookEvent::PayoutReversed => {
+            | webhooks::IncomingWebhookEvent::PayoutReversed
+            | webhooks::IncomingWebhookEvent::InvoiceGenerated
+            | webhooks::IncomingWebhookEvent::SetupWebhook
+            | webhooks::IncomingWebhookEvent::PaymentAssociatedDataUpdate => {
                 common_types::payments::RecoveryAction::InvalidAction
             }
             webhooks::IncomingWebhookEvent::RecoveryPaymentFailure => match attempt_triggered_by {
@@ -1483,12 +1628,19 @@ impl RecoveryAction {
         }
     }
 
+    pub fn is_invalid_action(&self) -> bool {
+        matches!(
+            self.action,
+            common_types::payments::RecoveryAction::InvalidAction
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn handle_action(
         &self,
         state: &SessionState,
         business_profile: &domain::Profile,
-        merchant_context: &domain::MerchantContext,
+        platform: &domain::Platform,
         billing_connector_account: &hyperswitch_domain_models::merchant_connector_account::MerchantConnectorAccount,
         mca_retry_threshold: u16,
         intent_retry_count: u16,
@@ -1510,7 +1662,7 @@ impl RecoveryAction {
                         handle_monitoring_threshold(
                             state,
                             business_profile,
-                            merchant_context.get_merchant_key_store(),
+                            platform.get_processor().get_key_store(),
                         )
                         .await
                     }
@@ -1520,7 +1672,7 @@ impl RecoveryAction {
                             intent_retry_count,
                             mca_retry_threshold,
                             state,
-                            merchant_context,
+                            platform,
                             recovery_tuple,
                             business_profile,
                             revenue_recovery_retry_type,

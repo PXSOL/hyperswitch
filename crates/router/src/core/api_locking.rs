@@ -52,6 +52,8 @@ impl LockingInput {
 }
 
 impl LockAction {
+    // deja: NO boundary — the lock outcome replays from the recorded redis reply.
+    // See `docs/design/deja-non-boundaries.md`.
     #[instrument(skip_all)]
     pub async fn perform_locking_action<A>(
         self,
@@ -67,7 +69,9 @@ impl LockAction {
                     .iter()
                     .find_map(|input| input.override_lock_retries)
                     .unwrap_or(state.conf().lock_settings.lock_retries);
-                let request_id = state.get_request_id();
+                let request_id = state
+                    .get_request_id()
+                    .ok_or(errors::ApiErrorResponse::InternalServerError)?;
                 let redis_lock_expiry_seconds =
                     state.conf().lock_settings.redis_lock_expiry_seconds;
                 let redis_conn = state
@@ -91,12 +95,12 @@ impl LockAction {
                         )
                         .await
                         .change_context(errors::ApiErrorResponse::InternalServerError)?;
-                    let lock_aqcuired = results.iter().all(|res| {
+                    let lock_acquired = results.iter().all(|res| {
                         // each redis value must match the request_id
                         // if even 1 does match, the lock is not acquired
                         *res.get_value() == request_id
                     });
-                    if lock_aqcuired {
+                    if lock_acquired {
                         logger::info!("Lock acquired for locking inputs {:?}", inputs);
                         return Ok(());
                     } else {
@@ -124,11 +128,14 @@ impl LockAction {
                 let lock_retries = input
                     .override_lock_retries
                     .unwrap_or(state.conf().lock_settings.lock_retries);
+                let request_id = state
+                    .get_request_id()
+                    .ok_or(errors::ApiErrorResponse::InternalServerError)?;
                 for _retry in 0..lock_retries {
                     let redis_lock_result = redis_conn
                         .set_key_if_not_exists_with_expiry(
                             &redis_locking_key.as_str().into(),
-                            state.get_request_id(),
+                            request_id.clone(),
                             Some(i64::from(redis_lock_expiry_seconds)),
                         )
                         .await;
@@ -163,6 +170,8 @@ impl LockAction {
         }
     }
 
+    // deja: NO boundary — the release is the inner redis delete_key.
+    // See `docs/design/deja-non-boundaries.md`.
     #[instrument(skip_all)]
     pub async fn free_lock_action<A>(
         self,

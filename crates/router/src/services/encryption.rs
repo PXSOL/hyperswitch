@@ -32,6 +32,66 @@ pub enum EncryptionAlgorithm {
     A256GCM,
 }
 
+/// deja: josekit generates the CEK and AEAD IV inside `jwe::serialize_compact`
+/// with no hook for the IV, so the whole JWE is the reproducible unit —
+/// recording it keeps every downstream request body byte-identical on replay.
+/// Instrumented here, the one function all call sites share. `public_key` is
+/// deliberately not part of the identity (deployment config would reintroduce
+/// lookup misses on environments whose keys differ from the recorder's).
+#[cfg_attr(
+    feature = "deja",
+    deja::id(
+        component = "router::services::encryption",
+        operation = "encrypt_jwe",
+        // A recorded failure is one the caller degrades on, so it replays as one.
+        codec = deja::codec::ResultCodec::<String, errors::EncryptionError>,
+        // The payload is a digest, never the bytes: the JWS arriving here
+        // carries the cleartext card object base64-encoded, which must not
+        // reach the tape. The digest is all the lookup needs.
+        args = serde_json::json!({
+            "algorithm": algorithm.as_ref(),
+            "key_id": key_id,
+            "payload_blake3": blake3::hash(payload).to_hex().as_str(),
+            "payload_len": payload.len(),
+        }),
+        // Callers index all five JWE segments, so build them in josekit's order:
+        // the real protected header, then opaque bytes at the encrypter's lengths,
+        // carved from one draw so the segments are not prefixes of each other.
+        on_miss = {
+            use base64::Engine as _;
+            use common_utils::synth_shape::Synthesize as _;
+
+            const WRAPPED_KEY_BYTES: usize = 256;
+            const GCM_IV_BYTES: usize = 12;
+            const GCM_TAG_BYTES: usize = 16;
+
+            let drawn = __deja_miss.byte_vec(
+                WRAPPED_KEY_BYTES + GCM_IV_BYTES + payload.len() + GCM_TAG_BYTES,
+            );
+            let (wrapped_key, drawn) = drawn.split_at(WRAPPED_KEY_BYTES);
+            let (iv, drawn) = drawn.split_at(GCM_IV_BYTES);
+            let (ciphertext, tag) = drawn.split_at(payload.len());
+
+            let mut header = serde_json::Map::new();
+            header.insert("alg".to_string(), "RSA-OAEP-256".into());
+            header.insert("enc".to_string(), algorithm.as_ref().into());
+            header.insert("typ".to_string(), "JWT".into());
+            if let Some(key_id) = key_id {
+                header.insert("kid".to_string(), key_id.into());
+            }
+
+            let engine = common_utils::consts::BASE64_ENGINE_URL_SAFE_NO_PAD;
+            Ok(format!(
+                "{}.{}.{}.{}.{}",
+                engine.encode(serde_json::Value::Object(header).to_string()),
+                engine.encode(wrapped_key),
+                engine.encode(iv),
+                engine.encode(ciphertext),
+                engine.encode(tag),
+            ))
+        },
+    )
+)]
 pub async fn encrypt_jwe(
     payload: &[u8],
     public_key: impl AsRef<[u8]>,
@@ -127,8 +187,6 @@ pub fn verify_sign(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
-
     use super::*;
 
     // Keys used for tests

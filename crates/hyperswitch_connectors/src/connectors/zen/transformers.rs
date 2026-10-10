@@ -23,7 +23,7 @@ use hyperswitch_interfaces::{
     consts::{NO_ERROR_CODE, NO_ERROR_MESSAGE},
     errors,
 };
-use masking::{ExposeInterface, PeekInterface, Secret};
+use hyperswitch_masking::{ExposeInterface, PeekInterface, Secret};
 use ring::digest;
 use serde::{Deserialize, Serialize};
 use strum::Display;
@@ -350,6 +350,10 @@ impl
             | BankTransferData::InstantBankTransferFinland { .. }
             | BankTransferData::InstantBankTransferPoland { .. }
             | BankTransferData::IndonesianBankTransfer { .. }
+            | BankTransferData::PixAutomaticoPush { .. }
+            | BankTransferData::PixAutomaticoQr {}
+            | BankTransferData::PixEmv {}
+            | BankTransferData::PixQr {}
             | BankTransferData::MandiriVaBankTransfer { .. } => {
                 Err(errors::ConnectorError::NotImplemented(
                     utils::get_unimplemented_payment_method_error_message("Zen"),
@@ -496,6 +500,7 @@ impl
             | WalletData::AmazonPayRedirect(_)
             | WalletData::Paysera(_)
             | WalletData::Skrill(_)
+            | WalletData::Neteller(_)
             | WalletData::MomoRedirect(_)
             | WalletData::KakaoPayRedirect(_)
             | WalletData::GoPayRedirect(_)
@@ -510,6 +515,7 @@ impl
             | WalletData::SamsungPay(_)
             | WalletData::TwintRedirect {}
             | WalletData::VippsRedirect {}
+            | WalletData::WeroRedirect {}
             | WalletData::TouchNGoRedirect(_)
             | WalletData::CashappQr(_)
             | WalletData::SwishQr(_)
@@ -661,14 +667,14 @@ fn get_browser_details(
         .screen_height
         .get_required_value("screen_height")
         .change_context(errors::ConnectorError::MissingRequiredField {
-            field_name: "screen_height",
+            field_name: "screen_height".into(),
         })?;
 
     let screen_width = browser_info
         .screen_width
         .get_required_value("screen_width")
         .change_context(errors::ConnectorError::MissingRequiredField {
-            field_name: "screen_width",
+            field_name: "screen_width".into(),
         })?;
 
     let window_size = match (screen_height, screen_width) {
@@ -721,7 +727,12 @@ impl TryFrom<&ZenRouterData<&types::PaymentsAuthorizeRouterData>> for ZenPayment
             | PaymentMethodData::OpenBanking(_)
             | PaymentMethodData::CardToken(_)
             | PaymentMethodData::NetworkToken(_)
-            | PaymentMethodData::CardDetailsForNetworkTransactionId(_) => {
+            | PaymentMethodData::CardDetailsForNetworkTransactionId(_)
+            | PaymentMethodData::CardWithOptionalCVC(_)
+            | PaymentMethodData::CardWithNetworkTokenDetails(_)
+            | PaymentMethodData::CardWithLimitedDetails(_)
+            | PaymentMethodData::DecryptedWalletTokenDetailsForNetworkTransactionId(_)
+            | PaymentMethodData::NetworkTokenDetailsForNetworkTransactionId(_) => {
                 Err(errors::ConnectorError::NotImplemented(
                     utils::get_unimplemented_payment_method_error_message("Zen"),
                 ))?
@@ -752,12 +763,11 @@ impl TryFrom<&BankRedirectData> for ZenPaymentsRequest {
             | BankRedirectData::OpenBankingUk { .. }
             | BankRedirectData::OnlineBankingFpx { .. }
             | BankRedirectData::OnlineBankingThailand { .. }
-            | BankRedirectData::LocalBankRedirect {} => {
-                Err(errors::ConnectorError::NotImplemented(
-                    utils::get_unimplemented_payment_method_error_message("Zen"),
-                )
-                .into())
-            }
+            | BankRedirectData::LocalBankRedirect {}
+            | BankRedirectData::OpenBanking { .. } => Err(errors::ConnectorError::NotImplemented(
+                utils::get_unimplemented_payment_method_error_message("Zen"),
+            )
+            .into()),
         }
     }
 }
@@ -775,7 +785,8 @@ impl TryFrom<&PayLaterData> for ZenPaymentsRequest {
             | PayLaterData::AlmaRedirect {}
             | PayLaterData::FlexitiRedirect {}
             | PayLaterData::AtomeRedirect {}
-            | PayLaterData::BreadpayRedirect {} => Err(errors::ConnectorError::NotImplemented(
+            | PayLaterData::BreadpayRedirect {}
+            | PayLaterData::PayjustnowRedirect {} => Err(errors::ConnectorError::NotImplemented(
                 utils::get_unimplemented_payment_method_error_message("Zen"),
             )
             .into()),
@@ -790,10 +801,14 @@ impl TryFrom<&BankDebitData> for ZenPaymentsRequest {
             BankDebitData::AchBankDebit { .. }
             | BankDebitData::SepaBankDebit { .. }
             | BankDebitData::BecsBankDebit { .. }
-            | BankDebitData::BacsBankDebit { .. } => Err(errors::ConnectorError::NotImplemented(
-                utils::get_unimplemented_payment_method_error_message("Zen"),
-            )
-            .into()),
+            | BankDebitData::BacsBankDebit { .. }
+            | BankDebitData::EftDebitOrder { .. }
+            | BankDebitData::SepaGuarenteedBankDebit { .. } => {
+                Err(errors::ConnectorError::NotImplemented(
+                    utils::get_unimplemented_payment_method_error_message("Zen"),
+                )
+                .into())
+            }
         }
     }
 }
@@ -956,6 +971,7 @@ fn get_zen_response(
             status_code,
             attempt_status: Some(status),
             connector_transaction_id: Some(response.id.clone()),
+            connector_response_reference_id: None,
             network_advice_code: None,
             network_decline_code: None,
             network_error_message: None,
@@ -970,9 +986,12 @@ fn get_zen_response(
         mandate_reference: Box::new(None),
         connector_metadata: None,
         network_txn_id: None,
+        network_txn_link_id: None,
         connector_response_reference_id: None,
         incremental_authorization_allowed: None,
+        authentication_data: None,
         charges: None,
+        payment_account_reference: None,
     };
     Ok((status, error, payment_response_data))
 }
@@ -989,7 +1008,10 @@ impl<F, T> TryFrom<ResponseRouterData<F, ApiResponse, T, PaymentsResponseData>>
 
         Ok(Self {
             status,
-            response: error.map_or_else(|| Ok(payment_response_data), Err),
+            response: match error {
+                Some(err) => Err(err),
+                None => Ok(payment_response_data),
+            },
             ..value.data
         })
     }
@@ -1014,9 +1036,12 @@ impl<F, T> TryFrom<ResponseRouterData<F, CheckoutResponse, T, PaymentsResponseDa
                 mandate_reference: Box::new(None),
                 connector_metadata: None,
                 network_txn_id: None,
+                network_txn_link_id: None,
                 connector_response_reference_id: None,
                 incremental_authorization_allowed: None,
+                authentication_data: None,
                 charges: None,
+                payment_account_reference: None,
             }),
             ..value.data
         })
@@ -1082,7 +1107,10 @@ impl TryFrom<RefundsResponseRouterData<Execute, RefundResponse>>
     ) -> Result<Self, Self::Error> {
         let (error, refund_response_data) = get_zen_refund_response(item.response, item.http_code)?;
         Ok(Self {
-            response: error.map_or_else(|| Ok(refund_response_data), Err),
+            response: match error {
+                Some(err) => Err(err),
+                None => Ok(refund_response_data),
+            },
             ..item.data
         })
     }
@@ -1106,6 +1134,7 @@ fn get_zen_refund_response(
             status_code,
             attempt_status: None,
             connector_transaction_id: Some(response.id.clone()),
+            connector_response_reference_id: None,
             network_advice_code: None,
             network_decline_code: None,
             network_error_message: None,

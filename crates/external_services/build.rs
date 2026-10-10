@@ -1,4 +1,3 @@
-#[allow(clippy::expect_used)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Compilation for revenue recovery protos
     #[cfg(feature = "revenue_recovery")]
@@ -6,11 +5,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let proto_base_path = router_env::workspace_path().join("proto");
         let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
         let recovery_proto_files = [proto_base_path.join("recovery_decider.proto")];
-        tonic_build::configure()
+
+        #[allow(clippy::expect_used, clippy::unwrap_in_result)]
+        tonic_prost_build::configure()
             .out_dir(&out_dir)
             .compile_well_known_types(true)
             .extern_path(".google.protobuf.Timestamp", "::prost_types::Timestamp")
-            .compile_protos(&recovery_proto_files, &[&proto_base_path])
+            // The deja gRPC boundary decodes this descriptor set at runtime to
+            // render request/response messages structurally.
+            .file_descriptor_set_path(out_dir.join("deja_recovery_descriptor.bin"))
+            .compile_protos(&recovery_proto_files, &[proto_base_path])
             .expect("Failed to compile revenue-recovery proto files");
     }
 
@@ -26,7 +30,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
 
         // Compile the .proto file
-        tonic_build::configure()
+        #[allow(clippy::expect_used, clippy::unwrap_in_result)]
+        tonic_prost_build::configure()
+            // The deja gRPC boundary decodes this descriptor set at runtime to
+            // render request/response messages structurally.
+            .file_descriptor_set_path(out_dir.join("deja_dynamic_routing_descriptor.bin"))
             .out_dir(out_dir)
             .compile_protos(
                 &[

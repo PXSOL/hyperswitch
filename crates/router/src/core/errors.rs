@@ -1,6 +1,9 @@
-pub mod chat;
 pub mod customers_error_response;
 pub mod error_handlers;
+#[cfg(feature = "olap")]
+pub mod launch_sage;
+#[cfg(feature = "olap")]
+pub mod oidc;
 pub mod transformers;
 #[cfg(feature = "olap")]
 pub mod user;
@@ -89,7 +92,8 @@ macro_rules! unimplemented_payment_method {
 
 macro_rules! impl_error_type {
     ($name: ident, $arg: tt) => {
-        #[derive(Debug)]
+        // Serializable so `ResultCodec` can replay a recorded failure as itself.
+        #[derive(Debug, serde::Serialize, serde::Deserialize)]
         pub struct $name;
 
         impl_error_display!($name, $arg);
@@ -147,6 +151,8 @@ pub enum WebhooksFlowError {
     CallToMerchantFailed,
     #[error("Webhook not received by merchant")]
     NotReceivedByMerchant,
+    #[error("Webhook not received by recipient")]
+    NotReceivedByRecipient,
     #[error("Dispute webhook status validation failed")]
     DisputeWebhookValidationFailed,
     #[error("Outgoing webhook body encoding failed")]
@@ -157,6 +163,12 @@ pub enum WebhooksFlowError {
     OutgoingWebhookRetrySchedulingFailed,
     #[error("Outgoing webhook response encoding failed")]
     OutgoingWebhookResponseEncodingFailed,
+    #[error("ID generation failed")]
+    IdGenerationFailed,
+    #[error("Webhook API call failed")]
+    WebhookCallFailed,
+    #[error("Webhook request construction failed")]
+    WebhookRequestConstructionFailed,
 }
 
 impl WebhooksFlowError {
@@ -165,7 +177,8 @@ impl WebhooksFlowError {
             Self::MerchantConfigNotFound
             | Self::MerchantWebhookDetailsNotFound
             | Self::MerchantWebhookUrlNotConfigured
-            | Self::OutgoingWebhookResponseEncodingFailed => false,
+            | Self::OutgoingWebhookResponseEncodingFailed
+            | Self::WebhookRequestConstructionFailed => false,
 
             Self::WebhookEventUpdationFailed
             | Self::OutgoingWebhookSigningFailed
@@ -174,7 +187,10 @@ impl WebhooksFlowError {
             | Self::DisputeWebhookValidationFailed
             | Self::OutgoingWebhookEncodingFailed
             | Self::OutgoingWebhookProcessTrackerTaskUpdateFailed
-            | Self::OutgoingWebhookRetrySchedulingFailed => true,
+            | Self::OutgoingWebhookRetrySchedulingFailed
+            | Self::IdGenerationFailed
+            | Self::WebhookCallFailed
+            | Self::NotReceivedByRecipient => true,
         }
     }
 }
@@ -255,49 +271,13 @@ pub enum GooglePayDecryptionError {
     DecryptedTokenExpired,
     #[error("Failed to parse the given value")]
     ParsingFailed,
+    #[error("Gateway merchant id in the token does not match the merchant being paid")]
+    InvalidGatewayMerchantId,
 }
 
-#[cfg(feature = "detailed_errors")]
-pub mod error_stack_parsing {
-
-    #[derive(serde::Deserialize)]
-    pub struct NestedErrorStack<'a> {
-        context: std::borrow::Cow<'a, str>,
-        attachments: Vec<std::borrow::Cow<'a, str>>,
-        sources: Vec<NestedErrorStack<'a>>,
-    }
-
-    #[derive(serde::Serialize, Debug)]
-    struct LinearErrorStack<'a> {
-        context: std::borrow::Cow<'a, str>,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        attachments: Vec<std::borrow::Cow<'a, str>>,
-    }
-
-    #[derive(serde::Serialize, Debug)]
-    pub struct VecLinearErrorStack<'a>(Vec<LinearErrorStack<'a>>);
-
-    impl<'a> From<Vec<NestedErrorStack<'a>>> for VecLinearErrorStack<'a> {
-        fn from(value: Vec<NestedErrorStack<'a>>) -> Self {
-            let multi_layered_errors: Vec<_> = value
-                .into_iter()
-                .flat_map(|current_error| {
-                    [LinearErrorStack {
-                        context: current_error.context,
-                        attachments: current_error.attachments,
-                    }]
-                    .into_iter()
-                    .chain(Into::<VecLinearErrorStack<'a>>::into(current_error.sources).0)
-                })
-                .collect();
-            Self(multi_layered_errors)
-        }
-    }
-}
-#[cfg(feature = "detailed_errors")]
-pub use error_stack_parsing::*;
-
+// Serializable under `deja` so a recorded error replays as the same variant.
 #[derive(Debug, Clone, thiserror::Error)]
+#[cfg_attr(feature = "deja", derive(serde::Serialize, serde::Deserialize))]
 pub enum RoutingError {
     #[error("Merchant routing algorithm not found in cache")]
     CacheMiss,
@@ -325,6 +305,8 @@ pub enum RoutingError {
     KgraphCacheFailure,
     #[error("failed to refresh the kgraph cache")]
     KgraphCacheRefreshFailed,
+    #[error("failed to fetch merchant connector accounts")]
+    MerchantConnectorAccountsFetchFailed,
     #[error("there was an error during the kgraph analysis phase")]
     KgraphAnalysisError,
     #[error("'profile_id' was not provided")]
@@ -435,6 +417,12 @@ pub enum NetworkTokenizationError {
     NotSupported { message: String },
     #[error("Failed to encrypt the NetworkToken payment method details")]
     NetworkTokenDetailsEncryptionFailed,
+    #[error("Failed to fetch Alt-ID from network token service")]
+    FetchAltIdFailed,
+    #[error("Failed to encrypt card data")]
+    CardDataEncryptionFailed,
+    #[error("Failed to decrypt response data")]
+    ResponseDecryptionFailed,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -474,8 +462,10 @@ pub enum RevenueRecoveryError {
     PaymentIntentCreateFailed,
     #[error("Source verification failed for billing connector")]
     WebhookAuthenticationFailed,
-    #[error("Payment merchant connector account not found using account reference id")]
-    PaymentMerchantConnectorAccountNotFound,
+    #[error("Payment merchant connector account {id} not found using account reference id")]
+    PaymentMerchantConnectorAccountNotFound { id: String },
+    #[error("Payment attempt cannot be recorded while the invoice is in {status} state")]
+    PaymentAttemptRecordNotAllowed { status: String },
     #[error("Failed to fetch primitive date_time")]
     ScheduleTimeFetchFailed,
     #[error("Failed to create process tracker")]
@@ -500,4 +490,50 @@ pub enum RevenueRecoveryError {
     RevenueRecoveryAttemptDataCreateFailed,
     #[error("Failed to insert the revenue recovery payment method data in redis")]
     RevenueRecoveryRedisInsertFailed,
+}
+
+#[cfg(all(feature = "revenue_recovery", feature = "v2"))]
+impl common_utils::errors::ErrorSwitch<ApiErrorResponse> for RevenueRecoveryError {
+    fn switch(&self) -> ApiErrorResponse {
+        match self {
+            Self::WebhookAuthenticationFailed => ApiErrorResponse::WebhookAuthenticationFailed,
+            Self::InvoiceWebhookProcessingFailed
+            | Self::TransactionWebhookProcessingFailed
+            | Self::RevenueRecoveryAttemptDataCreateFailed
+            | Self::CustomerIdNotFound => ApiErrorResponse::WebhookUnprocessableEntity,
+
+            Self::PaymentMerchantConnectorAccountNotFound { id } => {
+                ApiErrorResponse::MerchantConnectorAccountNotFound { id: id.clone() }
+            }
+            Self::PaymentAttemptRecordNotAllowed { status } => {
+                ApiErrorResponse::PreconditionFailed {
+                    message: format!(
+                        "payment attempt cannot be recorded because the invoice is already in \
+                         {status} state"
+                    ),
+                }
+            }
+
+            Self::BillingThresholdRetryCountFetchFailed => {
+                ApiErrorResponse::InvalidConnectorConfiguration {
+                    config: "revenue_recovery.billing_connector_retry_threshold".to_string(),
+                }
+            }
+
+            Self::PaymentAttemptIdNotFound | Self::RetryAlgorithmTypeNotFound => {
+                ApiErrorResponse::WebhookResourceNotFound
+            }
+            Self::PaymentIntentFetchFailed
+            | Self::PaymentAttemptFetchFailed
+            | Self::PaymentIntentCreateFailed
+            | Self::ScheduleTimeFetchFailed
+            | Self::ProcessTrackerCreationError
+            | Self::ProcessTrackerResponseError
+            | Self::BillingConnectorPaymentsSyncFailed
+            | Self::BillingConnectorInvoiceSyncFailed
+            | Self::RetryCountFetchFailed
+            | Self::RetryAlgorithmUpdationFailed
+            | Self::RevenueRecoveryRedisInsertFailed => ApiErrorResponse::WebhookProcessingFailure,
+        }
+    }
 }

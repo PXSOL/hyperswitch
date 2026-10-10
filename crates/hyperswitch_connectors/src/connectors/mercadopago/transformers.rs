@@ -24,7 +24,7 @@ use hyperswitch_domain_models::{
     },
 };
 use hyperswitch_interfaces::errors;
-use masking::{PeekInterface, Secret};
+use hyperswitch_masking::{PeekInterface, Secret};
 use serde::{de::Deserialize as DeDeserialize, Deserialize, Serialize};
 
 use crate::{
@@ -399,7 +399,7 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
             }
             _ => {
                 return Err(errors::ConnectorError::MissingRequiredField {
-                    field_name: "payment_method_token",
+                    field_name: "payment_method_token".into(),
                 }
                 .into())
             }
@@ -420,7 +420,7 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
             metadata
                 .payment_method_id
                 .ok_or(errors::ConnectorError::MissingRequiredField {
-                    field_name: "metadata.payment_method_id",
+                    field_name: "metadata.payment_method_id".into(),
                 })?;
 
         let issuer_id = metadata
@@ -550,7 +550,8 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
                 if fee > max_fee {
                     return Err(errors::ConnectorError::InvalidDataFormat {
                         field_name:
-                            "application_fee exceeds maximum allowed (0.7% of transaction_amount)",
+                            "application_fee exceeds maximum allowed (0.7% of transaction_amount)"
+                                .into(),
                     }
                     .into());
                 }
@@ -576,7 +577,11 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
             external_reference: router_data.connector_request_reference_id.clone(),
             binary_mode: Some(true),
             notification_url,
-            statement_descriptor: router_data.request.statement_descriptor.clone(),
+            statement_descriptor: router_data
+                .request
+                .billing_descriptor
+                .as_ref()
+                .and_then(|descriptor| descriptor.statement_descriptor.clone()),
             additional_info,
             application_fee,
         })
@@ -720,7 +725,8 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>>
                 if fee > max_fee {
                     return Err(errors::ConnectorError::InvalidDataFormat {
                         field_name:
-                            "application_fee exceeds maximum allowed (0.7% of transaction_amount)",
+                            "application_fee exceeds maximum allowed (0.7% of transaction_amount)"
+                                .into(),
                     }
                     .into());
                 }
@@ -807,7 +813,11 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>>
             back_urls,
             auto_return,
             notification_url,
-            statement_descriptor: router_data.request.statement_descriptor.clone(),
+            statement_descriptor: router_data
+                .request
+                .billing_descriptor
+                .as_ref()
+                .and_then(|descriptor| descriptor.statement_descriptor.clone()),
             binary_mode: checkout_pro.binary_mode,
             payment_methods,
             marketplace_fee,
@@ -1155,6 +1165,7 @@ impl<F, T> TryFrom<ResponseRouterData<F, MercadopagoPaymentsResponse, T, Payment
                 network_advice_code: None,
                 network_decline_code: Some(error_code),
                 network_error_message: Some(error_message),
+                connector_response_reference_id: None,
             })
         } else {
             Ok(PaymentsResponseData::TransactionResponse {
@@ -1169,6 +1180,9 @@ impl<F, T> TryFrom<ResponseRouterData<F, MercadopagoPaymentsResponse, T, Payment
                     .or(Some(connector_transaction_id)),
                 incremental_authorization_allowed: None,
                 charges: None,
+                network_txn_link_id: None,
+                payment_account_reference: None,
+                authentication_data: None,
             })
         };
 
@@ -1249,6 +1263,9 @@ impl<F, T> TryFrom<ResponseRouterData<F, MercadopagoAuthorizeResponse, T, Paymen
                             .or(Some(preference.id.clone())),
                         incremental_authorization_allowed: None,
                         charges: None,
+                        network_txn_link_id: None,
+                        payment_account_reference: None,
+                        authentication_data: None,
                     }),
                     ..item.data
                 })
@@ -1352,6 +1369,9 @@ fn keep_waiting_for_buyer<F, T>(
             connector_response_reference_id: None,
             incremental_authorization_allowed: None,
             charges: None,
+            network_txn_link_id: None,
+            payment_account_reference: None,
+            authentication_data: None,
         }),
         ..data
     }
