@@ -2279,9 +2279,7 @@ impl PaymentsRefundItem {
         };
         let currency_matches = amount
             .and_then(|amount| amount.currency_code.as_deref())
-            .map_or(true, |code| {
-                code.eq_ignore_ascii_case(&currency.to_string())
-            });
+            .is_none_or(|code| code.eq_ignore_ascii_case(&currency.to_string()));
         if !currency_matches {
             router_env::logger::warn!(
                 "paypal: refund of the order in a different currency than the payment; not reported"

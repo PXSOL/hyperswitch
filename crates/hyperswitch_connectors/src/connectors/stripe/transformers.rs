@@ -6030,7 +6030,7 @@ impl TryFrom<(&PaymentsAuthorizeRouterData, MinorUnit)> for StripeCheckoutSessio
                 .as_ref()
                 .and_then(|descriptor| descriptor.statement_descriptor_suffix.clone()),
             merchant_metadata: item.request.metadata.clone().map(Into::into),
-            now_unix_timestamp: time::OffsetDateTime::now_utc().unix_timestamp(),
+            now_unix_timestamp: common_utils::date_time::now_unix_timestamp(),
         }))
     }
 }

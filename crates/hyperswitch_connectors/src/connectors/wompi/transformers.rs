@@ -257,7 +257,7 @@ const ACCESS_TOKEN_TTL_MAX_SECONDS: i64 = 3600;
 /// reuse a cached token, so a non-positive TTL here simply is not cached, which is
 /// the correct outcome for a pair that is already (nearly) dead.
 fn access_token_ttl_seconds(acceptance_token: &str, personal_auth_token: &str) -> i64 {
-    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let now = common_utils::date_time::now_unix_timestamp();
     let min_exp = [
         decode_jwt_exp(acceptance_token),
         decode_jwt_exp(personal_auth_token),
@@ -526,7 +526,7 @@ impl TryFrom<&WompiRouterData<&PaymentsAuthorizeRouterData>> for WompiTransactio
         if router_data.request.currency != enums::Currency::COP {
             return Err(errors::ConnectorError::CurrencyNotSupported {
                 message: router_data.request.currency.to_string(),
-                connector: "wompi".into(),
+                connector: "wompi",
             }
             .into());
         }
@@ -881,7 +881,7 @@ impl
         if item.data.request.currency != enums::Currency::COP {
             return Err(errors::ConnectorError::CurrencyNotSupported {
                 message: item.data.request.currency.to_string(),
-                connector: "wompi".into(),
+                connector: "wompi",
             }
             .into());
         }
@@ -1209,7 +1209,7 @@ pub(super) fn build_three_ds_transaction_request(
     if req.request.currency != enums::Currency::COP {
         return Err(errors::ConnectorError::CurrencyNotSupported {
             message: req.request.currency.to_string(),
-            connector: "wompi".into(),
+            connector: "wompi",
         }
         .into());
     }
@@ -1636,7 +1636,7 @@ pub(super) fn build_card_three_ds_authorize_response(
     if item.data.request.currency != enums::Currency::COP {
         return Err(errors::ConnectorError::CurrencyNotSupported {
             message: item.data.request.currency.to_string(),
-            connector: "wompi".into(),
+            connector: "wompi",
         }
         .into());
     }
@@ -1928,7 +1928,7 @@ impl<F, T> TryFrom<ResponseRouterData<F, WompiSearchResponse, T, PaymentsRespons
     fn try_from(
         item: ResponseRouterData<F, WompiSearchResponse, T, PaymentsResponseData>,
     ) -> Result<Self, Self::Error> {
-        let now = time::OffsetDateTime::now_utc();
+        let now = common_utils::date_time::now().assume_utc();
         let outcome = select_hosted_transaction(item.response.data, now);
 
         let (status, response) = match outcome {
@@ -2085,7 +2085,7 @@ pub(super) fn validate_void_refund(
     if currency != enums::Currency::COP {
         return Err(errors::ConnectorError::CurrencyNotSupported {
             message: currency.to_string(),
-            connector: "wompi".into(),
+            connector: "wompi",
         }
         .into());
     }
@@ -2869,7 +2869,7 @@ mod tests {
 
     #[test]
     fn jwt_exp_claim_is_decoded() {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let now = common_utils::date_time::now_unix_timestamp();
         let token = make_jwt(now + 1000);
         assert_eq!(decode_jwt_exp(&token), Some(now + 1000));
     }
@@ -2881,7 +2881,7 @@ mod tests {
 
     #[test]
     fn access_token_ttl_uses_the_sooner_exp() {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let now = common_utils::date_time::now_unix_timestamp();
         let far_future = make_jwt(now + 100_000);
         let sooner = make_jwt(now + 2000);
         let ttl = access_token_ttl_seconds(&far_future, &sooner);
@@ -2891,7 +2891,7 @@ mod tests {
 
     #[test]
     fn access_token_ttl_clamps_down_to_maximum() {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let now = common_utils::date_time::now_unix_timestamp();
         let far_future = make_jwt(now + 100_000);
         let ttl = access_token_ttl_seconds(&far_future, &far_future);
         assert_eq!(ttl, ACCESS_TOKEN_TTL_MAX_SECONDS);
@@ -2899,7 +2899,7 @@ mod tests {
 
     #[test]
     fn access_token_ttl_never_clamps_an_expired_pair_up() {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let now = common_utils::date_time::now_unix_timestamp();
         // Already expired: raw TTL would be negative, and must stay 0 (never
         // cached) rather than being clamped up to a minimum that would cache a
         // dead pair.

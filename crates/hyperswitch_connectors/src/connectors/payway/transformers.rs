@@ -228,7 +228,7 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
             device_unique_identifier: device_id,
             purchase_totals: PaywayPurchaseTotals {
                 currency: currency.clone(),
-                amount: amount,
+                amount,
             },
             bill_to,
             customer_in_site: PaywayCustomerInSite {

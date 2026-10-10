@@ -351,7 +351,7 @@ impl PaymentAttempt {
         let query = FilterDsl::filter(
             FilterDsl::filter(
                 FilterDsl::filter(
-                    <Self as HasTable>::table().into_boxed(),
+                    crate::list::into_boxed_list(<Self as HasTable>::table()),
                     dsl::status.eq(enums::AttemptStatus::Failure),
                 ),
                 dsl::modified_at.ge(from_time),
@@ -392,14 +392,13 @@ impl PaymentAttempt {
             enums::AttemptStatus::PartialCharged,
         ];
 
-        let mut query = FilterDsl::filter(
+        let mut query = crate::list::into_boxed_list(FilterDsl::filter(
             FilterDsl::filter(
                 <Self as HasTable>::table().count(),
                 dsl::status.eq_any(success_statuses),
             ),
             dsl::modified_at.ge(from_time),
-        )
-        .into_boxed();
+        ));
 
         if let Some(mid) = merchant_id_filter {
             query = FilterDsl::filter(query, dsl::merchant_id.eq(mid.to_string()));
