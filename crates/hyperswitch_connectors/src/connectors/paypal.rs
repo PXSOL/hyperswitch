@@ -2271,6 +2271,15 @@ impl
         req: &VerifyWebhookSourceRouterData,
         connectors: &Connectors,
     ) -> CustomResult<Option<Request>, errors::ConnectorError> {
+        // A refund webhook routed to a sync of its parent payment is never verified: core then
+        // runs a live payment sync instead of consuming the refund resource as the order sync
+        // response it is not (same rule as Stripe's `charge.refunded`). Without a request, the
+        // verification keeps its initial error response and core reads it as unverified. The
+        // event only tells that something changed, so a forged one can at worst cause one extra
+        // read with the merchant's own credentials.
+        if paypal::refund_webhook_parent_attempt_id(&req.request.webhook_body).is_some() {
+            return Ok(None);
+        }
         let request = RequestBuilder::new()
             .method(Method::Post)
             .url(&VerifyWebhookSourceType::get_url(self, req, connectors)?)
@@ -2333,6 +2342,7 @@ impl IncomingWebhook for Paypal {
                 .body
                 .parse_struct("PaypalWebhooksBody")
                 .change_context(errors::ConnectorError::WebhookReferenceIdNotFound)?;
+        let refund_parent_attempt_id = payload.refund_parent_attempt_id();
         match payload.resource {
             paypal::PaypalResource::PaypalCardWebhooks(resource) => {
                 Ok(api_models::webhooks::ObjectReferenceId::PaymentId(
@@ -2352,10 +2362,20 @@ impl IncomingWebhook for Paypal {
                     ),
                 ))
             }
+            // A refund made on the PayPal dashboard is unknown to Hyperswitch, so routing it by
+            // its refund id ends in "resource not found" and PayPal retries it for days. When the
+            // refund names the attempt that created the order, the webhook syncs that payment
+            // instead, and the sync reports every refund of the order: it creates the external
+            // ones and updates the ones Hyperswitch made (matched by `connector_refund_id`).
             paypal::PaypalResource::PaypalRefundWebhooks(resource) => {
-                Ok(api_models::webhooks::ObjectReferenceId::RefundId(
-                    api_models::webhooks::RefundIdType::ConnectorRefundId(resource.id),
-                ))
+                Ok(match refund_parent_attempt_id {
+                    Some(attempt_id) => api_models::webhooks::ObjectReferenceId::PaymentId(
+                        api_models::payments::PaymentIdType::PaymentAttemptId(attempt_id),
+                    ),
+                    None => api_models::webhooks::ObjectReferenceId::RefundId(
+                        api_models::webhooks::RefundIdType::ConnectorRefundId(resource.id),
+                    ),
+                })
             }
             paypal::PaypalResource::PaypalDisputeWebhooks(resource) => {
                 let transaction = resource
@@ -2412,6 +2432,18 @@ impl IncomingWebhook for Paypal {
             .body
             .parse_struct("PaypalWebooksEventType")
             .change_context(errors::ConnectorError::WebhookResponseEncodingFailed)?;
+        // A refund routed to a sync of its parent payment (see `get_webhook_object_reference_id`).
+        // `PaymentIntentProcessing` is only a routing label for the payments webhook flow, as for
+        // Stripe's `charge.refunded`: the webhook reaches core unverified (see the source
+        // verification request), so the sync derives everything from PayPal and the attempt, and
+        // it triggers no mandate update.
+        if matches!(
+            payload.event_type,
+            PaypalWebhookEventType::PaymentCaptureRefunded
+        ) && paypal::refund_webhook_parent_attempt_id(request.body).is_some()
+        {
+            return Ok(api_models::webhooks::IncomingWebhookEvent::PaymentIntentProcessing);
+        }
         let outcome = match payload.event_type {
             PaypalWebhookEventType::CustomerDisputeResolved => Some(
                 request
@@ -3021,24 +3053,136 @@ mod external_refund_tests {
         .unwrap()
     }
 
-    #[test]
-    fn refund_webhooks_keep_the_refund_id_routing_because_the_parent_order_is_not_in_them() {
+    /// `PAYMENT.CAPTURE.REFUNDED` as the PayPal sandbox delivered it on 2026-10-10 for a refund
+    /// made directly on PayPal (not through Hyperswitch) of an order Hyperswitch created: PayPal
+    /// copied the order's `invoice_id`, the attempt id, into the refund. Payer ids replaced.
+    fn refund_webhook_with_invoice(event_type: &str, invoice_id: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "id": "WH-4",
+            "event_version": "1.0",
+            "create_time": "2026-10-10T23:05:03.000Z",
+            "resource_type": "refund",
+            "event_type": event_type,
+            "resource": {
+                "seller_payable_breakdown": {
+                    "gross_amount": {"currency_code": "USD", "value": "3.00"},
+                    "paypal_fee": {"currency_code": "USD", "value": "0.16"},
+                    "net_amount": {"currency_code": "USD", "value": "2.84"},
+                    "total_refunded_amount": {"currency_code": "USD", "value": "3.00"}
+                },
+                "amount": {"currency_code": "USD", "value": "3.00"},
+                "update_time": "2026-10-10T16:05:00-07:00",
+                "create_time": "2026-10-10T16:05:00-07:00",
+                "invoice_id": invoice_id,
+                "links": [
+                    {"href": "https://api.sandbox.paypal.com/v2/payments/refunds/9KJ83635H5468162Y", "rel": "self", "method": "GET"},
+                    {"href": "https://api.sandbox.paypal.com/v2/payments/captures/8NY61349TJ569970L", "rel": "up", "method": "GET"}
+                ],
+                "id": "9KJ83635H5468162Y",
+                "payer": {"email_address": "merchant@business.example.com", "merchant_id": "MERCHANT1"},
+                "status": "COMPLETED"
+            }
+        }))
+        .unwrap()
+    }
+
+    fn reference_and_event_of(
+        body: &[u8],
+    ) -> (
+        ObjectReferenceId,
+        api_models::webhooks::IncomingWebhookEvent,
+    ) {
         let headers = actix_web::http::header::HeaderMap::new();
-        let body = refund_webhook();
-        let request = details(&headers, &body);
-        let reference = Paypal::new()
-            .get_webhook_object_reference_id(&request)
-            .unwrap();
+        let request = details(&headers, body);
+        (
+            Paypal::new()
+                .get_webhook_object_reference_id(&request)
+                .unwrap(),
+            Paypal::new()
+                .get_webhook_event_type(&request, None)
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_refund_webhook_naming_its_attempt_syncs_the_parent_payment() {
+        let (reference, event) = reference_and_event_of(&refund_webhook_with_invoice(
+            "PAYMENT.CAPTURE.REFUNDED",
+            "pay_0e5ZlR73kFaoVVOKTb40_1",
+        ));
+        assert!(matches!(
+            reference,
+            ObjectReferenceId::PaymentId(api_models::payments::PaymentIdType::PaymentAttemptId(ref id))
+                if id == "pay_0e5ZlR73kFaoVVOKTb40_1"
+        ));
+        // Lands in the payments webhook flow (a payment sync), not in the refunds one.
+        assert_eq!(
+            event,
+            api_models::webhooks::IncomingWebhookEvent::PaymentIntentProcessing
+        );
+        assert_eq!(
+            api_models::webhooks::WebhookFlow::from(event),
+            api_models::webhooks::WebhookFlow::Payment
+        );
+    }
+
+    #[test]
+    fn refund_webhooks_without_an_invoice_keep_the_refund_id_routing() {
+        let (reference, event) = reference_and_event_of(&refund_webhook());
         assert!(matches!(
             reference,
             ObjectReferenceId::RefundId(RefundIdType::ConnectorRefundId(ref id))
                 if id == "1JU08902781691411"
         ));
         assert_eq!(
-            Paypal::new()
-                .get_webhook_event_type(&request, None)
-                .unwrap(),
+            event,
             api_models::webhooks::IncomingWebhookEvent::RefundSuccess
+        );
+    }
+
+    #[test]
+    fn refund_webhooks_whose_invoice_is_not_an_attempt_id_keep_the_refund_id_routing() {
+        for invoice_id in [
+            // Client-side SDK orders created by the merchant: `<reservation>-<attempt>`.
+            "4821-1",
+            // `payment_id_as_connector_request_id`: the bare payment id.
+            "pay_0e5ZlR73kFaoVVOKTb40",
+            "INV_",
+            "_1",
+            "",
+        ] {
+            let (reference, event) = reference_and_event_of(&refund_webhook_with_invoice(
+                "PAYMENT.CAPTURE.REFUNDED",
+                invoice_id,
+            ));
+            assert!(
+                matches!(
+                    reference,
+                    ObjectReferenceId::RefundId(RefundIdType::ConnectorRefundId(ref id))
+                        if id == "9KJ83635H5468162Y"
+                ),
+                "invoice {invoice_id:?}"
+            );
+            assert_eq!(
+                event,
+                api_models::webhooks::IncomingWebhookEvent::RefundSuccess,
+                "invoice {invoice_id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_capture_refunded_events_are_routed_to_the_parent_payment() {
+        // An event this connector does not handle keeps the refund-id routing (no payment
+        // lookup) and stays unsupported, whatever its invoice id.
+        let (reference, event) = reference_and_event_of(&refund_webhook_with_invoice(
+            "PAYMENT.CAPTURE.REVERSED",
+            "pay_0e5ZlR73kFaoVVOKTb40_1",
+        ));
+        assert!(matches!(reference, ObjectReferenceId::RefundId(_)));
+        assert_eq!(
+            event,
+            api_models::webhooks::IncomingWebhookEvent::EventNotSupported
         );
     }
 

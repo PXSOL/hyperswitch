@@ -4152,6 +4152,69 @@ pub struct PaypalRefundWebhooks {
     pub id: String,
     pub amount: OrderAmount,
     pub seller_payable_breakdown: PaypalSellerPayableBreakdown,
+    /// PayPal copies the `invoice_id` of the refunded capture into the refund, also for a refund
+    /// made on the PayPal dashboard. Hyperswitch sets it to the attempt's
+    /// `connector_request_reference_id` when it creates the order.
+    #[serde(default)]
+    pub invoice_id: Option<String>,
+}
+
+impl PaypalRefundWebhooks {
+    /// The Hyperswitch attempt that created the refunded order, when the refund's `invoice_id`
+    /// is one: the refund resource links the capture only (`links[rel=up]`), never the order id
+    /// Hyperswitch stores, so this is the only way to reach the parent payment.
+    ///
+    /// Only an invoice id shaped like an attempt id (`<payment id>_<attempt number>`, the default
+    /// request reference) qualifies. An order created outside Hyperswitch's order request (e.g.
+    /// by a client-side SDK button) carries the merchant's own invoice id, and a merchant with
+    /// `payment_id_as_connector_request_id` sends the bare payment id: neither resolves as an
+    /// attempt id, so their refunds keep the refund-id routing, which still finds a refund
+    /// Hyperswitch made.
+    pub fn parent_attempt_id(&self) -> Option<String> {
+        self.invoice_id
+            .clone()
+            .filter(|invoice_id| is_attempt_id_shaped(invoice_id))
+    }
+}
+
+/// Whether `reference` has the shape of a Hyperswitch attempt id, `<payment id>_<attempt
+/// number>` (e.g. `pay_0e5ZlR73kFaoVVOKTb40_1`).
+fn is_attempt_id_shaped(reference: &str) -> bool {
+    reference
+        .rsplit_once('_')
+        .is_some_and(|(payment_id, attempt_number)| {
+            !payment_id.is_empty()
+                && !attempt_number.is_empty()
+                && attempt_number.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+impl PaypalWebhooksBody {
+    /// The attempt a `PAYMENT.CAPTURE.REFUNDED` webhook is routed to, see
+    /// [`PaypalRefundWebhooks::parent_attempt_id`]. Any other event keeps its routing.
+    pub fn refund_parent_attempt_id(&self) -> Option<String> {
+        match (&self.event_type, &self.resource) {
+            (
+                PaypalWebhookEventType::PaymentCaptureRefunded,
+                PaypalResource::PaypalRefundWebhooks(refund),
+            ) => refund.parent_attempt_id(),
+            _ => None,
+        }
+    }
+}
+
+/// [`PaypalWebhooksBody::refund_parent_attempt_id`] of a raw webhook body, `None` when it does
+/// not parse.
+///
+/// Such a webhook is routed to a sync of the parent payment and must reach core as UNVERIFIED:
+/// a verified payments webhook is consumed as the payment sync response (`HandleResponse`), but
+/// this body is a refund, not an order, and carries no refund list. Unverified, core runs a live
+/// payment sync instead, whose orders response reports every refund of the order (see
+/// `Connector::syncs_refunds_and_disputes_on_payment_sync`).
+pub fn refund_webhook_parent_attempt_id(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<PaypalWebhooksBody>(body)
+        .ok()?
+        .refund_parent_attempt_id()
 }
 
 #[derive(Deserialize, Debug, Serialize)]
@@ -5271,6 +5334,139 @@ mod external_refund_sync_tests {
         let (metadata, mandate) = kept(false);
         assert!(metadata.is_some());
         assert!(mandate.is_some());
+    }
+
+    /// A `PAYMENT.CAPTURE.REFUNDED` webhook body, with or without an `invoice_id`.
+    fn refund_webhook_body(invoice_id: Option<&str>) -> Vec<u8> {
+        let mut resource = json!({
+            "id": REFUND_ID,
+            "status": "COMPLETED",
+            "amount": {"currency_code": "USD", "value": "3.00"},
+            "seller_payable_breakdown": {
+                "total_refunded_amount": {"currency_code": "USD", "value": "3.00"}
+            },
+            "links": [
+                {"href": format!("https://api.sandbox.paypal.com/v2/payments/captures/{CAPTURE_ID}"), "rel": "up", "method": "GET"}
+            ]
+        });
+        if let Some(invoice_id) = invoice_id {
+            resource["invoice_id"] = json!(invoice_id);
+        }
+        serde_json::to_vec(&json!({
+            "id": "WH-5",
+            "resource_type": "refund",
+            "event_type": "PAYMENT.CAPTURE.REFUNDED",
+            "resource": resource
+        }))
+        .unwrap()
+    }
+
+    fn verification_request_for(body: Vec<u8>) -> Option<common_utils::request::Request> {
+        use hyperswitch_interfaces::api::ConnectorIntegration;
+
+        let mut headers = actix_web::http::header::HeaderMap::new();
+        for (name, value) in [
+            (webhook_headers::PAYPAL_TRANSMISSION_ID, "tid"),
+            (
+                webhook_headers::PAYPAL_TRANSMISSION_TIME,
+                "2026-10-10T23:05:03Z",
+            ),
+            (
+                webhook_headers::PAYPAL_CERT_URL,
+                "https://api.sandbox.paypal.com/cert",
+            ),
+            (webhook_headers::PAYPAL_TRANSMISSION_SIG, "sig"),
+            (webhook_headers::PAYPAL_AUTH_ALGO, "SHA256withRSA"),
+        ] {
+            headers.insert(
+                actix_web::http::header::HeaderName::from_static(name),
+                actix_web::http::header::HeaderValue::from_static(value),
+            );
+        }
+        let mut data = router_data::<
+            VerifyWebhookSource,
+            VerifyWebhookSourceRequestData,
+            VerifyWebhookSourceResponseData,
+        >(VerifyWebhookSourceRequestData {
+            webhook_headers: headers,
+            webhook_body: body,
+            merchant_secret: api_models::webhooks::ConnectorWebhookSecrets {
+                secret: b"WEBHOOKID1".to_vec(),
+                additional_secret: None,
+            },
+            webhook_uri: "/webhooks/merchant/mca".parse().unwrap(),
+        });
+        data.connector_auth_type = ConnectorAuthType::BodyKey {
+            api_key: Secret::new("secret".to_string()),
+            key1: Secret::new("client".to_string()),
+        };
+        ConnectorIntegration::<
+            VerifyWebhookSource,
+            VerifyWebhookSourceRequestData,
+            VerifyWebhookSourceResponseData,
+        >::build_request(
+            crate::connectors::Paypal::new(),
+            &data,
+            &hyperswitch_interfaces::configs::Connectors::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_refund_webhook_routed_to_its_payment_is_never_verified() {
+        // No verification request: core keeps the webhook unverified and runs a live payment
+        // sync (`Trigger`) instead of consuming the refund resource as the sync response.
+        assert!(verification_request_for(refund_webhook_body(Some("pay_1_1"))).is_none());
+        // Every other webhook is still verified with PayPal.
+        assert!(verification_request_for(refund_webhook_body(None)).is_some());
+        assert!(verification_request_for(refund_webhook_body(Some("4821-1"))).is_some());
+        assert!(verification_request_for(
+            serde_json::to_vec(&json!({
+                "event_type": "CUSTOMER.DISPUTE.CREATED",
+                "resource": {"invoice_number": "pay_1_1"}
+            }))
+            .unwrap()
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn a_refund_webhook_resource_is_never_consumed_as_a_payment_sync() {
+        use hyperswitch_interfaces::{api::ConnectorIntegration, webhooks::IncomingWebhook};
+
+        // Defense in depth for the verified path: if core ever consumed the refund resource of
+        // such a webhook as the payment sync response (`HandleResponse`), the sync fails instead
+        // of reading the refund as an order or capture and rewriting the attempt.
+        let body = refund_webhook_body(Some("pay_1_1"));
+        let headers = actix_web::http::header::HeaderMap::new();
+        let request = hyperswitch_interfaces::webhooks::IncomingWebhookRequestDetails {
+            method: actix_web::http::Method::POST,
+            uri: "/webhooks/paypal".parse().unwrap(),
+            headers: &headers,
+            body: &body,
+            query_params: String::new(),
+        };
+        let resource_object = crate::connectors::Paypal::new()
+            .get_webhook_resource_object(&request)
+            .unwrap();
+        let response = hyperswitch_interfaces::types::Response {
+            headers: None,
+            response: serde_json::to_vec(&resource_object).unwrap().into(),
+            status_code: 200,
+        };
+        let data = router_data::<PSync, PaymentsSyncData, PaymentsResponseData>(sync_request());
+        let error =
+            ConnectorIntegration::<PSync, PaymentsSyncData, PaymentsResponseData>::handle_response(
+                crate::connectors::Paypal::new(),
+                &data,
+                None,
+                response,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error.current_context(),
+            errors::ConnectorError::ResponseDeserializationFailed
+        ));
     }
 }
 
