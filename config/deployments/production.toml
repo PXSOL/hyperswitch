@@ -1202,3 +1202,17 @@ batch_size = 500
 flush_after_records = 500
 flush_interval_ms = 1000
 shutdown_flush_ms = 5000
+
+# Superposition (configuration service). PXSOL does not run a Superposition service. The router
+# still validates this section at startup (endpoint, token, org_id and workspace_id must be set) and
+# panics if the client cannot load any configuration, so the endpoint below is a local placeholder
+# that refuses connections and the client serves the defaults from `backup_file_path`, the seed file
+# copied into the image next to this config (see Dockerfile). The same fallback is what local
+# development uses (config/development.toml).
+[superposition]
+endpoint = "http://localhost:8081"
+token = "unused"
+org_id = "pxsol"
+workspace_id = "default"
+polling_interval = 3600
+backup_file_path = "/local/config/superposition_seed.toml"
