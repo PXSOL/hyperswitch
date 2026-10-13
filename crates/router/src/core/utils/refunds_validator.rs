@@ -1,7 +1,9 @@
 use diesel_models::refund as diesel_refund;
 use error_stack::report;
 #[cfg(feature = "v1")]
-use hyperswitch_domain_models::router_response_types::SupportedPaymentMethodsExt;
+use hyperswitch_domain_models::router_response_types::{
+    SupportedPaymentMethods, SupportedPaymentMethodsExt,
+};
 #[cfg(feature = "v1")]
 use hyperswitch_interfaces::{self, api::ConnectorSpecifications};
 use router_env::{instrument, tracing};
@@ -126,14 +128,32 @@ pub fn validate_for_valid_refunds(
         .as_ref()
         .get_required_value("payment_method")?;
 
-    let payment_method_type = payment_attempt
-        .payment_method_type
-        .get_required_value("payment_method_type")?;
+    validate_refund_support(
+        *payment_method,
+        payment_attempt.payment_method_type,
+        connector_enum.get_supported_payment_methods(),
+        connector,
+    )
+}
 
-    let supported_payment_methods = connector_enum.get_supported_payment_methods();
+#[cfg(feature = "v1")]
+fn validate_refund_support(
+    payment_method: enums::PaymentMethod,
+    payment_method_type: Option<enums::PaymentMethodType>,
+    supported_payment_methods: Option<&SupportedPaymentMethods>,
+    connector: api_models::enums::Connector,
+) -> RouterResult<()> {
+    // PXSOL: upstream (#10735) made payment_method_type mandatory for every refund, which
+    // rejects card payments created without it (api2 never sends it for Payway, Mercado Pago,
+    // Stripe or Wompi cards) with IR_04. Without a type there is nothing to look up in the
+    // connector's supported payment methods, so such refunds go through as they did before
+    // the upstream sync. When the type is present, upstream's check applies unchanged.
+    let Some(payment_method_type) = payment_method_type else {
+        return Ok(());
+    };
 
     let is_refund_supported = supported_payment_methods.is_none_or(|supported_payment_method| {
-        supported_payment_method.is_refund_supported(payment_method, &payment_method_type)
+        supported_payment_method.is_refund_supported(&payment_method, &payment_method_type)
     });
 
     if !is_refund_supported {
@@ -297,5 +317,101 @@ pub fn validate_xendit_charge_refund(
             }
             Ok(Some(xendit_split_refund_request.for_user_id.clone()))
         }
+    }
+}
+
+#[cfg(all(test, feature = "v1"))]
+mod tests {
+    use hyperswitch_domain_models::router_response_types::PaymentMethodDetails;
+
+    use super::*;
+
+    fn card_credit_with_refunds(refunds: enums::FeatureStatus) -> SupportedPaymentMethods {
+        let mut supported_payment_methods = SupportedPaymentMethods::new();
+        supported_payment_methods.add(
+            enums::PaymentMethod::Card,
+            enums::PaymentMethodType::Credit,
+            PaymentMethodDetails {
+                mandates: enums::FeatureStatus::NotSupported,
+                refunds,
+                supported_capture_methods: vec![enums::CaptureMethod::Automatic],
+                specific_features: None,
+            },
+        );
+        supported_payment_methods
+    }
+
+    #[test]
+    fn refund_without_payment_method_type_is_allowed() {
+        let supported_payment_methods =
+            card_credit_with_refunds(enums::FeatureStatus::NotSupported);
+
+        let result = validate_refund_support(
+            enums::PaymentMethod::Card,
+            None,
+            Some(&supported_payment_methods),
+            api_models::enums::Connector::Payway,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn refund_with_supported_payment_method_type_is_allowed() {
+        let supported_payment_methods = card_credit_with_refunds(enums::FeatureStatus::Supported);
+
+        let result = validate_refund_support(
+            enums::PaymentMethod::Card,
+            Some(enums::PaymentMethodType::Credit),
+            Some(&supported_payment_methods),
+            api_models::enums::Connector::Payway,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn refund_with_unsupported_payment_method_type_is_rejected() {
+        let supported_payment_methods =
+            card_credit_with_refunds(enums::FeatureStatus::NotSupported);
+
+        let result = validate_refund_support(
+            enums::PaymentMethod::Card,
+            Some(enums::PaymentMethodType::Credit),
+            Some(&supported_payment_methods),
+            api_models::enums::Connector::Payway,
+        );
+
+        assert!(matches!(
+            result.as_ref().map_err(|error| error.current_context()),
+            Err(errors::ApiErrorResponse::InvalidRequestData { .. })
+        ));
+    }
+
+    #[test]
+    fn refund_with_undeclared_payment_method_type_is_allowed() {
+        let supported_payment_methods =
+            card_credit_with_refunds(enums::FeatureStatus::NotSupported);
+
+        let result = validate_refund_support(
+            enums::PaymentMethod::Card,
+            Some(enums::PaymentMethodType::Debit),
+            Some(&supported_payment_methods),
+            api_models::enums::Connector::Payway,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn refund_for_connector_without_supported_payment_methods_is_allowed() {
+        let result = validate_refund_support(
+            enums::PaymentMethod::Card,
+            Some(enums::PaymentMethodType::Credit),
+            None,
+            api_models::enums::Connector::Payway,
+        );
+
+        assert!(result.is_ok());
     }
 }
