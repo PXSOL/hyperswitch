@@ -32,7 +32,7 @@ use hyperswitch_domain_models::{
     router_response_types::{PaymentsResponseData, RedirectForm},
 };
 use hyperswitch_interfaces::{api::ConnectorCommon, types::Response};
-use masking::{PeekInterface, Secret};
+use hyperswitch_masking::{PeekInterface, Secret};
 use serde_json::json;
 
 use super::transformers as fiservemea;
@@ -102,6 +102,15 @@ fn empty_router_data<F>() -> RouterData<F, (), PaymentsResponseData> {
         psd2_sca_exemption_type: None,
         raw_connector_response: None,
         is_payment_id_from_merchant: None,
+        payment_method_type: None,
+        payout_id: None,
+        authorized_amount: None,
+        accept_amount_mismatch: None,
+        customer_document_details: None,
+        customer_date_of_birth: None,
+        feature_data: None,
+        sender_payment_instrument_id: None,
+        connector_returned_payment_method_details: None,
     }
 }
 
@@ -111,7 +120,9 @@ fn empty_router_data<F>() -> RouterData<F, (), PaymentsResponseData> {
 /// gateway no parseara, el fallo se ve acá con el payload que lo produjo.
 fn convert(raw: serde_json::Value, http_code: u16) -> TestRouterData {
     let response: fiservemea::FiservemeaPaymentsResponse = serde_json::from_value(raw.clone())
-        .unwrap_or_else(|err| panic!("la respuesta real del gateway no deserializó: {err}\n{raw:#}"));
+        .unwrap_or_else(|err| {
+            panic!("la respuesta real del gateway no deserializó: {err}\n{raw:#}")
+        });
     RouterData::try_from(ResponseRouterData {
         response,
         data: empty_router_data::<()>(),
@@ -1607,7 +1618,6 @@ pub(super) fn real_payment_of_a_voided_sale() -> serde_json::Value {
     })
 }
 
-
 /// `GET /payments/84667286296?storeId=...` — consulta de la venta ANULADA por su propio id.
 ///
 /// Traído en vivo del gateway de cert el 2026-08-13 (`apiTraceId` an0QkuOTJZTvEmGNMGmHtAAAAvs).
@@ -2071,20 +2081,48 @@ fn every_real_payment_response_shape_deserializes() {
     for (name, raw, http) in [
         ("sale aprobada", approved_sale(), 200),
         ("sale con token GW", approved_sale_with_gateway_token(), 200),
-        ("sale con network token", approved_sale_with_network_token(), 200),
-        ("3DS frictionless autenticada", frictionless_authenticated(), 200),
-        ("3DS rechazada pero aprobada", three_ds_rejected_but_approved(), 200),
+        (
+            "sale con network token",
+            approved_sale_with_network_token(),
+            200,
+        ),
+        (
+            "3DS frictionless autenticada",
+            frictionless_authenticated(),
+            200,
+        ),
+        (
+            "3DS rechazada pero aprobada",
+            three_ds_rejected_but_approved(),
+            200,
+        ),
         ("WAITING con 3DSMethod", waiting_with_three_ds_method(), 200),
-        ("WAITING con params de desafío", waiting_with_challenge_params(), 200),
+        (
+            "WAITING con params de desafío",
+            waiting_with_challenge_params(),
+            200,
+        ),
         ("void aprobado", approved_void(), 200),
         ("PSync de venta aprobada", sync_approved_sale(), 200),
         ("PSync de venta anulada", sync_of_a_voided_sale(), 200),
         ("PSync de venta rechazada", sync_of_a_declined_sale(), 200),
         ("409 3DS rechazado", declined_3ds_409(), 409),
-        ("409 3DS con cardholderInfo", declined_3ds_409_with_cardholder_info(), 409),
-        ("409 Data Only sin id", declined_data_only_without_transaction_id(), 409),
+        (
+            "409 3DS con cardholderInfo",
+            declined_3ds_409_with_cardholder_info(),
+            409,
+        ),
+        (
+            "409 Data Only sin id",
+            declined_data_only_without_transaction_id(),
+            409,
+        ),
         ("422 rechazo del emisor", issuer_decline_422(), 422),
-        ("PSync del rechazo del emisor", sync_of_an_issuer_declined_sale(), 200),
+        (
+            "PSync del rechazo del emisor",
+            sync_of_an_issuer_declined_sale(),
+            200,
+        ),
     ] {
         let parsed: Result<fiservemea::FiservemeaPaymentsResponse, _> =
             serde_json::from_value(raw.clone());
@@ -2103,7 +2141,10 @@ fn every_real_sync_response_shape_deserializes() {
     for (name, raw) in [
         ("transactionResponse", sync_approved_sale()),
         ("orderResponse", sync_order_response()),
-        ("orderResponse de una anulación", sync_order_of_a_voided_sale()),
+        (
+            "orderResponse de una anulación",
+            sync_order_of_a_voided_sale(),
+        ),
     ] {
         let parsed: Result<fiservemea::FiservemeaSyncResponse, _> =
             serde_json::from_value(raw.clone());
@@ -2177,7 +2218,8 @@ fn the_fixtures_are_verbatim_copies_of_the_evidence() {
             .unwrap_or_else(|| panic!("{name}: {path:?} no tiene la línea {line_index}"));
         let step: serde_json::Value = serde_json::from_str(line).unwrap();
         assert_eq!(
-            step["response"], fixture,
+            step["response"],
+            fixture,
             "el fixture `{name}` dejó de ser el cuerpo real de {run} línea {}",
             line_index + 1
         );
@@ -2313,7 +2355,10 @@ fn approved_sale_is_charged_with_its_transaction_id() {
         Some("84667286258")
     );
     let parsed = parsed(&data);
-    assert_eq!(parsed.reference_id.as_deref(), Some("PX-1786053416-01-sale"));
+    assert_eq!(
+        parsed.reference_id.as_deref(),
+        Some("PX-1786053416-01-sale")
+    );
     assert!(parsed.redirection.is_none());
     // Sin `paymentToken.value` no hay nada que guardar como mandato: publicar uno vacío haría
     // que Card on File intentara cobrar contra un token inexistente.
@@ -2562,7 +2607,10 @@ fn declined_message_is_the_generic_response_type_bug() {
     // `message` termina siendo la constante genérica del repo.
     let error = error_response(invalid_input_400(), 400);
     assert_eq!(error.code, "INVALID_INPUT");
-    assert_eq!(error.message, hyperswitch_interfaces::consts::NO_ERROR_MESSAGE);
+    assert_eq!(
+        error.message,
+        hyperswitch_interfaces::consts::NO_ERROR_MESSAGE
+    );
     // El detalle sí sobrevive, con el campo que el gateway señaló.
     let reason = error.reason.expect("el detalle del 400 no puede perderse");
     assert!(reason.contains("softDescriptor"));
@@ -2631,7 +2679,10 @@ fn the_issuer_decline_422_publishes_the_iso_code_for_the_retry_engine() {
     assert_eq!(error.code, "50005");
     assert_eq!(error.reason.as_deref(), Some("Do not honour"));
     assert_eq!(error.network_decline_code.as_deref(), Some("05"));
-    assert_eq!(error.network_error_message.as_deref(), Some("Do not honour"));
+    assert_eq!(
+        error.network_error_message.as_deref(),
+        Some("Do not honour")
+    );
     assert_eq!(error.network_advice_code, None);
     assert_eq!(
         error.connector_transaction_id.as_deref(),
@@ -2651,7 +2702,10 @@ fn psync_of_an_issuer_decline_carries_the_iso_code_as_the_error_code() {
     assert_eq!(error.code, "05");
     assert_eq!(error.message, "Do not honour");
     assert_eq!(error.network_decline_code.as_deref(), Some("05"));
-    assert_eq!(error.network_error_message.as_deref(), Some("Do not honour"));
+    assert_eq!(
+        error.network_error_message.as_deref(),
+        Some("Do not honour")
+    );
     assert_eq!(
         error.connector_transaction_id.as_deref(),
         Some("84668174890")
@@ -2666,7 +2720,10 @@ fn a_decline_without_a_transaction_id_still_carries_its_reason() {
     let error = error_response(declined_data_only_without_transaction_id(), 409);
     assert_eq!(error.code, "50655");
     assert_eq!(error.connector_transaction_id, None);
-    assert_eq!(error.reason.as_deref(), Some("Unable to verify card enrollment"));
+    assert_eq!(
+        error.reason.as_deref(),
+        Some("Unable to verify card enrollment")
+    );
 }
 
 #[test]
@@ -2694,10 +2751,7 @@ fn no_real_decline_arrives_without_a_code_or_a_reason() {
             hyperswitch_interfaces::consts::NO_ERROR_CODE,
             "{name} llegó sin código"
         );
-        assert!(
-            error.reason.is_some(),
-            "{name} llegó sin motivo"
-        );
+        assert!(error.reason.is_some(), "{name} llegó sin motivo");
     }
 
     // Y el rechazo que llega con HTTP 2xx (el PSync de una venta rechazada), que sale por el
@@ -2722,7 +2776,10 @@ fn every_approved_response_carries_an_id_to_sync_with() {
         ("sale con token GW", approved_sale_with_gateway_token()),
         ("sale con network token", approved_sale_with_network_token()),
         ("3DS frictionless", frictionless_authenticated()),
-        ("3DS rechazado pero aprobado", three_ds_rejected_but_approved()),
+        (
+            "3DS rechazado pero aprobado",
+            three_ds_rejected_but_approved(),
+        ),
         ("void", approved_void()),
         ("WAITING con 3DSMethod", waiting_with_three_ds_method()),
         ("WAITING con desafío", waiting_with_challenge_params()),

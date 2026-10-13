@@ -9,7 +9,6 @@ use common_utils::{
 };
 use error_stack::ResultExt;
 use hyperswitch_domain_models::{
-    payment_method_data::PaymentMethodData,
     router_data::{AccessToken, ConnectorAuthType, ErrorResponse, RouterData},
     router_flow_types::{
         access_token_auth::AccessTokenAuth,
@@ -38,7 +37,7 @@ use hyperswitch_interfaces::{
     types::{self, Response},
     webhooks,
 };
-use masking::{Mask, PeekInterface};
+use hyperswitch_masking::{Mask, PeekInterface};
 use transformers as mercadopago;
 
 use crate::{constants::headers, types::ResponseRouterData, utils, utils::RefundsRequestData};
@@ -79,11 +78,12 @@ impl ConnectorIntegration<PaymentMethodToken, PaymentMethodTokenizationData, Pay
         &self,
         req: &hyperswitch_domain_models::types::TokenizationRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         let mut headers = self.build_headers(req, connectors)?;
         headers.push((
             "x-platform-id".to_string(),
-            masking::Secret::new(PXSOL_PLATFORM_ID.to_string()).into_masked(),
+            hyperswitch_masking::Secret::new(PXSOL_PLATFORM_ID.to_string()).into_masked(),
         ));
         Ok(headers)
     }
@@ -169,7 +169,8 @@ where
         &self,
         req: &RouterData<Flow, Request, Response>,
         _connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         let mut header = vec![(
             headers::CONTENT_TYPE.to_string(),
             self.get_content_type().to_string().into(),
@@ -202,7 +203,8 @@ impl ConnectorCommon for Mercadopago {
     fn get_auth_header(
         &self,
         auth_type: &ConnectorAuthType,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         let auth = mercadopago::MercadopagoAuthType::try_from(auth_type)
             .change_context(errors::ConnectorError::FailedToObtainAuthType)?;
 
@@ -238,25 +240,12 @@ impl ConnectorCommon for Mercadopago {
             network_decline_code: Some(response.get_error_code()),
             network_error_message: Some(response.get_error_message()),
             connector_metadata: None,
+            connector_response_reference_id: None,
         })
     }
 }
 
 impl ConnectorValidation for Mercadopago {
-    fn validate_mandate_payment(
-        &self,
-        _pm_type: Option<enums::PaymentMethodType>,
-        pm_data: PaymentMethodData,
-    ) -> CustomResult<(), errors::ConnectorError> {
-        match pm_data {
-            PaymentMethodData::Card(_) => Ok(()),
-            _ => Err(errors::ConnectorError::NotImplemented(
-                "mandate payment not supported for this payment method".to_string(),
-            )
-            .into()),
-        }
-    }
-
     fn validate_psync_reference_id(
         &self,
         _data: &PaymentsSyncData,
@@ -286,7 +275,8 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         &self,
         req: &PaymentsAuthorizeRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         let mut headers = self.build_headers(req, connectors)?;
         // Mercado Pago requires X-Idempotency-Key header
         headers.push((
@@ -295,7 +285,7 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         ));
         headers.push((
             "x-platform-id".to_string(),
-            masking::Secret::new(PXSOL_PLATFORM_ID.to_string()).into_masked(),
+            hyperswitch_masking::Secret::new(PXSOL_PLATFORM_ID.to_string()).into_masked(),
         ));
         // Add X-meli-session-id header if device_id is provided in metadata or frm_metadata (for anti-fraud)
         let device_id = req
@@ -425,7 +415,8 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Mer
         &self,
         req: &PaymentsSyncRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.build_headers(req, connectors)
     }
 
@@ -548,7 +539,8 @@ impl ConnectorIntegration<Capture, PaymentsCaptureData, PaymentsResponseData> fo
         &self,
         req: &PaymentsCaptureRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         let mut headers = self.build_headers(req, connectors)?;
         headers.push((
             "X-Idempotency-Key".to_string(),
@@ -647,7 +639,8 @@ impl ConnectorIntegration<Void, PaymentsCancelData, PaymentsResponseData> for Me
         &self,
         req: &PaymentsCancelRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         let mut headers = self.build_headers(req, connectors)?;
         headers.push((
             "X-Idempotency-Key".to_string(),
@@ -736,7 +729,8 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Mercado
         &self,
         req: &RefundsRouterData<Execute>,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         let mut headers = self.build_headers(req, connectors)?;
         headers.push((
             "X-Idempotency-Key".to_string(),
@@ -834,7 +828,8 @@ impl ConnectorIntegration<RSync, RefundsData, RefundsResponseData> for Mercadopa
         &self,
         req: &RefundSyncRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.build_headers(req, connectors)
     }
 
@@ -978,7 +973,7 @@ impl webhooks::IncomingWebhook for Mercadopago {
         _merchant_id: &common_utils::id_type::MerchantId,
         _connector_webhook_details: Option<common_utils::pii::SecretSerdeValue>,
         _connector_account_details: common_utils::crypto::Encryptable<
-            masking::Secret<serde_json::Value>,
+            hyperswitch_masking::Secret<serde_json::Value>,
         >,
         _connector_name: &str,
     ) -> CustomResult<bool, errors::ConnectorError> {
@@ -1004,6 +999,7 @@ impl webhooks::IncomingWebhook for Mercadopago {
     fn get_webhook_event_type(
         &self,
         request: &webhooks::IncomingWebhookRequestDetails<'_>,
+        _context: Option<&webhooks::WebhookContext>,
     ) -> CustomResult<api_models::webhooks::IncomingWebhookEvent, errors::ConnectorError> {
         Ok(api_models::webhooks::IncomingWebhookEvent::from(
             &classify_mercadopago_webhook(request),
@@ -1013,7 +1009,8 @@ impl webhooks::IncomingWebhook for Mercadopago {
     fn get_webhook_resource_object(
         &self,
         request: &webhooks::IncomingWebhookRequestDetails<'_>,
-    ) -> CustomResult<Box<dyn masking::ErasedMaskSerialize>, errors::ConnectorError> {
+    ) -> CustomResult<Box<dyn hyperswitch_masking::ErasedMaskSerialize>, errors::ConnectorError>
+    {
         // Webhooks v1 (full) or Feed v2 (resource + topic) carry a JSON body; a
         // legacy IPN carries only `?topic=...&id=...`, so fall back to the query
         // (as `get_webhook_object_reference_id` does) instead of rejecting it.

@@ -47,7 +47,7 @@ async fn payment_attempt_health_func(
         "Payment attempt health diagnostic called"
     );
 
-    let window_minutes = query.window_minutes as i64;
+    let window_minutes = i64::from(query.window_minutes);
     let now = date_time::now();
     let from_time = now.saturating_sub(time::Duration::minutes(window_minutes));
 
@@ -71,7 +71,7 @@ async fn payment_attempt_health_func(
 
     let response = diagnostic::evaluate_payment_attempt_health(
         attempts,
-        total_successes.max(0) as u64,
+        u64::try_from(total_successes).unwrap_or(0),
         query.window_minutes,
         from_time,
         now,

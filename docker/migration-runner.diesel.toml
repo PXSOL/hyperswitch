@@ -1,0 +1,6 @@
+# diesel config for the production migration runner (docker/migration-runner.Dockerfile).
+# It only applies migrations. The repository's diesel.toml also regenerates schema.rs through
+# [print_schema] after migrating, which a runner does not need and which makes `diesel migration run`
+# exit 1 here (the drop_id.patch hunk no longer applies), so a successful run would look like a failure.
+[migrations_directory]
+dir = "migrations"
