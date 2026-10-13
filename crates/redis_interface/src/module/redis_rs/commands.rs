@@ -1372,7 +1372,7 @@ impl super::RedisConnectionWithContext {
             }
         })?;
 
-        Ok(reply
+        let result: StreamReadResult = reply
             .keys
             .into_iter()
             .map(|stream_response| {
@@ -1395,7 +1395,8 @@ impl super::RedisConnectionWithContext {
                     .collect();
                 (stream_response.key, stream_entries)
             })
-            .collect())
+            .collect();
+        non_empty_stream_read(result)
     }
 
     /// Read stream entries and return them grouped by stream key with optional field values.
@@ -1450,7 +1451,7 @@ impl super::RedisConnectionWithContext {
             }
         })?;
 
-        Ok(reply
+        let result: StreamReadResult = reply
             .keys
             .into_iter()
             .map(|stream_response| {
@@ -1473,7 +1474,8 @@ impl super::RedisConnectionWithContext {
                     .collect();
                 (stream_response.key, stream_entries)
             })
-            .collect())
+            .collect();
+        non_empty_stream_read(result)
     }
 
     // ─── List Commands ───────────────────────────────────────────────────────
@@ -1805,5 +1807,20 @@ impl super::RedisConnectionWithContext {
             SetnxReply::KeySet => SetGetReply::ValueSet(actual_value),
             SetnxReply::KeyNotSet => SetGetReply::ValueExists(actual_value),
         })
+    }
+}
+
+/// A nil XREAD/XREADGROUP reply (nothing new to read) decodes into an empty
+/// `StreamReadReply` here, while the fred backend reports it as an error. Callers
+/// such as the scheduler consumer rely on `StreamEmptyOrNotAvailable` to mean "no
+/// batches"; an empty `Ok` makes them acknowledge an empty ID list, which Redis
+/// rejects, so every idle poll was logged as an error.
+fn non_empty_stream_read(
+    result: StreamReadResult,
+) -> CustomResult<StreamReadResult, errors::RedisError> {
+    if result.values().all(|entries| entries.is_empty()) {
+        Err(report!(errors::RedisError::StreamEmptyOrNotAvailable))
+    } else {
+        Ok(result)
     }
 }
