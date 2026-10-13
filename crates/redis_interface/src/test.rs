@@ -1437,6 +1437,95 @@ async fn test_stream_read_with_options_xreadgroup() {
     assert!(is_success);
 }
 
+/// An XREADGROUP on an existing stream with nothing undelivered gets a nil reply. Both
+/// backends must report it as `StreamEmptyOrNotAvailable` (the scheduler consumer treats that as
+/// "no batches"); an `Ok` with no entries makes the consumer acknowledge an empty ID list, which
+/// Redis rejects, so every idle poll would be logged as an error.
+#[tokio::test]
+async fn test_stream_read_with_options_xreadgroup_empty_stream_is_reported_empty() {
+    let is_empty_error = tokio::task::spawn_blocking(move || {
+        futures::executor::block_on(async {
+            let pool = test_connection(&RedisSettings::default())
+                .await
+                .expect("failed to create redis connection pool");
+            let uid = unique_test_id();
+            let stream: RedisKey = format!("test_xreadgroup_empty_{uid}").into();
+            let group = format!("test_grp_empty_{uid}");
+            let consumer = format!("test_consumer_empty_{uid}");
+
+            // Creates the stream (MKSTREAM) without any entry.
+            pool.consumer_group_create(
+                &stream,
+                &group,
+                &RedisEntryId::UserSpecifiedID {
+                    milliseconds: "0".to_string(),
+                    sequence_number: "0".to_string(),
+                },
+            )
+            .await
+            .expect("failed to create group");
+
+            let result = pool
+                .stream_read_with_options(
+                    &[stream],
+                    vec![RedisEntryId::UndeliveredEntryID.to_stream_id()],
+                    Some(1),
+                    None,
+                    Some((&group, &consumer)),
+                )
+                .await;
+
+            matches!(
+                result.as_ref().map_err(|err| err.current_context()),
+                Err(crate::errors::RedisError::StreamEmptyOrNotAvailable)
+            )
+        })
+    })
+    .await
+    .expect("Spawn block failure");
+
+    assert!(is_empty_error);
+}
+
+/// Same contract for a plain XREAD on an existing stream that has no entries.
+#[tokio::test]
+async fn test_stream_read_entries_empty_stream_is_reported_empty() {
+    let is_empty_error = tokio::task::spawn_blocking(move || {
+        futures::executor::block_on(async {
+            let pool = test_connection(&RedisSettings::default())
+                .await
+                .expect("failed to create redis connection pool");
+            let uid = unique_test_id();
+            let stream: RedisKey = format!("test_xread_empty_{uid}").into();
+
+            // Creates the stream (MKSTREAM) without any entry.
+            pool.consumer_group_create(
+                &stream,
+                &format!("test_grp_xread_empty_{uid}"),
+                &RedisEntryId::UserSpecifiedID {
+                    milliseconds: "0".to_string(),
+                    sequence_number: "0".to_string(),
+                },
+            )
+            .await
+            .expect("failed to create group");
+
+            let result = pool
+                .stream_read_entries(&[stream], vec!["0".to_string()], Some(1))
+                .await;
+
+            matches!(
+                result.as_ref().map_err(|err| err.current_context()),
+                Err(crate::errors::RedisError::StreamEmptyOrNotAvailable)
+            )
+        })
+    })
+    .await
+    .expect("Spawn block failure");
+
+    assert!(is_empty_error);
+}
+
 #[tokio::test]
 async fn test_stream_acknowledge_entries() {
     let is_success = tokio::task::spawn_blocking(move || {
