@@ -2,6 +2,10 @@ FROM public.ecr.aws/docker/library/rust:trixie as builder
 
 ARG EXTRA_FEATURES=""
 ARG VERSION_FEATURE_SET="v1"
+# Redis client backend: exactly one of `redis-rs` (default) or `fred` must be enabled.
+# `--no-default-features` below applies to every workspace crate, which also drops
+# the crates' default backend, so it has to be selected explicitly here.
+ARG REDIS_BACKEND=redis-rs
 
 # Which cargo profile compiles the binaries: `release` (default, production),
 # `release-fast` (optimized, no LTO, for development cycles) or `dev`
@@ -41,6 +45,7 @@ RUN cargo build \
     --no-default-features \
     --features release \
     --features ${VERSION_FEATURE_SET} \
+    --features ${REDIS_BACKEND} \
     ${EXTRA_FEATURES}
 
 # Stage the binary at a profile-independent path for the runtime stage
@@ -61,6 +66,9 @@ ARG BIN_DIR=/local/bin
 # Copy this required fields config file
 COPY --from=builder /router/config/payment_required_fields_v2.toml ${CONFIG_DIR}/payment_required_fields_v2.toml
 COPY --from=builder /router/config/deployments/production.toml ${CONFIG_DIR}/production.toml
+# Fallback for the Superposition client (see [superposition] in production.toml): the router
+# refuses to start if it cannot load configuration from Superposition or from this file.
+COPY --from=builder /router/config/superposition_seed.toml ${CONFIG_DIR}/superposition_seed.toml
 
 # RUN_ENV decides the corresponding config file to be used
 ARG RUN_ENV=production
