@@ -785,16 +785,16 @@ impl TryFrom<RefundsResponseRouterData<RSync, RefundResponse>> for RefundsRouter
     }
 }
 
-//TODO: Fill the struct with respective fields
+/// Payway's generic error body, e.g. a 404 on `GET /payments/{id}`:
+/// `{"error_type": "not_found_error", "entity_name": "payments", "id": "749607027"}`.
+/// Every field is optional (`id` comes as a number or a string), so an error is
+/// reported even when Payway sends another shape.
 #[derive(Default, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PaywayErrorResponse {
-    pub status_code: u16,
-    pub code: String,
-    pub message: String,
-    pub reason: Option<String>,
-    pub network_advice_code: Option<String>,
-    pub network_decline_code: Option<String>,
-    pub network_error_message: Option<String>,
+    pub error_type: Option<String>,
+    pub entity_name: Option<String>,
+    pub id: Option<serde_json::Value>,
+    pub message: Option<String>,
 }
 
 // Tokenization request

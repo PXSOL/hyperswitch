@@ -477,24 +477,40 @@ impl ConnectorCommon for Payway {
             }
         }
 
-        let response: payway::PaywayErrorResponse = res
+        // Any other status (e.g. 404 `not_found_error` when Payway does not show the payment
+        // to these credentials) carries Payway's generic error shape. An unexpected body is
+        // still a connector error: failing to parse it must not abort the flow with a 500.
+        let response = res
             .response
-            .parse_struct("PaywayErrorResponse")
-            .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+            .parse_struct::<payway::PaywayErrorResponse>("PaywayErrorResponse")
+            .unwrap_or_default();
 
         event_builder.map(|i| i.set_response_body(&response));
-        router_env::logger::info!(connector_response=?response);
+        router_env::logger::info!(status_code = res.status_code, connector_response=?response);
+
+        let error_type = response
+            .error_type
+            .filter(|error_type| !error_type.is_empty());
+        let message = response
+            .message
+            .filter(|message| !message.is_empty())
+            .or_else(|| error_type.clone())
+            .unwrap_or_else(|| "connector error".to_string());
 
         Ok(ErrorResponse {
             status_code: res.status_code,
             code: "CE_00".to_string(),
-            message: response.message,
-            reason: Some("connector_error".to_string()),
+            message: message.clone(),
+            reason: Some(
+                error_type
+                    .clone()
+                    .unwrap_or_else(|| "connector_error".to_string()),
+            ),
             attempt_status: Some(AttemptStatus::Failure),
             connector_transaction_id: None,
             network_advice_code: None,
-            network_decline_code: Some("unknown".to_string()),
-            network_error_message: Some("unknown error".to_string()),
+            network_decline_code: Some(error_type.unwrap_or_else(|| res.status_code.to_string())),
+            network_error_message: Some(message),
             connector_metadata: None,
             connector_response_reference_id: None,
         })
@@ -691,12 +707,20 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Pay
         ))
     }
 
+    /// A failed sync says nothing about the payment itself, so it keeps the attempt's
+    /// status. With `attempt_status: None` the core keeps the current status for a non-2xx
+    /// sync error: a Payway 5xx, rejected credentials (401/403) or a payment Payway no longer
+    /// shows (404) never turn a settled payment into a failure. Settled Payway payments are
+    /// force-synced to read refunds and annulments made on its dashboard. Mercado Pago,
+    /// Wompi and Fiserv report sync errors the same way.
     fn get_error_response(
         &self,
         res: Response,
         event_builder: Option<&mut ConnectorEvent>,
     ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
-        self.build_error_response(res, event_builder)
+        let mut error = self.build_error_response(res, event_builder)?;
+        error.attempt_status = None;
+        Ok(error)
     }
 }
 
@@ -1779,5 +1803,100 @@ mod payment_sync_tests {
             sandbox_payment(16132607, "pre_approved", 7_000),
         );
         assert!(data.connector_response.is_none());
+    }
+
+    fn error_body(status_code: u16, body: &str) -> Response {
+        Response {
+            headers: None,
+            response: bytes::Bytes::from(body.to_string()),
+            status_code,
+        }
+    }
+
+    fn sync_error(status_code: u16, body: &str) -> ErrorResponse {
+        ConnectorIntegration::<PSync, PaymentsSyncData, PaymentsResponseData>::get_error_response(
+            Payway::new(),
+            error_body(status_code, body),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Body Payway sends when it does not show the payment to these credentials.
+    const NOT_FOUND: &str =
+        r#"{"error_type":"not_found_error","entity_name":"payments","id":"749607027"}"#;
+
+    #[test]
+    fn a_payment_payway_does_not_find_is_a_connector_error_not_a_server_error() {
+        let error = Payway::new()
+            .build_error_response(error_body(404, NOT_FOUND), None)
+            .unwrap();
+        assert_eq!(error.status_code, 404);
+        assert_eq!(error.code, "CE_00");
+        assert_eq!(error.message, "not_found_error");
+        assert_eq!(error.reason.as_deref(), Some("not_found_error"));
+        assert_eq!(
+            error.network_decline_code.as_deref(),
+            Some("not_found_error")
+        );
+        // Outside a sync (e.g. authorize) an error still fails the attempt, as before.
+        assert_eq!(error.attempt_status, Some(AttemptStatus::Failure));
+    }
+
+    #[test]
+    fn an_unexpected_error_body_is_still_reported() {
+        for body in ["", "<html>Bad Gateway</html>", r#"{"unexpected":true}"#] {
+            let error = Payway::new()
+                .build_error_response(error_body(409, body), None)
+                .unwrap();
+            assert_eq!(error.status_code, 409);
+            assert_eq!(error.message, "connector error");
+            assert_eq!(error.reason.as_deref(), Some("connector_error"));
+            assert_eq!(error.network_decline_code.as_deref(), Some("409"));
+        }
+        let error = Payway::new()
+            .build_error_response(
+                error_body(
+                    422,
+                    r#"{"error_type":"invalid_status_error","message":"payment is annulled"}"#,
+                ),
+                None,
+            )
+            .unwrap();
+        assert_eq!(error.message, "payment is annulled");
+        assert_eq!(error.reason.as_deref(), Some("invalid_status_error"));
+    }
+
+    #[test]
+    fn a_failed_sync_never_changes_the_attempt_status() {
+        for (status_code, body) in [
+            (404, NOT_FOUND),
+            (500, r#"{"error":"internal"}"#),
+            (503, ""),
+            (401, r#"{"message":"Invalid authentication credentials"}"#),
+            (403, r#"{"message":"forbidden"}"#),
+            (
+                400,
+                r#"{"error_type":"invalid_request_error","validation_errors":[{"code":"invalid_param","param":"id"}]}"#,
+            ),
+        ] {
+            let error = sync_error(status_code, body);
+            assert_eq!(error.status_code, status_code);
+            assert_eq!(
+                error.attempt_status, None,
+                "a {status_code} sync error must keep the attempt status"
+            );
+        }
+    }
+
+    #[test]
+    fn an_authorize_server_error_still_fails_the_attempt() {
+        let error = ConnectorIntegration::<
+            Authorize,
+            PaymentsAuthorizeData,
+            PaymentsResponseData,
+        >::get_error_response(Payway::new(), error_body(500, ""), None)
+        .unwrap();
+        assert_eq!(error.attempt_status, Some(AttemptStatus::Failure));
     }
 }
