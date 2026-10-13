@@ -16,8 +16,8 @@ RUN useradd --user-group --system --create-home --no-log-init app
 # Switch to the 'app' user
 USER app:app
 
-# Install diesel CLI
-RUN curl --proto '=https' --tlsv1.2 -LsSf https://github.com/diesel-rs/diesel/releases/latest/download/diesel_cli-installer.sh | sh
+# Install diesel CLI (pinned: the version the production upgrade was rehearsed with)
+RUN curl --proto '=https' --tlsv1.2 -LsSf https://github.com/diesel-rs/diesel/releases/download/v2.3.14/diesel_cli-installer.sh | sh
 
 ENV PATH="/home/app/.cargo/bin:$PATH"
 
@@ -26,9 +26,8 @@ WORKDIR /hyperswitch
 
 # Copy migration files and diesel config from the workspace
 COPY --chown=app:app ./migrations/ ./migrations/
-COPY --chown=app:app ./diesel.toml ./diesel.toml
-COPY --chown=app:app ./crates/diesel_models/src/schema.rs ./crates/diesel_models/src/schema.rs
-COPY --chown=app:app ./crates/diesel_models/drop_id.patch ./crates/diesel_models/drop_id.patch
+# Migration-only config (no [print_schema]); see docker/migration-runner.diesel.toml.
+COPY --chown=app:app ./docker/migration-runner.diesel.toml ./diesel.toml
 
 # Copy the migration runner script
 COPY --chown=app:app ./scripts/migration_runner_entrypoint.sh ./migration_runner_entrypoint.sh
