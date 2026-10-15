@@ -8863,3 +8863,9 @@ _context_ = { always_collect_shipping_details_from_wallet_connector = true, paym
 "dynamic_fields.shipping.email._is_required" = true
 "dynamic_fields.shipping.phone.country_code._is_required" = true
 "dynamic_fields.shipping.phone.number._is_required" = true
+
+# PayPal captures can stay PENDING for days and the PayPal connector has no webhook,
+# so keep re-syncing for ~30 days (3 min x30 min, 5 min x1 h, hourly to ~24 h, then daily).
+[[overrides]]
+_context_ = { connector = "paypal" }
+"process_tracker.pt_mapping_payment_sync" = { default_mapping = { start_after = 180, frequencies = [[180, 9], [300, 12], [3600, 23], [86400, 29]] }, max_retries_count = 73 }
