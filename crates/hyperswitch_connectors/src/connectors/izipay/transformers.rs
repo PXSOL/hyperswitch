@@ -32,12 +32,11 @@ pub const SANDBOX_SDK_URL: &str = "https://sandbox-checkout.izipay.pe/payments/v
 /// Izipay Web SDK, production.
 pub const PRODUCTION_SDK_URL: &str = "https://checkout.izipay.pe/payments/v1/js/index.js";
 
-/// Izipay session tokens are bound to one operation, so the access token cached by the router
-/// is only ever useful for the request that asked for it. The router subtracts 15 seconds from
-/// the TTL we report (`REDUCE_ACCESS_TOKEN_EXPIRY_TIME`), so 16 caches the token for about one
-/// second. A longer cache would hand an ECOMMERCE token to a refund of the same MCA (or the
-/// other way around), which Izipay rejects.
-const ACCESS_TOKEN_EXPIRES_SECONDS: i64 = 16;
+/// Lifetime of an Izipay session token (15 minutes). The router never caches Izipay access
+/// tokens (`Connector::issues_single_use_access_tokens`): they are generated per operation kind,
+/// and a cached ECOMMERCE token handed to a refund of the same account (or the other way
+/// around) would be rejected.
+const ACCESS_TOKEN_EXPIRES_SECONDS: i64 = 900;
 
 const IZIPAY_CONNECTOR_NAME: &str = "Izipay";
 const ORDER_NUMBER_LENGTH: usize = 15;
@@ -343,9 +342,8 @@ impl<F, T> TryFrom<ResponseRouterData<F, IzipayTokenResponse, T, AccessToken>>
 }
 
 /// Unpacks the access token fetched by the router and checks it was generated for the kind of
-/// operation about to run. Izipay tokens are per operation, so a mismatch means another
-/// operation of the same account refreshed the shared access token in between: nothing has
-/// been sent yet, retrying the operation is safe.
+/// operation about to run. The router fetches a fresh token for every Izipay operation, so a
+/// mismatch is a defect, not a race; nothing has been sent yet when it is detected.
 pub fn unpack_access_token(
     access_token: Option<&AccessToken>,
     expected_kind: IzipayTokenKind,
@@ -359,8 +357,7 @@ pub fn unpack_access_token(
     if packed.kind != expected_kind {
         return Err(report!(errors::ConnectorError::FailedToObtainAuthType)).attach_printable(
             format!(
-                "Izipay session token was generated for {:?} but this operation needs {:?}; \
-                 a concurrent operation of the same account replaced it, retry the request",
+                "Izipay session token was generated for {:?} but this operation needs {:?}",
                 packed.kind, expected_kind
             ),
         );
@@ -2352,7 +2349,7 @@ mod tests {
         })
         .unwrap();
         let access_token = converted.response.unwrap();
-        assert_eq!(access_token.expires, 16);
+        assert_eq!(access_token.expires, 900);
 
         let packed = unpack_access_token(Some(&access_token), IzipayTokenKind::Ecommerce).unwrap();
         assert_eq!(packed.transaction_id, TOKEN_TRANSACTION_ID);
