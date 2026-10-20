@@ -1,4 +1,7 @@
-FROM public.ecr.aws/docker/library/rust:trixie as builder
+# Base images come from Docker Hub, where the image workflow is logged in before it
+# builds. Anonymous pulls from the ECR Public mirror (upstream's choice) hit its data
+# limit on shared GitHub runners ("toomanyrequests: Data limit exceeded").
+FROM docker.io/library/rust:trixie as builder
 
 ARG EXTRA_FEATURES=""
 ARG VERSION_FEATURE_SET="v1"
@@ -57,7 +60,7 @@ RUN mkdir -p /router/out \
 
 
 
-FROM public.ecr.aws/docker/library/debian:trixie
+FROM docker.io/library/debian:trixie
 
 # Placing config and binary executable in different directories
 ARG CONFIG_DIR=/local/config
