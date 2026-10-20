@@ -807,6 +807,22 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Wom
         let attempt_connector_transaction_id = data.request.get_connector_transaction_id().ok();
         let attempt_connector_transaction_id = attempt_connector_transaction_id.as_deref();
         let http_code = res.status_code;
+        // A `refund.updated` webhook reaches PSync wrapped under `refund_event`; real
+        // Wompi transaction and search responses never carry that key.
+        if let Ok(envelope) = res
+            .response
+            .parse_struct::<wompi::WompiRefundEventEnvelope>("WompiRefundEventEnvelope")
+        {
+            event_builder.map(|i| i.set_response_body(&envelope));
+            router_env::logger::info!(connector_response=?envelope);
+            return wompi::refund_event_to_router_data(
+                envelope.refund_event,
+                data.clone(),
+                attempt_connector_transaction_id,
+                data.request.currency,
+                data.request.amount,
+            );
+        }
         if data.payment_method == enums::PaymentMethod::Wallet {
             let response: wompi::WompiSearchResponse = res
                 .response
@@ -1066,7 +1082,7 @@ impl ConnectorIntegration<RSync, RefundsData, RefundsResponseData> for Wompi {
 }
 
 // ============================================================================
-// Incoming webhooks — transaction.updated
+// Incoming webhooks — transaction.updated and refund.updated
 // ============================================================================
 
 #[async_trait::async_trait]
@@ -1175,15 +1191,10 @@ impl IncomingWebhook for Wompi {
                 .body
                 .parse_struct("WompiWebhookBody")
                 .change_context(errors::ConnectorError::WebhookResourceObjectNotFound)?;
-        // Wrapped as `{"data": transaction}` so the same PSync response parser
-        // (`WompiTransactionResponse`) can be reused to turn this into a payments
-        // response object.
-        let transaction = webhook_body
-            .data
-            .get("transaction")
-            .cloned()
-            .ok_or(errors::ConnectorError::WebhookResourceObjectNotFound)?;
-        Ok(Box::new(serde_json::json!({ "data": transaction })))
+        // `{"data": transaction}` for `transaction.updated` so the same PSync response
+        // parser (`WompiTransactionResponse`) can be reused; the `refund_event`
+        // wrapper for `refund.updated` (see `webhook_resource_object`).
+        Ok(Box::new(wompi::webhook_resource_object(&webhook_body)?))
     }
 }
 
