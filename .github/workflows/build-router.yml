@@ -230,12 +230,13 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push router image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
-          push: true
-          tags: ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }}
+          # Pushed by digest only; `publish` tags it once every image built.
+          outputs: type=image,name=${{ env.DOCKER_IMAGE }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
             BINARY=router
             VERSION_FEATURE_SET=${{ env.VERSION_FEATURE_SET }}
@@ -244,11 +245,39 @@ jobs:
           cache-to: type=registry,ref=${{ env.DOCKER_CACHE_REF }},mode=max
           provenance: false
 
+      - name: Record router image digest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          printf '%s@%s %s:%s\n' "$DOCKER_IMAGE" "$DIGEST" "$DOCKER_IMAGE" "$DOCKER_TAG" > "$RUNNER_TEMP/digests/router"
+
+      - name: Upload router image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-router
+          path: ${{ runner.temp }}/digests/router
+          if-no-files-found: error
+          # Long enough to re-run only `publish` after fixing a tagging failure.
+          retention-days: 7
+
+      # One failed build ends the whole run instead of letting the other builds run
+      # for another hour: nothing would be published anyway (`publish` needs every
+      # build). The run then shows as cancelled; this job keeps its failure.
+      - name: Stop the other builds
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run cancel "${{ github.run_id }}" --repo "${{ github.repository }}"
+
   scheduler:
     name: Build scheduler image (${{ inputs.docker_tag || (github.event_name == 'release' && github.event.release.tag_name) || github.ref_name }} - ${{ matrix.scheduler_flow }})
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     strategy:
       matrix:
+        # `publish` expects one digest per flow (EXPECTED_DIGESTS there).
         scheduler_flow: [consumer, producer]
     needs: registry_access
     env:
@@ -330,12 +359,13 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push scheduler image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
-          push: true
-          tags: ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }}-${{ matrix.scheduler_flow }}
+          # Pushed by digest only; `publish` tags it once every image built.
+          outputs: type=image,name=${{ env.DOCKER_IMAGE }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
             BINARY=scheduler
             SCHEDULER_FLOW=${{ matrix.scheduler_flow }}
@@ -344,6 +374,35 @@ jobs:
           cache-from: type=registry,ref=${{ env.DOCKER_CACHE_REF }}
           cache-to: type=registry,ref=${{ env.DOCKER_CACHE_REF }},mode=max
           provenance: false
+
+      - name: Record scheduler image digest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          SCHEDULER_FLOW: ${{ matrix.scheduler_flow }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          printf '%s@%s %s:%s-%s\n' "$DOCKER_IMAGE" "$DIGEST" "$DOCKER_IMAGE" "$DOCKER_TAG" "$SCHEDULER_FLOW" \
+            > "$RUNNER_TEMP/digests/scheduler-$SCHEDULER_FLOW"
+
+      - name: Upload scheduler image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-scheduler-${{ matrix.scheduler_flow }}
+          path: ${{ runner.temp }}/digests/scheduler-${{ matrix.scheduler_flow }}
+          if-no-files-found: error
+          # Long enough to re-run only `publish` after fixing a tagging failure.
+          retention-days: 7
+
+      # One failed build ends the whole run instead of letting the other builds run
+      # for another hour: nothing would be published anyway (`publish` needs every
+      # build). The run then shows as cancelled; this job keeps its failure.
+      - name: Stop the other builds
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run cancel "${{ github.run_id }}" --repo "${{ github.repository }}"
 
   drainer:
     name: Build drainer image (${{ inputs.docker_tag || (github.event_name == 'release' && github.event.release.tag_name) || github.ref_name }})
@@ -428,12 +487,13 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push drainer image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
-          push: true
-          tags: ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }}
+          # Pushed by digest only; `publish` tags it once every image built.
+          outputs: type=image,name=${{ env.DOCKER_IMAGE }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
             BINARY=drainer
             VERSION_FEATURE_SET=${{ env.VERSION_FEATURE_SET }}
@@ -441,3 +501,91 @@ jobs:
           cache-from: type=registry,ref=${{ env.DOCKER_CACHE_REF }}
           cache-to: type=registry,ref=${{ env.DOCKER_CACHE_REF }},mode=max
           provenance: false
+
+      - name: Record drainer image digest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          printf '%s@%s %s:%s\n' "$DOCKER_IMAGE" "$DIGEST" "$DOCKER_IMAGE" "$DOCKER_TAG" > "$RUNNER_TEMP/digests/drainer"
+
+      - name: Upload drainer image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-drainer
+          path: ${{ runner.temp }}/digests/drainer
+          if-no-files-found: error
+          # Long enough to re-run only `publish` after fixing a tagging failure.
+          retention-days: 7
+
+      # One failed build ends the whole run instead of letting the other builds run
+      # for another hour: nothing would be published anyway (`publish` needs every
+      # build). The run then shows as cancelled; this job keeps its failure.
+      - name: Stop the other builds
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run cancel "${{ github.run_id }}" --repo "${{ github.repository }}"
+
+  # Tags every image together, and only when all of them built: a failed or
+  # cancelled build never moves any tag. Each build job uploads one digest file,
+  # a single line `<image>@<digest> <image>:<tag>`.
+  publish:
+    name: Publish images (${{ inputs.docker_tag || (github.event_name == 'release' && github.event.release.tag_name) || github.ref_name }})
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    needs: [router, scheduler, drainer]
+    steps:
+      - name: Download image digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker registry
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Tag all images
+        shell: bash
+        env:
+          # router, drainer and one per scheduler flow (see the scheduler matrix)
+          EXPECTED_DIGESTS: "router drainer scheduler-consumer scheduler-producer"
+        run: |
+          set -euo pipefail
+          for name in $EXPECTED_DIGESTS; do
+            if [ ! -s "$RUNNER_TEMP/digests/$name" ]; then
+              echo "::error::Missing the $name image digest; nothing was tagged."
+              exit 1
+            fi
+          done
+
+          # Every source must exist before the first tag moves.
+          for name in $EXPECTED_DIGESTS; do
+            read -r source target < "$RUNNER_TEMP/digests/$name"
+            docker buildx imagetools inspect "$source" >/dev/null
+          done
+
+          # Retried so a transient registry error does not leave some tags moved
+          # and others not; a step that still fails says which ones moved.
+          for name in $EXPECTED_DIGESTS; do
+            read -r source target < "$RUNNER_TEMP/digests/$name"
+            for attempt in 1 2 3; do
+              if docker buildx imagetools create --prefer-index=false --tag "$target" "$source"; then
+                echo "Tagged $source as $target"
+                break
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                echo "::error::Could not tag $target; only the images reported as Tagged above moved. Re-run this job."
+                exit 1
+              fi
+              sleep $((attempt * 20))
+            done
+          done
