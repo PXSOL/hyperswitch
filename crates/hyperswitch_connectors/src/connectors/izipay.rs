@@ -46,9 +46,9 @@ use hyperswitch_interfaces::{
         PaymentsAuthorizeType, PaymentsSyncType, RefreshTokenType, RefundExecuteType,
         RefundSyncType, Response,
     },
-    webhooks::{IncomingWebhook, IncomingWebhookRequestDetails},
+    webhooks::{IncomingWebhook, IncomingWebhookRequestDetails, WebhookContext},
 };
-use masking::{Mask, PeekInterface, Secret};
+use hyperswitch_masking::{Mask, PeekInterface, Secret};
 use std::sync::LazyLock;
 use transformers as izipay;
 
@@ -74,7 +74,7 @@ impl Izipay {
 
     /// Headers of the calls that only generate a session token: no bearer, a fresh
     /// correlation id (the session token is bound to it).
-    fn token_generate_headers(&self) -> Vec<(String, masking::Maskable<String>)> {
+    fn token_generate_headers(&self) -> Vec<(String, hyperswitch_masking::Maskable<String>)> {
         vec![
             (
                 headers::CONTENT_TYPE.to_string(),
@@ -94,7 +94,8 @@ impl Izipay {
         &self,
         access_token: Option<&AccessToken>,
         expected_kind: izipay::IzipayTokenKind,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         let packed = izipay::unpack_access_token(access_token, expected_kind)?;
         Ok(vec![
             (
@@ -177,6 +178,7 @@ impl ConnectorCommon for Izipay {
                     network_decline_code: None,
                     network_error_message: None,
                     connector_metadata: None,
+                    connector_response_reference_id: None,
                 })
             }
             None => {
@@ -261,7 +263,8 @@ impl ConnectorIntegration<AccessTokenAuth, AccessTokenRequestData, AccessToken> 
         &self,
         _req: &RefreshTokenRouterData,
         _connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         Ok(self.token_generate_headers())
     }
 
@@ -343,7 +346,8 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         &self,
         _req: &PaymentsAuthorizeRouterData,
         _connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         Ok(self.token_generate_headers())
     }
 
@@ -432,7 +436,8 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Izi
         &self,
         req: &PaymentsSyncRouterData,
         _connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.session_headers(
             req.access_token.as_ref(),
             izipay::IzipayTokenKind::Ecommerce,
@@ -516,7 +521,8 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Izipay 
         &self,
         req: &RefundsRouterData<Execute>,
         _connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.session_headers(req.access_token.as_ref(), izipay::IzipayTokenKind::Refund)
     }
 
@@ -601,7 +607,8 @@ impl ConnectorIntegration<RSync, RefundsData, RefundsResponseData> for Izipay {
         &self,
         req: &RefundSyncRouterData,
         _connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.session_headers(req.access_token.as_ref(), izipay::IzipayTokenKind::Refund)
     }
 
@@ -712,6 +719,7 @@ impl IncomingWebhook for Izipay {
     fn get_webhook_event_type(
         &self,
         request: &IncomingWebhookRequestDetails<'_>,
+        _context: Option<&WebhookContext>,
     ) -> CustomResult<IncomingWebhookEvent, errors::ConnectorError> {
         let payload = izipay::parse_signed_payload(request.body)
             .change_context(errors::ConnectorError::WebhookEventTypeNotFound)?;
@@ -721,7 +729,8 @@ impl IncomingWebhook for Izipay {
     fn get_webhook_resource_object(
         &self,
         request: &IncomingWebhookRequestDetails<'_>,
-    ) -> CustomResult<Box<dyn masking::ErasedMaskSerialize>, errors::ConnectorError> {
+    ) -> CustomResult<Box<dyn hyperswitch_masking::ErasedMaskSerialize>, errors::ConnectorError>
+    {
         // Same shape as a Search response, so the PSync response handler parses it.
         Ok(Box::new(izipay::signed_payload_value(request.body)?))
     }

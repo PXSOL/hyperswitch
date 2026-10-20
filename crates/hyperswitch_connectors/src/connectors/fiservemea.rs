@@ -19,7 +19,6 @@ use common_utils::{
 };
 use error_stack::{report, ResultExt};
 use hyperswitch_domain_models::{
-    payment_method_data::PaymentMethodData,
     router_data::{AccessToken, ErrorResponse, RouterData},
     router_flow_types::{
         access_token_auth::AccessTokenAuth,
@@ -53,11 +52,9 @@ use hyperswitch_interfaces::{
     types::{self, Response},
     webhooks,
 };
-use masking::{ExposeInterface, Mask, PeekInterface};
+use hyperswitch_masking::{ExposeInterface, Mask, PeekInterface};
 use ring::hmac;
-use time::OffsetDateTime;
 use transformers as fiservemea;
-use uuid::Uuid;
 
 use crate::{
     constants::headers,
@@ -134,6 +131,16 @@ fn build_sync_url(
         _ => return Err(errors::ConnectorError::MissingConnectorTransactionID.into()),
     };
 
+    build_collection_url(base_url, collection, id, store_id)
+}
+
+/// Arma `{base}/{collection}/{id}?storeId=...` con el escape que corresponde a cada parte.
+fn build_collection_url(
+    base_url: &str,
+    collection: &str,
+    id: &str,
+    store_id: &str,
+) -> CustomResult<String, errors::ConnectorError> {
     let mut url = url::Url::parse(base_url)
         .change_context(errors::ConnectorError::FailedToObtainIntegrationUrl)?;
     url.path_segments_mut()
@@ -143,6 +150,33 @@ fn build_sync_url(
         .push(id);
     url.query_pairs_mut().append_pair("storeId", store_id);
     Ok(url.into())
+}
+
+/// URL del PSync según el estado actual del intento.
+///
+/// Un intento ya cobrado se consulta siempre por **orden** (`GET /orders/{orderId}?storeId=`):
+/// la consulta por transacción sólo muestra esa transacción, mientras que la orden lista
+/// también los `VOID` y `RETURN` hechos después, que es lo que permite descubrir devoluciones
+/// y anulaciones hechas por fuera de Hyperswitch. El `orderId` es el
+/// `connector_request_reference_id`, el mismo que se mandó en `order.orderId` al autorizar.
+/// Cualquier otro estado conserva la elección de `build_sync_url`, igual que sin esta rama.
+fn build_psync_url(
+    base_url: &str,
+    attempt_status: enums::AttemptStatus,
+    connector_transaction_id: &ResponseId,
+    connector_request_reference_id: &str,
+    store_id: &str,
+) -> CustomResult<String, errors::ConnectorError> {
+    if fiservemea::is_settled_attempt(attempt_status) && !connector_request_reference_id.is_empty()
+    {
+        return build_collection_url(base_url, "orders", connector_request_reference_id, store_id);
+    }
+    build_sync_url(
+        base_url,
+        connector_transaction_id,
+        connector_request_reference_id,
+        store_id,
+    )
 }
 
 #[derive(Clone)]
@@ -197,10 +231,11 @@ impl Fiservemea {
         &self,
         req: &RouterData<Flow, Req, Res>,
         payload: &str,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
-        let timestamp = OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
+        let timestamp = common_utils::date_time::now_unix_timestamp_millis();
         let auth = fiservemea::FiservemeaAuthType::try_from(&req.connector_auth_type)?;
-        let client_request_id = Uuid::new_v4().to_string();
+        let client_request_id = common_utils::generate_uuid_v4().to_string();
         let hmac = self
             .generate_authorization_signature(auth.clone(), &client_request_id, payload, timestamp)
             .change_context(errors::ConnectorError::RequestEncodingFailed)?;
@@ -210,7 +245,10 @@ impl Fiservemea {
                 self.common_get_content_type().to_string().into(),
             ),
             ("Client-Request-Id".to_string(), client_request_id.into()),
-            (headers::API_KEY.to_string(), auth.api_key.expose().into_masked()),
+            (
+                headers::API_KEY.to_string(),
+                auth.api_key.expose().into_masked(),
+            ),
             (headers::TIMESTAMP.to_string(), timestamp.to_string().into()),
             (headers::MESSAGE_SIGNATURE.to_string(), hmac.into_masked()),
         ])
@@ -244,7 +282,8 @@ impl ConnectorIntegration<SetupMandate, SetupMandateRequestData, PaymentsRespons
         &self,
         req: &RouterData<SetupMandate, SetupMandateRequestData, PaymentsResponseData>,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.build_headers(req, connectors)
     }
 
@@ -330,7 +369,8 @@ impl ConnectorIntegration<PaymentMethodToken, PaymentMethodTokenizationData, Pay
         &self,
         req: &TokenizationRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.build_headers(req, connectors)
     }
 
@@ -412,12 +452,13 @@ where
         &self,
         req: &RouterData<Flow, Request, Response>,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
-        let timestamp = OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
+        let timestamp = common_utils::date_time::now_unix_timestamp_millis();
         let auth: fiservemea::FiservemeaAuthType =
             fiservemea::FiservemeaAuthType::try_from(&req.connector_auth_type)?;
 
-        let client_request_id = Uuid::new_v4().to_string();
+        let client_request_id = common_utils::generate_uuid_v4().to_string();
         let http_method = self.get_http_method();
         let hmac = match http_method {
             Method::Get => self
@@ -504,7 +545,7 @@ impl ConnectorCommon for Fiservemea {
             .secure3d_response
             .as_ref()
             .and_then(fiservemea::FiservemeaSecure3dResponse::to_metadata)
-            .map(masking::Secret::new);
+            .map(hyperswitch_masking::Secret::new);
 
         match response.error {
             Some(error) => {
@@ -543,6 +584,7 @@ impl ConnectorCommon for Fiservemea {
                     },
                     attempt_status: None,
                     connector_transaction_id: connector_transaction_id.clone(),
+                    connector_response_reference_id: None,
                     network_advice_code: network.advice_code,
                     network_decline_code: network.decline_code,
                     network_error_message: network.error_message,
@@ -559,6 +601,7 @@ impl ConnectorCommon for Fiservemea {
                 reason: response.response_type,
                 attempt_status: None,
                 connector_transaction_id,
+                connector_response_reference_id: None,
                 network_advice_code: network.advice_code,
                 network_decline_code: network.decline_code,
                 network_error_message: network.error_message,
@@ -568,33 +611,15 @@ impl ConnectorCommon for Fiservemea {
     }
 }
 
-impl ConnectorValidation for Fiservemea {
-    /// Sin este override el pago con mandato nunca llega al gateway: el default del trait rechaza
-    /// TODO método de pago (`{pm_type} mandate payment is not supported by fiservemea`, IR_19), así
-    /// que el router cortaba el CIT de Card on File aunque el conector tenga el flujo implementado
-    /// y la config lo habilite en `[mandates.supported_payment_methods]`.
-    ///
-    /// Se aceptan los dos métodos que la rama de Card on File del conector realmente arma: la
-    /// tarjeta con PAN (`CREDENTIAL_ON_FILE_FIRST` + `schemeTransactionId`) y el network token.
-    fn validate_mandate_payment(
-        &self,
-        pm_type: Option<enums::PaymentMethodType>,
-        pm_data: PaymentMethodData,
-    ) -> CustomResult<(), errors::ConnectorError> {
-        let mandate_supported_pmd = std::collections::HashSet::from([
-            utils::PaymentMethodDataType::Card,
-            utils::PaymentMethodDataType::NetworkToken,
-        ]);
-        utils::is_mandate_supported(pm_data, pm_type, mandate_supported_pmd, self.id())
-    }
-}
+impl ConnectorValidation for Fiservemea {}
 
 impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData> for Fiservemea {
     fn get_headers(
         &self,
         req: &PaymentsAuthorizeRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.build_headers(req, connectors)
     }
 
@@ -714,7 +739,8 @@ impl ConnectorIntegration<CompleteAuthorize, CompleteAuthorizeData, PaymentsResp
         &self,
         req: &PaymentsCompleteAuthorizeRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.build_headers(req, connectors)
     }
 
@@ -863,7 +889,8 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Fis
         &self,
         req: &PaymentsSyncRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.build_headers(req, connectors)
     }
 
@@ -888,8 +915,9 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Fis
         // El `orderId` con el que se consulta es el mismo `connector_request_reference_id` que
         // se mandó en `order.orderId` al autorizar (ver `FiservemeaOrder`), así que la orden
         // existe aunque la venta haya fallado antes de devolver el `ipgTransactionId`.
-        build_sync_url(
+        build_psync_url(
             &determine_endpoint(connectors, req.test_mode)?,
+            req.status,
             &req.request.connector_transaction_id,
             &req.connector_request_reference_id,
             auth.store_id.peek(),
@@ -926,7 +954,21 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Fis
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         event_builder.map(|i| i.set_response_body(&sync_response));
         router_env::logger::info!(connector_response=?sync_response);
-        let response = sync_response.into_transaction()?;
+        // Un intento ya cobrado se consulta por orden (ver `build_psync_url`): además de su
+        // transacción se leen los VOID/RETURN de la orden como reembolsos reportados.
+        let attempt_is_settled = fiservemea::is_settled_attempt(data.status);
+        let (response, reported_activity) = if attempt_is_settled {
+            let attempt_connector_transaction_id = match &data.request.connector_transaction_id {
+                ResponseId::ConnectorTransactionId(id) if !id.is_empty() => Some(id.as_str()),
+                _ => None,
+            };
+            sync_response.into_settled_transaction(
+                attempt_connector_transaction_id,
+                self.amount_converter_to_float_major_unit,
+            )?
+        } else {
+            (sync_response.into_transaction()?, None)
+        };
 
         let integrity_object = response
             .settlement_amount()
@@ -945,6 +987,14 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Fis
             http_code: res.status_code,
         })?;
         router_data.request.integrity_object = integrity_object;
+        if attempt_is_settled {
+            router_data = fiservemea::finish_settled_sync(
+                router_data,
+                data.status,
+                &data.request.connector_transaction_id,
+                reported_activity,
+            );
+        }
         Ok(router_data)
     }
 
@@ -962,7 +1012,8 @@ impl ConnectorIntegration<Capture, PaymentsCaptureData, PaymentsResponseData> fo
         &self,
         req: &PaymentsCaptureRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.build_headers(req, connectors)
     }
 
@@ -1065,7 +1116,8 @@ impl ConnectorIntegration<Void, PaymentsCancelData, PaymentsResponseData> for Fi
         &self,
         req: &PaymentsCancelRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.build_headers(req, connectors)
     }
 
@@ -1145,7 +1197,8 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Fiserve
         &self,
         req: &RefundsRouterData<Execute>,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.build_headers(req, connectors)
     }
 
@@ -1247,7 +1300,8 @@ impl ConnectorIntegration<RSync, RefundsData, RefundsResponseData> for Fiserveme
         &self,
         req: &RefundSyncRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.build_headers(req, connectors)
     }
 
@@ -1350,6 +1404,7 @@ impl webhooks::IncomingWebhook for Fiservemea {
     fn get_webhook_event_type(
         &self,
         _request: &webhooks::IncomingWebhookRequestDetails<'_>,
+        _context: Option<&webhooks::WebhookContext>,
     ) -> CustomResult<api_models::webhooks::IncomingWebhookEvent, errors::ConnectorError> {
         Err(report!(errors::ConnectorError::WebhooksNotImplemented))
     }
@@ -1357,7 +1412,8 @@ impl webhooks::IncomingWebhook for Fiservemea {
     fn get_webhook_resource_object(
         &self,
         _request: &webhooks::IncomingWebhookRequestDetails<'_>,
-    ) -> CustomResult<Box<dyn masking::ErasedMaskSerialize>, errors::ConnectorError> {
+    ) -> CustomResult<Box<dyn hyperswitch_masking::ErasedMaskSerialize>, errors::ConnectorError>
+    {
         Err(report!(errors::ConnectorError::WebhooksNotImplemented))
     }
 }
@@ -1580,10 +1636,10 @@ mod tests {
             payment_method: enums::PaymentMethod::Card,
             connector_auth_type:
                 hyperswitch_domain_models::router_data::ConnectorAuthType::SignatureKey {
-                api_key: masking::Secret::new("apikey".to_string()),
-                key1: masking::Secret::new("5926072901".to_string()),
-                api_secret: masking::Secret::new("apisecret".to_string()),
-            },
+                    api_key: hyperswitch_masking::Secret::new("apikey".to_string()),
+                    key1: hyperswitch_masking::Secret::new("5926072901".to_string()),
+                    api_secret: hyperswitch_masking::Secret::new("apisecret".to_string()),
+                },
             description: None,
             address: hyperswitch_domain_models::payment_address::PaymentAddress::default(),
             auth_type: enums::AuthenticationType::NoThreeDs,
@@ -1627,6 +1683,15 @@ mod tests {
             psd2_sca_exemption_type: None,
             raw_connector_response: None,
             is_payment_id_from_merchant: None,
+            payment_method_type: None,
+            payout_id: None,
+            authorized_amount: None,
+            accept_amount_mismatch: None,
+            customer_document_details: None,
+            customer_date_of_birth: None,
+            feature_data: None,
+            sender_payment_instrument_id: None,
+            connector_returned_payment_method_details: None,
         }
     }
 
@@ -1638,13 +1703,12 @@ mod tests {
             ..Default::default()
         });
         let connector = Fiservemea::new();
-        let url =
-            ConnectorIntegration::<Void, PaymentsCancelData, PaymentsResponseData>::get_url(
-                connector,
-                &req,
-                &cert_connectors(),
-            )
-            .unwrap();
+        let url = ConnectorIntegration::<Void, PaymentsCancelData, PaymentsResponseData>::get_url(
+            connector,
+            &req,
+            &cert_connectors(),
+        )
+        .unwrap();
         assert_eq!(
             url,
             "https://cert.api.firstdata.com/gateway/v2/payments/84667286296"
@@ -1680,6 +1744,7 @@ mod tests {
             merchant_config_currency: None,
             capture_method: Some(enums::CaptureMethod::Automatic),
             additional_payment_method_data: None,
+            payment_connector_request_reference_id: None,
         }
     }
 
@@ -1765,11 +1830,73 @@ mod tests {
             connector_transaction_id: "84667286296".to_string(),
             ..Default::default()
         });
-        assert!(ConnectorIntegration::<Void, PaymentsCancelData, PaymentsResponseData>::get_url(
-            Fiservemea::new(),
-            &req,
-            &connectors
+        assert!(
+            ConnectorIntegration::<Void, PaymentsCancelData, PaymentsResponseData>::get_url(
+                Fiservemea::new(),
+                &req,
+                &connectors
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn settled_attempts_sync_by_order_even_with_a_transaction_id() {
+        // Un intento cobrado se consulta por orden para ver los VOID/RETURN posteriores.
+        for status in [
+            enums::AttemptStatus::Charged,
+            enums::AttemptStatus::PartialCharged,
+        ] {
+            let url = build_psync_url(
+                BASE,
+                status,
+                &ResponseId::ConnectorTransactionId("84667286296".to_string()),
+                "PX-1786053427-07-void",
+                "5926072901",
+            )
+            .unwrap();
+            assert_eq!(
+                url,
+                "https://cert.api.firstdata.com/gateway/v2/orders/PX-1786053427-07-void?storeId=5926072901"
+            );
+        }
+    }
+
+    #[test]
+    fn unsettled_attempts_keep_the_previous_sync_url_choice() {
+        for status in [
+            enums::AttemptStatus::Pending,
+            enums::AttemptStatus::AuthenticationPending,
+            enums::AttemptStatus::Authorized,
+            enums::AttemptStatus::Voided,
+            enums::AttemptStatus::Failure,
+        ] {
+            for transaction_id in [
+                ResponseId::ConnectorTransactionId("84667286296".to_string()),
+                ResponseId::NoResponseId,
+            ] {
+                assert_eq!(
+                    build_psync_url(BASE, status, &transaction_id, "PX-ref", "5926072901").unwrap(),
+                    build_sync_url(BASE, &transaction_id, "PX-ref", "5926072901").unwrap(),
+                    "{status:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn settled_attempt_without_a_reference_falls_back_to_the_transaction_url() {
+        let url = build_psync_url(
+            BASE,
+            enums::AttemptStatus::Charged,
+            &ResponseId::ConnectorTransactionId("84667286296".to_string()),
+            "",
+            "5926072901",
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(
+            url,
+            "https://cert.api.firstdata.com/gateway/v2/payments/84667286296?storeId=5926072901"
+        );
     }
 }

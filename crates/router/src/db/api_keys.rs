@@ -1,7 +1,7 @@
 use error_stack::report;
 use router_env::{instrument, tracing};
 #[cfg(feature = "accounts_cache")]
-use storage_impl::redis::cache::{self, CacheKind, ACCOUNTS_CACHE};
+use storage_impl::redis::cache::{self, CacheKind};
 
 use super::{MockDb, Store};
 use crate::{
@@ -187,12 +187,12 @@ impl ApiKeyInterface for Store {
 
         #[cfg(feature = "accounts_cache")]
         {
-            cache::get_or_populate_in_memory(
+            Box::pin(cache::get_or_populate_in_memory_redis(
                 self,
                 &_hashed_api_key.into_inner(),
-                find_call,
-                &ACCOUNTS_CACHE,
-            )
+                find_call(),
+                cache::CacheId::Accounts,
+            ))
             .await
         }
     }
@@ -374,10 +374,11 @@ impl ApiKeyInterface for MockDb {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
+    use std::{borrow::Cow, sync::Arc};
 
+    use common_utils::types::keymanager::KeyManagerState;
     use storage_impl::redis::{
-        cache::{self, CacheKey, CacheKind, ACCOUNTS_CACHE},
+        cache::{self, CacheInterface, CacheKey, CacheKind},
         kv_store::RedisConnInterface,
         pub_sub::PubSubInterface,
     };
@@ -388,13 +389,15 @@ mod tests {
         types::storage,
     };
 
-    #[allow(clippy::unwrap_used)]
     #[tokio::test]
     async fn test_mockdb_api_key_interface() {
         #[allow(clippy::expect_used)]
-        let mockdb = MockDb::new(&redis_interface::RedisSettings::default())
-            .await
-            .expect("Failed to create Mock store");
+        let mockdb = MockDb::new(
+            &redis_interface::RedisSettings::default(),
+            KeyManagerState::mock(),
+        )
+        .await
+        .expect("Failed to create Mock store");
 
         let merchant_id =
             common_utils::id_type::MerchantId::try_from(Cow::from("merchant1")).unwrap();
@@ -484,20 +487,21 @@ mod tests {
         );
     }
 
-    #[allow(clippy::unwrap_used)]
     #[tokio::test]
     async fn test_api_keys_cache() {
         let merchant_id =
             common_utils::id_type::MerchantId::try_from(Cow::from("test_merchant")).unwrap();
 
-        #[allow(clippy::expect_used)]
-        let db = MockDb::new(&redis_interface::RedisSettings::default())
-            .await
-            .expect("Failed to create Mock store");
+        let db = MockDb::new(
+            &redis_interface::RedisSettings::default(),
+            KeyManagerState::mock(),
+        )
+        .await
+        .expect("Failed to create Mock store");
 
         let redis_conn = db.get_redis_conn().unwrap();
         redis_conn
-            .subscribe("hyperswitch_invalidate")
+            .subscribe(&db.caches().invalidation_channel, Arc::clone(&db.caches))
             .await
             .unwrap();
 
@@ -522,16 +526,16 @@ mod tests {
             db.find_api_key_by_hash_optional(hashed_api_key.clone())
                 .await
         };
-        let _: Option<storage::ApiKey> = cache::get_or_populate_in_memory(
+        let _: Option<storage::ApiKey> = Box::pin(cache::get_or_populate_in_memory_redis(
             &db,
             &format!(
                 "{}_{}",
                 merchant_id.get_string_repr(),
                 hashed_api_key.clone().into_inner()
             ),
-            find_call,
-            &ACCOUNTS_CACHE,
-        )
+            find_call(),
+            cache::CacheId::Accounts,
+        ))
         .await
         .unwrap();
 
@@ -552,7 +556,9 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(ACCOUNTS_CACHE
+        assert!(db
+            .caches()
+            .accounts
             .get_val::<storage::ApiKey>(CacheKey {
                 key: format!(
                     "{}_{}",

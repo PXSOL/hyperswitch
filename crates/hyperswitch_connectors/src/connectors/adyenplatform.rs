@@ -27,7 +27,7 @@ use hyperswitch_domain_models::router_flow_types::PoFulfill;
 #[cfg(feature = "payouts")]
 use hyperswitch_domain_models::types::{PayoutsData, PayoutsResponseData, PayoutsRouterData};
 use hyperswitch_domain_models::{
-    api::ApplicationResponse,
+    api::WebhookResponse,
     router_data::{AccessToken, ConnectorAuthType},
     router_flow_types::{
         AccessTokenAuth, Authorize, Capture, Execute, PSync, PaymentMethodToken, RSync, Session,
@@ -50,15 +50,17 @@ use hyperswitch_interfaces::{
     api::{self, ConnectorCommon, ConnectorIntegration, ConnectorSpecifications},
     configs::Connectors,
     errors::ConnectorError,
-    webhooks::{IncomingWebhook, IncomingWebhookFlowError, IncomingWebhookRequestDetails},
+    webhooks::{
+        IncomingWebhook, IncomingWebhookFlowError, IncomingWebhookRequestDetails, WebhookContext,
+    },
 };
-use masking::{Mask as _, Maskable, Secret};
+use hyperswitch_masking::{Mask as _, Maskable, Secret};
 #[cfg(feature = "payouts")]
 use ring::hmac;
 #[cfg(feature = "payouts")]
 use router_env::{instrument, tracing};
 #[cfg(feature = "payouts")]
-use transformers::get_adyen_webhook_event;
+use transformers::get_adyen_payout_webhook_event;
 
 use self::transformers as adyenplatform;
 use crate::constants::headers;
@@ -115,13 +117,27 @@ impl ConnectorCommon for Adyenplatform {
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
 
+        let message = if let Some(invalid_fields) = &response.invalid_fields {
+            match serde_json::to_string(invalid_fields) {
+                Ok(invalid_fields_json) => {
+                    format!("{} Invalid fields: {}", response.title, invalid_fields_json)
+                }
+                Err(_) => response.title.clone(),
+            }
+        } else if let Some(detail) = &response.detail {
+            format!("{} Detail: {}", response.title, detail)
+        } else {
+            response.title.clone()
+        };
+
         Ok(ErrorResponse {
             status_code: res.status_code,
             code: response.error_code,
-            message: response.title,
+            message,
             reason: response.detail,
             attempt_status: None,
             connector_transaction_id: None,
+            connector_response_reference_id: None,
             network_advice_code: None,
             network_decline_code: None,
             network_error_message: None,
@@ -348,6 +364,27 @@ impl IncomingWebhook for Adyenplatform {
         Ok(payload_sign.as_bytes().eq(&signature))
     }
 
+    #[cfg(feature = "payouts")]
+    fn get_payout_webhook_details(
+        &self,
+        request: &IncomingWebhookRequestDetails<'_>,
+    ) -> CustomResult<api_models::webhooks::PayoutWebhookUpdate, ConnectorError> {
+        let webhook_body: adyenplatform::AdyenplatformIncomingWebhook = request
+            .body
+            .parse_struct("AdyenplatformIncomingWebhook")
+            .change_context(ConnectorError::ResponseDeserializationFailed)?;
+
+        let error_reason = webhook_body.data.reason.or(webhook_body
+            .data
+            .tracking
+            .and_then(|tracking_data| tracking_data.reason));
+
+        Ok(api_models::webhooks::PayoutWebhookUpdate {
+            error_message: error_reason.clone(),
+            error_code: error_reason,
+        })
+    }
+
     fn get_webhook_object_reference_id(
         &self,
         #[cfg(feature = "payouts")] request: &IncomingWebhookRequestDetails<'_>,
@@ -374,9 +411,10 @@ impl IncomingWebhook for Adyenplatform {
         &self,
         _request: &IncomingWebhookRequestDetails<'_>,
         error_kind: Option<IncomingWebhookFlowError>,
-    ) -> CustomResult<ApplicationResponse<serde_json::Value>, ConnectorError> {
+        _connector_authentication_type: Option<crypto::Encryptable<Secret<serde_json::Value>>>,
+    ) -> CustomResult<WebhookResponse<serde_json::Value>, ConnectorError> {
         if error_kind.is_some() {
-            Ok(ApplicationResponse::JsonWithHeaders((
+            Ok(WebhookResponse::JsonWithHeaders((
                 serde_json::Value::Null,
                 vec![(
                     "x-http-code".to_string(),
@@ -384,7 +422,7 @@ impl IncomingWebhook for Adyenplatform {
                 )],
             )))
         } else {
-            Ok(ApplicationResponse::StatusOk)
+            Ok(WebhookResponse::StatusOk)
         }
     }
 
@@ -392,6 +430,7 @@ impl IncomingWebhook for Adyenplatform {
         &self,
         #[cfg(feature = "payouts")] request: &IncomingWebhookRequestDetails<'_>,
         #[cfg(not(feature = "payouts"))] _request: &IncomingWebhookRequestDetails<'_>,
+        _context: Option<&WebhookContext>,
     ) -> CustomResult<IncomingWebhookEvent, ConnectorError> {
         #[cfg(feature = "payouts")]
         {
@@ -400,11 +439,10 @@ impl IncomingWebhook for Adyenplatform {
                 .parse_struct("AdyenplatformIncomingWebhook")
                 .change_context(ConnectorError::WebhookSourceVerificationFailed)?;
 
-            Ok(get_adyen_webhook_event(
+            Ok(get_adyen_payout_webhook_event(
                 webhook_body.webhook_type,
                 webhook_body.data.status,
                 webhook_body.data.tracking,
-                webhook_body.data.category.as_ref(),
             ))
         }
         #[cfg(not(feature = "payouts"))]
@@ -417,7 +455,7 @@ impl IncomingWebhook for Adyenplatform {
         &self,
         #[cfg(feature = "payouts")] request: &IncomingWebhookRequestDetails<'_>,
         #[cfg(not(feature = "payouts"))] _request: &IncomingWebhookRequestDetails<'_>,
-    ) -> CustomResult<Box<dyn masking::ErasedMaskSerialize>, ConnectorError> {
+    ) -> CustomResult<Box<dyn hyperswitch_masking::ErasedMaskSerialize>, ConnectorError> {
         #[cfg(feature = "payouts")]
         {
             let webhook_body: adyenplatform::AdyenplatformIncomingWebhook = request
@@ -451,5 +489,19 @@ impl ConnectorSpecifications for Adyenplatform {
 
     fn get_supported_webhook_flows(&self) -> Option<&'static [common_enums::enums::EventClass]> {
         None
+    }
+    #[cfg(feature = "v1")]
+    fn generate_connector_customer_id(
+        &self,
+        customer_id: &Option<common_utils::id_type::CustomerId>,
+        merchant_id: &common_utils::id_type::MerchantId,
+    ) -> Option<String> {
+        customer_id.as_ref().map(|cid| {
+            format!(
+                "{}_{}",
+                merchant_id.get_string_repr(),
+                cid.get_string_repr()
+            )
+        })
     }
 }

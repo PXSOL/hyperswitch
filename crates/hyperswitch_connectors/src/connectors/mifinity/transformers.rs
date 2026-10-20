@@ -12,7 +12,7 @@ use hyperswitch_domain_models::{
     types,
 };
 use hyperswitch_interfaces::errors;
-use masking::Secret;
+use hyperswitch_masking::Secret;
 use serde::{Deserialize, Serialize};
 use time::Date;
 
@@ -137,7 +137,7 @@ impl TryFrom<&MifinityRouterData<&types::PaymentsAuthorizeRouterData>> for Mifin
                     );
                     let client_reference = item.router_data.customer_id.clone().ok_or(
                         errors::ConnectorError::MissingRequiredField {
-                            field_name: "client_reference",
+                            field_name: "client_reference".into(),
                         },
                     )?;
                     let destination_account_number = metadata.destination_account_number;
@@ -165,6 +165,7 @@ impl TryFrom<&MifinityRouterData<&types::PaymentsAuthorizeRouterData>> for Mifin
                 | WalletData::AmazonPayRedirect(_)
                 | WalletData::Paysera(_)
                 | WalletData::Skrill(_)
+                | WalletData::Neteller(_)
                 | WalletData::BluecodeRedirect {}
                 | WalletData::MomoRedirect(_)
                 | WalletData::KakaoPayRedirect(_)
@@ -185,6 +186,7 @@ impl TryFrom<&MifinityRouterData<&types::PaymentsAuthorizeRouterData>> for Mifin
                 | WalletData::SamsungPay(_)
                 | WalletData::TwintRedirect {}
                 | WalletData::VippsRedirect {}
+                | WalletData::WeroRedirect {}
                 | WalletData::TouchNGoRedirect(_)
                 | WalletData::WeChatPayRedirect(_)
                 | WalletData::WeChatPayQr(_)
@@ -193,6 +195,7 @@ impl TryFrom<&MifinityRouterData<&types::PaymentsAuthorizeRouterData>> for Mifin
                 | WalletData::RevolutPay(_)
                 | WalletData::MercadoPagoSdk(_)
                 | WalletData::WompiCheckout {}
+                | WalletData::StripeCheckout {}
                 | WalletData::IzipayCheckout {}
                 | WalletData::MercadoPagoCheckoutPro {} => {
                     Err(errors::ConnectorError::NotImplemented(
@@ -218,7 +221,12 @@ impl TryFrom<&MifinityRouterData<&types::PaymentsAuthorizeRouterData>> for Mifin
             | PaymentMethodData::OpenBanking(_)
             | PaymentMethodData::CardToken(_)
             | PaymentMethodData::NetworkToken(_)
-            | PaymentMethodData::CardDetailsForNetworkTransactionId(_) => {
+            | PaymentMethodData::CardDetailsForNetworkTransactionId(_)
+            | PaymentMethodData::CardWithOptionalCVC(_)
+            | PaymentMethodData::CardWithNetworkTokenDetails(_)
+            | PaymentMethodData::CardWithLimitedDetails(_)
+            | PaymentMethodData::DecryptedWalletTokenDetailsForNetworkTransactionId(_)
+            | PaymentMethodData::NetworkTokenDetailsForNetworkTransactionId(_) => {
                 Err(errors::ConnectorError::NotImplemented(
                     utils::get_unimplemented_payment_method_error_message("Mifinity"),
                 )
@@ -279,9 +287,12 @@ impl<F, T> TryFrom<ResponseRouterData<F, MifinityPaymentsResponse, T, PaymentsRe
                         mandate_reference: Box::new(None),
                         connector_metadata: None,
                         network_txn_id: None,
+                        network_txn_link_id: None,
                         connector_response_reference_id: Some(trace_id),
                         incremental_authorization_allowed: None,
+                        authentication_data: None,
                         charges: None,
+                        payment_account_reference: None,
                     }),
                     ..item.data
                 })
@@ -294,9 +305,12 @@ impl<F, T> TryFrom<ResponseRouterData<F, MifinityPaymentsResponse, T, PaymentsRe
                     mandate_reference: Box::new(None),
                     connector_metadata: None,
                     network_txn_id: None,
+                    network_txn_link_id: None,
                     connector_response_reference_id: None,
                     incremental_authorization_allowed: None,
+                    authentication_data: None,
                     charges: None,
+                    payment_account_reference: None,
                 }),
                 ..item.data
             }),
@@ -362,9 +376,12 @@ impl<F, T> TryFrom<ResponseRouterData<F, MifinityPsyncResponse, T, PaymentsRespo
                                 mandate_reference: Box::new(None),
                                 connector_metadata: None,
                                 network_txn_id: None,
+                                network_txn_link_id: None,
                                 connector_response_reference_id: None,
                                 incremental_authorization_allowed: None,
+                                authentication_data: None,
                                 charges: None,
+                                payment_account_reference: None,
                             }),
                             ..item.data
                         })
@@ -377,9 +394,12 @@ impl<F, T> TryFrom<ResponseRouterData<F, MifinityPsyncResponse, T, PaymentsRespo
                             mandate_reference: Box::new(None),
                             connector_metadata: None,
                             network_txn_id: None,
+                            network_txn_link_id: None,
                             connector_response_reference_id: None,
                             incremental_authorization_allowed: None,
+                            authentication_data: None,
                             charges: None,
+                            payment_account_reference: None,
                         }),
                         ..item.data
                     }),
@@ -393,9 +413,12 @@ impl<F, T> TryFrom<ResponseRouterData<F, MifinityPsyncResponse, T, PaymentsRespo
                     mandate_reference: Box::new(None),
                     connector_metadata: None,
                     network_txn_id: None,
+                    network_txn_link_id: None,
                     connector_response_reference_id: None,
                     incremental_authorization_allowed: None,
+                    authentication_data: None,
                     charges: None,
+                    payment_account_reference: None,
                 }),
                 ..item.data
             }),

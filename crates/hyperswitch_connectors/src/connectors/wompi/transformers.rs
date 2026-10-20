@@ -31,7 +31,7 @@ use hyperswitch_domain_models::{
     router_request_types::{CompleteAuthorizeData, RefundsData},
 };
 use hyperswitch_interfaces::errors;
-use masking::{ExposeInterface, PeekInterface, Secret};
+use hyperswitch_masking::{ExposeInterface, PeekInterface, Secret};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -191,13 +191,13 @@ pub(super) fn extract_installments(
             .or_else(|| value.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
             .and_then(|n| i32::try_from(n).ok())
             .ok_or(errors::ConnectorError::InvalidDataFormat {
-                field_name: "metadata.installments",
+                field_name: "metadata.installments".into(),
             })?,
     };
 
     if !(1..=MAX_INSTALLMENTS).contains(&installments) {
         return Err(errors::ConnectorError::InvalidDataFormat {
-            field_name: "metadata.installments",
+            field_name: "metadata.installments".into(),
         }
         .into());
     }
@@ -257,7 +257,7 @@ const ACCESS_TOKEN_TTL_MAX_SECONDS: i64 = 3600;
 /// reuse a cached token, so a non-positive TTL here simply is not cached, which is
 /// the correct outcome for a pair that is already (nearly) dead.
 fn access_token_ttl_seconds(acceptance_token: &str, personal_auth_token: &str) -> i64 {
-    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let now = common_utils::date_time::now_unix_timestamp();
     let min_exp = [
         decode_jwt_exp(acceptance_token),
         decode_jwt_exp(personal_auth_token),
@@ -389,7 +389,7 @@ impl TryFrom<&hyperswitch_domain_models::types::TokenizationRouterData> for Womp
             .clone()
             .or_else(|| item.get_optional_billing_full_name())
             .ok_or(errors::ConnectorError::MissingRequiredField {
-                field_name: "card_holder_name",
+                field_name: "card_holder_name".into(),
             })?;
 
         // Wompi rejects a card holder shorter than 5 characters. This is a value
@@ -397,7 +397,7 @@ impl TryFrom<&hyperswitch_domain_models::types::TokenizationRouterData> for Womp
         // `InvalidDataFormat` rather than `MissingRequiredField`.
         if card_holder.clone().expose().trim().chars().count() < 5 {
             return Err(errors::ConnectorError::InvalidDataFormat {
-                field_name: "card_holder_name",
+                field_name: "card_holder_name".into(),
             }
             .into());
         }
@@ -539,7 +539,7 @@ impl TryFrom<&WompiRouterData<&PaymentsAuthorizeRouterData>> for WompiTransactio
         if !router_data.request.is_auto_capture()? {
             return Err(errors::ConnectorError::NotSupported {
                 message: "manual capture".to_string(),
-                connector: "wompi",
+                connector: "wompi".into(),
             }
             .into());
         }
@@ -560,7 +560,7 @@ impl TryFrom<&WompiRouterData<&PaymentsAuthorizeRouterData>> for WompiTransactio
             Some(hyperswitch_domain_models::router_data::PaymentMethodToken::Token(token)) => token,
             _ => {
                 return Err(errors::ConnectorError::MissingRequiredField {
-                    field_name: "payment_method_token",
+                    field_name: "payment_method_token".into(),
                 }
                 .into())
             }
@@ -582,7 +582,7 @@ impl TryFrom<&WompiRouterData<&PaymentsAuthorizeRouterData>> for WompiTransactio
             .get_optional_email()
             .or_else(|| router_data.get_optional_billing_email())
             .ok_or(errors::ConnectorError::MissingRequiredField {
-                field_name: "email",
+                field_name: "email".into(),
             })?;
 
         let full_name = router_data.get_optional_billing_full_name();
@@ -684,6 +684,8 @@ pub(super) fn reclassify_external_void(
 
     Some(ConnectorReportedActivity {
         refunds: vec![ConnectorReportedRefund {
+            amount_is_remaining_balance: false,
+            amount_is_cumulative_total: false,
             connector_refund_id: format!("{VOID_REFUND_ID_PREFIX}{}", voided.id),
             amount: voided
                 .amount_in_cents
@@ -733,6 +735,88 @@ pub(super) fn sync_with_external_void<F, T>(
         payment_amount,
     );
     let mut router_data = build(transactions, data)?;
+    if let Some(activity) = activity {
+        attach_reported_activity(&mut router_data, activity);
+    }
+    Ok(router_data)
+}
+
+/// PSync outcome for a `refund.updated` webhook (`refund_event` wrapper): the
+/// payment keeps its attempt status and the refund Wompi executed is reported as
+/// `ConnectorReportedRefund`, so core records `ref_wompi_<refund_id>` and fires the
+/// outgoing refund webhook.
+///
+/// The original Wompi transaction stays APPROVED after such a refund, so a real
+/// `GET /transactions/{id}` can never show it; the event is the only signal.
+/// Replays are harmless: deduplication by refund id is core's job. Anything that
+/// does not line up with the attempt (not settled yet, another or an unknown
+/// transaction id, a different currency, an amount that is not positive or exceeds
+/// the payment) is an error so Wompi retries the delivery later instead of the
+/// refund being recorded against the wrong payment or lost. Those checks are what
+/// make trusting the UNSIGNED `refund.transaction_id` and `refund.amount_in_cents`
+/// safe: the transaction id must be the attempt's own, already known, connector
+/// transaction id (the webhook looked the attempt up by it), and the amount must fit
+/// in the payment. The response carries no `connector_metadata` nor reference,
+/// which core does not treat as an overwrite of the stored attempt values.
+pub(super) fn refund_event_to_router_data<F, T>(
+    refund: WompiWebhookRefund,
+    data: RouterData<F, T, PaymentsResponseData>,
+    attempt_connector_transaction_id: Option<&str>,
+    payment_currency: enums::Currency,
+    payment_amount: MinorUnit,
+) -> CustomResult<RouterData<F, T, PaymentsResponseData>, errors::ConnectorError> {
+    if !matches!(
+        data.status,
+        enums::AttemptStatus::Charged | enums::AttemptStatus::PartialCharged
+    ) {
+        return Err(report!(errors::ConnectorError::ResponseHandlingFailed)
+            .attach_printable("Wompi refund event received for a payment that is not settled"));
+    }
+    if attempt_connector_transaction_id != Some(refund.transaction_id.as_str()) {
+        return Err(report!(errors::ConnectorError::ResponseHandlingFailed)
+            .attach_printable("Wompi refund event is not for the attempt's known transaction"));
+    }
+    if refund.status == WompiRefundStatus::Approved
+        && (refund.amount_in_cents <= 0
+            || refund.amount_in_cents > payment_amount.get_amount_as_i64())
+    {
+        return Err(report!(errors::ConnectorError::ResponseHandlingFailed)
+            .attach_printable("Wompi refund event amount is not within the payment amount"));
+    }
+    if matches!(&refund.currency, Some(currency)
+        if !currency.eq_ignore_ascii_case(&payment_currency.to_string()))
+    {
+        return Err(report!(errors::ConnectorError::ResponseHandlingFailed)
+            .attach_printable("Wompi refund event currency differs from the payment currency"));
+    }
+
+    let approved = refund.status == WompiRefundStatus::Approved;
+    let activity = approved.then(|| ConnectorReportedActivity {
+        refunds: vec![ConnectorReportedRefund {
+            amount_is_remaining_balance: false,
+            amount_is_cumulative_total: false,
+            connector_refund_id: refund.refund_id,
+            amount: MinorUnit::new(refund.amount_in_cents),
+            status: enums::RefundStatus::Success,
+        }],
+        dispute: None,
+    });
+    let mut router_data = RouterData {
+        response: Ok(PaymentsResponseData::TransactionResponse {
+            resource_id: ResponseId::ConnectorTransactionId(refund.transaction_id),
+            redirection_data: Box::new(None),
+            mandate_reference: Box::new(None),
+            connector_metadata: None,
+            network_txn_id: None,
+            connector_response_reference_id: None,
+            incremental_authorization_allowed: None,
+            charges: None,
+            network_txn_link_id: None,
+            payment_account_reference: None,
+            authentication_data: None,
+        }),
+        ..data
+    };
     if let Some(activity) = activity {
         attach_reported_activity(&mut router_data, activity);
     }
@@ -815,6 +899,7 @@ pub(super) fn transaction_to_router_data<F, T>(
             network_decline_code: None,
             network_error_message: None,
             connector_metadata: None,
+            connector_response_reference_id: None,
         })
     } else {
         Ok(PaymentsResponseData::TransactionResponse {
@@ -826,6 +911,9 @@ pub(super) fn transaction_to_router_data<F, T>(
             connector_response_reference_id: Some(transaction.reference),
             incremental_authorization_allowed: None,
             charges: None,
+            network_txn_link_id: None,
+            payment_account_reference: None,
+            authentication_data: None,
         })
     };
 
@@ -940,6 +1028,9 @@ impl
                 connector_response_reference_id: Some(reference),
                 incremental_authorization_allowed: None,
                 charges: None,
+                network_txn_link_id: None,
+                payment_account_reference: None,
+                authentication_data: None,
             }),
             ..item.data
         })
@@ -1148,10 +1239,15 @@ fn extract_browser_field(
     let value = payload
         .get(field_name)
         .and_then(|value| value.as_str())
-        .ok_or(errors::ConnectorError::MissingRequiredField { field_name })?;
+        .ok_or(errors::ConnectorError::MissingRequiredField {
+            field_name: field_name.into(),
+        })?;
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.chars().count() > MAX_BROWSER_FIELD_LEN {
-        return Err(errors::ConnectorError::InvalidDataFormat { field_name }.into());
+        return Err(errors::ConnectorError::InvalidDataFormat {
+            field_name: field_name.into(),
+        }
+        .into());
     }
     Ok(trimmed.to_string())
 }
@@ -1167,7 +1263,7 @@ pub(super) fn parse_browser_info_payload(
         .and_then(|redirect_response| redirect_response.payload.as_ref())
         .and_then(|payload| payload.peek().as_object().cloned())
         .ok_or(errors::ConnectorError::MissingRequiredField {
-            field_name: "redirect_response.payload",
+            field_name: "redirect_response.payload".into(),
         })?;
 
     Ok(WompiBrowserInfo {
@@ -1349,7 +1445,7 @@ pub(super) fn build_challenge_page(
 ) -> CustomResult<String, errors::ConnectorError> {
     let mut done_url = url::Url::parse(complete_authorize_url).change_context(
         errors::ConnectorError::InvalidDataFormat {
-            field_name: "complete_authorize_url",
+            field_name: "complete_authorize_url".into(),
         },
     )?;
     done_url
@@ -1493,6 +1589,9 @@ pub(super) fn three_ds_create_response<F, T>(
             connector_response_reference_id: Some(transaction.reference),
             incremental_authorization_allowed: None,
             charges: None,
+            network_txn_link_id: None,
+            payment_account_reference: None,
+            authentication_data: None,
         }),
         ..data
     })
@@ -1544,6 +1643,9 @@ pub(super) fn three_ds_poll_response<F, T>(
             connector_response_reference_id: Some(transaction.reference),
             incremental_authorization_allowed: None,
             charges: None,
+            network_txn_link_id: None,
+            payment_account_reference: None,
+            authentication_data: None,
         }),
         ..data
     })
@@ -1625,7 +1727,7 @@ pub(super) fn build_card_three_ds_authorize_response(
         Some(hyperswitch_domain_models::router_data::PaymentMethodToken::Token(token)) => token,
         _ => {
             return Err(errors::ConnectorError::MissingRequiredField {
-                field_name: "payment_method_token",
+                field_name: "payment_method_token".into(),
             }
             .into())
         }
@@ -1637,7 +1739,7 @@ pub(super) fn build_card_three_ds_authorize_response(
         .get_optional_email()
         .or_else(|| item.data.get_optional_billing_email())
         .ok_or(errors::ConnectorError::MissingRequiredField {
-            field_name: "email",
+            field_name: "email".into(),
         })?;
 
     let card_holder_name = match &item.data.request.payment_method_data {
@@ -1649,12 +1751,12 @@ pub(super) fn build_card_three_ds_authorize_response(
         .get_optional_billing_full_name()
         .or(card_holder_name)
         .ok_or(errors::ConnectorError::MissingRequiredField {
-            field_name: "billing.address.first_name",
+            field_name: "billing.address.first_name".into(),
         })?;
 
     let phone_number = build_customer_data_phone_number(&item.data).ok_or(
         errors::ConnectorError::MissingRequiredField {
-            field_name: "billing.phone.number",
+            field_name: "billing.phone.number".into(),
         },
     )?;
 
@@ -1672,7 +1774,7 @@ pub(super) fn build_card_three_ds_authorize_response(
 
     let complete_authorize_url = item.data.request.complete_authorize_url.clone().ok_or(
         errors::ConnectorError::MissingRequiredField {
-            field_name: "complete_authorize_url",
+            field_name: "complete_authorize_url".into(),
         },
     )?;
     let page = build_browser_info_collection_page(&complete_authorize_url);
@@ -1689,6 +1791,9 @@ pub(super) fn build_card_three_ds_authorize_response(
             connector_response_reference_id: Some(reference),
             incremental_authorization_allowed: None,
             charges: None,
+            network_txn_link_id: None,
+            payment_account_reference: None,
+            authentication_data: None,
         }),
         ..item.data
     })
@@ -1867,6 +1972,9 @@ pub(super) fn card_sync_by_reference_response<F, T>(
                 connector_response_reference_id: None,
                 incremental_authorization_allowed: None,
                 charges: None,
+                network_txn_link_id: None,
+                payment_account_reference: None,
+                authentication_data: None,
             }),
             ..data
         },
@@ -1902,7 +2010,7 @@ impl<F, T> TryFrom<ResponseRouterData<F, WompiSearchResponse, T, PaymentsRespons
     fn try_from(
         item: ResponseRouterData<F, WompiSearchResponse, T, PaymentsResponseData>,
     ) -> Result<Self, Self::Error> {
-        let now = time::OffsetDateTime::now_utc();
+        let now = common_utils::date_time::now().assume_utc();
         let outcome = select_hosted_transaction(item.response.data, now);
 
         let (status, response) = match outcome {
@@ -1921,6 +2029,9 @@ impl<F, T> TryFrom<ResponseRouterData<F, WompiSearchResponse, T, PaymentsRespons
                     connector_response_reference_id: Some(reference),
                     incremental_authorization_allowed: None,
                     charges: None,
+                    network_txn_link_id: None,
+                    payment_account_reference: None,
+                    authentication_data: None,
                 }),
             ),
             HostedSyncOutcome::Voided { id, reference } => (
@@ -1934,6 +2045,9 @@ impl<F, T> TryFrom<ResponseRouterData<F, WompiSearchResponse, T, PaymentsRespons
                     connector_response_reference_id: Some(reference),
                     incremental_authorization_allowed: None,
                     charges: None,
+                    network_txn_link_id: None,
+                    payment_account_reference: None,
+                    authentication_data: None,
                 }),
             ),
             HostedSyncOutcome::Pending { id } => (
@@ -1949,6 +2063,9 @@ impl<F, T> TryFrom<ResponseRouterData<F, WompiSearchResponse, T, PaymentsRespons
                     connector_response_reference_id: None,
                     incremental_authorization_allowed: None,
                     charges: None,
+                    network_txn_link_id: None,
+                    payment_account_reference: None,
+                    authentication_data: None,
                 }),
             ),
             HostedSyncOutcome::Failure {
@@ -1968,6 +2085,7 @@ impl<F, T> TryFrom<ResponseRouterData<F, WompiSearchResponse, T, PaymentsRespons
                     network_decline_code: None,
                     network_error_message: None,
                     connector_metadata: None,
+                    connector_response_reference_id: None,
                 }),
             ),
         };
@@ -2057,7 +2175,7 @@ pub(super) fn validate_void_refund(
     if refund_amount != payment_amount {
         return Err(errors::ConnectorError::NotSupported {
             message: "partial refund".to_string(),
-            connector: "wompi",
+            connector: "wompi".into(),
         }
         .into());
     }
@@ -2070,7 +2188,7 @@ pub(super) fn validate_void_refund(
         if payment_method_type != "CARD" {
             return Err(errors::ConnectorError::NotSupported {
                 message: "refund of a non-card payment".to_string(),
-                connector: "wompi",
+                connector: "wompi".into(),
             }
             .into());
         }
@@ -2148,6 +2266,7 @@ impl<F> TryFrom<RefundsResponseRouterData<F, WompiVoidResponse>> for RefundsRout
                 network_decline_code: None,
                 network_error_message: None,
                 connector_metadata: None,
+                connector_response_reference_id: None,
             })
         } else {
             Ok(RefundsResponseData {
@@ -2270,7 +2389,7 @@ impl WompiErrorBody {
 }
 
 // ============================================================================
-// Webhooks — transaction.updated
+// Webhooks — transaction.updated and refund.updated
 // ============================================================================
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2292,6 +2411,65 @@ pub struct WompiWebhookTransaction {
     pub id: String,
     pub reference: String,
     pub status: WompiTransactionStatus,
+}
+
+const REFUND_UPDATED_EVENT: &str = "refund.updated";
+
+/// The `data.refund` object of a `refund.updated` event (other fields, such as
+/// `reference`, `code` and `message`, are ignored; the status reuses
+/// `WompiRefundStatus`, whose catch-all keeps an unknown value from being read as
+/// approved). Also the payload of the
+/// connector-private `refund_event` wrapper handed to PSync.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WompiWebhookRefund {
+    pub refund_id: String,
+    pub transaction_id: String,
+    pub status: WompiRefundStatus,
+    pub amount_in_cents: i64,
+    #[serde(default)]
+    pub currency: Option<String>,
+}
+
+fn parse_webhook_refund(
+    webhook: &WompiWebhookBody,
+) -> CustomResult<WompiWebhookRefund, errors::ConnectorError> {
+    serde_json::from_value(
+        webhook
+            .data
+            .get("refund")
+            .cloned()
+            .ok_or(errors::ConnectorError::WebhookResourceObjectNotFound)?,
+    )
+    .change_context(errors::ConnectorError::WebhookResourceObjectNotFound)
+}
+
+/// Wrapper under which a `refund.updated` webhook's refund reaches PSync as the
+/// webhook resource object. Real Wompi transaction and search responses never
+/// carry a `refund_event` key, so the REQUIRED field keeps them from matching.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WompiRefundEventEnvelope {
+    pub refund_event: WompiWebhookRefund,
+}
+
+/// Resource object for a webhook: `{"data": transaction}` for `transaction.updated`
+/// (so the PSync response parser is reused as is), or the `refund_event` wrapper
+/// for `refund.updated`.
+pub(super) fn webhook_resource_object(
+    webhook: &WompiWebhookBody,
+) -> CustomResult<serde_json::Value, errors::ConnectorError> {
+    if webhook.event == REFUND_UPDATED_EVENT {
+        let refund_event = WompiRefundEventEnvelope {
+            refund_event: parse_webhook_refund(webhook)?,
+        };
+        return serde_json::to_value(refund_event)
+            .change_context(errors::ConnectorError::WebhookResourceObjectNotFound);
+    }
+    let transaction = webhook
+        .data
+        .get("transaction")
+        .cloned()
+        .ok_or(errors::ConnectorError::WebhookResourceObjectNotFound)?;
+    Ok(serde_json::json!({ "data": transaction }))
 }
 
 fn parse_webhook_transaction(
@@ -2322,9 +2500,23 @@ pub(super) enum WompiWebhookReference {
 /// signed `transaction.id` (Wompi's own id); if neither is signed the webhook is
 /// rejected. A hosted-checkout attempt whose connector id isn't known yet is simply
 /// not resolved by the webhook; the ordinary PSync poll resolves it instead.
+///
+/// `refund.updated` is the exception: Wompi signs only `refund.refund_id` and
+/// `refund.status` there, so `refund.transaction_id` is UNSIGNED and is trusted on
+/// purpose (accepted decision: HTTPS delivery plus a signed refund id and status;
+/// the PSync side additionally requires it to match the attempt's own connector
+/// transaction id, see `refund_event_to_router_data`).
 pub(super) fn webhook_payment_reference(
     webhook: &WompiWebhookBody,
 ) -> CustomResult<WompiWebhookReference, errors::ConnectorError> {
+    if webhook.event == REFUND_UPDATED_EVENT {
+        return Ok(WompiWebhookReference::ConnectorTransactionId(
+            parse_webhook_refund(webhook)
+                .change_context(errors::ConnectorError::WebhookReferenceIdNotFound)?
+                .transaction_id,
+        ));
+    }
+
     let transaction = parse_webhook_transaction(webhook)?;
 
     let is_signed = |property: &str| {
@@ -2356,6 +2548,28 @@ pub(super) fn webhook_payment_reference(
 pub(super) fn map_webhook_event(
     webhook: &WompiWebhookBody,
 ) -> CustomResult<IncomingWebhookEvent, errors::ConnectorError> {
+    if webhook.event == REFUND_UPDATED_EVENT {
+        // A refund Wompi support executes on request (the original transaction stays
+        // APPROVED, so a payment sync alone never shows it). The event is a routing
+        // label into the payments flow, not a payment outcome: an unknown refund in
+        // the refund flow is a WE_04 404 and core has no create-on-unknown path,
+        // while the payments flow re-syncs the payment and records the refund (see
+        // `refund_event_to_router_data`). `PaymentIntentProcessing` is the label
+        // PayPal uses for the same purpose. A refund that did not complete (DECLINED,
+        // ERROR, CANCELLED, or a status this connector does not know) moved no money,
+        // so there is nothing to record.
+        let refund = parse_webhook_refund(webhook)
+            .change_context(errors::ConnectorError::WebhookEventTypeNotFound)?;
+        return Ok(match refund.status {
+            WompiRefundStatus::Approved => IncomingWebhookEvent::PaymentIntentProcessing,
+            WompiRefundStatus::Declined
+            | WompiRefundStatus::Error
+            | WompiRefundStatus::Cancelled
+            | WompiRefundStatus::Pending
+            | WompiRefundStatus::Unknown => IncomingWebhookEvent::EventNotSupported,
+        });
+    }
+
     if webhook.event != "transaction.updated" {
         return Ok(IncomingWebhookEvent::EventNotSupported);
     }
@@ -2832,7 +3046,7 @@ mod tests {
 
     #[test]
     fn jwt_exp_claim_is_decoded() {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let now = common_utils::date_time::now_unix_timestamp();
         let token = make_jwt(now + 1000);
         assert_eq!(decode_jwt_exp(&token), Some(now + 1000));
     }
@@ -2844,7 +3058,7 @@ mod tests {
 
     #[test]
     fn access_token_ttl_uses_the_sooner_exp() {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let now = common_utils::date_time::now_unix_timestamp();
         let far_future = make_jwt(now + 100_000);
         let sooner = make_jwt(now + 2000);
         let ttl = access_token_ttl_seconds(&far_future, &sooner);
@@ -2854,7 +3068,7 @@ mod tests {
 
     #[test]
     fn access_token_ttl_clamps_down_to_maximum() {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let now = common_utils::date_time::now_unix_timestamp();
         let far_future = make_jwt(now + 100_000);
         let ttl = access_token_ttl_seconds(&far_future, &far_future);
         assert_eq!(ttl, ACCESS_TOKEN_TTL_MAX_SECONDS);
@@ -2862,7 +3076,7 @@ mod tests {
 
     #[test]
     fn access_token_ttl_never_clamps_an_expired_pair_up() {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let now = common_utils::date_time::now_unix_timestamp();
         // Already expired: raw TTL would be negative, and must stay 0 (never
         // cached) rather than being clamped up to a minimum that would cache a
         // dead pair.
@@ -3407,6 +3621,10 @@ mod tests {
             nick_name: None,
             card_holder_name: Some(Secret::new("PXSOL TEST".to_string())),
             co_badged_card_data: None,
+            card_subtype: None,
+            card_segment_type: None,
+            funding_source: None,
+            card_issuing_country_code: None,
         }
     }
 
@@ -3427,8 +3645,6 @@ mod tests {
             customer_name: None,
             currency,
             confirm: true,
-            statement_descriptor_suffix: None,
-            statement_descriptor: None,
             capture_method: Some(enums::CaptureMethod::Automatic),
             router_return_url,
             webhook_url: None,
@@ -3465,6 +3681,20 @@ mod tests {
             payment_channel: None,
             enable_partial_authorization: None,
             enable_overcapture: None,
+            ucs_authentication_data: None,
+            force_3ds_challenge: None,
+            guest_customer: None,
+            is_stored_credential: None,
+            mit_category: None,
+            billing_descriptor: None,
+            tokenization: None,
+            partner_merchant_identifier_details: None,
+            feature_metadata: None,
+            installment_details: None,
+            connector_intent_metadata: None,
+            is_account_funded_transaction: None,
+            recipient_details: None,
+            business_country: None,
         }
     }
 
@@ -3537,6 +3767,15 @@ mod tests {
             psd2_sca_exemption_type: None,
             raw_connector_response: None,
             is_payment_id_from_merchant: None,
+            payment_method_type: None,
+            payout_id: None,
+            authorized_amount: None,
+            accept_amount_mismatch: None,
+            customer_document_details: None,
+            customer_date_of_birth: None,
+            feature_data: None,
+            sender_payment_instrument_id: None,
+            connector_returned_payment_method_details: None,
         }
     }
 
@@ -3605,9 +3844,8 @@ mod tests {
         let result = WompiTransactionsRequest::try_from(&wompi_router_data);
         assert!(matches!(
             result.unwrap_err().current_context(),
-            errors::ConnectorError::MissingRequiredField {
-                field_name: "email"
-            }
+            errors::ConnectorError::MissingRequiredField { field_name }
+                if field_name == "email"
         ));
     }
 
@@ -3829,6 +4067,7 @@ mod tests {
             merchant_config_currency: None,
             capture_method: None,
             additional_payment_method_data: None,
+            payment_connector_request_reference_id: None,
         }
     }
 
@@ -3890,6 +4129,15 @@ mod tests {
             psd2_sca_exemption_type: None,
             raw_connector_response: None,
             is_payment_id_from_merchant: None,
+            payment_method_type: None,
+            payout_id: None,
+            authorized_amount: None,
+            accept_amount_mismatch: None,
+            customer_document_details: None,
+            customer_date_of_birth: None,
+            feature_data: None,
+            sender_payment_instrument_id: None,
+            connector_returned_payment_method_details: None,
         }
     }
 
@@ -4343,6 +4591,20 @@ mod tests {
             merchant_account_id: None,
             merchant_config_currency: None,
             threeds_method_comp_ind: None,
+            request_incremental_authorization: false,
+            authentication_data: None,
+            payment_method_type: None,
+            is_stored_credential: None,
+            tokenization: None,
+            router_return_url: None,
+            merchant_order_reference_id: None,
+            is_account_funded_transaction: None,
+            recipient_details: None,
+            business_country: None,
+            connector_intent_metadata: None,
+            order_id: None,
+            force_3ds_challenge: None,
+            enable_overcapture: None,
         };
 
         RouterData {
@@ -4402,6 +4664,15 @@ mod tests {
             psd2_sca_exemption_type: None,
             raw_connector_response: None,
             is_payment_id_from_merchant: None,
+            payment_method_type: None,
+            payout_id: None,
+            authorized_amount: None,
+            accept_amount_mismatch: None,
+            customer_document_details: None,
+            customer_date_of_birth: None,
+            feature_data: None,
+            sender_payment_instrument_id: None,
+            connector_returned_payment_method_details: None,
         }
     }
 
@@ -4429,9 +4700,8 @@ mod tests {
         let result = parse_browser_info_payload(Some(&redirect_response));
         assert!(matches!(
             result.unwrap_err().current_context(),
-            errors::ConnectorError::MissingRequiredField {
-                field_name: "browser_tz"
-            }
+            errors::ConnectorError::MissingRequiredField { field_name }
+                if field_name == "browser_tz"
         ));
     }
 
@@ -4443,9 +4713,8 @@ mod tests {
         let result = parse_browser_info_payload(Some(&redirect_response));
         assert!(matches!(
             result.unwrap_err().current_context(),
-            errors::ConnectorError::InvalidDataFormat {
-                field_name: "browser_user_agent"
-            }
+            errors::ConnectorError::InvalidDataFormat { field_name }
+                if field_name == "browser_user_agent"
         ));
     }
 
@@ -4867,6 +5136,7 @@ mod tests {
             network_decline_code: None,
             network_error_message: None,
             connector_metadata: None,
+            connector_response_reference_id: None,
         };
         assert!(is_duplicate_reference_error(&error));
     }
@@ -4884,6 +5154,7 @@ mod tests {
             network_decline_code: None,
             network_error_message: None,
             connector_metadata: None,
+            connector_response_reference_id: None,
         };
         assert!(!is_duplicate_reference_error(&error));
     }
@@ -4928,5 +5199,259 @@ mod tests {
 
         let phone_number = build_customer_data_phone_number(&router_data).unwrap();
         assert_eq!(phone_number.peek(), "573001234567");
+    }
+
+    // ------------------------------------------------------------------
+    // refund.updated
+    // ------------------------------------------------------------------
+
+    const REFUND_EVENT_TIMESTAMP: i64 = 1530291411;
+
+    fn refund_webhook_body(status: &str) -> WompiWebhookBody {
+        WompiWebhookBody {
+            event: "refund.updated".to_string(),
+            data: serde_json::json!({
+                "refund": {
+                    "refund_id": "COa7Bk9m1",
+                    "transaction_id": "txn-1",
+                    "status": status,
+                    "amount_in_cents": 100000,
+                    "currency": "COP",
+                    "reference": "support-ticket-1",
+                }
+            }),
+            signature: WompiWebhookSignature {
+                properties: vec!["refund.refund_id".to_string(), "refund.status".to_string()],
+                checksum: String::new(),
+            },
+            timestamp: REFUND_EVENT_TIMESTAMP,
+        }
+    }
+
+    fn refund_event(status: WompiRefundStatus) -> WompiWebhookRefund {
+        WompiWebhookRefund {
+            refund_id: "COa7Bk9m1".to_string(),
+            transaction_id: "txn-1".to_string(),
+            status,
+            amount_in_cents: 100000,
+            currency: Some("COP".to_string()),
+        }
+    }
+
+    #[test]
+    fn refund_updated_approved_routes_into_the_payments_flow() {
+        assert_eq!(
+            map_webhook_event(&refund_webhook_body("APPROVED")).unwrap(),
+            IncomingWebhookEvent::PaymentIntentProcessing
+        );
+    }
+
+    #[test]
+    fn refund_updated_that_moved_no_money_is_not_supported() {
+        for status in ["DECLINED", "ERROR", "CANCELLED", "SOMETHING_NEW"] {
+            assert_eq!(
+                map_webhook_event(&refund_webhook_body(status)).unwrap(),
+                IncomingWebhookEvent::EventNotSupported,
+                "status {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn refund_updated_does_not_need_a_transaction_object() {
+        let webhook = refund_webhook_body("APPROVED");
+        assert!(webhook.data.get("transaction").is_none());
+        assert!(map_webhook_event(&webhook).is_ok());
+    }
+
+    #[test]
+    fn transaction_updated_is_unaffected_by_refund_routing() {
+        assert_eq!(
+            map_webhook_event(&sample_webhook_body()).unwrap(),
+            IncomingWebhookEvent::PaymentIntentSuccess
+        );
+    }
+
+    #[test]
+    fn refund_updated_reference_is_the_refunded_transaction_id() {
+        assert_eq!(
+            webhook_payment_reference(&refund_webhook_body("APPROVED")).unwrap(),
+            WompiWebhookReference::ConnectorTransactionId("txn-1".to_string())
+        );
+    }
+
+    #[test]
+    fn refund_updated_checksum_covers_refund_id_and_status() {
+        let webhook = refund_webhook_body("APPROVED");
+        let message = build_webhook_message(&webhook, SYNTHETIC_WEBHOOK_SECRET.as_bytes());
+        let expected =
+            format!("COa7Bk9m1APPROVED{REFUND_EVENT_TIMESTAMP}{SYNTHETIC_WEBHOOK_SECRET}");
+        assert_eq!(message, expected.as_bytes());
+        let digest = Sha256.generate_digest(&message).unwrap();
+        assert_eq!(
+            hex::encode(digest),
+            hex::encode(Sha256.generate_digest(expected.as_bytes()).unwrap())
+        );
+
+        let mut tampered = refund_webhook_body("DECLINED");
+        tampered.signature.properties = webhook.signature.properties.clone();
+        assert_ne!(
+            build_webhook_message(&tampered, SYNTHETIC_WEBHOOK_SECRET.as_bytes()),
+            message
+        );
+    }
+
+    #[test]
+    fn refund_updated_resource_object_is_wrapped_under_refund_event() {
+        let resource = webhook_resource_object(&refund_webhook_body("APPROVED")).unwrap();
+        assert_eq!(resource["refund_event"]["refund_id"], "COa7Bk9m1");
+        assert_eq!(resource["refund_event"]["transaction_id"], "txn-1");
+        assert_eq!(resource["refund_event"]["amount_in_cents"], 100000);
+        let envelope: WompiRefundEventEnvelope = serde_json::from_value(resource).unwrap();
+        assert_eq!(envelope.refund_event.status, WompiRefundStatus::Approved);
+    }
+
+    #[test]
+    fn transaction_updated_resource_object_is_unchanged() {
+        let resource = webhook_resource_object(&sample_webhook_body()).unwrap();
+        assert_eq!(resource["data"]["id"], "1234-1610641025-49201");
+        assert!(resource.get("refund_event").is_none());
+    }
+
+    #[test]
+    fn refund_event_envelope_rejects_transaction_and_search_bodies() {
+        let transaction = br#"{"data":{"id":"txn-1","status":"APPROVED","reference":"REF-1"}}"#;
+        let search = br#"{"data":[{"id":"txn-1","status":"APPROVED","reference":"REF-1"}]}"#;
+        assert!(serde_json::from_slice::<WompiRefundEventEnvelope>(transaction).is_err());
+        assert!(serde_json::from_slice::<WompiRefundEventEnvelope>(search).is_err());
+    }
+
+    #[test]
+    fn approved_refund_event_on_a_charged_payment_is_reported_as_a_refund() {
+        let result = refund_event_to_router_data(
+            refund_event(WompiRefundStatus::Approved),
+            charged_sync_router_data(enums::AttemptStatus::Charged),
+            Some("txn-1"),
+            enums::Currency::COP,
+            MinorUnit::new(100000),
+        )
+        .expect("refund event must be accepted");
+
+        assert_eq!(result.status, enums::AttemptStatus::Charged);
+        assert!(matches!(
+            result.response,
+            Ok(PaymentsResponseData::TransactionResponse {
+                resource_id: ResponseId::ConnectorTransactionId(ref id),
+                connector_metadata: None,
+                connector_response_reference_id: None,
+                ..
+            }) if id == "txn-1"
+        ));
+        let reported = result
+            .connector_response
+            .as_ref()
+            .and_then(|response| response.get_reported_activity())
+            .expect("the refund must be attached as reported activity");
+        assert_eq!(reported.refunds.len(), 1);
+        assert_eq!(reported.refunds[0].connector_refund_id, "COa7Bk9m1");
+        assert_eq!(reported.refunds[0].amount, MinorUnit::new(100000));
+        assert_eq!(reported.refunds[0].status, enums::RefundStatus::Success);
+    }
+
+    #[test]
+    fn refund_event_without_currency_is_accepted() {
+        let mut refund = refund_event(WompiRefundStatus::Approved);
+        refund.currency = None;
+        assert!(refund_event_to_router_data(
+            refund,
+            charged_sync_router_data(enums::AttemptStatus::PartialCharged),
+            Some("txn-1"),
+            enums::Currency::COP,
+            MinorUnit::new(100000),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn refund_event_for_an_attempt_without_a_known_transaction_is_an_error() {
+        assert!(refund_event_to_router_data(
+            refund_event(WompiRefundStatus::Approved),
+            charged_sync_router_data(enums::AttemptStatus::Charged),
+            None,
+            enums::Currency::COP,
+            MinorUnit::new(100000),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn refund_event_amount_must_be_positive_and_within_the_payment() {
+        for amount_in_cents in [0, -1, 100001] {
+            let mut refund = refund_event(WompiRefundStatus::Approved);
+            refund.amount_in_cents = amount_in_cents;
+            assert!(
+                refund_event_to_router_data(
+                    refund,
+                    charged_sync_router_data(enums::AttemptStatus::Charged),
+                    Some("txn-1"),
+                    enums::Currency::COP,
+                    MinorUnit::new(100000),
+                )
+                .is_err(),
+                "amount {amount_in_cents}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_approved_refund_event_reaching_psync_reports_nothing() {
+        let result = refund_event_to_router_data(
+            refund_event(WompiRefundStatus::Declined),
+            charged_sync_router_data(enums::AttemptStatus::Charged),
+            Some("txn-1"),
+            enums::Currency::COP,
+            MinorUnit::new(100000),
+        )
+        .unwrap();
+        assert_eq!(result.status, enums::AttemptStatus::Charged);
+        assert!(result.connector_response.is_none());
+    }
+
+    #[test]
+    fn refund_event_for_an_unsettled_payment_is_an_error() {
+        assert!(refund_event_to_router_data(
+            refund_event(WompiRefundStatus::Approved),
+            charged_sync_router_data(enums::AttemptStatus::Pending),
+            Some("txn-1"),
+            enums::Currency::COP,
+            MinorUnit::new(100000),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn refund_event_for_another_transaction_is_an_error() {
+        assert!(refund_event_to_router_data(
+            refund_event(WompiRefundStatus::Approved),
+            charged_sync_router_data(enums::AttemptStatus::Charged),
+            Some("txn-other"),
+            enums::Currency::COP,
+            MinorUnit::new(100000),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn refund_event_in_another_currency_is_an_error() {
+        let mut refund = refund_event(WompiRefundStatus::Approved);
+        refund.currency = Some("USD".to_string());
+        assert!(refund_event_to_router_data(
+            refund,
+            charged_sync_router_data(enums::AttemptStatus::Charged),
+            Some("txn-1"),
+            enums::Currency::COP,
+            MinorUnit::new(100000),
+        )
+        .is_err());
     }
 }

@@ -19,8 +19,7 @@ use hyperswitch_domain_models::{
     },
 };
 use hyperswitch_interfaces::errors;
-use masking::{PeekInterface, Secret};
-use rand::Rng;
+use hyperswitch_masking::{PeekInterface, Secret};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -153,20 +152,14 @@ pub fn order_number_from_attempt_id(attempt_id: &str) -> String {
 
 /// Correlation id of one Token/Generate call: `{unix_ms}{4 random digits}`.
 pub fn new_transaction_id() -> String {
-    let unix_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis())
-        .unwrap_or_default();
-    let suffix: u16 = rand::thread_rng().gen_range(0..10_000);
-    format!("{unix_ms}{suffix:04}")
+    let unix_ms = common_utils::date_time::now_unix_timestamp_millis();
+    let suffix = common_utils::generate_random_numeric_string(4);
+    format!("{unix_ms}{suffix}")
 }
 
 /// `dateTimeTransaction` of the SDK order: 16 digits, unix milliseconds times 1000.
 fn current_date_time_transaction() -> String {
-    let unix_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis())
-        .unwrap_or_default();
+    let unix_ms = common_utils::date_time::now_unix_timestamp_millis();
     format!("{}", unix_ms * 1000)
 }
 
@@ -301,6 +294,7 @@ fn error_response_from_code(
         network_decline_code: None,
         network_error_message: None,
         connector_metadata: None,
+        connector_response_reference_id: None,
     }
 }
 
@@ -357,7 +351,7 @@ pub fn unpack_access_token(
     expected_kind: IzipayTokenKind,
 ) -> CustomResult<IzipayPackedToken, errors::ConnectorError> {
     let access_token = access_token.ok_or(errors::ConnectorError::MissingRequiredField {
-        field_name: "access_token",
+        field_name: "access_token".into(),
     })?;
     let packed: IzipayPackedToken = serde_json::from_str(access_token.token.peek())
         .change_context(errors::ConnectorError::FailedToObtainAuthType)
@@ -416,7 +410,11 @@ fn required_text(
     value
         .map(|value| value.peek().trim().to_string())
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| report!(errors::ConnectorError::MissingRequiredField { field_name }))
+        .ok_or_else(|| {
+            report!(errors::ConnectorError::MissingRequiredField {
+                field_name: field_name.into()
+            })
+        })
 }
 
 fn name_within_range(
@@ -427,7 +425,7 @@ fn name_within_range(
         Ok(value)
     } else {
         Err(report!(errors::ConnectorError::InvalidDataFormat {
-            field_name
+            field_name: field_name.into()
         }))
     }
 }
@@ -447,7 +445,7 @@ fn truncated_text(
     };
     if char_len(&value) < min_chars {
         return Err(report!(errors::ConnectorError::InvalidDataFormat {
-            field_name
+            field_name: field_name.into()
         }));
     }
     Ok(value)
@@ -483,7 +481,7 @@ pub fn build_billing(
         .map(|email| email.peek().trim().to_string())
         .filter(|email| !email.is_empty())
         .ok_or(errors::ConnectorError::MissingRequiredField {
-            field_name: "billing.email",
+            field_name: "billing.email".into(),
         })?;
 
     let phone_number: String = billing
@@ -498,11 +496,11 @@ pub fn build_billing(
         })
         .filter(|number| !number.is_empty())
         .ok_or(errors::ConnectorError::MissingRequiredField {
-            field_name: "billing.phone.number",
+            field_name: "billing.phone.number".into(),
         })?;
     if !(7..=15).contains(&phone_number.len()) {
         return Err(report!(errors::ConnectorError::InvalidDataFormat {
-            field_name: "billing.phone.number"
+            field_name: "billing.phone.number".into()
         }));
     }
 
@@ -526,7 +524,7 @@ pub fn build_billing(
             .map(|city| city.trim().to_string())
             .filter(|city| !city.is_empty())
             .ok_or(errors::ConnectorError::MissingRequiredField {
-                field_name: "billing.address.city",
+                field_name: "billing.address.city".into(),
             })?,
         3,
         25,
@@ -545,7 +543,7 @@ pub fn build_billing(
     let country = address
         .and_then(|address| address.country)
         .ok_or(errors::ConnectorError::MissingRequiredField {
-            field_name: "billing.address.country",
+            field_name: "billing.address.country".into(),
         })?
         .to_string();
 
@@ -555,7 +553,7 @@ pub fn build_billing(
     )?;
     if !(5..=10).contains(&char_len(&postal_code)) {
         return Err(report!(errors::ConnectorError::InvalidDataFormat {
-            field_name: "billing.address.zip"
+            field_name: "billing.address.zip".into()
         }));
     }
 
@@ -596,12 +594,12 @@ fn build_document(
 
     let document_type = metadata_text(DOCUMENT_TYPE_METADATA_KEY).ok_or(
         errors::ConnectorError::MissingRequiredField {
-            field_name: "metadata.buyer_document_type",
+            field_name: "metadata.buyer_document_type".into(),
         },
     )?;
     let document = metadata_text(DOCUMENT_NUMBER_METADATA_KEY).ok_or(
         errors::ConnectorError::MissingRequiredField {
-            field_name: "metadata.buyer_document_number",
+            field_name: "metadata.buyer_document_number".into(),
         },
     )?;
 
@@ -612,7 +610,7 @@ fn build_document(
         "PASAPORTE" | "OTROS" => (8..=12, false),
         _ => {
             return Err(report!(errors::ConnectorError::InvalidDataFormat {
-                field_name: "metadata.buyer_document_type"
+                field_name: "metadata.buyer_document_type".into()
             }))
         }
     };
@@ -625,7 +623,7 @@ fn build_document(
     };
     if !valid_characters || !allowed_lengths.contains(&document.len()) {
         return Err(report!(errors::ConnectorError::InvalidDataFormat {
-            field_name: "metadata.buyer_document_number"
+            field_name: "metadata.buyer_document_number".into()
         }));
     }
 
@@ -654,7 +652,7 @@ fn validate_currency_and_capture_method(
     ) {
         return Err(errors::ConnectorError::NotSupported {
             message: "manual capture".to_string(),
-            connector: IZIPAY_CONNECTOR_NAME,
+            connector: IZIPAY_CONNECTOR_NAME.into(),
         }
         .into());
     }
@@ -678,7 +676,7 @@ fn validate_authorize_request(
 
     let return_url = router_data.request.router_return_url.clone().ok_or(
         errors::ConnectorError::MissingRequiredField {
-            field_name: "router_return_url",
+            field_name: "router_return_url".into(),
         },
     )?;
     // Fails early when the return url cannot carry the result marker.
@@ -723,7 +721,7 @@ impl TryFrom<&IzipayRouterData<&PaymentsAuthorizeRouterData>> for IzipayTokenReq
 fn result_url(return_url: &str, result: &str) -> CustomResult<String, errors::ConnectorError> {
     let mut url =
         url::Url::parse(return_url).change_context(errors::ConnectorError::InvalidDataFormat {
-            field_name: "router_return_url",
+            field_name: "router_return_url".into(),
         })?;
     url.query_pairs_mut().append_pair("izipay_result", result);
     Ok(url.to_string())
@@ -900,6 +898,9 @@ pub fn authorize_response(
             connector_response_reference_id: Some(order_number),
             incremental_authorization_allowed: None,
             charges: None,
+            network_txn_link_id: None,
+            payment_account_reference: None,
+            authentication_data: None,
         }),
         ..data
     })
@@ -1067,6 +1068,7 @@ impl TryFrom<PaymentsSyncResponseRouterData<IzipaySearchResponse>> for PaymentsS
                 network_decline_code: None,
                 network_error_message: None,
                 connector_metadata: None,
+                connector_response_reference_id: None,
             })
         } else {
             // A voided order is listed with a new unique id and authorization code: they must
@@ -1087,6 +1089,9 @@ impl TryFrom<PaymentsSyncResponseRouterData<IzipaySearchResponse>> for PaymentsS
                 connector_response_reference_id: Some(order_number),
                 incremental_authorization_allowed: None,
                 charges: None,
+                network_txn_link_id: None,
+                payment_account_reference: None,
+                authentication_data: None,
             })
         };
 
@@ -1144,7 +1149,11 @@ fn metadata_text(
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| report!(errors::ConnectorError::MissingRequiredField { field_name }))
+        .ok_or_else(|| {
+            report!(errors::ConnectorError::MissingRequiredField {
+                field_name: field_name.into()
+            })
+        })
 }
 
 fn merchant_ruc(
@@ -1156,13 +1165,13 @@ fn merchant_ruc(
         .map(str::trim)
         .filter(|ruc| !ruc.is_empty())
         .ok_or(errors::ConnectorError::MissingRequiredField {
-            field_name: "connector_metadata.ruc",
+            field_name: "connector_metadata.ruc".into(),
         })?;
     if ruc.len() == 11 && ruc.chars().all(|digit| digit.is_ascii_digit()) {
         Ok(ruc.to_string())
     } else {
         Err(report!(errors::ConnectorError::InvalidDataFormat {
-            field_name: "connector_metadata.ruc"
+            field_name: "connector_metadata.ruc".into()
         }))
     }
 }
@@ -1319,7 +1328,7 @@ impl TryFrom<RefundsResponseRouterData<RSync, IzipayRefundStatusResponse>>
     ) -> Result<Self, Self::Error> {
         let connector_refund_id = item.data.request.connector_refund_id.clone().ok_or(
             errors::ConnectorError::MissingRequiredField {
-                field_name: "connector_refund_id",
+                field_name: "connector_refund_id".into(),
             },
         )?;
         let body = item.response.response.as_ref();
@@ -1351,6 +1360,7 @@ impl TryFrom<RefundsResponseRouterData<RSync, IzipayRefundStatusResponse>>
                     network_decline_code: None,
                     network_error_message: None,
                     connector_metadata: None,
+                    connector_response_reference_id: None,
                 })
             } else {
                 Ok(RefundsResponseData {
@@ -1587,8 +1597,6 @@ mod tests {
             customer_name: None,
             currency: enums::Currency::PEN,
             confirm: true,
-            statement_descriptor_suffix: None,
-            statement_descriptor: None,
             capture_method: Some(enums::CaptureMethod::Automatic),
             router_return_url: Some(RETURN_URL.to_string()),
             webhook_url: Some("https://hyperswitch.example/webhooks/merchant_1/mca_1".to_string()),
@@ -1628,6 +1636,20 @@ mod tests {
             payment_channel: None,
             enable_partial_authorization: None,
             enable_overcapture: None,
+            ucs_authentication_data: None,
+            force_3ds_challenge: None,
+            guest_customer: None,
+            is_stored_credential: None,
+            mit_category: None,
+            billing_descriptor: None,
+            tokenization: None,
+            partner_merchant_identifier_details: None,
+            feature_metadata: None,
+            installment_details: None,
+            connector_intent_metadata: None,
+            is_account_funded_transaction: None,
+            recipient_details: None,
+            business_country: None,
         }
     }
 
@@ -1693,6 +1715,15 @@ mod tests {
             psd2_sca_exemption_type: None,
             raw_connector_response: None,
             is_payment_id_from_merchant: None,
+            payment_method_type: None,
+            payout_id: None,
+            authorized_amount: None,
+            accept_amount_mismatch: None,
+            customer_document_details: None,
+            customer_date_of_birth: None,
+            feature_data: None,
+            sender_payment_instrument_id: None,
+            connector_returned_payment_method_details: None,
         }
     }
 
@@ -1723,6 +1754,10 @@ mod tests {
                 integrity_object: None,
                 connector_reference_id: None,
                 setup_future_usage: None,
+                feature_metadata: None,
+                connector_mandate_id: None,
+                enable_partial_authorization: None,
+                is_overcapture_enabled: None,
             },
             PaymentAddress::default(),
             "PX1790971180429",
@@ -1749,6 +1784,7 @@ mod tests {
             refund_status: enums::RefundStatus::Pending,
             merchant_account_id: None,
             merchant_config_currency: None,
+            payment_connector_request_reference_id: None,
             capture_method: None,
             additional_payment_method_data: None,
         }
@@ -1794,21 +1830,15 @@ mod tests {
 
     #[test]
     fn transaction_id_is_the_unix_millis_plus_a_four_digit_random_suffix() {
-        let before = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
+        let before = common_utils::date_time::now_unix_timestamp_millis();
         let id = new_transaction_id();
-        let after = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
+        let after = common_utils::date_time::now_unix_timestamp_millis();
         assert!(id.chars().all(|c| c.is_ascii_digit()));
         // Izipay accepts 5 to 40 characters; the suffix keeps two ids of the same millisecond
         // apart with probability 9999/10000, which is not asserted (it would be flaky).
         assert!((5..=40).contains(&id.len()));
         let (millis, suffix) = id.split_at(id.len() - 4);
-        let millis: u128 = millis.parse().unwrap();
+        let millis: i128 = millis.parse().unwrap();
         assert!((before..=after).contains(&millis));
         assert_eq!(suffix.len(), 4);
     }
@@ -1874,18 +1904,14 @@ mod tests {
         router_data.address = PaymentAddress::default();
         assert!(matches!(
             billing_error(&router_data).current_context(),
-            errors::ConnectorError::MissingRequiredField {
-                field_name: "billing.address.first_name"
-            }
+            errors::ConnectorError::MissingRequiredField { field_name } if field_name == "billing.address.first_name"
         ));
 
         let mut router_data = authorize_router_data();
         router_data.address = billing_address("Lucho", None, "Av. Jorge Chavez 275", "Lima");
         assert!(matches!(
             billing_error(&router_data).current_context(),
-            errors::ConnectorError::MissingRequiredField {
-                field_name: "billing.address.zip"
-            }
+            errors::ConnectorError::MissingRequiredField { field_name } if field_name == "billing.address.zip"
         ));
 
         // Neither a billing email nor a request email.
@@ -1913,9 +1939,7 @@ mod tests {
         );
         assert!(matches!(
             billing_error(&router_data).current_context(),
-            errors::ConnectorError::MissingRequiredField {
-                field_name: "billing.email"
-            }
+            errors::ConnectorError::MissingRequiredField { field_name } if field_name == "billing.email"
         ));
     }
 
@@ -1926,9 +1950,7 @@ mod tests {
             billing_address("Lucho", Some("1425"), "Av. Jorge Chavez 275", "Lima");
         assert!(matches!(
             billing_error(&router_data).current_context(),
-            errors::ConnectorError::InvalidDataFormat {
-                field_name: "billing.address.zip"
-            }
+            errors::ConnectorError::InvalidDataFormat { field_name } if field_name == "billing.address.zip"
         ));
     }
 
@@ -1956,17 +1978,13 @@ mod tests {
         router_data.address = billing_address("Lucho", Some("15074"), "ÑÑÑÑ", "Lima");
         assert!(matches!(
             billing_error(&router_data).current_context(),
-            errors::ConnectorError::InvalidDataFormat {
-                field_name: "billing.address.line1"
-            }
+            errors::ConnectorError::InvalidDataFormat { field_name } if field_name == "billing.address.line1"
         ));
 
         router_data.address = billing_address("Ñ", Some("15074"), "Av. Jorge Chavez 275", "Lima");
         assert!(matches!(
             billing_error(&router_data).current_context(),
-            errors::ConnectorError::InvalidDataFormat {
-                field_name: "billing.address.first_name"
-            }
+            errors::ConnectorError::InvalidDataFormat { field_name } if field_name == "billing.address.first_name"
         ));
 
         router_data.address = billing_address("Ñé", Some("15074"), "Av. Jorge Chavez 275", "Lima");
@@ -1992,17 +2010,13 @@ mod tests {
         router_data.request.metadata = None;
         assert!(matches!(
             billing_error(&router_data).current_context(),
-            errors::ConnectorError::MissingRequiredField {
-                field_name: "metadata.buyer_document_type"
-            }
+            errors::ConnectorError::MissingRequiredField { field_name } if field_name == "metadata.buyer_document_type"
         ));
 
         router_data.request.metadata = Some(serde_json::json!({ "buyer_document_type": "DNI" }));
         assert!(matches!(
             billing_error(&router_data).current_context(),
-            errors::ConnectorError::MissingRequiredField {
-                field_name: "metadata.buyer_document_number"
-            }
+            errors::ConnectorError::MissingRequiredField { field_name } if field_name == "metadata.buyer_document_number"
         ));
     }
 
@@ -2027,9 +2041,7 @@ mod tests {
             assert!(
                 matches!(
                     billing_error(&with_document(document_type, document)).current_context(),
-                    errors::ConnectorError::InvalidDataFormat {
-                        field_name: "metadata.buyer_document_number"
-                    }
+                    errors::ConnectorError::InvalidDataFormat { field_name } if field_name == "metadata.buyer_document_number"
                 ),
                 "{document_type} {document} must be rejected"
             );
@@ -2037,9 +2049,7 @@ mod tests {
 
         assert!(matches!(
             billing_error(&with_document("LIBRETA", "12345678")).current_context(),
-            errors::ConnectorError::InvalidDataFormat {
-                field_name: "metadata.buyer_document_type"
-            }
+            errors::ConnectorError::InvalidDataFormat { field_name } if field_name == "metadata.buyer_document_type"
         ));
     }
 
@@ -2090,9 +2100,7 @@ mod tests {
             validate_authorize_request(&router_data)
                 .unwrap_err()
                 .current_context(),
-            errors::ConnectorError::MissingRequiredField {
-                field_name: "router_return_url"
-            }
+            errors::ConnectorError::MissingRequiredField { field_name } if field_name == "router_return_url"
         ));
 
         let mut router_data = authorize_router_data();
@@ -2296,6 +2304,7 @@ mod tests {
                 app_id: Secret::new("x".to_string()),
                 id: None,
                 authentication_token: None,
+                current_flow: None,
             },
             PaymentAddress::default(),
             "PX1790971180429",
@@ -2331,6 +2340,7 @@ mod tests {
                 app_id: Secret::new("x".to_string()),
                 id: None,
                 authentication_token: None,
+                current_flow: None,
             },
             PaymentAddress::default(),
             "PX1790971180429",
@@ -2579,9 +2589,7 @@ mod tests {
             IzipayRefundRequest::try_from(&item)
                 .unwrap_err()
                 .current_context(),
-            errors::ConnectorError::MissingRequiredField {
-                field_name: "connector_metadata.ruc"
-            }
+            errors::ConnectorError::MissingRequiredField { field_name } if field_name == "connector_metadata.ruc"
         ));
 
         let router_data = refund_router_data::<Execute>(
@@ -2603,9 +2611,7 @@ mod tests {
             IzipayRefundRequest::try_from(&item)
                 .unwrap_err()
                 .current_context(),
-            errors::ConnectorError::MissingRequiredField {
-                field_name: "connector_metadata.unique_id"
-            }
+            errors::ConnectorError::MissingRequiredField { field_name } if field_name == "connector_metadata.unique_id"
         ));
     }
 

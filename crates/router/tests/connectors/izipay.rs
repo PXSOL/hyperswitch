@@ -5,7 +5,7 @@ use hyperswitch_domain_models::{
     payment_method_data::{PaymentMethodData, WalletData},
     router_response_types::RedirectForm,
 };
-use masking::Secret;
+use hyperswitch_masking::Secret;
 use router::types::{self, api, storage::enums};
 use std::str::FromStr;
 use test_utils::connector_auth;

@@ -5,7 +5,7 @@ use hyperswitch_domain_models::{
     payment_method_data::{Card, PaymentMethodData},
     router_request_types::AuthenticationData,
 };
-use masking::Secret;
+use hyperswitch_masking::Secret;
 use router::types::{self, storage::enums, PaymentAddress};
 
 use crate::{
@@ -109,6 +109,9 @@ fn get_threeds_payment_authorize_data() -> Option<types::PaymentsAuthorizeData> 
             message_extension: None,
             acs_trans_id: None,
             authentication_type: None,
+            cb_network_params: None,
+            exemption_indicator: None,
+            transaction_status: None,
         }),
         ..utils::PaymentAuthorizeType::default().0
     })
