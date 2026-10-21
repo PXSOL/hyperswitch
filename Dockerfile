@@ -83,8 +83,15 @@ ARG RUN_ENV=production
 ARG BINARY=router
 ARG SCHEDULER_FLOW=consumer
 
+# Connector calls without a client or CA certificate go through OpenSSL and trust
+# this system store. ca-certificates 20250419+deb13u1 (trixie-security) drops
+# "emSign ECC Root CA - G3" and "Comodo AAA Services root" after the October 2026
+# eMudhra CA key compromise. The checks fail the build if an older package (for
+# example from a cached layer) still ships either root.
 RUN apt-get update \
-    && apt-get install -y ca-certificates tzdata libpq-dev curl procps
+    && apt-get install -y ca-certificates tzdata libpq-dev curl procps \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20250419+deb13u1 \
+    && ! ls /etc/ssl/certs | grep -E '^(emSign_ECC_Root_CA_-_G3|Comodo_AAA_Services_root)\.pem$'
 
 EXPOSE 8080
 
