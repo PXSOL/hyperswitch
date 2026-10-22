@@ -2625,25 +2625,54 @@ pub(super) fn extract_property_value(data: &serde_json::Value, dot_path: &str) -
     }
 }
 
+/// Wompi signs about three properties per event; this leaves ample headroom.
+const MAX_WEBHOOK_SIGNATURE_PROPERTIES: usize = 16;
+/// Cap on the concatenated property values of the checksum message.
+const MAX_WEBHOOK_MESSAGE_BYTES: usize = 8 * 1024;
+
 /// Builds the checksum message: concatenated property values, in
 /// `signature.properties` order, followed by the timestamp, followed by the
-/// events secret. The secret is folded into the *message* rather than passed
-/// separately: `common_utils::crypto::Sha256::verify_signature` ignores its
+/// events secret. Over-long, duplicated or oversized property lists are
+/// rejected before the checksum is computed. The secret is folded into the
+/// *message* rather than passed separately: `common_utils::crypto::Sha256::verify_signature` ignores its
 /// `secret` argument entirely (it only hashes `msg` and compares raw bytes),
 /// so a plain SHA-256 webhook scheme only authenticates anything if the
 /// secret is part of what gets hashed.
-pub(super) fn build_webhook_message(webhook: &WompiWebhookBody, events_secret: &[u8]) -> Vec<u8> {
-    let mut message = webhook
-        .signature
-        .properties
-        .iter()
-        .map(|path| extract_property_value(&webhook.data, path))
-        .collect::<Vec<_>>()
-        .join("");
+pub(super) fn build_webhook_message(
+    webhook: &WompiWebhookBody,
+    events_secret: &[u8],
+) -> CustomResult<Vec<u8>, errors::ConnectorError> {
+    let properties = &webhook.signature.properties;
+    // `signature.properties` is attacker-controlled and this runs before the
+    // checksum is verified, so bound it before cloning any value.
+    if properties.len() > MAX_WEBHOOK_SIGNATURE_PROPERTIES {
+        return Err(report!(
+            errors::ConnectorError::WebhookSourceVerificationFailed
+        ))
+        .attach_printable("Wompi webhook signature lists too many properties");
+    }
+    let mut seen = std::collections::HashSet::with_capacity(properties.len());
+    if !properties.iter().all(|path| seen.insert(path.as_str())) {
+        return Err(report!(
+            errors::ConnectorError::WebhookSourceVerificationFailed
+        ))
+        .attach_printable("Wompi webhook signature repeats a property");
+    }
+
+    let mut message = String::new();
+    for path in properties {
+        message.push_str(&extract_property_value(&webhook.data, path));
+        if message.len() > MAX_WEBHOOK_MESSAGE_BYTES {
+            return Err(report!(
+                errors::ConnectorError::WebhookSourceVerificationFailed
+            ))
+            .attach_printable("Wompi webhook checksum message is too large");
+        }
+    }
     message.push_str(&webhook.timestamp.to_string());
     let mut message = message.into_bytes();
     message.extend_from_slice(events_secret);
-    message
+    Ok(message)
 }
 
 #[cfg(test)]
@@ -2716,7 +2745,8 @@ mod tests {
     #[test]
     fn webhook_checksum_matches_synthetic_example() {
         let webhook = sample_webhook_body();
-        let message = build_webhook_message(&webhook, SYNTHETIC_WEBHOOK_SECRET.as_bytes());
+        let message = build_webhook_message(&webhook, SYNTHETIC_WEBHOOK_SECRET.as_bytes())
+            .expect("message must build");
         let digest = Sha256
             .generate_digest(&message)
             .expect("digest must succeed");
@@ -2727,11 +2757,64 @@ mod tests {
     fn webhook_checksum_rejects_tampered_amount() {
         let mut webhook = sample_webhook_body();
         webhook.data["transaction"]["amount_in_cents"] = serde_json::json!(1);
-        let message = build_webhook_message(&webhook, SYNTHETIC_WEBHOOK_SECRET.as_bytes());
+        let message = build_webhook_message(&webhook, SYNTHETIC_WEBHOOK_SECRET.as_bytes())
+            .expect("message must build");
         let digest = Sha256
             .generate_digest(&message)
             .expect("digest must succeed");
         assert_ne!(hex::encode(digest), SYNTHETIC_WEBHOOK_CHECKSUM);
+    }
+
+    #[test]
+    fn webhook_message_for_a_real_shape_event_is_unchanged() {
+        let message =
+            build_webhook_message(&sample_webhook_body(), SYNTHETIC_WEBHOOK_SECRET.as_bytes())
+                .expect("message must build");
+        assert_eq!(
+            message,
+            format!("1234-1610641025-49201APPROVED44900001530291411{SYNTHETIC_WEBHOOK_SECRET}")
+                .as_bytes()
+        );
+    }
+
+    #[test]
+    fn webhook_message_rejects_more_than_the_max_properties() {
+        let mut webhook = sample_webhook_body();
+        webhook.signature.properties = (0..=MAX_WEBHOOK_SIGNATURE_PROPERTIES)
+            .map(|index| format!("transaction.field_{index}"))
+            .collect();
+        assert!(build_webhook_message(&webhook, SYNTHETIC_WEBHOOK_SECRET.as_bytes()).is_err());
+
+        // Exactly at the limit still builds.
+        webhook.signature.properties.pop();
+        assert!(build_webhook_message(&webhook, SYNTHETIC_WEBHOOK_SECRET.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn webhook_message_rejects_duplicate_properties() {
+        let mut webhook = sample_webhook_body();
+        webhook.signature.properties = vec![
+            "transaction.id".to_string(),
+            "transaction.status".to_string(),
+            "transaction.id".to_string(),
+        ];
+        assert!(build_webhook_message(&webhook, SYNTHETIC_WEBHOOK_SECRET.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn webhook_message_rejects_oversized_values_without_amplifying_them() {
+        let mut webhook = sample_webhook_body();
+        webhook.data["transaction"]["reference"] =
+            serde_json::Value::String("a".repeat(100 * 1024));
+        // Distinct paths that all resolve to the huge value: the cap must stop
+        // the build at the first push instead of accumulating every copy.
+        webhook.data["transaction"]["alias"] = webhook.data["transaction"]["reference"].clone();
+        webhook.signature.properties = vec![
+            "transaction.reference".to_string(),
+            "transaction.alias".to_string(),
+            "transaction.status".to_string(),
+        ];
+        assert!(build_webhook_message(&webhook, SYNTHETIC_WEBHOOK_SECRET.as_bytes()).is_err());
     }
 
     #[test]
@@ -5283,7 +5366,8 @@ mod tests {
     #[test]
     fn refund_updated_checksum_covers_refund_id_and_status() {
         let webhook = refund_webhook_body("APPROVED");
-        let message = build_webhook_message(&webhook, SYNTHETIC_WEBHOOK_SECRET.as_bytes());
+        let message = build_webhook_message(&webhook, SYNTHETIC_WEBHOOK_SECRET.as_bytes())
+            .expect("message must build");
         let expected =
             format!("COa7Bk9m1APPROVED{REFUND_EVENT_TIMESTAMP}{SYNTHETIC_WEBHOOK_SECRET}");
         assert_eq!(message, expected.as_bytes());
@@ -5296,7 +5380,8 @@ mod tests {
         let mut tampered = refund_webhook_body("DECLINED");
         tampered.signature.properties = webhook.signature.properties.clone();
         assert_ne!(
-            build_webhook_message(&tampered, SYNTHETIC_WEBHOOK_SECRET.as_bytes()),
+            build_webhook_message(&tampered, SYNTHETIC_WEBHOOK_SECRET.as_bytes())
+                .expect("message must build"),
             message
         );
     }

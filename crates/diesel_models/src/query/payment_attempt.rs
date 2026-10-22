@@ -341,9 +341,12 @@ impl PaymentAttempt {
         merchant_id_filter: Option<&str>,
         profile_id_filter: Option<&str>,
     ) -> StorageResult<Vec<Self>> {
-        use diesel::query_dsl::methods::{FilterDsl, OrderDsl};
+        use diesel::query_dsl::methods::{FilterDsl, LimitDsl, OrderDsl};
 
         use crate::query::utils::GetPrimaryKey;
+
+        // Hard cap on the rows loaded into memory, whatever the window is.
+        const MAX_DIAGNOSTIC_ROWS: i64 = 10_000;
 
         let now = common_utils::date_time::now();
         let from_time = now.saturating_sub(time::Duration::minutes(window_minutes));
@@ -367,7 +370,7 @@ impl PaymentAttempt {
             query = FilterDsl::filter(query, dsl::profile_id.eq(pid.to_string()));
         }
 
-        query
+        LimitDsl::limit(query, MAX_DIAGNOSTIC_ROWS)
             .get_results_async(conn.raw_connection())
             .await
             .change_context(DatabaseError::Others)

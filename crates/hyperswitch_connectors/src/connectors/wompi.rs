@@ -116,7 +116,8 @@ where
         &self,
         req: &RouterData<Flow, Request, Response>,
         _connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         let mut headers = vec![(
             headers::CONTENT_TYPE.to_string(),
             self.get_content_type().to_string().into(),
@@ -151,7 +152,8 @@ impl ConnectorCommon for Wompi {
     fn get_auth_header(
         &self,
         auth_type: &ConnectorAuthType,
-    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         // Default (public-key) credential, for the calls Wompi documents with the
         // public key (merchant lookup, card tokenization, transaction creation).
         // Every server-side read of a transaction or refund overrides `get_headers`
@@ -268,7 +270,8 @@ impl ConnectorIntegration<PaymentMethodToken, PaymentMethodTokenizationData, Pay
         &self,
         req: &TokenizationRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.build_headers(req, connectors)
     }
 
@@ -353,7 +356,8 @@ impl ConnectorIntegration<AccessTokenAuth, AccessTokenRequestData, AccessToken> 
         &self,
         _req: &RefreshTokenRouterData,
         _connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         Ok(vec![(
             headers::CONTENT_TYPE.to_string(),
             self.common_get_content_type().to_string().into(),
@@ -444,7 +448,8 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         &self,
         req: &PaymentsAuthorizeRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         self.build_headers(req, connectors)
     }
 
@@ -592,7 +597,8 @@ impl ConnectorIntegration<CompleteAuthorize, CompleteAuthorizeData, PaymentsResp
         &self,
         req: &PaymentsCompleteAuthorizeRouterData,
         connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         match wompi::determine_complete_authorize_stage(req)? {
             wompi::WompiCompleteAuthorizeStage::Create(_) => self.build_headers(req, connectors),
             wompi::WompiCompleteAuthorizeStage::Poll { .. } => {
@@ -742,7 +748,8 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Wom
         &self,
         req: &PaymentsSyncRouterData,
         _connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         // Private key for both shapes: in production `GET /transactions/{id}` with
         // the public key answers 404 once a transaction is a few days old (seen on
         // transactions it had returned the same day), while the private key keeps
@@ -928,7 +935,8 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Wompi {
         &self,
         req: &RefundsRouterData<Execute>,
         _connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         let auth = wompi::WompiAuthType::try_from(&req.connector_auth_type)?;
         Ok(self.private_key_headers(&auth))
     }
@@ -1016,7 +1024,8 @@ impl ConnectorIntegration<RSync, RefundsData, RefundsResponseData> for Wompi {
         &self,
         req: &RefundSyncRouterData,
         _connectors: &Connectors,
-    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError> {
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
         let auth = wompi::WompiAuthType::try_from(&req.connector_auth_type)?;
         Ok(self.private_key_headers(&auth))
     }
@@ -1133,10 +1142,7 @@ impl IncomingWebhook for Wompi {
                 .body
                 .parse_struct("WompiWebhookBody")
                 .change_context(errors::ConnectorError::WebhookSignatureNotFound)?;
-        Ok(wompi::build_webhook_message(
-            &webhook_body,
-            &connector_webhook_secrets.secret,
-        ))
+        wompi::build_webhook_message(&webhook_body, &connector_webhook_secrets.secret)
     }
 
     fn get_webhook_object_reference_id(
@@ -1185,7 +1191,8 @@ impl IncomingWebhook for Wompi {
     fn get_webhook_resource_object(
         &self,
         request: &IncomingWebhookRequestDetails<'_>,
-    ) -> CustomResult<Box<dyn hyperswitch_masking::ErasedMaskSerialize>, errors::ConnectorError> {
+    ) -> CustomResult<Box<dyn hyperswitch_masking::ErasedMaskSerialize>, errors::ConnectorError>
+    {
         let webhook_body: wompi::WompiWebhookBody =
             request
                 .body

@@ -175,6 +175,8 @@ pub struct Settings<S: SecretState> {
     pub saved_payment_methods: EligiblePaymentMethods,
     pub user_auth_methods: SecretStateContainer<UserAuthMethodSettings, S>,
     pub decision: Option<DecisionConfig>,
+    #[serde(default)]
+    pub diagnostic: DiagnosticSettings,
     pub locker_based_open_banking_connectors: LockerBasedRecipientConnectorList,
     pub grpc_client: GrpcClientSettings,
     pub cell_information: CellInformation,
@@ -490,6 +492,14 @@ impl Multitenancy {
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct DecisionConfig {
     pub base_url: String,
+}
+
+/// Settings for the `/diagnostic` endpoints. The endpoints are disabled while
+/// `api_key` is unset or empty.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(default)]
+pub struct DiagnosticSettings {
+    pub api_key: Option<Secret<String>>,
 }
 
 type StorageInterfaceMap = HashMap<id_type::TenantId, Box<dyn app::StorageInterface>>;

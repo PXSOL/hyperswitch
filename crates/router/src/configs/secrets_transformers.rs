@@ -780,6 +780,7 @@ pub(crate) async fn fetch_raw_secrets(
         multitenancy: conf.multitenancy,
         user_auth_methods,
         decision: conf.decision,
+        diagnostic: conf.diagnostic,
         locker_based_open_banking_connectors: conf.locker_based_open_banking_connectors,
         grpc_client: conf.grpc_client,
         crm: conf.crm,
