@@ -6,9 +6,47 @@ use api_models::diagnostic::{
     AlertRule, ErrorCategoryCounts, FailureDetail, HealthStatus, PaymentAttemptHealthResponse,
     PaymentAttemptMetrics, TimeWindow,
 };
+use hyperswitch_masking::PeekInterface;
 use router_env::logger;
 
 use crate::db::diagnostic::FailureAttemptData;
+
+/// Largest `window_minutes` the diagnostic endpoint accepts (7 days).
+pub const MAX_WINDOW_MINUTES: u32 = 7 * 24 * 60;
+
+/// Constant-time check of the presented `x-diagnostic-key` against the
+/// configured one. An unset or empty configured key never matches, so the
+/// endpoint stays disabled until a key is provisioned. Both values go through
+/// a fixed-length MAC first, so the comparison does not leak the key length.
+pub fn diagnostic_key_matches(
+    configured: Option<&hyperswitch_masking::Secret<String>>,
+    presented: Option<&str>,
+) -> bool {
+    let (Some(configured), Some(presented)) = (configured, presented) else {
+        return false;
+    };
+    let configured = configured.peek().as_bytes();
+    if configured.is_empty() {
+        return false;
+    }
+    // MAC the same message under both keys and let `hmac::verify` do the
+    // constant-time tag comparison.
+    const PROBE: &[u8] = b"diagnostic-key-check";
+    let configured_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, configured);
+    let presented_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, presented.as_bytes());
+    let presented_tag = ring::hmac::sign(&presented_key, PROBE);
+    ring::hmac::verify(&configured_key, PROBE, presented_tag.as_ref()).is_ok()
+}
+
+/// Rejects windows larger than [`MAX_WINDOW_MINUTES`].
+pub fn validate_window_minutes(window_minutes: u32) -> Result<(), String> {
+    if window_minutes > MAX_WINDOW_MINUTES {
+        return Err(format!(
+            "window_minutes must not exceed {MAX_WINDOW_MINUTES} (7 days)"
+        ));
+    }
+    Ok(())
+}
 
 /// Errores de usuario/negocio (ruido, no requieren acción) - comunes a todos
 const USER_ERROR_PATTERNS: &[&str] = &[
@@ -272,4 +310,49 @@ fn categorize_error(reason_context: &str, technical_context: &str) -> ErrorCateg
         return ErrorCategory::User;
     }
     ErrorCategory::Unknown
+}
+
+#[cfg(test)]
+mod diagnostic_auth_tests {
+    use hyperswitch_masking::Secret;
+
+    use super::*;
+
+    #[test]
+    fn key_matches_only_the_configured_key() {
+        let configured = Secret::new("s3cret-key".to_string());
+        assert!(diagnostic_key_matches(
+            Some(&configured),
+            Some("s3cret-key")
+        ));
+        assert!(!diagnostic_key_matches(
+            Some(&configured),
+            Some("s3cret-kez")
+        ));
+        assert!(!diagnostic_key_matches(
+            Some(&configured),
+            Some("s3cret-key ")
+        ));
+        assert!(!diagnostic_key_matches(Some(&configured), Some("")));
+        assert!(!diagnostic_key_matches(Some(&configured), None));
+    }
+
+    #[test]
+    fn unset_or_empty_configured_key_disables_the_endpoint() {
+        let empty = Secret::new(String::new());
+        assert!(!diagnostic_key_matches(None, Some("anything")));
+        assert!(!diagnostic_key_matches(None, Some("")));
+        assert!(!diagnostic_key_matches(Some(&empty), Some("")));
+        assert!(!diagnostic_key_matches(Some(&empty), Some("anything")));
+    }
+
+    #[test]
+    fn window_minutes_is_capped_at_seven_days() {
+        assert!(validate_window_minutes(0).is_ok());
+        assert!(validate_window_minutes(10).is_ok());
+        assert!(validate_window_minutes(MAX_WINDOW_MINUTES).is_ok());
+        assert_eq!(MAX_WINDOW_MINUTES, 10080);
+        assert!(validate_window_minutes(MAX_WINDOW_MINUTES + 1).is_err());
+        assert!(validate_window_minutes(u32::MAX).is_err());
+    }
 }
