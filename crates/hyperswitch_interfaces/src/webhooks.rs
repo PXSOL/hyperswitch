@@ -282,6 +282,11 @@ pub trait IncomingWebhook: ConnectorCommon + Sync {
         _connector_account_details: crypto::Encryptable<Secret<serde_json::Value>>,
         connector_name: &str,
     ) -> CustomResult<bool, errors::ConnectorError> {
+        // Without a merchant webhook secret the lookup returns a placeholder that is public in
+        // this source, so a webhook signed with it would pass. Report it as unverified instead:
+        // the caller then syncs with the connector rather than trusting the webhook body.
+        let merchant_secret_configured = connector_webhook_details.is_some();
+
         let algorithm = self
             .get_webhook_source_verification_algorithm(request)
             .change_context(errors::ConnectorError::WebhookSourceVerificationFailed)?;
@@ -294,6 +299,10 @@ pub trait IncomingWebhook: ConnectorCommon + Sync {
             )
             .await
             .change_context(errors::ConnectorError::WebhookSourceVerificationFailed)?;
+
+        if !merchant_secret_configured || connector_webhook_secrets.secret.is_empty() {
+            return Ok(false);
+        }
 
         let signature = self
             .get_webhook_source_verification_signature(request, &connector_webhook_secrets)
@@ -469,5 +478,152 @@ pub trait IncomingWebhook: ConnectorCommon + Sync {
             "get_subscription_mit_payment_data method".to_string(),
         )
         .into())
+    }
+}
+
+#[cfg(test)]
+mod verify_webhook_source_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use common_utils::crypto::SignMessage;
+    use hyperswitch_domain_models::connector_endpoints::Connectors;
+
+    use super::*;
+
+    const BODY: &[u8] = br#"{"type":"payment_intent.succeeded"}"#;
+
+    /// HMAC-SHA256 over the raw body, hex signature in `x-signature`: the shape Stripe uses,
+    /// with the default merchant-secret lookup and the default `verify_webhook_source`.
+    struct HmacConnector;
+
+    impl ConnectorCommon for HmacConnector {
+        fn id(&self) -> &'static str {
+            "hmac_test"
+        }
+
+        fn base_url<'a>(&self, _connectors: &'a Connectors) -> &'a str {
+            ""
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IncomingWebhook for HmacConnector {
+        fn get_webhook_source_verification_algorithm(
+            &self,
+            _request: &IncomingWebhookRequestDetails<'_>,
+        ) -> CustomResult<Box<dyn crypto::VerifySignature + Send>, errors::ConnectorError> {
+            Ok(Box::new(crypto::HmacSha256))
+        }
+
+        fn get_webhook_source_verification_signature(
+            &self,
+            request: &IncomingWebhookRequestDetails<'_>,
+            _connector_webhook_secrets: &api_models::webhooks::ConnectorWebhookSecrets,
+        ) -> CustomResult<Vec<u8>, errors::ConnectorError> {
+            let header = request
+                .headers
+                .get("x-signature")
+                .and_then(|value| value.to_str().ok())
+                .ok_or(errors::ConnectorError::WebhookSignatureNotFound)?;
+            Ok(from_hex(header))
+        }
+
+        fn get_webhook_source_verification_message(
+            &self,
+            request: &IncomingWebhookRequestDetails<'_>,
+            _merchant_id: &common_utils::id_type::MerchantId,
+            _connector_webhook_secrets: &api_models::webhooks::ConnectorWebhookSecrets,
+        ) -> CustomResult<Vec<u8>, errors::ConnectorError> {
+            Ok(request.body.to_vec())
+        }
+
+        fn get_webhook_object_reference_id(
+            &self,
+            _request: &IncomingWebhookRequestDetails<'_>,
+        ) -> CustomResult<api_models::webhooks::ObjectReferenceId, errors::ConnectorError> {
+            Err(errors::ConnectorError::WebhooksNotImplemented.into())
+        }
+
+        fn get_webhook_event_type(
+            &self,
+            _request: &IncomingWebhookRequestDetails<'_>,
+            _context: Option<&WebhookContext>,
+        ) -> CustomResult<api_models::webhooks::IncomingWebhookEvent, errors::ConnectorError>
+        {
+            Ok(api_models::webhooks::IncomingWebhookEvent::EventNotSupported)
+        }
+
+        fn get_webhook_resource_object(
+            &self,
+            _request: &IncomingWebhookRequestDetails<'_>,
+        ) -> CustomResult<Box<dyn hyperswitch_masking::ErasedMaskSerialize>, errors::ConnectorError>
+        {
+            Err(errors::ConnectorError::WebhooksNotImplemented.into())
+        }
+    }
+
+    fn to_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn from_hex(hex: &str) -> Vec<u8> {
+        hex.as_bytes()
+            .chunks(2)
+            .filter_map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+            .collect()
+    }
+
+    fn webhook_details(merchant_secret: &str) -> Option<common_utils::pii::SecretSerdeValue> {
+        Some(Secret::new(
+            serde_json::json!({ "merchant_secret": merchant_secret }),
+        ))
+    }
+
+    async fn verify(
+        signing_key: &[u8],
+        connector_webhook_details: Option<common_utils::pii::SecretSerdeValue>,
+    ) -> bool {
+        let signature = crypto::HmacSha256.sign_message(signing_key, BODY).unwrap();
+        let mut headers = actix_web::http::header::HeaderMap::new();
+        headers.insert(
+            actix_web::http::header::HeaderName::from_static("x-signature"),
+            actix_web::http::header::HeaderValue::from_str(&to_hex(&signature)).unwrap(),
+        );
+        let request = IncomingWebhookRequestDetails {
+            method: http::Method::POST,
+            uri: "/webhooks/merchant/hmac_test".parse().unwrap(),
+            headers: &headers,
+            body: BODY,
+            query_params: String::new(),
+        };
+        let account_details =
+            crypto::Encryptable::new(Secret::new(serde_json::json!({})), Secret::new(Vec::new()));
+        HmacConnector
+            .verify_webhook_source(
+                &request,
+                &common_utils::id_type::MerchantId::default(),
+                connector_webhook_details,
+                account_details,
+                "hmac_test",
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_merchant_secret_verifies_a_webhook_signed_with_it() {
+        assert!(verify(b"whsec_merchant", webhook_details("whsec_merchant")).await);
+        assert!(!verify(b"whsec_other", webhook_details("whsec_merchant")).await);
+    }
+
+    #[tokio::test]
+    async fn no_merchant_secret_never_verifies_even_with_the_placeholder_key() {
+        assert!(!verify(b"default_secret", None).await);
+        assert!(!verify(b"", None).await);
+    }
+
+    #[tokio::test]
+    async fn an_empty_merchant_secret_never_verifies() {
+        assert!(!verify(b"", webhook_details("")).await);
     }
 }

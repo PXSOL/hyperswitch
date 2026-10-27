@@ -3,7 +3,9 @@
 
 use actix_web::{web, HttpRequest};
 use api_models::diagnostic::{PaymentAttemptHealthQuery, PaymentAttemptHealthResponse};
+use async_trait::async_trait;
 use common_utils::date_time;
+use error_stack::report;
 use router_env::{instrument, logger, tracing, Flow};
 
 use super::app;
@@ -11,8 +13,36 @@ use crate::{
     core::{api_locking, diagnostic},
     errors::{self, RouterResponse},
     routes::metrics,
-    services::{api, authentication as auth},
+    services::{
+        api,
+        authentication::{AuthenticateAndFetch, AuthenticationType},
+    },
 };
+
+const DIAGNOSTIC_KEY_HEADER: &str = "x-diagnostic-key";
+
+/// Guards the diagnostic endpoints with the `x-diagnostic-key` header, checked
+/// against `diagnostic.api_key`. The endpoints are disabled while no key is
+/// configured.
+struct DiagnosticKeyAuth;
+
+#[async_trait]
+impl AuthenticateAndFetch<(), app::SessionState> for DiagnosticKeyAuth {
+    async fn authenticate_and_fetch(
+        &self,
+        request_headers: &actix_web::http::header::HeaderMap,
+        state: &app::SessionState,
+    ) -> errors::RouterResult<((), AuthenticationType)> {
+        let presented = request_headers
+            .get(DIAGNOSTIC_KEY_HEADER)
+            .and_then(|value| value.to_str().ok());
+        if diagnostic::diagnostic_key_matches(state.conf.diagnostic.api_key.as_ref(), presented) {
+            Ok(((), AuthenticationType::NoAuth))
+        } else {
+            Err(report!(errors::ApiErrorResponse::Unauthorized))
+        }
+    }
+}
 
 #[instrument(skip_all, fields(flow = ?Flow::HealthCheck))]
 pub async fn payment_attempt_health(
@@ -30,7 +60,7 @@ pub async fn payment_attempt_health(
         &request,
         query.into_inner(),
         |state, _: (), query_params, _| payment_attempt_health_func(state, query_params),
-        &auth::NoAuth,
+        &DiagnosticKeyAuth,
         api_locking::LockAction::NotApplicable,
     ))
     .await
@@ -40,6 +70,9 @@ async fn payment_attempt_health_func(
     state: app::SessionState,
     query: PaymentAttemptHealthQuery,
 ) -> RouterResponse<PaymentAttemptHealthResponse> {
+    diagnostic::validate_window_minutes(query.window_minutes)
+        .map_err(|message| errors::ApiErrorResponse::InvalidRequestData { message })?;
+
     logger::info!(
         window_minutes = query.window_minutes,
         merchant_id = ?query.merchant_id,

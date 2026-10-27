@@ -1,4 +1,7 @@
-FROM public.ecr.aws/docker/library/rust:trixie as builder
+# Base images come from Docker Hub, where the image workflow is logged in before it
+# builds. Anonymous pulls from the ECR Public mirror (upstream's choice) hit its data
+# limit on shared GitHub runners ("toomanyrequests: Data limit exceeded").
+FROM docker.io/library/rust:trixie as builder
 
 ARG EXTRA_FEATURES=""
 ARG VERSION_FEATURE_SET="v1"
@@ -57,7 +60,7 @@ RUN mkdir -p /router/out \
 
 
 
-FROM public.ecr.aws/docker/library/debian:trixie
+FROM docker.io/library/debian:trixie
 
 # Placing config and binary executable in different directories
 ARG CONFIG_DIR=/local/config
@@ -80,8 +83,15 @@ ARG RUN_ENV=production
 ARG BINARY=router
 ARG SCHEDULER_FLOW=consumer
 
+# Connector calls without a client or CA certificate go through OpenSSL and trust
+# this system store. ca-certificates 20250419+deb13u1 (trixie-security) drops
+# "emSign ECC Root CA - G3" and "Comodo AAA Services root" after the October 2026
+# eMudhra CA key compromise. The checks fail the build if an older package (for
+# example from a cached layer) still ships either root.
 RUN apt-get update \
-    && apt-get install -y ca-certificates tzdata libpq-dev curl procps
+    && apt-get install -y ca-certificates tzdata libpq-dev curl procps \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20250419+deb13u1 \
+    && ! ls /etc/ssl/certs | grep -E '^(emSign_ECC_Root_CA_-_G3|Comodo_AAA_Services_root)\.pem$'
 
 EXPOSE 8080
 
