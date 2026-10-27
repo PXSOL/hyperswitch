@@ -202,6 +202,7 @@ fn get_dir_value_payment_method(
         api_enums::PaymentMethodType::Wero => Ok(dirval!(WalletType = Wero)),
         api_enums::PaymentMethodType::OpenBanking => Ok(dirval!(BankRedirectType = OpenBanking)),
         api_enums::PaymentMethodType::NetworkToken => Ok(dirval!(NetworkTokenType = NetworkToken)),
+        api_enums::PaymentMethodType::Izipay => Ok(dirval!(WalletType = Izipay)),
     }
 }
 

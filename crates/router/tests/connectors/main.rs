@@ -70,6 +70,7 @@ mod imerchantsolutions;
 mod inespay;
 mod interpayments;
 mod itaubank;
+mod izipay;
 mod jpmorgan;
 mod juspaythreedsserver;
 mod katapult;

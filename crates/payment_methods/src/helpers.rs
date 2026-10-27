@@ -152,6 +152,7 @@ pub fn validate_payment_method_type_against_payment_method(
                 | api_enums::PaymentMethodType::Wompi
                 | api_enums::PaymentMethodType::StripeCheckout
                 | api_enums::PaymentMethodType::Wero
+                | api_enums::PaymentMethodType::Izipay
         ),
         api_enums::PaymentMethod::BankRedirect => matches!(
             payment_method_type,

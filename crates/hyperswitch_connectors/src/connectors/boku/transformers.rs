@@ -215,6 +215,7 @@ fn get_wallet_type(wallet_data: &WalletData) -> Result<String, errors::Connector
         | WalletData::MercadoPagoSdk(_)
         | WalletData::WompiCheckout {}
         | WalletData::StripeCheckout {}
+        | WalletData::IzipayCheckout {}
         | WalletData::MercadoPagoCheckoutPro {} => Err(errors::ConnectorError::NotImplemented(
             utils::get_unimplemented_payment_method_error_message("boku"),
         )),

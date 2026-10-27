@@ -92,6 +92,7 @@ pub enum WalletType {
     MobilePay,
     Wompi,
     StripeCheckout,
+    Izipay,
     WeChatPay,
     SamsungPay,
     GoPay,

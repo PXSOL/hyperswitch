@@ -522,6 +522,10 @@ wise.base_url = "https://api.wise-sandbox.com/"
 # connector picks one per request from the key prefix (pub_test_ / pub_prod_).
 wompi.base_url = "https://production.wompi.co/v1"
 wompi.secondary_base_url = "https://sandbox.wompi.co/v1"
+# izipay: base_url is production and secondary_base_url is sandbox in every environment; the
+# connector picks one per request from the MCA test_mode flag.
+izipay.base_url = "https://api-pw.izipay.pe"
+izipay.secondary_base_url = "https://sandbox-api-pw.izipay.pe"
 worldline.base_url = "https://eu.sandbox.api-ingenico.com/"
 worldpay.base_url = "https://try.access.worldpay.com/"
 worldpaymodular.base_url = "https://try.access.worldpay.com/"
@@ -1291,6 +1295,9 @@ payjustnow = { country = "ZA", currency = "ZAR" }
 
 [pm_filters.payjustnowinstore]
 payjustnow = { country = "ZA", currency = "ZAR" }
+
+[pm_filters.izipay]
+izipay = { currency = "PEN,USD" }
 
 [tokenization]
 # `flow = "mandates"` no es opcional: sin él el filtro del router acepta cualquier pago, y toda

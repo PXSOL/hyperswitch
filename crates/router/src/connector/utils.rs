@@ -2410,6 +2410,7 @@ pub enum PaymentMethodDataType {
     MercadoPagoCheckoutPro,
     WompiCheckout,
     StripeCheckout,
+    IzipayCheckout,
     Paze,
     SamsungPay,
     TwintRedirect,

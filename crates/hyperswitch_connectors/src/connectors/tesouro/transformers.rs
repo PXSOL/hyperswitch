@@ -884,6 +884,7 @@ impl TryFrom<&TesouroRouterData<&PaymentsAuthorizeRouterData>> for TesouroAuthor
                 | WalletData::MercadoPagoCheckoutPro {}
                 | WalletData::WompiCheckout {}
                 | WalletData::StripeCheckout {}
+                | WalletData::IzipayCheckout {}
                 | WalletData::Mifinity(_) => Err(errors::ConnectorError::NotImplemented(
                     connector_utils::get_unimplemented_payment_method_error_message("Tesouro"),
                 ))?,

@@ -366,7 +366,8 @@ default_imp_for_authorize_session_token!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_payment_settlement_split_create {
@@ -549,7 +550,8 @@ default_imp_for_payment_settlement_split_create!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_calculate_tax {
@@ -732,7 +734,8 @@ default_imp_for_calculate_tax!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_session_update {
@@ -915,7 +918,8 @@ default_imp_for_session_update!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_post_session_tokens {
@@ -1098,7 +1102,8 @@ default_imp_for_post_session_tokens!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_create_order {
@@ -1277,7 +1282,8 @@ default_imp_for_create_order!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_update_metadata {
@@ -1472,7 +1478,8 @@ default_imp_for_update_post_confirm!(
     connectors::Razorpay,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 default_imp_for_update_metadata!(
@@ -1641,7 +1648,8 @@ default_imp_for_update_metadata!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_cancel_post_capture {
@@ -1832,7 +1840,8 @@ default_imp_for_cancel_post_capture!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_cancel_post_capture_sync {
@@ -2022,7 +2031,8 @@ default_imp_for_cancel_post_capture_sync!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 use crate::connectors;
@@ -2360,7 +2370,8 @@ default_imp_for_incremental_authorization!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_extend_authorization {
@@ -2542,7 +2553,8 @@ default_imp_for_extend_authorization!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_create_customer {
@@ -2714,7 +2726,8 @@ default_imp_for_create_customer!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_connector_redirect_response {
@@ -2877,7 +2890,8 @@ default_imp_for_connector_redirect_response!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_pre_authenticate_steps{
@@ -3054,7 +3068,8 @@ default_imp_for_pre_authenticate_steps!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_authenticate_steps{
@@ -3236,7 +3251,8 @@ default_imp_for_authenticate_steps!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_post_authenticate_steps{
@@ -3417,7 +3433,8 @@ default_imp_for_post_authenticate_steps!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_post_processing_steps{
@@ -3601,7 +3618,8 @@ default_imp_for_post_processing_steps!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_approve {
@@ -3786,7 +3804,8 @@ default_imp_for_approve!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_reject {
@@ -3971,7 +3990,8 @@ default_imp_for_reject!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_webhook_source_verification {
@@ -4154,7 +4174,8 @@ default_imp_for_webhook_source_verification!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_accept_dispute {
@@ -4336,7 +4357,8 @@ default_imp_for_accept_dispute!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_submit_evidence {
@@ -4517,7 +4539,8 @@ default_imp_for_submit_evidence!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_defend_dispute {
@@ -4700,7 +4723,8 @@ default_imp_for_defend_dispute!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_fetch_disputes {
@@ -4884,7 +4908,8 @@ default_imp_for_fetch_disputes!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_dispute_sync {
@@ -5068,7 +5093,8 @@ default_imp_for_dispute_sync!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_file_upload {
@@ -5258,7 +5284,8 @@ default_imp_for_file_upload!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_payouts {
@@ -5416,6 +5443,7 @@ default_imp_for_payouts!(
     connectors::Zsl,
     connectors::CtpMastercard,
     connectors::Wompi,
+    connectors::Izipay,
     connectors::Mercadopago,
     connectors::Payway
 );
@@ -5595,6 +5623,7 @@ default_imp_for_payouts_create!(
     connectors::Zsl,
     connectors::CtpMastercard,
     connectors::Wompi,
+    connectors::Izipay,
     connectors::Mercadopago,
     connectors::Payway
 );
@@ -5774,6 +5803,7 @@ default_imp_for_payouts_retrieve!(
     connectors::Zsl,
     connectors::CtpMastercard,
     connectors::Wompi,
+    connectors::Izipay,
     connectors::Mercadopago,
     connectors::Payway
 );
@@ -5957,6 +5987,7 @@ default_imp_for_payouts_eligibility!(
     connectors::Zsl,
     connectors::CtpMastercard,
     connectors::Wompi,
+    connectors::Izipay,
     connectors::Mercadopago,
     connectors::Payway
 );
@@ -6127,6 +6158,7 @@ default_imp_for_payouts_fulfill!(
     connectors::Zsl,
     connectors::CtpMastercard,
     connectors::Wompi,
+    connectors::Izipay,
     connectors::Mercadopago,
     connectors::Payway
 );
@@ -6308,6 +6340,7 @@ default_imp_for_payouts_cancel!(
     connectors::Zsl,
     connectors::CtpMastercard,
     connectors::Wompi,
+    connectors::Izipay,
     connectors::Mercadopago,
     connectors::Payway
 );
@@ -6491,6 +6524,7 @@ default_imp_for_payouts_quote!(
     connectors::Zsl,
     connectors::CtpMastercard,
     connectors::Wompi,
+    connectors::Izipay,
     connectors::Mercadopago,
     connectors::Payway
 );
@@ -6673,6 +6707,7 @@ default_imp_for_payouts_recipient!(
     connectors::Zsl,
     connectors::CtpMastercard,
     connectors::Wompi,
+    connectors::Izipay,
     connectors::Mercadopago,
     connectors::Payway
 );
@@ -6859,7 +6894,8 @@ default_imp_for_payouts_recipient_account!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 #[cfg(feature = "frm")]
@@ -7042,7 +7078,8 @@ default_imp_for_frm_sale!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 #[cfg(feature = "frm")]
@@ -7224,7 +7261,8 @@ default_imp_for_frm_checkout!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 #[cfg(feature = "frm")]
@@ -7409,7 +7447,8 @@ default_imp_for_po_frm!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 #[cfg(feature = "frm")]
@@ -7591,7 +7630,8 @@ default_imp_for_frm_transaction!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 #[cfg(feature = "frm")]
@@ -7774,7 +7814,8 @@ default_imp_for_frm_fulfillment!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 #[cfg(feature = "frm")]
@@ -7957,7 +7998,8 @@ default_imp_for_frm_record_return!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_revoking_mandates {
@@ -8136,7 +8178,8 @@ default_imp_for_revoking_mandates!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_uas_pre_authentication {
@@ -8319,7 +8362,8 @@ default_imp_for_uas_pre_authentication!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_uas_webhook {
@@ -8501,7 +8545,8 @@ default_imp_for_uas_webhook!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_uas_post_authentication {
@@ -8683,7 +8728,8 @@ default_imp_for_uas_post_authentication!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_uas_authentication_confirmation {
@@ -8866,7 +8912,8 @@ default_imp_for_uas_authentication_confirmation!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_connector_request_id {
@@ -9041,7 +9088,8 @@ default_imp_for_connector_request_id!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 #[cfg(feature = "frm")]
@@ -9215,7 +9263,8 @@ default_imp_for_fraud_check!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_connector_authentication {
@@ -9421,7 +9470,8 @@ default_imp_for_connector_authentication!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_uas_authentication {
@@ -9602,7 +9652,8 @@ default_imp_for_uas_authentication!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_revenue_recovery {
@@ -9798,7 +9849,8 @@ default_imp_for_revenue_recovery_dispute_record_back!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 default_imp_for_revenue_recovery!(
@@ -9968,7 +10020,8 @@ default_imp_for_revenue_recovery!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_subscriptions {
@@ -10202,7 +10255,8 @@ default_imp_for_subscriptions!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 #[cfg(all(feature = "v2", feature = "revenue_recovery"))]
@@ -10387,7 +10441,8 @@ default_imp_for_billing_connector_payment_sync!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 #[cfg(all(feature = "v2", feature = "revenue_recovery"))]
@@ -10564,7 +10619,8 @@ default_imp_for_revenue_recovery_record_back!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 #[cfg(all(feature = "v2", feature = "revenue_recovery"))]
@@ -10750,7 +10806,8 @@ default_imp_for_billing_connector_invoice_sync!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_external_vault {
@@ -10926,7 +10983,8 @@ default_imp_for_external_vault!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_external_vault_insert {
@@ -11109,7 +11167,8 @@ default_imp_for_external_vault_insert!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_gift_card_balance_check {
@@ -11291,7 +11350,8 @@ default_imp_for_gift_card_balance_check!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_external_vault_retrieve {
@@ -11474,7 +11534,8 @@ default_imp_for_external_vault_retrieve!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_external_vault_delete {
@@ -11659,7 +11720,8 @@ default_imp_for_external_vault_delete!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_external_vault_create {
@@ -11843,7 +11905,8 @@ default_imp_for_external_vault_create!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_connector_authentication_token {
@@ -12026,7 +12089,8 @@ default_imp_for_connector_authentication_token!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_external_vault_proxy_payments_create {
@@ -12211,7 +12275,8 @@ default_imp_for_external_vault_proxy_payments_create!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_connector_webhook_register {
@@ -12402,7 +12467,8 @@ default_imp_for_connector_webhook_register!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 #[cfg(feature = "dummy_connector")]
@@ -13405,7 +13471,8 @@ default_imp_for_generate_qr_flow!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_push_notification_flow {
@@ -13589,7 +13656,8 @@ default_imp_for_push_notification_flow!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_pre_authorize_void {
@@ -13780,7 +13848,8 @@ default_imp_for_pre_authorize_void!(
     connectors::Trustly,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 macro_rules! default_imp_for_refund_void_post_refund {
@@ -13980,7 +14049,8 @@ default_imp_for_refund_void_post_refund!(
     connectors::Zsl,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi
+    connectors::Wompi,
+    connectors::Izipay
 );
 
 #[cfg(feature = "dummy_connector")]

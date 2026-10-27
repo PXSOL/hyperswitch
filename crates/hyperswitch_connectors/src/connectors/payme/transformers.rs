@@ -470,6 +470,7 @@ impl TryFrom<&PaymentMethodData> for SalePaymentMethod {
                 | WalletData::MercadoPagoSdk(_)
                 | WalletData::WompiCheckout {}
                 | WalletData::StripeCheckout {}
+                | WalletData::IzipayCheckout {}
                 | WalletData::MercadoPagoCheckoutPro {}
                 | WalletData::RevolutPay(_) => Err(errors::ConnectorError::NotSupported {
                     message: "Wallet".to_string(),

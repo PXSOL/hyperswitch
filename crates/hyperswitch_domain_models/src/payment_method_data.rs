@@ -1248,6 +1248,7 @@ pub enum WalletData {
     MercadoPagoCheckoutPro {},
     WompiCheckout {},
     StripeCheckout {},
+    IzipayCheckout {},
     Paze(PazeWalletData),
     SamsungPay(Box<SamsungPayWalletData>),
     TwintRedirect {},
@@ -3025,6 +3026,7 @@ impl From<api_models::payments::WalletData> for WalletData {
             }
             api_models::payments::WalletData::WompiCheckout {} => Self::WompiCheckout {},
             api_models::payments::WalletData::StripeCheckout {} => Self::StripeCheckout {},
+            api_models::payments::WalletData::IzipayCheckout {} => Self::IzipayCheckout {},
             api_models::payments::WalletData::Paze(paze_data) => {
                 Self::Paze(PazeWalletData::from(paze_data))
             }
@@ -4024,6 +4026,7 @@ impl GetPaymentMethodType for WalletData {
             }
             Self::WompiCheckout {} => api_enums::PaymentMethodType::Wompi,
             Self::StripeCheckout {} => api_enums::PaymentMethodType::StripeCheckout,
+            Self::IzipayCheckout {} => api_enums::PaymentMethodType::Izipay,
             Self::Paze(_) => api_enums::PaymentMethodType::Paze,
             Self::SamsungPay(_) => api_enums::PaymentMethodType::SamsungPay,
             Self::TwintRedirect {} => api_enums::PaymentMethodType::Twint,

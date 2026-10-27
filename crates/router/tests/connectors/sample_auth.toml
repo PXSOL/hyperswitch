@@ -416,6 +416,11 @@ key2 = "key2"
 
 [globalpayments_heartland]
 api_key = "Secret API Key"
+[izipay]
+api_key="sample_api_key"
+key1="sample_merchant_code"
+api_secret="sample_hash_key"
+key2="sample_public_rsa_key"
 
 [wompi]
 api_key="pub_test_sample_public_key"

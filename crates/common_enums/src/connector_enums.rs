@@ -139,6 +139,7 @@ pub enum Connector {
     Ilixium,
     Imerchantsolutions,
     Itaubank,
+    Izipay,
     Jpmorgan,
     JpmorganOrbital,
     Juspay,
@@ -329,6 +330,7 @@ impl Connector {
                 | (Self::Iatapay, _)
                 | (Self::Volt, _)
                 | (Self::Itaubank, _)
+                | (Self::Izipay, PaymentMethod::Wallet)
                 | (Self::Facilitapay, _)
                 | (Self::Dwolla, _)
                 | (Self::Santander, _)
@@ -420,6 +422,7 @@ impl Connector {
             | Self::Iatapay
 			| Self::Inespay
             | Self::Itaubank
+            | Self::Izipay
             | Self::Jpmorgan
             | Self::Juspay
             | Self::Juspaythreedsserver
@@ -586,8 +589,11 @@ impl Connector {
     /// Wompi's access token carries its presigned acceptance tokens, and Wompi
     /// production rejects a reused one ("El token de aceptación ya fue usado"):
     /// a cached token only works for the first payment that spends it.
+    /// Izipay's session tokens are generated per operation kind (a refund needs a
+    /// `REFUND` token, every other call an `ECOMMERCE` one), so a cached token can
+    /// belong to the wrong kind of operation of the same account.
     pub fn issues_single_use_access_tokens(self) -> bool {
-        matches!(self, Self::Wompi)
+        matches!(self, Self::Wompi | Self::Izipay)
     }
 
     /// Validates if dummy connector can be created
@@ -642,8 +648,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_wompi_issues_single_use_access_tokens() {
+    fn only_wompi_and_izipay_issue_single_use_access_tokens() {
         assert!(Connector::Wompi.issues_single_use_access_tokens());
+        assert!(Connector::Izipay.issues_single_use_access_tokens());
         // Connectors whose access tokens are reusable bearer tokens keep the cache.
         assert!(!Connector::Paypal.issues_single_use_access_tokens());
         assert!(!Connector::Mercadopago.issues_single_use_access_tokens());

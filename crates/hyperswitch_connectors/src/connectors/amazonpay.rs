@@ -398,6 +398,7 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
                 | WalletDataPaymentMethod::MercadoPagoSdk(_)
                 | WalletDataPaymentMethod::WompiCheckout {}
                 | WalletDataPaymentMethod::StripeCheckout {}
+                | WalletDataPaymentMethod::IzipayCheckout {}
                 | WalletDataPaymentMethod::MercadoPagoCheckoutPro {}
                 | WalletDataPaymentMethod::Mifinity(_) => {
                     Err(errors::ConnectorError::NotImplemented(

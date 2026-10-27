@@ -1903,6 +1903,7 @@ impl From<PaymentMethodType> for PaymentMethod {
             PaymentMethodType::WeChatPay => Self::Wallet,
             PaymentMethodType::Wompi => Self::Wallet,
             PaymentMethodType::StripeCheckout => Self::Wallet,
+            PaymentMethodType::Izipay => Self::Wallet,
             PaymentMethodType::TouchNGo => Self::Wallet,
             PaymentMethodType::Atome => Self::PayLater,
             PaymentMethodType::Payjustnow => Self::PayLater,

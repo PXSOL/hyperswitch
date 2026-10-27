@@ -423,7 +423,8 @@ impl ConnectorValidation for Adyen {
                 | PaymentMethodType::MercadoPago
                 | PaymentMethodType::Wompi
                 | PaymentMethodType::StripeCheckout
-                | PaymentMethodType::Ted => {
+                | PaymentMethodType::Ted
+                | PaymentMethodType::Izipay => {
                     capture_method_not_supported!(connector, capture_method, payment_method_type)
                 }
             },

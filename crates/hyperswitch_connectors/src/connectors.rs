@@ -74,6 +74,7 @@ pub mod imerchantsolutions;
 pub mod inespay;
 pub mod interpayments;
 pub mod itaubank;
+pub mod izipay;
 pub mod jpmorgan;
 pub mod jpmorgan_orbital;
 pub mod juspaythreedsserver;
@@ -189,7 +190,7 @@ pub use self::{
     gotyme_sanlam::GotymeSanlam, gpayments::Gpayments, helcim::Helcim, hipay::Hipay,
     hyperpg::Hyperpg, hyperswitch_vault::HyperswitchVault, hyperwallet::Hyperwallet,
     iatapay::Iatapay, ilixium::Ilixium, imerchantsolutions::Imerchantsolutions, inespay::Inespay,
-    interpayments::Interpayments, itaubank::Itaubank, jpmorgan::Jpmorgan,
+    interpayments::Interpayments, itaubank::Itaubank, izipay::Izipay, jpmorgan::Jpmorgan,
     jpmorgan_orbital::JpmorganOrbital, juspaythreedsserver::Juspaythreedsserver, katapult::Katapult,
     klarna::Klarna, loonio::Loonio, mercadopago::Mercadopago, merchante::Merchante,
     mifinity::Mifinity, mollie::Mollie, moneris::Moneris, mpgs::Mpgs, multisafepay::Multisafepay,

@@ -440,6 +440,7 @@ impl TryFrom<&NovalnetRouterData<&PaymentsAuthorizeRouterData>> for NovalnetPaym
                     | WalletDataPaymentMethod::MercadoPagoSdk(_)
                     | WalletDataPaymentMethod::WompiCheckout {}
                     | WalletDataPaymentMethod::StripeCheckout {}
+                    | WalletDataPaymentMethod::IzipayCheckout {}
                     | WalletDataPaymentMethod::MercadoPagoCheckoutPro {}
                     | WalletDataPaymentMethod::Mifinity(_) => {
                         Err(errors::ConnectorError::NotImplemented(
@@ -1928,6 +1929,7 @@ impl TryFrom<&SetupMandateRouterData> for NovalnetPaymentsRequest {
                 | WalletDataPaymentMethod::MercadoPagoSdk(_)
                 | WalletDataPaymentMethod::WompiCheckout {}
                 | WalletDataPaymentMethod::StripeCheckout {}
+                | WalletDataPaymentMethod::IzipayCheckout {}
                 | WalletDataPaymentMethod::MercadoPagoCheckoutPro {}
                 | WalletDataPaymentMethod::Mifinity(_) => {
                     Err(errors::ConnectorError::NotImplemented(

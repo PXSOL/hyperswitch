@@ -4744,6 +4744,7 @@ impl transformers::ForeignTryFrom<common_enums::PaymentMethodType>
             // Fork-only hosted checkouts, unknown to the Unified Connector Service.
             common_enums::PaymentMethodType::MercadoPago
             | common_enums::PaymentMethodType::Wompi
+            | common_enums::PaymentMethodType::Izipay
             | common_enums::PaymentMethodType::StripeCheckout => Err(error_stack::report!(
                 UnifiedConnectorServiceError::NotImplemented(value.to_string())
             )),

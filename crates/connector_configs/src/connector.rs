@@ -311,6 +311,7 @@ pub struct ConnectorConfig {
     pub itaubank: Option<ConnectorTomlConfig>,
     #[cfg(feature = "payouts")]
     pub itaubank_payout: Option<ConnectorTomlConfig>,
+    pub izipay: Option<ConnectorTomlConfig>,
     pub opennode: Option<ConnectorTomlConfig>,
     pub bambora: Option<ConnectorTomlConfig>,
     pub cybersourcedecisionmanager: Option<ConnectorTomlConfig>,
@@ -616,6 +617,7 @@ impl ConnectorConfig {
             Connector::DummyBillingConnector => Ok(connector_data.dummy_connector),
             Connector::Iatapay => Ok(connector_data.iatapay),
             Connector::Itaubank => Ok(connector_data.itaubank),
+            Connector::Izipay => Ok(connector_data.izipay),
             Connector::Opennode => Ok(connector_data.opennode),
             Connector::Bambora => Ok(connector_data.bambora),
             Connector::Datatrans => Ok(connector_data.datatrans),

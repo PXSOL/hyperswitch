@@ -678,7 +678,8 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
                         | common_enums::PaymentMethodType::MercadoPago
                         | common_enums::PaymentMethodType::Wompi
                         | common_enums::PaymentMethodType::StripeCheckout
-                        | common_enums::PaymentMethodType::Ted,
+                        | common_enums::PaymentMethodType::Ted
+                        | common_enums::PaymentMethodType::Izipay,
                     ) => Err(error_stack::report!(errors::ConnectorError::NotSupported {
                         message: payment_method_type.to_string(),
                         connector: "klarna".into(),
@@ -972,7 +973,8 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
                         | common_enums::PaymentMethodType::MercadoPago
                         | common_enums::PaymentMethodType::Wompi
                         | common_enums::PaymentMethodType::StripeCheckout
-                        | common_enums::PaymentMethodType::Ted,
+                        | common_enums::PaymentMethodType::Ted
+                        | common_enums::PaymentMethodType::Izipay,
                     ) => Err(error_stack::report!(errors::ConnectorError::NotSupported {
                         message: payment_method_type.to_string(),
                         connector: "klarna".into(),

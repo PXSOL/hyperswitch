@@ -101,6 +101,7 @@ impl ForeignTryFrom<api_enums::Connector> for euclid::enums::RoutableConnectors 
             api_enums::Connector::Inespay => Self::Inespay,
             api_enums::Connector::Interpayments => Self::Interpayments,
             api_enums::Connector::Itaubank => Self::Itaubank,
+            api_enums::Connector::Izipay => Self::Izipay,
             api_enums::Connector::Jpmorgan => Self::Jpmorgan,
             api_enums::Connector::Juspay => {
                 Err(common_utils::errors::ValidationError::InvalidValue {

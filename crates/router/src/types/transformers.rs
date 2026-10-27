@@ -324,7 +324,8 @@ impl ForeignFrom<api_enums::PaymentMethodType> for api_enums::PaymentMethod {
             | api_enums::PaymentMethodType::MercadoPago
             | api_enums::PaymentMethodType::Wompi
             | api_enums::PaymentMethodType::StripeCheckout
-            | api_enums::PaymentMethodType::Wero => Self::Wallet,
+            | api_enums::PaymentMethodType::Wero
+            | api_enums::PaymentMethodType::Izipay => Self::Wallet,
             api_enums::PaymentMethodType::Affirm
             | api_enums::PaymentMethodType::Alma
             | api_enums::PaymentMethodType::AfterpayClearpay

@@ -149,6 +149,7 @@ impl TryFrom<(&types::TokenizationRouterData, WalletData)> for SquareTokenReques
             | WalletData::MercadoPagoSdk(_)
             | WalletData::WompiCheckout {}
             | WalletData::StripeCheckout {}
+            | WalletData::IzipayCheckout {}
             | WalletData::MercadoPagoCheckoutPro {} => {
                 Err(errors::ConnectorError::NotImplemented(
                     utils::get_unimplemented_payment_method_error_message("Square"),

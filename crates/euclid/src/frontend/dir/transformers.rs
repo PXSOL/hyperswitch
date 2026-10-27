@@ -92,6 +92,7 @@ impl IntoDirValue for (global_enums::PaymentMethodType, global_enums::PaymentMet
             global_enums::PaymentMethodType::StripeCheckout => {
                 Ok(dirval!(WalletType = StripeCheckout))
             }
+            global_enums::PaymentMethodType::Izipay => Ok(dirval!(WalletType = Izipay)),
             global_enums::PaymentMethodType::Cashapp => Ok(dirval!(WalletType = Cashapp)),
             global_enums::PaymentMethodType::Multibanco => {
                 Ok(dirval!(BankTransferType = Multibanco))
