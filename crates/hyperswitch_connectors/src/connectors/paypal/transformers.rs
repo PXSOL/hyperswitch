@@ -2728,15 +2728,15 @@ pub fn is_bcdc_card_payment(request: &PaymentsAuthorizeData) -> bool {
         && metadata_selects_bcdc(request.metadata.as_ref())
 }
 
-/// The return from the 3DS challenge of a BCDC order. The marker stored with the pre
-/// authentication response is what identifies it; the payment metadata is the fallback.
+/// The return from the 3DS challenge of a BCDC order. Only the marker stored with the pre
+/// authentication response identifies it: the payment metadata is caller input and must never
+/// switch off the liability shift check of an ACDC payment.
 pub fn is_bcdc_complete_authorize(request: &CompleteAuthorizeData) -> bool {
-    let marked = request
+    request
         .connector_meta
         .clone()
         .and_then(|meta| serde_json::from_value::<PaypalMeta>(meta).ok())
-        .is_some_and(|meta| meta.card_flow == Some(PaypalCardFlow::Bcdc));
-    marked || metadata_selects_bcdc(request.metadata.as_ref())
+        .is_some_and(|meta| meta.card_flow == Some(PaypalCardFlow::Bcdc))
 }
 
 /// BCDC creates a guest payer, so there is nothing to vault for later off session charges.
@@ -3034,7 +3034,6 @@ impl TryFrom<&PaymentsPreAuthenticateRouterData> for PaypalBcdcConfirmRequest {
 pub struct PaypalBcdcConfirmResponse {
     id: String,
     status: PaypalOrderStatus,
-    intent: Option<PaypalPaymentIntent>,
     #[serde(default)]
     links: Vec<PaypalLinks>,
 }
@@ -3087,9 +3086,11 @@ impl
             // The card is accepted: the order is ready to be captured or authorized.
             PaypalOrderStatus::Approved => Ok(Self {
                 status: storage_enums::AttemptStatus::AuthenticationSuccessful,
+                // No capture or authorization exists until the settle call, so a sync before
+                // it reads the order, like in the 3DS branch.
                 response: Ok(transaction_response(
                     None,
-                    item.response.intent.unwrap_or(PaypalPaymentIntent::Capture),
+                    PaypalPaymentIntent::Authenticate,
                 )),
                 ..item.data
             }),
@@ -3379,7 +3380,9 @@ fn is_bcdc_pending_sync(
     is_bcdc
         && matches!(
             response.status,
-            PaypalOrderStatus::Created | PaypalOrderStatus::PayerActionRequired
+            PaypalOrderStatus::Created
+                | PaypalOrderStatus::PayerActionRequired
+                | PaypalOrderStatus::Approved
         )
         && !response.links.iter().any(|link| link.rel == "payer-action")
 }
@@ -3410,8 +3413,14 @@ impl
             PaypalSyncResponse::PaypalRedirectSyncResponse(response)
                 if is_bcdc_pending_sync(&item.data.request.connector_meta, &response) =>
             {
+                // An APPROVED order is accepted but not settled yet: never reported as charged.
+                let status = if response.status == PaypalOrderStatus::Approved {
+                    storage_enums::AttemptStatus::AuthenticationSuccessful
+                } else {
+                    storage_enums::AttemptStatus::AuthenticationPending
+                };
                 Ok(Self {
-                    status: storage_enums::AttemptStatus::AuthenticationPending,
+                    status,
                     response: Ok(PaymentsResponseData::TransactionResponse {
                         resource_id: ResponseId::ConnectorTransactionId(response.id.clone()),
                         redirection_data: Box::new(None),
@@ -6364,9 +6373,9 @@ mod bcdc_tests {
                 complete_authorize_data(Some(paypal_meta(Some(PaypalCardFlow::Bcdc))), None)
             ))
         );
-        // BCDC: the selector, when the marker is not there.
+        // The selector alone never skips the check: ACDC payments can carry the metadata key.
         assert!(
-            !paypal.is_post_authentication_flow_required(complete_authorize_flow(
+            paypal.is_post_authentication_flow_required(complete_authorize_flow(
                 complete_authorize_data(None, bcdc_metadata())
             ))
         );
@@ -6638,6 +6647,61 @@ mod bcdc_tests {
         }
     }
 
+    fn sync_order(
+        order: serde_json::Value,
+        status: storage_enums::AttemptStatus,
+    ) -> PaymentsSyncRouterData {
+        let response: PaypalSyncResponse = serde_json::from_value(order).unwrap();
+        let mut data = sync_data(Some(paypal_meta(Some(PaypalCardFlow::Bcdc))));
+        data.status = status;
+        PaymentsSyncRouterData::foreign_try_from((
+            ResponseRouterData {
+                response,
+                data,
+                http_code: 200,
+            },
+            None,
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_settled_bcdc_order_syncs_as_charged_and_an_unsettled_approved_one_does_not() {
+        let completed = sync_order(
+            json!({
+                "id": ORDER_ID, "intent": "CAPTURE", "status": "COMPLETED",
+                "purchase_units": [{"reference_id": "pay_1_1", "invoice_id": "pay_1_1",
+                    "payments": {"captures": [{
+                        "id": "3C679366HH908993F", "status": "COMPLETED",
+                        "amount": {"currency_code": "USD", "value": "100.00"}
+                    }]}}],
+                "payment_source": {"paypal": {"account_status": "UNVERIFIED"}}
+            }),
+            storage_enums::AttemptStatus::AuthenticationSuccessful,
+        );
+        assert_eq!(completed.status, storage_enums::AttemptStatus::Charged);
+
+        let approved = sync_order(
+            json!({
+                "id": ORDER_ID, "intent": "CAPTURE", "status": "APPROVED",
+                "purchase_units": [{"reference_id": "pay_1_1", "invoice_id": "pay_1_1"}],
+                "links": [{"rel": "self", "href": "https://api.sandbox.paypal.com/v2/checkout/orders/x"}]
+            }),
+            storage_enums::AttemptStatus::AuthenticationSuccessful,
+        );
+        assert_eq!(
+            approved.status,
+            storage_enums::AttemptStatus::AuthenticationSuccessful
+        );
+        assert!(matches!(
+            approved.response,
+            Ok(PaymentsResponseData::TransactionResponse {
+                redirection_data,
+                ..
+            }) if redirection_data.is_none()
+        ));
+    }
+
     #[test]
     fn a_redirect_sync_without_the_bcdc_marker_behaves_as_before() {
         // No payer-action link: the shared redirect conversion still errors for ACDC/wallets.
@@ -6684,7 +6748,11 @@ mod bcdc_tests {
                     ResponseId::ConnectorTransactionId(id) if id == ORDER_ID
                 ));
                 assert!(redirection_data.is_none());
-                assert_eq!(connector_metadata.unwrap()["card_flow"], "bcdc");
+                let meta = connector_metadata.unwrap();
+                assert_eq!(meta["card_flow"], "bcdc");
+                // Synced as an order until the settle call stores the capture/authorization id.
+                assert_eq!(meta["psync_flow"], "AUTHENTICATE");
+                assert!(meta["capture_id"].is_null() && meta["authorize_id"].is_null());
             }
             other => panic!("unexpected response {other:?}"),
         }
