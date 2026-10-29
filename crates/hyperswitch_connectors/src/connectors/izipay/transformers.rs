@@ -4,18 +4,21 @@ use common_enums::enums;
 use common_utils::{
     crypto::{HmacSha256, VerifySignature},
     errors::CustomResult,
-    types::StringMajorUnit,
+    types::{MinorUnit, StringMajorUnit},
 };
 use error_stack::{report, ResultExt};
 use hyperswitch_domain_models::{
     payment_method_data::{PaymentMethodData, WalletData},
     router_data::{AccessToken, ConnectorAuthType, ErrorResponse, RouterData},
-    router_flow_types::refunds::{Execute, RSync},
-    router_request_types::ResponseId,
+    router_flow_types::{
+        payments::PostCaptureVoid,
+        refunds::{Execute, RSync},
+    },
+    router_request_types::{PaymentsCancelPostCaptureData, ResponseId},
     router_response_types::{PaymentsResponseData, RedirectForm, RefundsResponseData},
     types::{
-        PaymentsAuthorizeRouterData, PaymentsSyncRouterData, RefreshTokenRouterData,
-        RefundsRouterData,
+        PaymentsAuthorizeRouterData, PaymentsCancelPostCaptureRouterData, PaymentsSyncRouterData,
+        RefreshTokenRouterData, RefundsRouterData,
     },
 };
 use hyperswitch_interfaces::errors;
@@ -206,13 +209,67 @@ impl IzipayTokenRequest {
     }
 }
 
-/// Generic session token: `orderNumber` is the merchant code and the amount is `0.00`, which
-/// Izipay accepts for search and refund operations.
+/// Order and amount the session token of a post-capture void has to be bound to: Izipay's
+/// Cancel API rejects a token that is not tied to the original order number and the amount
+/// being voided (422 "the amount does not match the token's").
+#[derive(Debug, PartialEq, Eq)]
+struct VoidTokenBinding {
+    order_number: String,
+    amount: String,
+}
+
+/// Amount with two decimals, as Izipay expects it (PEN and USD, the only currencies the
+/// connector supports, both have two).
+fn two_decimal_amount(amount: MinorUnit) -> String {
+    let minor = amount.get_amount_as_i64();
+    format!("{}.{:02}", minor / 100, minor % 100)
+}
+
+/// Recognises the token request of a post-capture void. The router builds it from the flow's
+/// router data, which keeps these fields, and no other Izipay flow produces this shape:
+/// - refunds carry a `refund_id`
+/// - authorize and payment sync pass the flow they run in (`current_flow`)
+/// - capture, void and the rest are not supported by the connector
+///
+/// A post-capture void only exists for a charged attempt, and the amount to void is what was
+/// captured. The order number is the attempt's connector reference, which is also the
+/// connector transaction id the void is sent for.
+fn post_capture_void_binding(req: &RefreshTokenRouterData) -> Option<VoidTokenBinding> {
+    if req.refund_id.is_some()
+        || req.request.current_flow.is_some()
+        || req.status != enums::AttemptStatus::Charged
+    {
+        return None;
+    }
+    let captured = req.minor_amount_captured?;
+    let order_number = req.connector_request_reference_id.trim();
+    if order_number.is_empty() || captured.get_amount_as_i64() <= 0 {
+        return None;
+    }
+    Some(VoidTokenBinding {
+        order_number: order_number.to_string(),
+        amount: two_decimal_amount(captured),
+    })
+}
+
+/// Session token of one operation:
+/// - post-capture void: bound to the original order number and the amount being voided
+/// - everything else: generic, `orderNumber` is the merchant code and the amount is `0.00`,
+///   which Izipay accepts for search and refund operations.
 impl TryFrom<&RefreshTokenRouterData> for IzipayTokenRequest {
     type Error = error_stack::Report<errors::ConnectorError>;
 
     fn try_from(req: &RefreshTokenRouterData) -> Result<Self, Self::Error> {
         let auth = IzipayAuthType::try_from(&req.connector_auth_type)?;
+        if let Some(binding) = post_capture_void_binding(req) {
+            return Ok(Self {
+                request_source: IzipayTokenKind::Ecommerce.request_source(),
+                merchant_code: auth.merchant_code,
+                order_number: binding.order_number,
+                public_key: auth.api_key,
+                amount: binding.amount,
+            });
+        }
         let kind = if req.refund_id.is_some() {
             IzipayTokenKind::Refund
         } else {
@@ -1047,6 +1104,16 @@ impl TryFrom<PaymentsSyncResponseRouterData<IzipaySearchResponse>> for PaymentsS
         // `get_error_response`); this covers a 2xx carrying the same code.
         let status = match map_search_status(&response.code, order) {
             _ if response.code == "MC" => item.data.status,
+            // An order that was already charged and is now voided is a post-capture void
+            // (the IPN of one we requested, or one done from Izipay's back office).
+            enums::AttemptStatus::Voided
+                if matches!(
+                    item.data.status,
+                    enums::AttemptStatus::Charged | enums::AttemptStatus::VoidedPostCharge
+                ) =>
+            {
+                enums::AttemptStatus::VoidedPostCharge
+            }
             status => status,
         };
 
@@ -1095,6 +1162,241 @@ impl TryFrom<PaymentsSyncResponseRouterData<IzipaySearchResponse>> for PaymentsS
         Ok(Self {
             status,
             response: payment_response,
+            ..item.data
+        })
+    }
+}
+
+// ============================================================================
+// Post-capture void: POST /cancel/api/Transaction/Cancel (ECOMMERCE session token bound to the
+// original order number and amount, see `post_capture_void_binding`). Izipay voids the whole
+// payment the day it was made (before 21:00 Lima time); after that a refund is needed.
+// ============================================================================
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayCancelRequest {
+    merchant_code: String,
+    order: IzipayCancelOrder,
+    language: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayCancelOrder {
+    order_number: String,
+    currency: String,
+    amount: String,
+    pay_method: String,
+    channel: &'static str,
+    unique_id: String,
+    authorization_code: String,
+    transaction_datetime: String,
+}
+
+fn metadata_str<'a>(metadata: Option<&'a serde_json::Value>, key: &str) -> Option<&'a str> {
+    metadata
+        .and_then(|metadata| metadata.get(key))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+/// `transactionDatetime` of the payment to void, from what the sync that charged it stored:
+/// `transaction_date` (`YYYYMMDD`) and `transaction_time` (`HHMMSS`). Payments charged before
+/// the time was stored fall back to `00:00:00`.
+fn transaction_datetime(
+    metadata: Option<&serde_json::Value>,
+) -> CustomResult<String, errors::ConnectorError> {
+    let date = metadata_text(
+        metadata,
+        "transaction_date",
+        "connector_metadata.transaction_date",
+    )?;
+    let time = metadata_str(metadata, "transaction_time").unwrap_or("000000");
+    let is_digits = |value: &str, len: usize| {
+        value.len() == len && value.chars().all(|digit| digit.is_ascii_digit())
+    };
+    if !is_digits(&date, 8) {
+        return Err(report!(errors::ConnectorError::InvalidDataFormat {
+            field_name: "connector_metadata.transaction_date".into()
+        }));
+    }
+    if !is_digits(time, 6) {
+        return Err(report!(errors::ConnectorError::InvalidDataFormat {
+            field_name: "connector_metadata.transaction_time".into()
+        }));
+    }
+    Ok(format!(
+        "{}-{}-{} {}:{}:{}.000",
+        &date[0..4],
+        &date[4..6],
+        &date[6..8],
+        &time[0..2],
+        &time[2..4],
+        &time[4..6]
+    ))
+}
+
+impl TryFrom<&PaymentsCancelPostCaptureRouterData> for IzipayCancelRequest {
+    type Error = error_stack::Report<errors::ConnectorError>;
+
+    fn try_from(req: &PaymentsCancelPostCaptureRouterData) -> Result<Self, Self::Error> {
+        let auth = IzipayAuthType::try_from(&req.connector_auth_type)?;
+        let currency =
+            req.request
+                .currency
+                .ok_or(errors::ConnectorError::MissingRequiredField {
+                    field_name: "currency".into(),
+                })?;
+        if !matches!(currency, enums::Currency::PEN | enums::Currency::USD) {
+            return Err(errors::ConnectorError::CurrencyNotSupported {
+                message: currency.to_string(),
+                connector: IZIPAY_CONNECTOR_NAME,
+            }
+            .into());
+        }
+        let minor_amount =
+            req.request
+                .minor_amount
+                .ok_or(errors::ConnectorError::MissingRequiredField {
+                    field_name: "minor_amount".into(),
+                })?;
+        let amount = two_decimal_amount(minor_amount);
+        let payment_metadata = req.request.connector_meta.as_ref();
+
+        // Only the whole payment can be voided: the amount must be the one Izipay approved.
+        if let Some(approved_amount) = metadata_str(payment_metadata, "amount") {
+            if approved_amount != amount {
+                return Err(errors::ConnectorError::NotSupported {
+                    message: "Partial post-capture void".to_string(),
+                    connector: IZIPAY_CONNECTOR_NAME.into(),
+                }
+                .into());
+            }
+        }
+
+        Ok(Self {
+            merchant_code: auth.merchant_code,
+            order: IzipayCancelOrder {
+                order_number: req.request.connector_transaction_id.clone(),
+                currency: currency.to_string(),
+                amount,
+                pay_method: metadata_str(payment_metadata, "pay_method")
+                    .unwrap_or("CARD")
+                    .to_string(),
+                channel: "ecommerce",
+                unique_id: metadata_text(
+                    payment_metadata,
+                    "unique_id",
+                    "connector_metadata.unique_id",
+                )?,
+                authorization_code: metadata_text(
+                    payment_metadata,
+                    "authorization_code",
+                    "connector_metadata.authorization_code",
+                )?,
+                transaction_datetime: transaction_datetime(payment_metadata)?,
+            },
+            language: "ESP",
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayCancelResponse {
+    pub code: String,
+    pub message: Option<String>,
+    pub response: Option<IzipayCancelBody>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayCancelBody {
+    pub result: Option<IzipayCancelResult>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IzipayCancelResult {
+    pub message_friendly: Option<String>,
+    pub unique_id_cancel: Option<String>,
+}
+
+impl
+    TryFrom<
+        ResponseRouterData<
+            PostCaptureVoid,
+            IzipayCancelResponse,
+            PaymentsCancelPostCaptureData,
+            PaymentsResponseData,
+        >,
+    > for PaymentsCancelPostCaptureRouterData
+{
+    type Error = error_stack::Report<errors::ConnectorError>;
+
+    fn try_from(
+        item: ResponseRouterData<
+            PostCaptureVoid,
+            IzipayCancelResponse,
+            PaymentsCancelPostCaptureData,
+            PaymentsResponseData,
+        >,
+    ) -> Result<Self, Self::Error> {
+        if item.response.code != SUCCESS_CODE {
+            let message = item
+                .response
+                .response
+                .as_ref()
+                .and_then(|body| body.result.as_ref())
+                .and_then(|result| result.message_friendly.as_deref())
+                .or(item.response.message.as_deref());
+            // The attempt keeps the status it has: a failed void leaves it charged.
+            return Ok(Self {
+                response: Err(error_response_from_code(
+                    &item.response.code,
+                    message,
+                    item.http_code,
+                    None,
+                )),
+                ..item.data
+            });
+        }
+        let order_number = item.data.request.connector_transaction_id.clone();
+        let unique_id_cancel = item
+            .response
+            .response
+            .as_ref()
+            .and_then(|body| body.result.as_ref())
+            .and_then(|result| result.unique_id_cancel.clone())
+            .filter(|unique_id| !unique_id.is_empty());
+        // What a refund or another void needs (`unique_id`, `authorization_code`) must stay as
+        // it is: the cancellation id is stored beside it.
+        let mut metadata = match item.data.request.connector_meta.as_ref() {
+            Some(serde_json::Value::Object(previous)) => previous.clone(),
+            _ => serde_json::Map::new(),
+        };
+        if let Some(unique_id_cancel) = unique_id_cancel {
+            metadata.insert(
+                "unique_id_cancel".to_string(),
+                serde_json::json!(unique_id_cancel),
+            );
+        }
+        Ok(Self {
+            status: enums::AttemptStatus::VoidedPostCharge,
+            response: Ok(PaymentsResponseData::TransactionResponse {
+                resource_id: ResponseId::ConnectorTransactionId(order_number.clone()),
+                redirection_data: Box::new(None),
+                mandate_reference: Box::new(None),
+                connector_metadata: Some(serde_json::Value::Object(metadata)),
+                network_txn_id: None,
+                connector_response_reference_id: Some(order_number),
+                incremental_authorization_allowed: None,
+                charges: None,
+                network_txn_link_id: None,
+                payment_account_reference: None,
+                authentication_data: None,
+            }),
             ..item.data
         })
     }
@@ -2818,5 +3120,303 @@ mod tests {
         })
         .unwrap();
         assert_eq!(result.status, status_before);
+    }
+
+    // ------------------------------------------------------------------
+    // Post-capture void
+    // ------------------------------------------------------------------
+
+    const CANCEL_OK: &str = r#"{"code":"00","message":"Operación exitosa.","header":{"millis":"292"},"response":{"order":{"orderNumber":"PX1790971180429","currency":"PEN","amount":"1.99"},"result":{"messageFriendly":"Operación exitosa.","authorizationCode":"S97758","uniqueIdCancel":"S78185"}}}"#;
+
+    const CANCEL_AMOUNT_MISMATCH: &str = r#"{"code":"422","message":"El monto no concinde con el del token.","response":{"result":{"messageFriendly":"El monto no concinde con el del token.","authorizationCode":"S97758","uniqueIdCancel":"450249587"}}}"#;
+
+    fn void_charged_metadata() -> serde_json::Value {
+        serde_json::json!({
+            "transaction_id": TOKEN_TRANSACTION_ID,
+            "order_number": "PX1790971180429",
+            "unique_id": "450249587",
+            "authorization_code": "S97758",
+            "reference_number": "2000000",
+            "transaction_date": "20261002",
+            "transaction_time": "150001",
+            "pay_method": "CARD",
+            "currency": "PEN",
+            "amount": "1.99",
+        })
+    }
+
+    fn void_router_data(
+        connector_meta: Option<serde_json::Value>,
+        minor_amount: i64,
+    ) -> PaymentsCancelPostCaptureRouterData {
+        let mut router_data = base_router_data::<PostCaptureVoid, _, PaymentsResponseData>(
+            PaymentsCancelPostCaptureData {
+                currency: Some(enums::Currency::PEN),
+                connector_transaction_id: "PX1790971180429".to_string(),
+                cancellation_reason: None,
+                connector_meta,
+                minor_amount: Some(MinorUnit::new(minor_amount)),
+            },
+            PaymentAddress::default(),
+            "PX1790971180429",
+        );
+        router_data.status = enums::AttemptStatus::Charged;
+        router_data
+    }
+
+    fn void_body(router_data: &PaymentsCancelPostCaptureRouterData) -> serde_json::Value {
+        serde_json::to_value(IzipayCancelRequest::try_from(router_data).unwrap()).unwrap()
+    }
+
+    fn cancel_response(body: &str, http_code: u16) -> PaymentsCancelPostCaptureRouterData {
+        let response: IzipayCancelResponse = serde_json::from_str(body).unwrap();
+        PaymentsCancelPostCaptureRouterData::try_from(ResponseRouterData {
+            response,
+            data: void_router_data(Some(void_charged_metadata()), 199),
+            http_code,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn cancel_request_body_matches_the_verified_sandbox_call() {
+        let body = void_body(&void_router_data(Some(void_charged_metadata()), 199));
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "merchantCode": "4004353",
+                "order": {
+                    "orderNumber": "PX1790971180429",
+                    "currency": "PEN",
+                    "amount": "1.99",
+                    "payMethod": "CARD",
+                    "channel": "ecommerce",
+                    "uniqueId": "450249587",
+                    "authorizationCode": "S97758",
+                    "transactionDatetime": "2026-10-02 15:00:01.000"
+                },
+                "language": "ESP"
+            })
+        );
+    }
+
+    #[test]
+    fn cancel_request_uses_midnight_when_the_time_was_not_stored() {
+        let mut metadata = void_charged_metadata();
+        metadata.as_object_mut().unwrap().remove("transaction_time");
+        metadata.as_object_mut().unwrap().remove("pay_method");
+        let body = void_body(&void_router_data(Some(metadata), 199));
+        assert_eq!(
+            body["order"]["transactionDatetime"],
+            "2026-10-02 00:00:00.000"
+        );
+        assert_eq!(body["order"]["payMethod"], "CARD");
+    }
+
+    #[test]
+    fn cancel_request_needs_what_the_charging_sync_stored() {
+        for missing in ["unique_id", "authorization_code", "transaction_date"] {
+            let mut metadata = void_charged_metadata();
+            metadata.as_object_mut().unwrap().remove(missing);
+            let error = IzipayCancelRequest::try_from(&void_router_data(Some(metadata), 199))
+                .expect_err("a missing field must fail before anything is sent");
+            assert!(matches!(
+                error.current_context(),
+                errors::ConnectorError::MissingRequiredField { .. }
+            ));
+        }
+        assert!(IzipayCancelRequest::try_from(&void_router_data(None, 199)).is_err());
+
+        let mut metadata = void_charged_metadata();
+        metadata["transaction_date"] = serde_json::json!("02/10/2026");
+        assert!(matches!(
+            IzipayCancelRequest::try_from(&void_router_data(Some(metadata), 199))
+                .unwrap_err()
+                .current_context(),
+            errors::ConnectorError::InvalidDataFormat { .. }
+        ));
+    }
+
+    #[test]
+    fn cancel_request_rejects_a_partial_void() {
+        let error = IzipayCancelRequest::try_from(&void_router_data(Some(void_charged_metadata()), 100))
+            .expect_err("only the approved amount can be voided");
+        assert!(matches!(
+            error.current_context(),
+            errors::ConnectorError::NotSupported { .. }
+        ));
+    }
+
+    #[test]
+    fn cancel_success_is_voided_post_charge_and_keeps_the_refund_metadata() {
+        let result = cancel_response(CANCEL_OK, 200);
+        assert_eq!(result.status, enums::AttemptStatus::VoidedPostCharge);
+        match result.response.unwrap() {
+            PaymentsResponseData::TransactionResponse {
+                resource_id,
+                connector_metadata,
+                ..
+            } => {
+                assert!(matches!(
+                    resource_id,
+                    ResponseId::ConnectorTransactionId(ref id) if id == "PX1790971180429"
+                ));
+                let mut expected = void_charged_metadata();
+                expected["unique_id_cancel"] = serde_json::json!("S78185");
+                assert_eq!(connector_metadata, Some(expected));
+            }
+            other => panic!("expected a TransactionResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancel_error_carries_the_izipay_code_and_keeps_the_status() {
+        let result = cancel_response(CANCEL_AMOUNT_MISMATCH, 422);
+        assert_eq!(result.status, enums::AttemptStatus::Charged);
+        let error = result.response.unwrap_err();
+        assert_eq!(error.code, "422");
+        assert_eq!(error.message, "El monto no concinde con el del token.");
+        assert_eq!(error.attempt_status, None);
+    }
+
+    fn token_router_data(
+        status: enums::AttemptStatus,
+        minor_amount_captured: Option<i64>,
+        refund_id: Option<&str>,
+        current_flow: Option<hyperswitch_domain_models::router_request_types::CurrentFlowInfo>,
+    ) -> RefreshTokenRouterData {
+        let mut router_data = base_router_data::<
+            hyperswitch_domain_models::router_flow_types::access_token_auth::AccessTokenAuth,
+            hyperswitch_domain_models::router_request_types::AccessTokenRequestData,
+            AccessToken,
+        >(
+            hyperswitch_domain_models::router_request_types::AccessTokenRequestData {
+                app_id: Secret::new("x".to_string()),
+                id: None,
+                authentication_token: None,
+                current_flow,
+            },
+            PaymentAddress::default(),
+            "PX1790971180429",
+        );
+        router_data.status = status;
+        router_data.minor_amount_captured = minor_amount_captured.map(MinorUnit::new);
+        router_data.refund_id = refund_id.map(str::to_string);
+        router_data
+    }
+
+    fn token_body(router_data: &RefreshTokenRouterData) -> serde_json::Value {
+        serde_json::to_value(IzipayTokenRequest::try_from(router_data).unwrap()).unwrap()
+    }
+
+    fn generic_token_body() -> serde_json::Value {
+        serde_json::json!({
+            "requestSource": "ECOMMERCE",
+            "merchantCode": "4004353",
+            "orderNumber": "4004353",
+            "publicKey": "sample_api_key",
+            "amount": "0.00"
+        })
+    }
+
+    #[test]
+    fn void_token_is_bound_to_the_original_order_and_amount() {
+        let router_data = token_router_data(enums::AttemptStatus::Charged, Some(199), None, None);
+        assert_eq!(
+            token_body(&router_data),
+            serde_json::json!({
+                "requestSource": "ECOMMERCE",
+                "merchantCode": "4004353",
+                "orderNumber": "PX1790971180429",
+                "publicKey": "sample_api_key",
+                "amount": "1.99"
+            })
+        );
+        // Amounts below one sol keep their leading zero and every amount two decimals.
+        let router_data = token_router_data(enums::AttemptStatus::Charged, Some(5), None, None);
+        assert_eq!(token_body(&router_data)["amount"], "0.05");
+        let router_data = token_router_data(enums::AttemptStatus::Charged, Some(12000), None, None);
+        assert_eq!(token_body(&router_data)["amount"], "120.00");
+    }
+
+    #[test]
+    fn payment_sync_and_refund_tokens_are_not_bound_to_an_order() {
+        let psync_flow = hyperswitch_domain_models::router_request_types::CurrentFlowInfo::Psync {
+            request_data: Box::new(sync_router_data(None).request),
+        };
+        // Same charged attempt and captured amount as the void, but the flow tells them apart.
+        let psync = token_router_data(
+            enums::AttemptStatus::Charged,
+            Some(199),
+            None,
+            Some(psync_flow),
+        );
+        assert_eq!(token_body(&psync), generic_token_body());
+
+        let refund = token_router_data(
+            enums::AttemptStatus::Charged,
+            Some(199),
+            Some("ref_1"),
+            None,
+        );
+        let mut expected = generic_token_body();
+        expected["requestSource"] = serde_json::json!("REFUND");
+        assert_eq!(token_body(&refund), expected);
+
+        // A payment that is not charged (or has no captured amount) is never a void.
+        let pending = token_router_data(
+            enums::AttemptStatus::AuthenticationPending,
+            Some(199),
+            None,
+            None,
+        );
+        assert_eq!(token_body(&pending), generic_token_body());
+        let no_amount = token_router_data(enums::AttemptStatus::Charged, None, None, None);
+        assert_eq!(token_body(&no_amount), generic_token_body());
+    }
+
+    #[test]
+    fn void_token_is_packed_as_an_ecommerce_token() {
+        let router_data = token_router_data(enums::AttemptStatus::Charged, Some(199), None, None);
+        let access_token = RouterData::try_from(ResponseRouterData {
+            response: token_response(),
+            data: router_data,
+            http_code: 200,
+        })
+        .unwrap()
+        .response
+        .unwrap();
+        // The cancel call reads it back as an ecommerce token, never as a refund one.
+        assert!(unpack_access_token(Some(&access_token), IzipayTokenKind::Ecommerce).is_ok());
+        assert!(unpack_access_token(Some(&access_token), IzipayTokenKind::Refund).is_err());
+    }
+
+    #[test]
+    fn a_charged_order_that_izipay_reports_voided_is_a_post_capture_void() {
+        let response: IzipaySearchResponse = serde_json::from_str(SEARCH_VOIDED).unwrap();
+        for (before, expected) in [
+            (
+                enums::AttemptStatus::Charged,
+                enums::AttemptStatus::VoidedPostCharge,
+            ),
+            (
+                enums::AttemptStatus::VoidedPostCharge,
+                enums::AttemptStatus::VoidedPostCharge,
+            ),
+            (
+                enums::AttemptStatus::AuthenticationPending,
+                enums::AttemptStatus::Voided,
+            ),
+        ] {
+            let mut data = sync_router_data(Some(void_charged_metadata()));
+            data.status = before;
+            let result = PaymentsSyncRouterData::try_from(ResponseRouterData {
+                response: response.clone(),
+                data,
+                http_code: 200,
+            })
+            .unwrap();
+            assert_eq!(result.status, expected);
+        }
     }
 }

@@ -1840,8 +1840,7 @@ default_imp_for_cancel_post_capture!(
     connectors::CtpMastercard,
     connectors::Mercadopago,
     connectors::Payway,
-    connectors::Wompi,
-    connectors::Izipay
+    connectors::Wompi
 );
 
 macro_rules! default_imp_for_cancel_post_capture_sync {

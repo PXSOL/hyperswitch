@@ -15,23 +15,24 @@ use hyperswitch_domain_models::{
     router_flow_types::{
         access_token_auth::AccessTokenAuth,
         payments::{
-            Authorize, Capture, CompleteAuthorize, PSync, PaymentMethodToken, Session,
-            SetupMandate, Void,
+            Authorize, Capture, CompleteAuthorize, PSync, PaymentMethodToken, PostCaptureVoid,
+            Session, SetupMandate, Void,
         },
         refunds::{Execute, RSync},
     },
     router_request_types::{
         AccessTokenRequestData, CompleteAuthorizeData, PaymentMethodTokenizationData,
-        PaymentsAuthorizeData, PaymentsCancelData, PaymentsCaptureData, PaymentsSessionData,
-        PaymentsSyncData, RefundsData, SetupMandateRequestData,
+        PaymentsAuthorizeData, PaymentsCancelData, PaymentsCancelPostCaptureData,
+        PaymentsCaptureData, PaymentsSessionData, PaymentsSyncData, RefundsData,
+        SetupMandateRequestData,
     },
     router_response_types::{
         ConnectorInfo, PaymentMethodDetails, PaymentsResponseData, RefundsResponseData,
         SupportedPaymentMethods, SupportedPaymentMethodsExt,
     },
     types::{
-        PaymentsAuthorizeRouterData, PaymentsSyncRouterData, RefreshTokenRouterData,
-        RefundSyncRouterData, RefundsRouterData,
+        PaymentsAuthorizeRouterData, PaymentsCancelPostCaptureRouterData, PaymentsSyncRouterData,
+        RefreshTokenRouterData, RefundSyncRouterData, RefundsRouterData,
     },
 };
 use hyperswitch_interfaces::{
@@ -43,8 +44,8 @@ use hyperswitch_interfaces::{
     errors,
     events::connector_api_logs::ConnectorEvent,
     types::{
-        PaymentsAuthorizeType, PaymentsSyncType, RefreshTokenType, RefundExecuteType,
-        RefundSyncType, Response,
+        PaymentsAuthorizeType, PaymentsPostCaptureVoidType, PaymentsSyncType, RefreshTokenType,
+        RefundExecuteType, RefundSyncType, Response,
     },
     webhooks::{IncomingWebhook, IncomingWebhookRequestDetails, WebhookContext},
 };
@@ -123,6 +124,7 @@ impl api::PaymentsCompleteAuthorize for Izipay {}
 impl api::PaymentSync for Izipay {}
 impl api::PaymentCapture for Izipay {}
 impl api::PaymentVoid for Izipay {}
+impl api::PaymentPostCaptureVoid for Izipay {}
 impl api::PaymentToken for Izipay {}
 impl api::Refund for Izipay {}
 impl api::RefundExecute for Izipay {}
@@ -491,6 +493,102 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Izi
         let response: izipay::IzipaySearchResponse = res
             .response
             .parse_struct("IzipaySearchResponse")
+            .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+        event_builder.map(|i| i.set_response_body(&response));
+        router_env::logger::info!(connector_response=?response);
+        RouterData::try_from(ResponseRouterData {
+            response,
+            data: data.clone(),
+            http_code: res.status_code,
+        })
+    }
+
+    fn get_error_response(
+        &self,
+        res: Response,
+        event_builder: Option<&mut ConnectorEvent>,
+    ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
+        self.build_error_response(res, event_builder)
+    }
+}
+
+// ============================================================================
+// Post-capture void: POST /cancel/api/Transaction/Cancel. The ECOMMERCE session token the
+// router fetches for this flow is bound to the original order number and the amount (see
+// `izipay::IzipayTokenRequest`). Izipay answers synchronously and also sends the IPN, which the
+// payment sync maps to the same `VoidedPostCharge` status. There is no post-capture void sync
+// on purpose: it keeps the default (unsupported) implementation, so Izipay is never polled for
+// it (Izipay bans clients that query too often).
+// ============================================================================
+
+impl ConnectorIntegration<PostCaptureVoid, PaymentsCancelPostCaptureData, PaymentsResponseData>
+    for Izipay
+{
+    fn get_headers(
+        &self,
+        req: &PaymentsCancelPostCaptureRouterData,
+        _connectors: &Connectors,
+    ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
+    {
+        self.session_headers(
+            req.access_token.as_ref(),
+            izipay::IzipayTokenKind::Ecommerce,
+        )
+    }
+
+    fn get_content_type(&self) -> &'static str {
+        self.common_get_content_type()
+    }
+
+    fn get_url(
+        &self,
+        req: &PaymentsCancelPostCaptureRouterData,
+        connectors: &Connectors,
+    ) -> CustomResult<String, errors::ConnectorError> {
+        let base_url = get_izipay_base_url(connectors, req.test_mode)?;
+        Ok(format!("{base_url}/cancel/api/Transaction/Cancel"))
+    }
+
+    fn get_request_body(
+        &self,
+        req: &PaymentsCancelPostCaptureRouterData,
+        _connectors: &Connectors,
+    ) -> CustomResult<RequestContent, errors::ConnectorError> {
+        let connector_req = izipay::IzipayCancelRequest::try_from(req)?;
+        Ok(RequestContent::Json(Box::new(connector_req)))
+    }
+
+    fn build_request(
+        &self,
+        req: &PaymentsCancelPostCaptureRouterData,
+        connectors: &Connectors,
+    ) -> CustomResult<Option<Request>, errors::ConnectorError> {
+        Ok(Some(
+            RequestBuilder::new()
+                .method(Method::Post)
+                .url(&PaymentsPostCaptureVoidType::get_url(
+                    self, req, connectors,
+                )?)
+                .attach_default_headers()
+                .headers(PaymentsPostCaptureVoidType::get_headers(
+                    self, req, connectors,
+                )?)
+                .set_body(PaymentsPostCaptureVoidType::get_request_body(
+                    self, req, connectors,
+                )?)
+                .build(),
+        ))
+    }
+
+    fn handle_response(
+        &self,
+        data: &PaymentsCancelPostCaptureRouterData,
+        event_builder: Option<&mut ConnectorEvent>,
+        res: Response,
+    ) -> CustomResult<PaymentsCancelPostCaptureRouterData, errors::ConnectorError> {
+        let response: izipay::IzipayCancelResponse = res
+            .response
+            .parse_struct("IzipayCancelResponse")
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
