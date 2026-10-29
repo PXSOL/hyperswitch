@@ -2787,6 +2787,7 @@ connector = { position = 1, schema = { enum = [
     "inespay",
     "iatapay",
     "itaubank",
+    "izipay",
     "jpmorgan",
     "juspaythreedsserver",
     "klarna",
@@ -8869,3 +8870,11 @@ _context_ = { always_collect_shipping_details_from_wallet_connector = true, paym
 [[overrides]]
 _context_ = { connector = "paypal" }
 "process_tracker.pt_mapping_payment_sync" = { default_mapping = { start_after = 180, frequencies = [[180, 9], [300, 12], [3600, 23], [86400, 29]] }, max_retries_count = 73 }
+
+# Izipay bans clients that make more than ~10 status queries per minute, and its IPN is the
+# primary sync, so polling stays minimal. A session token lasts 15 min, hence the first payment
+# check at ~20 min and the last at ~60 min. Refunds are checked at ~6 h and ~24 h.
+[[overrides]]
+_context_ = { connector = "izipay" }
+"process_tracker.pt_mapping_payment_sync" = { default_mapping = { start_after = 1200, frequencies = [[2400, 1]] }, max_retries_count = 1 }
+"process_tracker.pt_mapping_refund_sync" = { default_mapping = { start_after = 21600, frequencies = [[64800, 1]] }, max_retries_count = 1 }
