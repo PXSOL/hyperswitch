@@ -25,25 +25,26 @@ use hyperswitch_domain_models::{
         },
         refunds::{Execute, RSync},
         unified_authentication_service::PostAuthenticate,
-        CompleteAuthorize, VerifyWebhookSource,
+        CompleteAuthorize, CreateOrder, PreAuthenticate, VerifyWebhookSource,
     },
     router_request_types::{
-        AccessTokenRequestData, CompleteAuthorizeData, PaymentMethodTokenizationData,
-        PaymentsAuthorizeData, PaymentsCancelData, PaymentsCaptureData,
-        PaymentsExtendAuthorizationData, PaymentsIncrementalAuthorizationData,
-        PaymentsPostAuthenticateData, PaymentsPostSessionTokensData, PaymentsSessionData,
-        PaymentsSyncData, RefundsData, ResponseId, SdkPaymentsSessionUpdateData,
-        SetupMandateRequestData, VerifyWebhookSourceRequestData,
+        AccessTokenRequestData, CompleteAuthorizeData, CreateOrderRequestData,
+        PaymentMethodTokenizationData, PaymentsAuthorizeData, PaymentsCancelData,
+        PaymentsCaptureData, PaymentsExtendAuthorizationData, PaymentsIncrementalAuthorizationData,
+        PaymentsPostAuthenticateData, PaymentsPostSessionTokensData, PaymentsPreAuthenticateData,
+        PaymentsSessionData, PaymentsSyncData, RefundsData, ResponseId,
+        SdkPaymentsSessionUpdateData, SetupMandateRequestData, VerifyWebhookSourceRequestData,
     },
     router_response_types::{
         ConnectorInfo, PaymentMethodDetails, PaymentsResponseData, RefundsResponseData,
         SupportedPaymentMethods, SupportedPaymentMethodsExt, VerifyWebhookSourceResponseData,
     },
     types::{
-        PaymentsAuthorizeRouterData, PaymentsCancelRouterData, PaymentsCaptureRouterData,
-        PaymentsCompleteAuthorizeRouterData, PaymentsExtendAuthorizationRouterData,
-        PaymentsIncrementalAuthorizationRouterData, PaymentsPostAuthenticateRouterData,
-        PaymentsPostSessionTokensRouterData, PaymentsSessionRouterData, PaymentsSyncRouterData,
+        CreateOrderRouterData, PaymentsAuthorizeRouterData, PaymentsCancelRouterData,
+        PaymentsCaptureRouterData, PaymentsCompleteAuthorizeRouterData,
+        PaymentsExtendAuthorizationRouterData, PaymentsIncrementalAuthorizationRouterData,
+        PaymentsPostAuthenticateRouterData, PaymentsPostSessionTokensRouterData,
+        PaymentsPreAuthenticateRouterData, PaymentsSessionRouterData, PaymentsSyncRouterData,
         RefreshTokenRouterData, RefundSyncRouterData, RefundsRouterData,
         SdkSessionUpdateRouterData, SetupMandateRouterData, VerifyWebhookSourceRouterData,
     },
@@ -66,11 +67,12 @@ use hyperswitch_interfaces::{
     disputes, errors,
     events::connector_api_logs::ConnectorEvent,
     types::{
-        ExtendedAuthorizationType, IncrementalAuthorizationType, PaymentsAuthorizeType,
-        PaymentsCaptureType, PaymentsCompleteAuthorizeType, PaymentsPostAuthenticateType,
-        PaymentsPostSessionTokensType, PaymentsSessionType, PaymentsSyncType, PaymentsVoidType,
-        RefreshTokenType, RefundExecuteType, RefundSyncType, Response, SdkSessionUpdateType,
-        SetupMandateType, VerifyWebhookSourceType,
+        CreateOrderType, ExtendedAuthorizationType, IncrementalAuthorizationType,
+        PaymentsAuthorizeType, PaymentsCaptureType, PaymentsCompleteAuthorizeType,
+        PaymentsPostAuthenticateType, PaymentsPostSessionTokensType, PaymentsPreAuthenticateType,
+        PaymentsSessionType, PaymentsSyncType, PaymentsVoidType, RefreshTokenType,
+        RefundExecuteType, RefundSyncType, Response, SdkSessionUpdateType, SetupMandateType,
+        VerifyWebhookSourceType,
     },
     webhooks::{IncomingWebhook, IncomingWebhookRequestDetails, WebhookContext},
 };
@@ -124,6 +126,8 @@ impl api::ConnectorVerifyWebhookSource for Paypal {}
 impl api::PaymentPostSessionTokens for Paypal {}
 impl api::PaymentSessionUpdate for Paypal {}
 impl api::PaymentExtendAuthorization for Paypal {}
+impl api::PaymentsCreateOrder for Paypal {}
+impl api::PaymentsPreAuthenticate for Paypal {}
 
 impl api::Payouts for Paypal {}
 #[cfg(feature = "payouts")]
@@ -1232,6 +1236,24 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
                     paypal_wallet_data.token
                 ))
             }
+            // BCDC: the order was created and the card confirmed in the legs before, this
+            // call settles that order exactly like the PaypalSdk one.
+            PaymentMethodData::Card(_) if paypal::is_bcdc_card_payment(&req.request) => {
+                let order_id = req
+                    .request
+                    .order_id
+                    .as_ref()
+                    .ok_or(errors::ConnectorError::MissingConnectorTransactionID)?;
+                let settle_action = if req.request.is_auto_capture()? {
+                    "capture"
+                } else {
+                    "authorize"
+                };
+                Ok(format!(
+                    "{}v2/checkout/orders/{order_id}/{settle_action}",
+                    self.base_url(connectors)
+                ))
+            }
             _ => Ok(format!("{}v2/checkout/orders", self.base_url(connectors))),
         }
     }
@@ -1241,6 +1263,12 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         req: &PaymentsAuthorizeRouterData,
         _connectors: &Connectors,
     ) -> CustomResult<RequestContent, errors::ConnectorError> {
+        if paypal::is_bcdc_card_payment(&req.request) {
+            paypal::reject_bcdc_mandate(req.request.setup_future_usage)?;
+            return Ok(RequestContent::Json(Box::new(
+                paypal::PaypalEmptyRequest {},
+            )));
+        }
         let amount = connector_utils::convert_amount(
             self.amount_converter,
             req.request.minor_amount,
@@ -1332,6 +1360,188 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
     ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
         self.get_order_error_response(res, event_builder)
     }
+}
+
+impl ConnectorIntegration<CreateOrder, CreateOrderRequestData, PaymentsResponseData> for Paypal {
+    fn get_headers(
+        &self,
+        req: &CreateOrderRouterData,
+        connectors: &Connectors,
+    ) -> CustomResult<Vec<(String, Maskable<String>)>, errors::ConnectorError> {
+        self.build_headers(req, connectors)
+    }
+
+    fn get_content_type(&self) -> &'static str {
+        self.common_get_content_type()
+    }
+
+    fn get_url(
+        &self,
+        _req: &CreateOrderRouterData,
+        connectors: &Connectors,
+    ) -> CustomResult<String, errors::ConnectorError> {
+        Ok(format!("{}v2/checkout/orders", self.base_url(connectors)))
+    }
+
+    fn get_request_body(
+        &self,
+        req: &CreateOrderRouterData,
+        _connectors: &Connectors,
+    ) -> CustomResult<RequestContent, errors::ConnectorError> {
+        let amount = connector_utils::convert_amount(
+            self.amount_converter,
+            req.request.minor_amount,
+            req.request.currency,
+        )?;
+        let connector_req = paypal::PaypalBcdcOrderRequest::try_from((req, amount))?;
+        Ok(RequestContent::Json(Box::new(connector_req)))
+    }
+
+    fn build_request(
+        &self,
+        req: &CreateOrderRouterData,
+        connectors: &Connectors,
+    ) -> CustomResult<Option<Request>, errors::ConnectorError> {
+        Ok(Some(
+            RequestBuilder::new()
+                .method(Method::Post)
+                .url(&CreateOrderType::get_url(self, req, connectors)?)
+                .attach_default_headers()
+                .headers(CreateOrderType::get_headers(self, req, connectors)?)
+                .set_body(CreateOrderType::get_request_body(self, req, connectors)?)
+                .build(),
+        ))
+    }
+
+    fn handle_response(
+        &self,
+        data: &CreateOrderRouterData,
+        event_builder: Option<&mut ConnectorEvent>,
+        res: Response,
+    ) -> CustomResult<CreateOrderRouterData, errors::ConnectorError> {
+        let response: paypal::PaypalBcdcOrderResponse = res
+            .response
+            .parse_struct("paypal PaypalBcdcOrderResponse")
+            .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+        event_builder.map(|i| i.set_response_body(&response));
+        router_env::logger::info!(connector_response=?response);
+        RouterData::try_from(ResponseRouterData {
+            response,
+            data: data.clone(),
+            http_code: res.status_code,
+        })
+    }
+
+    fn get_error_response(
+        &self,
+        res: Response,
+        event_builder: Option<&mut ConnectorEvent>,
+    ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
+        self.get_order_error_response(res, event_builder)
+    }
+}
+
+impl ConnectorIntegration<PreAuthenticate, PaymentsPreAuthenticateData, PaymentsResponseData>
+    for Paypal
+{
+    fn get_headers(
+        &self,
+        req: &PaymentsPreAuthenticateRouterData,
+        connectors: &Connectors,
+    ) -> CustomResult<Vec<(String, Maskable<String>)>, errors::ConnectorError> {
+        let mut headers = self.build_headers(req, connectors)?;
+        // PayPal ties the device fingerprint of the guest payment to the order.
+        headers.push((
+            auth_headers::PAYPAL_CLIENT_METADATA_ID.to_string(),
+            get_bcdc_order_id(req)?.into_masked(),
+        ));
+        Ok(headers)
+    }
+
+    fn get_content_type(&self) -> &'static str {
+        self.common_get_content_type()
+    }
+
+    fn get_url(
+        &self,
+        req: &PaymentsPreAuthenticateRouterData,
+        connectors: &Connectors,
+    ) -> CustomResult<String, errors::ConnectorError> {
+        Ok(format!(
+            "{}v1/aggregator/partner-checkout/orders/{}/confirm-guest-payment",
+            self.base_url(connectors),
+            get_bcdc_order_id(req)?
+        ))
+    }
+
+    fn get_request_body(
+        &self,
+        req: &PaymentsPreAuthenticateRouterData,
+        _connectors: &Connectors,
+    ) -> CustomResult<RequestContent, errors::ConnectorError> {
+        let connector_req = paypal::PaypalBcdcConfirmRequest::try_from(req)?;
+        Ok(RequestContent::Json(Box::new(connector_req)))
+    }
+
+    fn build_request(
+        &self,
+        req: &PaymentsPreAuthenticateRouterData,
+        connectors: &Connectors,
+    ) -> CustomResult<Option<Request>, errors::ConnectorError> {
+        Ok(Some(
+            RequestBuilder::new()
+                .method(Method::Post)
+                .url(&PaymentsPreAuthenticateType::get_url(
+                    self, req, connectors,
+                )?)
+                .attach_default_headers()
+                .headers(PaymentsPreAuthenticateType::get_headers(
+                    self, req, connectors,
+                )?)
+                .set_body(PaymentsPreAuthenticateType::get_request_body(
+                    self, req, connectors,
+                )?)
+                .build(),
+        ))
+    }
+
+    fn handle_response(
+        &self,
+        data: &PaymentsPreAuthenticateRouterData,
+        event_builder: Option<&mut ConnectorEvent>,
+        res: Response,
+    ) -> CustomResult<PaymentsPreAuthenticateRouterData, errors::ConnectorError> {
+        let response: paypal::PaypalBcdcConfirmResponse = res
+            .response
+            .parse_struct("paypal PaypalBcdcConfirmResponse")
+            .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+        event_builder.map(|i| i.set_response_body(&response));
+        router_env::logger::info!(connector_response=?response);
+        RouterData::try_from(ResponseRouterData {
+            response,
+            data: data.clone(),
+            http_code: res.status_code,
+        })
+    }
+
+    fn get_error_response(
+        &self,
+        res: Response,
+        event_builder: Option<&mut ConnectorEvent>,
+    ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
+        self.get_order_error_response(res, event_builder)
+    }
+}
+
+fn get_bcdc_order_id(
+    req: &PaymentsPreAuthenticateRouterData,
+) -> CustomResult<String, errors::ConnectorError> {
+    req.request.order_id.clone().ok_or_else(|| {
+        errors::ConnectorError::MissingRequiredField {
+            field_name: "order_id".into(),
+        }
+        .into()
+    })
 }
 
 impl
@@ -2845,15 +3055,38 @@ static PAYPAL_SUPPORTED_WEBHOOK_FLOWS: [enums::EventClass; 3] = [
     enums::EventClass::Disputes,
 ];
 
+fn is_bcdc_authorize(current_flow: &api::CurrentFlowInfo) -> bool {
+    matches!(
+        current_flow,
+        api::CurrentFlowInfo::Authorize { request_data, .. }
+            if paypal::is_bcdc_card_payment(request_data)
+    )
+}
+
 impl ConnectorSpecifications for Paypal {
+    // BCDC (guest card checkout) creates the order and confirms the card as two legs before the
+    // settle call of Authorize. Cards without the selector keep the single ACDC call.
+    fn is_order_create_flow_required(&self, current_flow: api::CurrentFlowInfo) -> bool {
+        is_bcdc_authorize(&current_flow)
+    }
+
+    fn is_pre_authentication_flow_required(&self, current_flow: api::CurrentFlowInfo) -> bool {
+        is_bcdc_authorize(&current_flow)
+    }
+
     fn is_post_authentication_flow_required(&self, current_flow: api::CurrentFlowInfo) -> bool {
         match current_flow {
             api::CurrentFlowInfo::Authorize { .. } => false,
+            // The liability shift check reads `payment_source.card` of the order, which a BCDC
+            // order does not have (its source is the guest PayPal account).
             api::CurrentFlowInfo::CompleteAuthorize {
-                request_data: _,
+                request_data,
                 payment_method,
                 ..
-            } => payment_method == Some(enums::PaymentMethod::Card),
+            } => {
+                payment_method == Some(enums::PaymentMethod::Card)
+                    && !paypal::is_bcdc_complete_authorize(&request_data)
+            }
             api::CurrentFlowInfo::SetupMandate { .. } => false,
             api::CurrentFlowInfo::Psync { .. } => false,
             api::CurrentFlowInfo::UpdatePostConfirm { .. } => false,
@@ -2907,6 +3140,7 @@ mod external_refund_tests {
             psync_flow: flow,
             next_action: None,
             order_id: None,
+            card_flow: None,
         }
     }
 
