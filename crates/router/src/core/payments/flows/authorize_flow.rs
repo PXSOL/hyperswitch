@@ -614,6 +614,18 @@ impl Feature<api::Authorize, types::PaymentsAuthorizeData> for types::PaymentsAu
                     }) => redirection_data.is_none(),
                     _ => false,
                 },
+                // PayPal BCDC (guest card checkout) only: PreAuthenticate confirms the card on the
+                // order. When PayPal approves it without a 3DS challenge, continue straight to the
+                // capture/authorize Authorize call; when it asks for 3DS, break so the shopper
+                // completes it and CompleteAuthorize settles the order. Without the BCDC selector
+                // PayPal never runs this leg, so its other payments are not affected.
+                api_models::enums::Connector::Paypal => match &authorize_router_data.response {
+                    Ok(types::PaymentsResponseData::TransactionResponse {
+                        redirection_data,
+                        ..
+                    }) => redirection_data.is_none(),
+                    _ => false,
+                },
                 _ => false,
             };
             Ok((authorize_router_data, should_continue_after_preauthenticate))

@@ -31,21 +31,22 @@ use hyperswitch_domain_models::{
     router_flow_types::{
         payments::{Authorize, PostSessionTokens},
         refunds::{Execute, RSync},
-        VerifyWebhookSource,
+        CreateOrder, PreAuthenticate, VerifyWebhookSource,
     },
     router_request_types::{
-        CompleteAuthorizeData, PaymentsAuthorizeData, PaymentsIncrementalAuthorizationData,
-        PaymentsPostSessionTokensData, PaymentsSyncData, ResponseId,
-        VerifyWebhookSourceRequestData,
+        CompleteAuthorizeData, CreateOrderRequestData, PaymentsAuthorizeData,
+        PaymentsIncrementalAuthorizationData, PaymentsPostSessionTokensData,
+        PaymentsPreAuthenticateData, PaymentsSyncData, ResponseId, VerifyWebhookSourceRequestData,
     },
     router_response_types::{
         MandateReference, PaymentsResponseData, RedirectForm, RefundsResponseData,
         VerifyWebhookSourceResponseData, VerifyWebhookStatus,
     },
     types::{
-        OrderDetailsWithAmount, PaymentsAuthorizeRouterData, PaymentsCaptureRouterData,
-        PaymentsExtendAuthorizationRouterData, PaymentsIncrementalAuthorizationRouterData,
-        PaymentsPostSessionTokensRouterData, PaymentsSessionRouterData, PaymentsSyncRouterData,
+        CreateOrderRouterData, OrderDetailsWithAmount, PaymentsAuthorizeRouterData,
+        PaymentsCaptureRouterData, PaymentsExtendAuthorizationRouterData,
+        PaymentsIncrementalAuthorizationRouterData, PaymentsPostSessionTokensRouterData,
+        PaymentsPreAuthenticateRouterData, PaymentsSessionRouterData, PaymentsSyncRouterData,
         RefreshTokenRouterData, RefundsRouterData, SdkSessionUpdateRouterData,
         SetupMandateRouterData, VerifyWebhookSourceRouterData,
     },
@@ -59,7 +60,7 @@ use hyperswitch_interfaces::{
     consts::{NO_ERROR_CODE, NO_ERROR_MESSAGE},
     errors,
 };
-use hyperswitch_masking::{ExposeInterface, Secret};
+use hyperswitch_masking::{ExposeInterface, PeekInterface, Secret};
 use serde::{Deserialize, Serialize};
 use time::PrimitiveDateTime;
 use url::Url;
@@ -154,6 +155,7 @@ pub mod auth_headers {
     pub const PREFER: &str = "Prefer";
     pub const PAYPAL_REQUEST_ID: &str = "PayPal-Request-Id";
     pub const PAYPAL_AUTH_ASSERTION: &str = "PayPal-Auth-Assertion";
+    pub const PAYPAL_CLIENT_METADATA_ID: &str = "PayPal-Client-Metadata-Id";
 }
 
 const ORDER_QUANTITY: u16 = 1;
@@ -2691,7 +2693,454 @@ pub struct PaypalMeta {
     pub psync_flow: PaypalPaymentIntent,
     pub next_action: Option<NextActionCall>,
     pub order_id: Option<String>,
+    /// Set only for cards charged through BCDC (guest checkout); absent for every other
+    /// payment so the stored metadata of ACDC and wallet payments is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_flow: Option<PaypalCardFlow>,
 }
+
+/// Selects how PayPal charges a card. Without the selector a card is charged through ACDC.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PaypalCardFlow {
+    /// PayPal guest card checkout: `confirm-guest-payment` on a bare order.
+    Bcdc,
+}
+
+/// Payment metadata key that selects the card flow of the payment.
+pub const PAYPAL_CARD_FLOW_METADATA_KEY: &str = "paypal_card_flow";
+/// Value of [`PAYPAL_CARD_FLOW_METADATA_KEY`] that selects BCDC.
+pub const PAYPAL_CARD_FLOW_BCDC: &str = "bcdc";
+/// Payment metadata keys with the buyer document (same keys as the izipay connector).
+const BUYER_DOCUMENT_TYPE_KEY: &str = "buyer_document_type";
+const BUYER_DOCUMENT_NUMBER_KEY: &str = "buyer_document_number";
+
+fn metadata_selects_bcdc(metadata: Option<&serde_json::Value>) -> bool {
+    metadata
+        .and_then(|metadata| metadata.get(PAYPAL_CARD_FLOW_METADATA_KEY))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|flow| flow == PAYPAL_CARD_FLOW_BCDC)
+}
+
+/// A card payment is charged through BCDC only when the payment metadata selects it.
+pub fn is_bcdc_card_payment(request: &PaymentsAuthorizeData) -> bool {
+    matches!(request.payment_method_data, PaymentMethodData::Card(_))
+        && metadata_selects_bcdc(request.metadata.as_ref())
+}
+
+/// The return from the 3DS challenge of a BCDC order. The marker stored with the pre
+/// authentication response is what identifies it; the payment metadata is the fallback.
+pub fn is_bcdc_complete_authorize(request: &CompleteAuthorizeData) -> bool {
+    let marked = request
+        .connector_meta
+        .clone()
+        .and_then(|meta| serde_json::from_value::<PaypalMeta>(meta).ok())
+        .is_some_and(|meta| meta.card_flow == Some(PaypalCardFlow::Bcdc));
+    marked || metadata_selects_bcdc(request.metadata.as_ref())
+}
+
+/// BCDC creates a guest payer, so there is nothing to vault for later off session charges.
+pub fn reject_bcdc_mandate(
+    setup_future_usage: Option<enums::FutureUsage>,
+) -> Result<(), error_stack::Report<errors::ConnectorError>> {
+    match setup_future_usage {
+        Some(enums::FutureUsage::OffSession) => Err(errors::ConnectorError::NotSupported {
+            message: "Saving the card for off session payments".to_string(),
+            connector: "Paypal card guest checkout (BCDC)".into(),
+        }
+        .into()),
+        Some(enums::FutureUsage::OnSession) | None => Ok(()),
+    }
+}
+
+/// Body of `v2/checkout/orders` for a BCDC payment: a bare order, the card comes later with
+/// `confirm-guest-payment`.
+#[derive(Debug, Serialize)]
+pub struct PaypalBcdcOrderRequest {
+    intent: PaypalPaymentIntent,
+    purchase_units: Vec<PaypalBcdcPurchaseUnit>,
+    application_context: PaypalBcdcApplicationContext,
+}
+
+#[derive(Debug, Serialize)]
+struct PaypalBcdcPurchaseUnit {
+    reference_id: String,
+    invoice_id: String,
+    amount: OrderAmount,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payee: Option<Payee>,
+}
+
+#[derive(Debug, Serialize)]
+struct PaypalBcdcApplicationContext {
+    shipping_preference: ShippingPreference,
+}
+
+impl TryFrom<(&CreateOrderRouterData, StringMajorUnit)> for PaypalBcdcOrderRequest {
+    type Error = error_stack::Report<errors::ConnectorError>;
+    fn try_from(
+        (item, amount): (&CreateOrderRouterData, StringMajorUnit),
+    ) -> Result<Self, Self::Error> {
+        if item.request.setup_mandate_details.is_some() {
+            reject_bcdc_mandate(Some(enums::FutureUsage::OffSession))?;
+        }
+        let paypal_auth = PaypalAuthType::try_from(&item.connector_auth_type)?;
+        let intent = if item.request.is_auto_capture() {
+            PaypalPaymentIntent::Capture
+        } else {
+            PaypalPaymentIntent::Authorize
+        };
+        Ok(Self {
+            intent,
+            purchase_units: vec![PaypalBcdcPurchaseUnit {
+                reference_id: item.connector_request_reference_id.clone(),
+                invoice_id: item.connector_request_reference_id.clone(),
+                amount: OrderAmount {
+                    currency_code: item.request.currency,
+                    value: amount,
+                },
+                payee: get_payee(&paypal_auth),
+            }],
+            // The buyer is not asked for a shipping address, PayPal rejects the confirmation
+            // of a guest payment on an order that still needs one (SHIPPING_ADDRESS_MISSING).
+            application_context: PaypalBcdcApplicationContext {
+                shipping_preference: ShippingPreference::NoShipping,
+            },
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PaypalBcdcOrderResponse {
+    id: String,
+}
+
+impl
+    TryFrom<
+        ResponseRouterData<
+            CreateOrder,
+            PaypalBcdcOrderResponse,
+            CreateOrderRequestData,
+            PaymentsResponseData,
+        >,
+    > for CreateOrderRouterData
+{
+    type Error = error_stack::Report<errors::ConnectorError>;
+    fn try_from(
+        item: ResponseRouterData<
+            CreateOrder,
+            PaypalBcdcOrderResponse,
+            CreateOrderRequestData,
+            PaymentsResponseData,
+        >,
+    ) -> Result<Self, Self::Error> {
+        Ok(Self {
+            response: Ok(PaymentsResponseData::PaymentsCreateOrderResponse {
+                order_id: item.response.id,
+                session_token: None,
+            }),
+            ..item.data
+        })
+    }
+}
+
+/// Body of `confirm-guest-payment`: the card, the billing address and the buyer.
+#[derive(Debug, Serialize)]
+pub struct PaypalBcdcConfirmRequest {
+    payment_source: PaypalBcdcPaymentSource,
+}
+
+#[derive(Debug, Serialize)]
+struct PaypalBcdcPaymentSource {
+    card: PaypalBcdcCard,
+}
+
+#[derive(Debug, Serialize)]
+struct PaypalBcdcCard {
+    number: cards::CardNumber,
+    expiry: Secret<String>,
+    security_code: Secret<String>,
+    /// Required by PayPal in combo card markets (e.g. BR); omitted when unknown.
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    card_type: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<Secret<String>>,
+    billing_address: PaypalBcdcBillingAddress,
+    attributes: PaypalBcdcCardAttributes,
+}
+
+#[derive(Debug, Serialize)]
+struct PaypalBcdcBillingAddress {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address_line_1: Option<Secret<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address_line_2: Option<Secret<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    admin_area_1: Option<Secret<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    admin_area_2: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    postal_code: Option<Secret<String>>,
+    country_code: enums::CountryAlpha2,
+}
+
+#[derive(Debug, Serialize)]
+struct PaypalBcdcCardAttributes {
+    customer: PaypalBcdcCustomer,
+}
+
+#[derive(Debug, Serialize)]
+struct PaypalBcdcCustomer {
+    name: PaypalBcdcCustomerName,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email_address: Option<Email>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity_document: Option<PaypalBcdcIdentityDocument>,
+}
+
+#[derive(Debug, Serialize)]
+struct PaypalBcdcCustomerName {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    given_name: Option<Secret<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    surname: Option<Secret<String>>,
+}
+
+#[derive(Debug, Serialize)]
+struct PaypalBcdcIdentityDocument {
+    #[serde(rename = "type")]
+    document_type: String,
+    value: Secret<String>,
+}
+
+/// The buyer document (CPF, CNPJ, ...) travels in the payment metadata; PayPal needs it only
+/// in some markets, so it is sent only when both the type and the number are there.
+fn get_bcdc_identity_document(
+    metadata: Option<&serde_json::Value>,
+) -> Option<PaypalBcdcIdentityDocument> {
+    let text = |key: &str| {
+        metadata
+            .and_then(|metadata| metadata.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    Some(PaypalBcdcIdentityDocument {
+        document_type: text(BUYER_DOCUMENT_TYPE_KEY)?.to_string(),
+        value: Secret::new(text(BUYER_DOCUMENT_NUMBER_KEY)?.to_string()),
+    })
+}
+
+/// CREDIT or DEBIT: the payment method type first, the card's own type as fallback.
+fn get_bcdc_card_type(
+    payment_method_type: Option<storage_enums::PaymentMethodType>,
+    card_type: Option<&str>,
+) -> Option<&'static str> {
+    match payment_method_type {
+        Some(storage_enums::PaymentMethodType::Credit) => Some("CREDIT"),
+        Some(storage_enums::PaymentMethodType::Debit) => Some("DEBIT"),
+        _ => card_type.and_then(|card_type| {
+            let card_type = card_type.trim();
+            if card_type.eq_ignore_ascii_case("credit") {
+                Some("CREDIT")
+            } else if card_type.eq_ignore_ascii_case("debit") {
+                Some("DEBIT")
+            } else {
+                None
+            }
+        }),
+    }
+}
+
+impl TryFrom<&PaymentsPreAuthenticateRouterData> for PaypalBcdcConfirmRequest {
+    type Error = error_stack::Report<errors::ConnectorError>;
+    fn try_from(item: &PaymentsPreAuthenticateRouterData) -> Result<Self, Self::Error> {
+        let PaymentMethodData::Card(card) = &item.request.payment_method_data else {
+            return Err(errors::ConnectorError::NotSupported {
+                message: "Payment method".to_string(),
+                connector: "Paypal card guest checkout (BCDC)".into(),
+            }
+            .into());
+        };
+        let billing = item.get_billing_address()?;
+        let country_code = *billing.get_country()?;
+
+        let billing_full_name = item.get_optional_billing_full_name();
+        let given_name = billing.get_optional_first_name();
+        let surname = billing.get_optional_last_name();
+        // Without a billing name the card holder name is split on its first space.
+        let (given_name, surname) = match (given_name, surname) {
+            (None, None) => card
+                .card_holder_name
+                .as_ref()
+                .map(|holder| {
+                    let holder = holder.peek().trim();
+                    match holder.split_once(' ') {
+                        Some((first, rest)) => (
+                            Some(Secret::new(first.to_string())),
+                            Some(Secret::new(rest.trim().to_string())),
+                        ),
+                        None => (Some(Secret::new(holder.to_string())), None),
+                    }
+                })
+                .unwrap_or((None, None)),
+            names => names,
+        };
+
+        let metadata = item.request.metadata.as_ref().map(PeekInterface::peek);
+
+        Ok(Self {
+            payment_source: PaypalBcdcPaymentSource {
+                card: PaypalBcdcCard {
+                    number: card.card_number.clone(),
+                    expiry: card.get_expiry_date_as_yyyymm("-"),
+                    security_code: card.card_cvc.clone(),
+                    card_type: get_bcdc_card_type(
+                        item.request.payment_method_type,
+                        card.card_type.as_deref(),
+                    ),
+                    name: billing_full_name.or_else(|| card.card_holder_name.clone()),
+                    billing_address: PaypalBcdcBillingAddress {
+                        address_line_1: billing.get_optional_line1(),
+                        address_line_2: billing.get_optional_line2(),
+                        admin_area_1: billing.get_optional_state(),
+                        admin_area_2: billing.get_optional_city(),
+                        postal_code: billing.get_optional_zip(),
+                        country_code,
+                    },
+                    attributes: PaypalBcdcCardAttributes {
+                        customer: PaypalBcdcCustomer {
+                            name: PaypalBcdcCustomerName {
+                                given_name,
+                                surname,
+                            },
+                            email_address: item
+                                .request
+                                .email
+                                .clone()
+                                .or_else(|| item.get_optional_billing_email()),
+                            identity_document: get_bcdc_identity_document(metadata),
+                        },
+                    },
+                },
+            },
+        })
+    }
+}
+
+/// Response of `confirm-guest-payment`. Only what the flow needs is read: the payer data of the
+/// guest account stays out of the logs and the stored response.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PaypalBcdcConfirmResponse {
+    id: String,
+    status: PaypalOrderStatus,
+    intent: Option<PaypalPaymentIntent>,
+    #[serde(default)]
+    links: Vec<PaypalLinks>,
+}
+
+impl
+    TryFrom<
+        ResponseRouterData<
+            PreAuthenticate,
+            PaypalBcdcConfirmResponse,
+            PaymentsPreAuthenticateData,
+            PaymentsResponseData,
+        >,
+    > for PaymentsPreAuthenticateRouterData
+{
+    type Error = error_stack::Report<errors::ConnectorError>;
+    fn try_from(
+        item: ResponseRouterData<
+            PreAuthenticate,
+            PaypalBcdcConfirmResponse,
+            PaymentsPreAuthenticateData,
+            PaymentsResponseData,
+        >,
+    ) -> Result<Self, Self::Error> {
+        let order_id = item.response.id;
+        let transaction_response =
+            |redirection_data: Option<RedirectForm>, psync_flow: PaypalPaymentIntent| {
+                PaymentsResponseData::TransactionResponse {
+                    resource_id: ResponseId::ConnectorTransactionId(order_id.clone()),
+                    redirection_data: Box::new(redirection_data),
+                    mandate_reference: Box::new(None),
+                    connector_metadata: Some(serde_json::json!(PaypalMeta {
+                        authorize_id: None,
+                        capture_id: None,
+                        incremental_authorization_id: None,
+                        psync_flow,
+                        next_action: None,
+                        order_id: None,
+                        card_flow: Some(PaypalCardFlow::Bcdc),
+                    })),
+                    network_txn_id: None,
+                    network_txn_link_id: None,
+                    connector_response_reference_id: Some(order_id.clone()),
+                    incremental_authorization_allowed: None,
+                    authentication_data: None,
+                    charges: None,
+                    payment_account_reference: None,
+                }
+            };
+        match item.response.status {
+            // The card is accepted: the order is ready to be captured or authorized.
+            PaypalOrderStatus::Approved => Ok(Self {
+                status: storage_enums::AttemptStatus::AuthenticationSuccessful,
+                response: Ok(transaction_response(
+                    None,
+                    item.response.intent.unwrap_or(PaypalPaymentIntent::Capture),
+                )),
+                ..item.data
+            }),
+            // The issuer asks for 3DS: the shopper completes it on PayPal's page and comes
+            // back to the complete authorize url, where the order is captured or authorized.
+            PaypalOrderStatus::PayerActionRequired => {
+                let link = get_redirect_url(item.response.links)?;
+                let redirection_data =
+                    paypal_threeds_link((link, item.data.request.complete_authorize_url.clone()))?;
+                Ok(Self {
+                    status: storage_enums::AttemptStatus::AuthenticationPending,
+                    // No capture or authorization exists yet, the order itself is synced.
+                    response: Ok(transaction_response(
+                        Some(redirection_data),
+                        PaypalPaymentIntent::Authenticate,
+                    )),
+                    ..item.data
+                })
+            }
+            PaypalOrderStatus::Created
+            | PaypalOrderStatus::Saved
+            | PaypalOrderStatus::Pending
+            | PaypalOrderStatus::Completed
+            | PaypalOrderStatus::Voided
+            | PaypalOrderStatus::Unknown => Ok(Self {
+                status: storage_enums::AttemptStatus::Failure,
+                response: Err(ErrorResponse {
+                    code: NO_ERROR_CODE.to_string(),
+                    message: NO_ERROR_MESSAGE.to_string(),
+                    reason: Some(format!(
+                        "Unexpected order status {:?} after confirming the guest payment",
+                        item.response.status
+                    )),
+                    status_code: item.http_code,
+                    attempt_status: Some(storage_enums::AttemptStatus::Failure),
+                    connector_transaction_id: Some(order_id),
+                    connector_response_reference_id: None,
+                    network_advice_code: None,
+                    network_decline_code: None,
+                    network_error_message: None,
+                    connector_metadata: None,
+                }),
+                ..item.data
+            }),
+        }
+    }
+}
+
+/// Body of the capture and authorize calls of an order: PayPal takes an empty object.
+#[derive(Debug, Serialize)]
+pub struct PaypalEmptyRequest {}
 
 fn get_id_based_on_intent(
     intent: &PaypalPaymentIntent,
@@ -2759,6 +3208,7 @@ where
                     psync_flow: item.response.intent.clone(),
                     next_action: None,
                     order_id: None,
+                    card_flow: None,
                 }),
                 ResponseId::ConnectorTransactionId(item.response.id.clone()),
             ),
@@ -2773,6 +3223,7 @@ where
                     psync_flow: item.response.intent.clone(),
                     next_action: None,
                     order_id: None,
+                    card_flow: None,
                 }),
                 ResponseId::ConnectorTransactionId(item.response.id.clone()),
             ),
@@ -2917,6 +3368,22 @@ fn get_redirect_url(
     Ok(link)
 }
 
+fn is_bcdc_pending_sync(
+    connector_meta: &Option<serde_json::Value>,
+    response: &PaypalRedirectResponse,
+) -> bool {
+    let is_bcdc = connector_meta
+        .clone()
+        .and_then(|meta| serde_json::from_value::<PaypalMeta>(meta).ok())
+        .is_some_and(|meta| meta.card_flow == Some(PaypalCardFlow::Bcdc));
+    is_bcdc
+        && matches!(
+            response.status,
+            PaypalOrderStatus::Created | PaypalOrderStatus::PayerActionRequired
+        )
+        && !response.links.iter().any(|link| link.rel == "payer-action")
+}
+
 impl
     ForeignTryFrom<(
         PaymentsSyncResponseRouterData<PaypalSyncResponse>,
@@ -2936,6 +3403,29 @@ impl
                     response,
                     data: item.data,
                     http_code: item.http_code,
+                })
+            }
+            // A BCDC order waiting for 3DS has no payer-action link when it is read back
+            // (status CREATED, only the approve link): keep it pending, no new redirection.
+            PaypalSyncResponse::PaypalRedirectSyncResponse(response)
+                if is_bcdc_pending_sync(&item.data.request.connector_meta, &response) =>
+            {
+                Ok(Self {
+                    status: storage_enums::AttemptStatus::AuthenticationPending,
+                    response: Ok(PaymentsResponseData::TransactionResponse {
+                        resource_id: ResponseId::ConnectorTransactionId(response.id.clone()),
+                        redirection_data: Box::new(None),
+                        mandate_reference: Box::new(None),
+                        connector_metadata: item.data.request.connector_meta.clone(),
+                        network_txn_id: None,
+                        network_txn_link_id: None,
+                        connector_response_reference_id: Some(response.id),
+                        incremental_authorization_allowed: None,
+                        authentication_data: None,
+                        charges: None,
+                        payment_account_reference: None,
+                    }),
+                    ..item.data
                 })
             }
             PaypalSyncResponse::PaypalRedirectSyncResponse(response) => Self::foreign_try_from((
@@ -2998,6 +3488,7 @@ impl<F, T>
             psync_flow: item.response.intent,
             next_action,
             order_id: None,
+            card_flow: None,
         });
         let purchase_units = item.response.purchase_units.first();
         let connector_response = get_connector_response_with_payer_details(
@@ -3067,6 +3558,7 @@ impl
             psync_flow: item.response.intent,
             next_action: None,
             order_id: None,
+            card_flow: None,
         });
         let purchase_units = item.response.purchase_units.first();
         let connector_response = get_connector_response_with_payer_details(
@@ -3135,6 +3627,7 @@ impl
             psync_flow: item.response.intent,
             next_action,
             order_id: Some(item.response.id.clone()),
+            card_flow: None,
         });
 
         Ok(Self {
@@ -3196,6 +3689,7 @@ impl TryFrom<PaymentsResponseRouterData<PaypalThreeDsResponse>> for PaymentsAuth
             psync_flow: PaypalPaymentIntent::Authenticate, // when there is no capture or auth id present
             next_action: None,
             order_id: None,
+            card_flow: None,
         });
 
         let status = get_order_status(
@@ -3767,6 +4261,7 @@ impl TryFrom<PaymentsCaptureResponseRouterData<PaypalCaptureResponse>>
                     psync_flow: PaypalPaymentIntent::Capture,
                     next_action: None,
                     order_id: None,
+                    card_flow: None,
                 })),
                 network_txn_id: None,
                 network_txn_link_id: None,
@@ -4865,7 +5360,7 @@ mod external_refund_sync_tests {
     const CAPTURE_ID: &str = "3C679366HH908993F";
     const REFUND_ID: &str = "1JU08902781691411";
 
-    fn router_data<Flow, Req, Res>(request: Req) -> RouterData<Flow, Req, Res> {
+    pub(super) fn router_data<Flow, Req, Res>(request: Req) -> RouterData<Flow, Req, Res> {
         RouterData {
             flow: PhantomData,
             merchant_id: common_utils::id_type::MerchantId::default(),
@@ -5587,6 +6082,809 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&context).unwrap(),
             serde_json::json!({"user_action": "PAY_NOW", "shipping_preference": "NO_SHIPPING"})
+        );
+    }
+}
+
+#[cfg(test)]
+mod bcdc_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
+
+    use common_utils::types::{MinorUnit, StringMajorUnitForConnector};
+    use hyperswitch_domain_models::{
+        address::{Address as DomainAddress, AddressDetails},
+        payment_address::PaymentAddress,
+        router_request_types::CompleteAuthorizeData,
+    };
+    use hyperswitch_interfaces::api::{ConnectorSpecifications, CurrentFlowInfo};
+    use serde_json::json;
+
+    use super::{external_refund_sync_tests::router_data, *};
+    use crate::connectors::Paypal;
+
+    const ORDER_ID: &str = "5O190127TN364715T";
+
+    fn amount_100() -> StringMajorUnit {
+        utils::convert_amount(
+            &StringMajorUnitForConnector,
+            MinorUnit::new(10_000),
+            enums::Currency::USD,
+        )
+        .unwrap()
+    }
+
+    fn card() -> hyperswitch_domain_models::payment_method_data::Card {
+        hyperswitch_domain_models::payment_method_data::Card {
+            card_number: cards::CardNumber::try_from("4032032941822931".to_string()).unwrap(),
+            card_exp_month: Secret::new("01".to_string()),
+            card_exp_year: Secret::new("2029".to_string()),
+            card_cvc: Secret::new("321".to_string()),
+            card_issuer: None,
+            card_network: None,
+            card_type: None,
+            card_subtype: None,
+            card_segment_type: None,
+            funding_source: None,
+            card_issuing_country: None,
+            card_issuing_country_code: None,
+            bank_code: None,
+            nick_name: None,
+            card_holder_name: Some(Secret::new("Jane Doe".to_string())),
+            co_badged_card_data: None,
+        }
+    }
+
+    fn billing() -> DomainAddress {
+        DomainAddress {
+            address: Some(AddressDetails {
+                city: Some("Sao Paulo".to_string()),
+                country: Some(enums::CountryAlpha2::BR),
+                line1: Some(Secret::new("Av Paulista 1000".to_string())),
+                line2: Some(Secret::new("Apto 12".to_string())),
+                line3: None,
+                zip: Some(Secret::new("01310-100".to_string())),
+                state: Some(Secret::new("SP".to_string())),
+                first_name: Some(Secret::new("Jane".to_string())),
+                last_name: Some(Secret::new("Doe".to_string())),
+                origin_zip: None,
+            }),
+            phone: None,
+            email: None,
+        }
+    }
+
+    fn metadata(entries: serde_json::Value) -> Option<serde_json::Value> {
+        Some(entries)
+    }
+
+    fn bcdc_metadata() -> Option<serde_json::Value> {
+        metadata(json!({"paypal_card_flow": "bcdc"}))
+    }
+
+    fn authorize_data(
+        payment_method_data: PaymentMethodData,
+        metadata: Option<serde_json::Value>,
+    ) -> PaymentsAuthorizeData {
+        PaymentsAuthorizeData {
+            currency: enums::Currency::USD,
+            payment_method_data,
+            confirm: true,
+            mandate_id: None,
+            setup_future_usage: None,
+            off_session: None,
+            setup_mandate_details: None,
+            router_return_url: None,
+            email: None,
+            customer_name: None,
+            amount: 10_000,
+            order_tax_amount: None,
+            minor_amount: MinorUnit::new(10_000),
+            capture_method: Some(enums::CaptureMethod::Automatic),
+            webhook_url: None,
+            complete_authorize_url: Some("https://hs.example/complete".to_string()),
+            browser_info: None,
+            order_details: None,
+            order_category: None,
+            session_token: None,
+            enrolled_for_3ds: false,
+            related_transaction_id: None,
+            payment_experience: None,
+            payment_method_type: None,
+            customer_id: None,
+            surcharge_details: None,
+            request_extended_authorization: None,
+            request_incremental_authorization: false,
+            metadata,
+            authentication_data: None,
+            ucs_authentication_data: None,
+            force_3ds_challenge: None,
+            customer_acceptance: None,
+            split_payments: None,
+            guest_customer: None,
+            merchant_order_reference_id: None,
+            integrity_object: None,
+            additional_payment_method_data: None,
+            shipping_cost: None,
+            merchant_account_id: None,
+            merchant_config_currency: None,
+            connector_testing_data: None,
+            order_id: None,
+            locale: None,
+            payment_channel: None,
+            enable_partial_authorization: None,
+            enable_overcapture: None,
+            is_stored_credential: None,
+            mit_category: None,
+            billing_descriptor: None,
+            tokenization: None,
+            partner_merchant_identifier_details: None,
+            feature_metadata: None,
+            installment_details: None,
+            is_account_funded_transaction: None,
+            recipient_details: None,
+            business_country: None,
+            connector_intent_metadata: None,
+        }
+    }
+
+    fn authorize_flow(request: PaymentsAuthorizeData) -> CurrentFlowInfo {
+        CurrentFlowInfo::Authorize {
+            auth_type: enums::AuthenticationType::NoThreeDs,
+            request_data: Box::new(request),
+        }
+    }
+
+    fn complete_authorize_data(
+        connector_meta: Option<serde_json::Value>,
+        metadata: Option<serde_json::Value>,
+    ) -> CompleteAuthorizeData {
+        CompleteAuthorizeData {
+            payment_method_data: Some(PaymentMethodData::Card(card())),
+            amount: 10_000,
+            email: None,
+            currency: enums::Currency::USD,
+            confirm: true,
+            statement_descriptor_suffix: None,
+            capture_method: Some(enums::CaptureMethod::Automatic),
+            setup_future_usage: None,
+            mandate_id: None,
+            off_session: None,
+            setup_mandate_details: None,
+            redirect_response: None,
+            browser_info: None,
+            connector_transaction_id: Some(ORDER_ID.to_string()),
+            connector_meta,
+            complete_authorize_url: None,
+            metadata,
+            customer_acceptance: None,
+            request_incremental_authorization: false,
+            authentication_data: None,
+            payment_method_type: None,
+            minor_amount: MinorUnit::new(10_000),
+            merchant_account_id: None,
+            merchant_config_currency: None,
+            threeds_method_comp_ind: None,
+            is_stored_credential: None,
+            tokenization: None,
+            router_return_url: None,
+            merchant_order_reference_id: None,
+            is_account_funded_transaction: None,
+            recipient_details: None,
+            business_country: None,
+            connector_intent_metadata: None,
+            order_id: None,
+            force_3ds_challenge: None,
+            enable_overcapture: None,
+        }
+    }
+
+    fn complete_authorize_flow(request: CompleteAuthorizeData) -> CurrentFlowInfo {
+        CurrentFlowInfo::CompleteAuthorize {
+            auth_type: enums::AuthenticationType::NoThreeDs,
+            request_data: Box::new(request),
+            payment_method: Some(enums::PaymentMethod::Card),
+        }
+    }
+
+    fn paypal_meta(card_flow: Option<PaypalCardFlow>) -> serde_json::Value {
+        serde_json::to_value(PaypalMeta {
+            authorize_id: None,
+            capture_id: None,
+            incremental_authorization_id: None,
+            psync_flow: PaypalPaymentIntent::Authenticate,
+            next_action: None,
+            order_id: None,
+            card_flow,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn the_hooks_are_off_without_the_selector() {
+        let paypal = Paypal::new();
+        let flow = authorize_flow(authorize_data(PaymentMethodData::Card(card()), None));
+        assert!(!paypal.is_order_create_flow_required(flow.clone()));
+        assert!(!paypal.is_pre_authentication_flow_required(flow));
+
+        let other = authorize_flow(authorize_data(
+            PaymentMethodData::Card(card()),
+            metadata(json!({"paypal_card_flow": "acdc"})),
+        ));
+        assert!(!paypal.is_order_create_flow_required(other.clone()));
+        assert!(!paypal.is_pre_authentication_flow_required(other));
+    }
+
+    #[test]
+    fn the_hooks_are_on_for_a_card_with_the_selector() {
+        let paypal = Paypal::new();
+        let flow = authorize_flow(authorize_data(
+            PaymentMethodData::Card(card()),
+            bcdc_metadata(),
+        ));
+        assert!(paypal.is_order_create_flow_required(flow.clone()));
+        assert!(paypal.is_pre_authentication_flow_required(flow));
+    }
+
+    #[test]
+    fn the_hooks_are_off_for_a_wallet_even_with_the_selector() {
+        let paypal = Paypal::new();
+        let wallet = PaymentMethodData::Wallet(WalletData::PaypalRedirect(
+            hyperswitch_domain_models::payment_method_data::PaypalRedirection { email: None },
+        ));
+        let flow = authorize_flow(authorize_data(wallet, bcdc_metadata()));
+        assert!(!paypal.is_order_create_flow_required(flow.clone()));
+        assert!(!paypal.is_pre_authentication_flow_required(flow));
+    }
+
+    #[test]
+    fn the_hooks_ignore_the_other_flows() {
+        let paypal = Paypal::new();
+        let flow = complete_authorize_flow(complete_authorize_data(None, bcdc_metadata()));
+        assert!(!paypal.is_order_create_flow_required(flow.clone()));
+        assert!(!paypal.is_pre_authentication_flow_required(flow));
+    }
+
+    #[test]
+    fn the_post_authentication_check_stays_for_acdc_and_is_skipped_for_bcdc() {
+        let paypal = Paypal::new();
+        // ACDC: no marker, no selector.
+        assert!(
+            paypal.is_post_authentication_flow_required(complete_authorize_flow(
+                complete_authorize_data(Some(paypal_meta(None)), None)
+            ))
+        );
+        // BCDC: the marker stored with the pre authentication response.
+        assert!(
+            !paypal.is_post_authentication_flow_required(complete_authorize_flow(
+                complete_authorize_data(Some(paypal_meta(Some(PaypalCardFlow::Bcdc))), None)
+            ))
+        );
+        // BCDC: the selector, when the marker is not there.
+        assert!(
+            !paypal.is_post_authentication_flow_required(complete_authorize_flow(
+                complete_authorize_data(None, bcdc_metadata())
+            ))
+        );
+    }
+
+    #[test]
+    fn the_marker_is_not_written_for_acdc_metadata() {
+        assert!(!paypal_meta(None)
+            .as_object()
+            .unwrap()
+            .contains_key("card_flow"));
+        assert_eq!(paypal_meta(Some(PaypalCardFlow::Bcdc))["card_flow"], "bcdc");
+    }
+
+    fn create_order_data(capture_method: enums::CaptureMethod) -> CreateOrderRequestData {
+        CreateOrderRequestData {
+            minor_amount: MinorUnit::new(10_000),
+            currency: enums::Currency::USD,
+            payment_method_data: None,
+            order_details: None,
+            webhook_url: None,
+            payment_method_type: None,
+            router_return_url: None,
+            setup_mandate_details: None,
+            capture_method: Some(capture_method),
+        }
+    }
+
+    fn create_order_router_data(capture_method: enums::CaptureMethod) -> CreateOrderRouterData {
+        let mut data = router_data(create_order_data(capture_method));
+        data.connector_auth_type = ConnectorAuthType::BodyKey {
+            api_key: Secret::new("secret".to_string()),
+            key1: Secret::new("client".to_string()),
+        };
+        data
+    }
+
+    #[test]
+    fn the_order_has_no_payment_source_and_asks_for_no_shipping() {
+        let data = create_order_router_data(enums::CaptureMethod::Automatic);
+        let request = PaypalBcdcOrderRequest::try_from((&data, amount_100())).unwrap();
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            json!({
+                "intent": "CAPTURE",
+                "purchase_units": [{
+                    "reference_id": "pay_1_1",
+                    "invoice_id": "pay_1_1",
+                    "amount": {"currency_code": "USD", "value": "100.00"}
+                }],
+                "application_context": {"shipping_preference": "NO_SHIPPING"}
+            })
+        );
+    }
+
+    #[test]
+    fn the_order_intent_follows_the_capture_method() {
+        let data = create_order_router_data(enums::CaptureMethod::Manual);
+        let request = PaypalBcdcOrderRequest::try_from((&data, amount_100())).unwrap();
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["intent"],
+            "AUTHORIZE"
+        );
+    }
+
+    #[test]
+    fn the_order_is_not_created_for_a_card_that_would_be_vaulted() {
+        let mut data = create_order_router_data(enums::CaptureMethod::Automatic);
+        data.request.setup_mandate_details = Some(Default::default());
+        assert!(PaypalBcdcOrderRequest::try_from((&data, amount_100())).is_err());
+    }
+
+    #[test]
+    fn saving_the_card_for_off_session_is_rejected() {
+        assert!(reject_bcdc_mandate(Some(enums::FutureUsage::OffSession)).is_err());
+        assert!(reject_bcdc_mandate(Some(enums::FutureUsage::OnSession)).is_ok());
+        assert!(reject_bcdc_mandate(None).is_ok());
+    }
+
+    fn pre_authenticate_router_data(
+        metadata: Option<serde_json::Value>,
+    ) -> PaymentsPreAuthenticateRouterData {
+        let mut data = router_data(PaymentsPreAuthenticateData {
+            payment_method_data: PaymentMethodData::Card(card()),
+            order_id: Some(ORDER_ID.to_string()),
+            amount: 10_000,
+            email: Some(Email::try_from("jane@example.com".to_string()).unwrap()),
+            capture_method: Some(enums::CaptureMethod::Automatic),
+            currency: Some(enums::Currency::USD),
+            payment_method_type: None,
+            router_return_url: None,
+            complete_authorize_url: Some("https://hs.example/complete".to_string()),
+            browser_info: None,
+            enrolled_for_3ds: false,
+            customer_name: None,
+            metadata: metadata.map(Secret::new),
+            minor_amount: MinorUnit::new(10_000),
+            webhook_url: None,
+        });
+        data.address = PaymentAddress::new(None, Some(billing()), None, None);
+        data
+    }
+
+    #[test]
+    fn the_confirmation_carries_the_card_the_billing_and_the_buyer() {
+        let data = pre_authenticate_router_data(None);
+        let request = PaypalBcdcConfirmRequest::try_from(&data).unwrap();
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            json!({"payment_source": {"card": {
+                "number": "4032032941822931",
+                "expiry": "2029-01",
+                "security_code": "321",
+                "name": "Jane Doe",
+                "billing_address": {
+                    "address_line_1": "Av Paulista 1000",
+                    "address_line_2": "Apto 12",
+                    "admin_area_1": "SP",
+                    "admin_area_2": "Sao Paulo",
+                    "postal_code": "01310-100",
+                    "country_code": "BR"
+                },
+                "attributes": {"customer": {
+                    "name": {"given_name": "Jane", "surname": "Doe"},
+                    "email_address": "jane@example.com"
+                }}
+            }}})
+        );
+    }
+
+    #[test]
+    fn the_identity_document_needs_both_metadata_keys() {
+        let both = pre_authenticate_router_data(Some(json!({
+            "buyer_document_type": "CPF",
+            "buyer_document_number": "390.533.447-05"
+        })));
+        let body =
+            serde_json::to_value(PaypalBcdcConfirmRequest::try_from(&both).unwrap()).unwrap();
+        assert_eq!(
+            body["payment_source"]["card"]["attributes"]["customer"]["identity_document"],
+            json!({"type": "CPF", "value": "390.533.447-05"})
+        );
+
+        for partial in [
+            json!({"buyer_document_type": "CPF"}),
+            json!({"buyer_document_number": "390.533.447-05"}),
+            json!({"buyer_document_type": "CPF", "buyer_document_number": "  "}),
+        ] {
+            let data = pre_authenticate_router_data(Some(partial));
+            let body =
+                serde_json::to_value(PaypalBcdcConfirmRequest::try_from(&data).unwrap()).unwrap();
+            assert!(body["payment_source"]["card"]["attributes"]["customer"]
+                .get("identity_document")
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn the_confirmation_needs_the_billing_country() {
+        let mut data = pre_authenticate_router_data(None);
+        let mut billing = billing();
+        billing.address.as_mut().unwrap().country = None;
+        data.address = PaymentAddress::new(None, Some(billing), None, None);
+        assert!(PaypalBcdcConfirmRequest::try_from(&data).is_err());
+    }
+
+    #[test]
+    fn the_card_type_is_sent_for_credit_and_debit_and_omitted_when_unknown() {
+        use storage_enums::PaymentMethodType::{Credit, Debit};
+        let body = |pmt, card_type: Option<&str>| {
+            let mut data = pre_authenticate_router_data(None);
+            data.request.payment_method_type = pmt;
+            if let PaymentMethodData::Card(card) = &mut data.request.payment_method_data {
+                card.card_type = card_type.map(str::to_string);
+            }
+            serde_json::to_value(PaypalBcdcConfirmRequest::try_from(&data).unwrap()).unwrap()
+                ["payment_source"]["card"]
+                .get("type")
+                .cloned()
+        };
+        assert_eq!(body(Some(Credit), None), Some(json!("CREDIT")));
+        assert_eq!(body(Some(Debit), Some("credit")), Some(json!("DEBIT")));
+        assert_eq!(body(None, Some("Debit")), Some(json!("DEBIT")));
+        assert_eq!(body(None, Some(" CREDIT ")), Some(json!("CREDIT")));
+        assert_eq!(body(None, None), None);
+        assert_eq!(body(None, Some("prepaid")), None);
+    }
+
+    fn sync_data(connector_meta: Option<serde_json::Value>) -> PaymentsSyncRouterData {
+        router_data(PaymentsSyncData {
+            connector_transaction_id: ResponseId::ConnectorTransactionId(ORDER_ID.to_string()),
+            encoded_data: None,
+            capture_method: None,
+            connector_meta,
+            sync_type:
+                hyperswitch_domain_models::router_request_types::SyncRequestType::SinglePaymentSync,
+            mandate_id: None,
+            payment_method_type: None,
+            currency: enums::Currency::USD,
+            payment_experience: None,
+            split_payments: None,
+            amount: MinorUnit::new(10_000),
+            integrity_object: None,
+            connector_reference_id: None,
+            setup_future_usage: None,
+            feature_metadata: None,
+            connector_mandate_id: None,
+            enable_partial_authorization: None,
+            is_overcapture_enabled: None,
+        })
+    }
+
+    /// `GET v2/checkout/orders/{id}` of a BCDC order that is waiting for 3DS.
+    fn created_order() -> serde_json::Value {
+        json!({
+            "id": ORDER_ID,
+            "intent": "CAPTURE",
+            "status": "CREATED",
+            "purchase_units": [{"reference_id": "pay_1_1", "invoice_id": "pay_1_1"}],
+            "links": [
+                {"href": "https://api.sandbox.paypal.com/v2/checkout/orders/5O190127TN364715T", "rel": "self", "method": "GET"},
+                {"href": "https://www.sandbox.paypal.com/checkoutnow?token=5O190127TN364715T", "rel": "approve", "method": "GET"},
+                {"href": "https://api.sandbox.paypal.com/v2/checkout/orders/5O190127TN364715T", "rel": "update", "method": "PATCH"},
+                {"href": "https://api.sandbox.paypal.com/v2/checkout/orders/5O190127TN364715T/capture", "rel": "capture", "method": "POST"}
+            ]
+        })
+    }
+
+    fn sync(
+        connector_meta: Option<serde_json::Value>,
+    ) -> Result<PaymentsSyncRouterData, error_stack::Report<errors::ConnectorError>> {
+        let response: PaypalSyncResponse = serde_json::from_value(created_order()).unwrap();
+        assert!(matches!(
+            response,
+            PaypalSyncResponse::PaypalRedirectSyncResponse(_)
+        ));
+        PaymentsSyncRouterData::foreign_try_from((
+            ResponseRouterData {
+                response,
+                data: sync_data(connector_meta),
+                http_code: 200,
+            },
+            None,
+        ))
+    }
+
+    #[test]
+    fn a_bcdc_order_pending_3ds_syncs_as_authentication_pending() {
+        let result = sync(Some(paypal_meta(Some(PaypalCardFlow::Bcdc)))).unwrap();
+        assert_eq!(
+            result.status,
+            storage_enums::AttemptStatus::AuthenticationPending
+        );
+        match result.response.unwrap() {
+            PaymentsResponseData::TransactionResponse {
+                resource_id,
+                redirection_data,
+                connector_metadata,
+                ..
+            } => {
+                assert!(matches!(
+                    resource_id,
+                    ResponseId::ConnectorTransactionId(id) if id == ORDER_ID
+                ));
+                assert!(redirection_data.is_none());
+                assert_eq!(connector_metadata.unwrap()["card_flow"], "bcdc");
+            }
+            other => panic!("unexpected response {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_redirect_sync_without_the_bcdc_marker_behaves_as_before() {
+        // No payer-action link: the shared redirect conversion still errors for ACDC/wallets.
+        assert!(sync(Some(paypal_meta(None))).is_err());
+        assert!(sync(None).is_err());
+    }
+
+    fn confirm_response(body: serde_json::Value) -> PaypalBcdcConfirmResponse {
+        serde_json::from_value(body).unwrap()
+    }
+
+    fn pre_authenticate_result(body: serde_json::Value) -> PaymentsPreAuthenticateRouterData {
+        PaymentsPreAuthenticateRouterData::try_from(ResponseRouterData {
+            response: confirm_response(body),
+            data: pre_authenticate_router_data(None),
+            http_code: 200,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn an_approved_order_continues_without_redirection() {
+        // The guest payer data of PayPal is part of the real answer and must be tolerated.
+        let result = pre_authenticate_result(json!({
+            "id": ORDER_ID,
+            "intent": "CAPTURE",
+            "status": "APPROVED",
+            "payment_source": {"paypal": {"account_status": "UNVERIFIED"}},
+            "payer": {"email_address": "guest@example.com"}
+        }));
+        assert_eq!(
+            result.status,
+            storage_enums::AttemptStatus::AuthenticationSuccessful
+        );
+        match result.response.unwrap() {
+            PaymentsResponseData::TransactionResponse {
+                resource_id,
+                redirection_data,
+                connector_metadata,
+                ..
+            } => {
+                assert!(matches!(
+                    resource_id,
+                    ResponseId::ConnectorTransactionId(id) if id == ORDER_ID
+                ));
+                assert!(redirection_data.is_none());
+                assert_eq!(connector_metadata.unwrap()["card_flow"], "bcdc");
+            }
+            other => panic!("unexpected response {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_order_that_needs_3ds_redirects_to_the_payer_action_link() {
+        let result = pre_authenticate_result(json!({
+            "id": ORDER_ID,
+            "status": "PAYER_ACTION_REQUIRED",
+            "links": [
+                {"rel": "self", "href": "https://api.sandbox.paypal.com/v2/checkout/orders/5O190127TN364715T"},
+                {"rel": "payer-action", "method": "GET",
+                 "href": "https://www.sandbox.paypal.com/heliosnext/threeDS?action=verify&flow=3ds&cart_id=5O190127TN364715T"}
+            ]
+        }));
+        assert_eq!(
+            result.status,
+            storage_enums::AttemptStatus::AuthenticationPending
+        );
+        match result.response.unwrap() {
+            PaymentsResponseData::TransactionResponse {
+                resource_id,
+                redirection_data,
+                connector_metadata,
+                ..
+            } => {
+                assert!(matches!(
+                    resource_id,
+                    ResponseId::ConnectorTransactionId(id) if id == ORDER_ID
+                ));
+                match *redirection_data {
+                    Some(RedirectForm::Form {
+                        endpoint,
+                        method,
+                        form_fields,
+                    }) => {
+                        assert_eq!(
+                            endpoint,
+                            "https://www.sandbox.paypal.com/heliosnext/threeDS"
+                        );
+                        assert_eq!(method, Method::Get);
+                        assert_eq!(form_fields["cart_id"], ORDER_ID);
+                        assert_eq!(form_fields["flow"], "3ds");
+                        assert_eq!(form_fields["redirect_uri"], "https://hs.example/complete");
+                    }
+                    other => panic!("unexpected redirection {other:?}"),
+                }
+                let meta = connector_metadata.unwrap();
+                assert_eq!(meta["card_flow"], "bcdc");
+                assert_eq!(meta["psync_flow"], "AUTHENTICATE");
+            }
+            other => panic!("unexpected response {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_3ds_order_without_the_payer_action_link_is_an_error() {
+        let result = PaymentsPreAuthenticateRouterData::try_from(ResponseRouterData {
+            response: confirm_response(json!({
+                "id": ORDER_ID,
+                "status": "PAYER_ACTION_REQUIRED",
+                "links": [{"rel": "self", "href": "https://api.sandbox.paypal.com/v2/checkout/orders/x"}]
+            })),
+            data: pre_authenticate_router_data(None),
+            http_code: 200,
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn an_order_in_another_status_fails_the_payment() {
+        let result = pre_authenticate_result(json!({"id": ORDER_ID, "status": "CREATED"}));
+        assert_eq!(result.status, storage_enums::AttemptStatus::Failure);
+        assert!(result.response.is_err());
+    }
+
+    #[test]
+    fn the_create_order_response_gives_the_order_id() {
+        let data = create_order_router_data(enums::CaptureMethod::Automatic);
+        let result = CreateOrderRouterData::try_from(ResponseRouterData {
+            response: serde_json::from_value::<PaypalBcdcOrderResponse>(
+                json!({"id": ORDER_ID, "status": "CREATED", "links": []}),
+            )
+            .unwrap(),
+            data,
+            http_code: 201,
+        })
+        .unwrap();
+        assert!(matches!(
+            result.response,
+            Ok(PaymentsResponseData::PaymentsCreateOrderResponse { order_id, session_token: None })
+                if order_id == ORDER_ID
+        ));
+    }
+
+    #[test]
+    fn an_unprocessable_confirmation_is_mapped_from_the_order_error_shape() {
+        let body = json!({
+            "name": "UNPROCESSABLE_ENTITY",
+            "message": "The requested action could not be performed, semantically incorrect, or failed business validation.",
+            "debug_id": "abc123",
+            "details": [{
+                "issue": "MERCHANT_NOT_WHITELISTED",
+                "description": "Merchant is not eligible for guest payment in this market"
+            }]
+        });
+        let response = hyperswitch_interfaces::types::Response {
+            headers: None,
+            response: serde_json::to_vec(&body).unwrap().into(),
+            status_code: 422,
+        };
+        let error = Paypal::new()
+            .get_order_error_response(response, None)
+            .unwrap();
+        assert_eq!(error.status_code, 422);
+        assert_eq!(error.code, "MERCHANT_NOT_WHITELISTED");
+        assert_eq!(error.connector_transaction_id.as_deref(), Some("abc123"));
+        assert!(error
+            .reason
+            .unwrap()
+            .contains("Merchant is not eligible for guest payment in this market"));
+    }
+
+    #[test]
+    fn the_settle_call_of_an_order_sends_an_empty_object() {
+        assert_eq!(
+            serde_json::to_value(PaypalEmptyRequest {}).unwrap(),
+            json!({})
+        );
+    }
+
+    fn acdc_router_data() -> PaymentsAuthorizeRouterData {
+        let mut data = router_data(authorize_data(PaymentMethodData::Card(card()), None));
+        data.connector_auth_type = ConnectorAuthType::BodyKey {
+            api_key: Secret::new("secret".to_string()),
+            key1: Secret::new("client".to_string()),
+        };
+        data.address = PaymentAddress::new(None, Some(billing()), None, None);
+        data
+    }
+
+    #[test]
+    fn a_card_without_the_selector_keeps_the_acdc_request() {
+        let data = acdc_router_data();
+        let router_data = PaypalRouterData::try_from((
+            amount_100(),
+            Some(
+                utils::convert_amount(
+                    &StringMajorUnitForConnector,
+                    MinorUnit::zero(),
+                    enums::Currency::USD,
+                )
+                .unwrap(),
+            ),
+            None,
+            None,
+            &data,
+        ))
+        .unwrap();
+        let request = PaypalPaymentsRequest::try_from(&router_data).unwrap();
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            json!({
+                "intent": "CAPTURE",
+                "purchase_units": [{
+                    "reference_id": "pay_1_1",
+                    "invoice_id": "pay_1_1",
+                    "custom_id": null,
+                    "amount": {
+                        "currency_code": "USD",
+                        "value": "100.00",
+                        "breakdown": {
+                            "item_total": {"currency_code": "USD", "value": "100.00"},
+                            "tax_total": null,
+                            "shipping": {"currency_code": "USD", "value": "0.00"}
+                        }
+                    },
+                    "shipping": {"address": null, "name": {"full_name": null}},
+                    "items": [{
+                        "name": "Payment for invoice pay_1_1",
+                        "quantity": 1,
+                        "unit_amount": {"currency_code": "USD", "value": "100.00"},
+                        "tax": null
+                    }]
+                }],
+                "payment_source": {"card": {
+                    "billing_address": {
+                        "address_line_1": "Av Paulista 1000",
+                        "postal_code": "01310-100",
+                        "country_code": "BR",
+                        "admin_area_2": "Sao Paulo"
+                    },
+                    "expiry": "2029-01",
+                    "name": "Jane Doe",
+                    "number": "4032032941822931",
+                    "security_code": "321",
+                    "attributes": {"vault": null, "verification": null}
+                }}
+            })
         );
     }
 }
