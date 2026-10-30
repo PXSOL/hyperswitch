@@ -207,8 +207,9 @@ pub(super) fn extract_installments(
 
 // ============================================================================
 // Integrity signature (§5): sha256_hex(reference + amount_in_cents + currency
-// [+ expiration_time] + integrity_secret). Wompi never sends `expiration_time`
-// from this connector, so that optional segment is always empty.
+// [+ expiration_time] + integrity_secret). Only the hosted checkout sends
+// `expiration_time` (see `HOSTED_CHECKOUT_EXPIRATION_SECONDS`); every other
+// flow leaves that optional segment empty.
 // ============================================================================
 
 pub(super) fn build_integrity_signature(
@@ -217,9 +218,26 @@ pub(super) fn build_integrity_signature(
     currency: &str,
     integrity_secret: &Secret<String>,
 ) -> CustomResult<String, errors::ConnectorError> {
+    build_integrity_signature_with_expiration(
+        reference,
+        amount_in_cents,
+        currency,
+        None,
+        integrity_secret,
+    )
+}
+
+pub(super) fn build_integrity_signature_with_expiration(
+    reference: &str,
+    amount_in_cents: MinorUnit,
+    currency: &str,
+    expiration_time: Option<&str>,
+    integrity_secret: &Secret<String>,
+) -> CustomResult<String, errors::ConnectorError> {
     let amount_str = amount_in_cents.get_amount_as_i64().to_string();
+    let expiration_time = expiration_time.unwrap_or_default();
     let message = format!(
-        "{reference}{amount_str}{currency}{}",
+        "{reference}{amount_str}{currency}{expiration_time}{}",
         integrity_secret.clone().expose()
     );
     let digest = Sha256
@@ -930,6 +948,32 @@ pub(super) fn transaction_to_router_data<F, T>(
 
 pub const WOMPI_CHECKOUT_ENDPOINT: &str = "https://checkout.wompi.co/p/";
 
+// How long the hosted checkout stays payable. Without `expiration-time` it never
+// expires, so a buyer could pay after api2's pending-transactions cron
+// (channel-scripts `cancel_pending_transactions.php`) already cancelled the row,
+// and nothing re-reads a cancelled row. Past this time Wompi refuses to create
+// the transaction (verified live 2026-10-30: 422 `expiration_time` "El tiempo
+// para iniciar la transacción ha expirado"). That cron's minimum age for
+// `wompicheckout` must stay above this window.
+pub(super) const HOSTED_CHECKOUT_EXPIRATION_SECONDS: i64 = 30 * 60;
+
+/// `expiration-time` for a hosted checkout created at `now`: ISO 8601 UTC with
+/// milliseconds (`2023-06-09T20:28:50.000Z`), the exact shape Wompi documents.
+/// The same string goes into the integrity signature.
+pub(super) fn hosted_checkout_expiration_time(now: time::OffsetDateTime) -> String {
+    let expires_at = (now + time::Duration::seconds(HOSTED_CHECKOUT_EXPIRATION_SECONDS))
+        .to_offset(time::UtcOffset::UTC);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.000Z",
+        expires_at.year(),
+        u8::from(expires_at.month()),
+        expires_at.day(),
+        expires_at.hour(),
+        expires_at.minute(),
+        expires_at.second()
+    )
+}
+
 /// Authorize is the only flow that produces this response shape (a merchant
 /// lookup used to build the hosted-checkout redirect), so this conversion is
 /// written concretely against `PaymentsAuthorizeData` rather than behind a
@@ -973,8 +1017,15 @@ impl
         let amount_in_cents = item.data.request.minor_amount;
         let integrity_secret =
             WompiAuthType::try_from(&item.data.connector_auth_type)?.integrity_secret;
-        let signature =
-            build_integrity_signature(&reference, amount_in_cents, &currency, &integrity_secret)?;
+        let expiration_time =
+            hosted_checkout_expiration_time(common_utils::date_time::now().assume_utc());
+        let signature = build_integrity_signature_with_expiration(
+            &reference,
+            amount_in_cents,
+            &currency,
+            Some(&expiration_time),
+            &integrity_secret,
+        )?;
 
         let public_key = WompiAuthType::try_from(&item.data.connector_auth_type)?
             .public_key
@@ -989,6 +1040,7 @@ impl
         );
         form_fields.insert("reference".to_string(), reference.clone());
         form_fields.insert("signature:integrity".to_string(), signature);
+        form_fields.insert("expiration-time".to_string(), expiration_time);
 
         // The buyer returns to Hyperswitch's own redirect-response endpoint
         // (router_return_url) exactly as the MercadoPago Checkout Pro hosted
@@ -3227,6 +3279,61 @@ mod tests {
         assert_eq!(signature, hex::encode(manual_digest));
     }
 
+    #[test]
+    fn checkout_form_signature_includes_the_expiration_time() {
+        let reference = "attempt_ref_123";
+        let amount = MinorUnit::new(9500000);
+        let secret = Secret::new("test_integrity_secret_value".to_string());
+        let expiration_time = "2026-10-30T15:30:00.000Z";
+        let signature = build_integrity_signature_with_expiration(
+            reference,
+            amount,
+            "COP",
+            Some(expiration_time),
+            &secret,
+        )
+        .unwrap();
+
+        // Wompi §5: reference + amount + currency + expiration_time + secret.
+        let manual_message = format!(
+            "{reference}{}COP{expiration_time}{}",
+            amount.get_amount_as_i64(),
+            secret.clone().expose()
+        );
+        let manual_digest = Sha256.generate_digest(manual_message.as_bytes()).unwrap();
+        assert_eq!(signature, hex::encode(manual_digest));
+        assert_ne!(
+            signature,
+            build_integrity_signature(reference, amount, "COP", &secret).unwrap()
+        );
+    }
+
+    #[test]
+    fn hosted_checkout_expiration_time_is_thirty_minutes_later_in_utc() {
+        let now = time::OffsetDateTime::parse(
+            "2026-10-30T10:45:12.987-05:00",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        assert_eq!(
+            hosted_checkout_expiration_time(now),
+            "2026-10-30T16:15:12.000Z"
+        );
+    }
+
+    #[test]
+    fn hosted_checkout_expiration_time_rolls_over_the_day() {
+        let now = time::OffsetDateTime::parse(
+            "2026-12-31T23:45:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        assert_eq!(
+            hosted_checkout_expiration_time(now),
+            "2027-01-01T00:15:00.000Z"
+        );
+    }
+
     // ------------------------------------------------------------------
     // Webhook object reference: SIGNED data only (see `webhook_payment_reference`)
     // ------------------------------------------------------------------
@@ -4067,8 +4174,10 @@ mod tests {
             http_code: 200,
         };
 
+        let before = common_utils::date_time::now().assume_utc();
         let result = PaymentsAuthorizeRouterData::try_from(response_router_data)
             .expect("hosted checkout conversion must succeed");
+        let after = common_utils::date_time::now().assume_utc();
 
         assert_eq!(result.status, enums::AttemptStatus::AuthenticationPending);
 
@@ -4095,10 +4204,23 @@ mod tests {
                         form_fields.get("reference"),
                         Some(&"wompi-test-ref-7".to_string())
                     );
-                    let expected_signature = build_integrity_signature(
+                    let expiration_time = form_fields
+                        .get("expiration-time")
+                        .expect("the hosted checkout must expire");
+                    let expires_at = time::OffsetDateTime::parse(
+                        expiration_time,
+                        &time::format_description::well_known::Rfc3339,
+                    )
+                    .expect("expiration-time must be ISO 8601");
+                    let window = time::Duration::seconds(HOSTED_CHECKOUT_EXPIRATION_SECONDS);
+                    // Whole seconds: the fraction is always `.000`.
+                    assert!(expires_at >= (before + window).replace_nanosecond(0).unwrap());
+                    assert!(expires_at <= after + window);
+                    let expected_signature = build_integrity_signature_with_expiration(
                         "wompi-test-ref-7",
                         MinorUnit::new(150000),
                         "COP",
+                        Some(expiration_time),
                         &Secret::new("test_integrity_x".to_string()),
                     )
                     .unwrap();
