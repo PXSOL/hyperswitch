@@ -473,6 +473,20 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Izi
         req: &PaymentsSyncRouterData,
         connectors: &Connectors,
     ) -> CustomResult<Option<Request>, errors::ConnectorError> {
+        // The buyer came back from a bridge page that could not open Izipay's checkout. The
+        // status check below still decides the outcome; this makes the reason findable by
+        // payment id (it is the only point that always has both, also when Izipay answers 403).
+        if let Some(sdk_error) =
+            izipay::IzipaySdkError::from_return_query(req.request.encoded_data.as_deref())
+        {
+            router_env::logger::warn!(
+                payment_id = %req.payment_id,
+                error_code = izipay::SDK_ERROR_CODE,
+                sdk_error_reason = %sdk_error.reason,
+                sdk_error_detail = sdk_error.detail.as_deref().unwrap_or(""),
+                "Izipay bridge page could not open the checkout"
+            );
+        }
         Ok(Some(
             RequestBuilder::new()
                 .method(Method::Post)
