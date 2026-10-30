@@ -838,16 +838,17 @@ fn sanitize_sdk_error_detail(value: &str) -> Option<String> {
     (!truncated.is_empty()).then_some(truncated)
 }
 
-/// The attempt statuses in which Izipay has not reported any payment: a page that gave up is
-/// only believed then; a payment Izipay reports as charged (or denied, or voided) wins.
+/// The attempt statuses in which Izipay has no order for the payment (Search answered "does not
+/// exist", so the attempt kept its pre-redirect status): a page that gave up is only believed
+/// then. An order Izipay knows about wins, including one still `Pending` (`map_search_status`
+/// maps every undecided order there): it may settle later, e.g. an asynchronous method or a form
+/// opened in another tab, and must not be failed locally.
 fn is_unpaid_status(status: enums::AttemptStatus) -> bool {
     matches!(
         status,
         enums::AttemptStatus::Started
             | enums::AttemptStatus::AuthenticationPending
-            | enums::AttemptStatus::Pending
             | enums::AttemptStatus::PaymentMethodAwaited
-            | enums::AttemptStatus::ConfirmationAwaited
     )
 }
 
@@ -3482,13 +3483,22 @@ mod tests {
         assert_eq!(error.reason.as_deref(), Some("script load timeout"));
         assert_eq!(error.attempt_status, Some(enums::AttemptStatus::Failure));
 
-        // A pending order (the buyer never paid) is treated the same way.
+        // An order Izipay knows about and still lists as pending may settle later (an
+        // asynchronous method, a form opened in another tab): the marker never fails it.
         let pending = sync_with_return_query(
             r#"{"code":"00","response":{"order":[{"orderNumber":"PX1790971180429","stateMessage":"Pendiente"}]}}"#,
             SDK_ERROR_QUERY,
             enums::AttemptStatus::AuthenticationPending,
         );
-        assert_eq!(pending.response.unwrap_err().code, SDK_ERROR_CODE);
+        assert_eq!(pending.status, enums::AttemptStatus::Pending);
+        assert!(
+            pending
+                .response
+                .as_ref()
+                .err()
+                .map_or(true, |error| error.code != SDK_ERROR_CODE),
+            "a pending Izipay order must not get the SDK error code"
+        );
     }
 
     #[test]
