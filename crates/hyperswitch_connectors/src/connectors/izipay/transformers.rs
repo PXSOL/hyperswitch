@@ -771,6 +771,86 @@ impl TryFrom<&IzipayRouterData<&PaymentsAuthorizeRouterData>> for IzipayTokenReq
     }
 }
 
+/// Value of `izipay_result` the bridge page uses when the Izipay Web SDK could not be opened.
+const SDK_ERROR_RESULT: &str = "sdk_error";
+/// Stable internal error code of a payment whose bridge page gave up opening the SDK.
+pub const SDK_ERROR_CODE: &str = "IZIPAY_SDK_ERROR";
+const MAX_SDK_ERROR_DETAIL_CHARS: usize = 200;
+const MAX_SDK_ERROR_REASON_CHARS: usize = 40;
+
+/// Why the bridge page could not open Izipay's checkout, read back from the return url query
+/// (`izipay_result=sdk_error&izipay_error=..&izipay_error_detail=..`). Both values come from
+/// the buyer's browser, so they are untrusted: they are only logged and stored in internal
+/// error fields, never used for decisions beyond "the page gave up".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IzipaySdkError {
+    pub reason: String,
+    pub detail: Option<String>,
+}
+
+impl IzipaySdkError {
+    /// Reads the raw query string of the return url (what the router keeps as `encoded_data`).
+    pub fn from_return_query(query: Option<&str>) -> Option<Self> {
+        let query = query?.trim_start_matches('?');
+        let mut is_sdk_error = false;
+        let mut reason = None;
+        let mut detail = None;
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            match key.as_ref() {
+                "izipay_result" if value == SDK_ERROR_RESULT => is_sdk_error = true,
+                "izipay_error" => reason = Some(sanitize_sdk_error_reason(&value)),
+                "izipay_error_detail" => detail = sanitize_sdk_error_detail(&value),
+                _ => {}
+            }
+        }
+        is_sdk_error.then(|| Self {
+            reason: reason.unwrap_or_else(|| "unknown".to_string()),
+            detail,
+        })
+    }
+}
+
+/// Machine code: lowercase letters, digits and underscores only.
+fn sanitize_sdk_error_reason(value: &str) -> String {
+    let reason: String = value.chars().take(MAX_SDK_ERROR_REASON_CHARS + 1).collect();
+    let is_valid = !reason.is_empty()
+        && char_len(&reason) <= MAX_SDK_ERROR_REASON_CHARS
+        && reason
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if is_valid {
+        reason
+    } else {
+        "unknown".to_string()
+    }
+}
+
+/// Free text from the browser: control characters dropped, whitespace collapsed, truncated.
+fn sanitize_sdk_error_detail(value: &str) -> Option<String> {
+    let cleaned = value
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let truncated: String = cleaned.chars().take(MAX_SDK_ERROR_DETAIL_CHARS).collect();
+    (!truncated.is_empty()).then_some(truncated)
+}
+
+/// The attempt statuses in which Izipay has not reported any payment: a page that gave up is
+/// only believed then; a payment Izipay reports as charged (or denied, or voided) wins.
+fn is_unpaid_status(status: enums::AttemptStatus) -> bool {
+    matches!(
+        status,
+        enums::AttemptStatus::Started
+            | enums::AttemptStatus::AuthenticationPending
+            | enums::AttemptStatus::Pending
+            | enums::AttemptStatus::PaymentMethodAwaited
+            | enums::AttemptStatus::ConfirmationAwaited
+    )
+}
+
 /// Appends the `izipay_result` marker to the merchant return url (`?` or `&` as needed).
 fn result_url(return_url: &str, result: &str) -> CustomResult<String, errors::ConnectorError> {
     let mut url =
@@ -804,19 +884,106 @@ const CHECKOUT_PAGE_TEMPLATE: &str = r#"<!doctype html>
 <style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;color:#333}</style>
 </head>
 <body>
-<p id="izipay-status">Redirecting to Izipay&hellip;</p>
-<script src="__SDK_URL__"></script>
+<p id="izipay-status">Taking you to the payment page&hellip;</p>
 <script>
 var izipayData = __PAGE_DATA__;
-window.addEventListener('load', function () {
-  try {
-    var checkout = new Izipay({ config: izipayData.config });
-    checkout.LoadForm({ authorization: izipayData.authorization, keyRSA: izipayData.keyRSA });
-  } catch (error) {
-    document.getElementById('izipay-status').textContent = 'The Izipay payment page could not be opened. Returning to the merchant…';
-    setTimeout(function () { window.location.replace(izipayData.sdkErrorUrl); }, 3000);
+(function () {
+  var isSpanish = (navigator.language || '').toLowerCase().indexOf('es') === 0;
+  var texts = isSpanish
+    ? {
+        loading: 'Te estamos llevando a la página de pago…',
+        failed: 'No pudimos abrir la página de pago. Te llevamos de vuelta para que puedas intentarlo de nuevo.'
+      }
+    : {
+        loading: 'Taking you to the payment page…',
+        failed: 'We couldn’t open the payment page. Taking you back so you can try again.'
+      };
+  var statusElement = document.getElementById('izipay-status');
+  if (isSpanish) { document.documentElement.lang = 'es'; }
+  statusElement.textContent = texts.loading;
+
+  var retryDelaysMs = [1000, 2000, 4000];
+  var loadTimeoutMs = 15000;
+  var maxDetailLength = 200;
+  var retries = 0;
+  var opened = false;
+  var givenUp = false;
+
+  function describe(error) {
+    var text = 'script load error';
+    if (typeof error === 'string') {
+      text = error;
+    } else if (error && error.message) {
+      text = (error.name || 'Error') + ': ' + error.message;
+    }
+    [izipayData.authorization, izipayData.keyRSA].forEach(function (secret) {
+      if (secret && typeof secret === 'string') { text = text.split(secret).join('[removed]'); }
+    });
+    return text.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, maxDetailLength);
   }
-});
+
+  function giveUp(code, error) {
+    if (givenUp || opened) { return; }
+    givenUp = true;
+    statusElement.textContent = texts.failed;
+    var url = izipayData.sdkErrorUrl;
+    url += (url.indexOf('?') < 0 ? '?' : '&') + 'izipay_error=' + encodeURIComponent(code) +
+      '&izipay_error_detail=' + encodeURIComponent(describe(error));
+    setTimeout(function () { window.location.replace(url); }, 3000);
+  }
+
+  function retry(code, error) {
+    if (opened || givenUp) { return; }
+    if (retries >= retryDelaysMs.length) { giveUp(code, error); return; }
+    var delay = retryDelaysMs[retries];
+    retries += 1;
+    setTimeout(attempt, delay);
+  }
+
+  function loadSdk(onReady, onFailed) {
+    var settled = false;
+    var script = document.createElement('script');
+    var timer = null;
+    function settle(error) {
+      if (settled) { return; }
+      settled = true;
+      clearTimeout(timer);
+      if (error === null) { onReady(); return; }
+      if (script.parentNode) { script.parentNode.removeChild(script); }
+      onFailed(error);
+    }
+    var url = izipayData.sdkUrl;
+    if (retries > 0) { url += (url.indexOf('?') < 0 ? '?' : '&') + 'retry=' + retries; }
+    script.async = true;
+    script.onload = function () { settle(null); };
+    script.onerror = function () { settle('script load error'); };
+    timer = setTimeout(function () { settle('script load timeout'); }, loadTimeoutMs);
+    script.src = url;
+    document.head.appendChild(script);
+  }
+
+  function openForm() {
+    if (opened) { return; }
+    try {
+      var checkout = new Izipay({ config: izipayData.config });
+      checkout.LoadForm({ authorization: izipayData.authorization, keyRSA: izipayData.keyRSA });
+      opened = true;
+    } catch (error) {
+      retry('sdk_init_failed', error);
+    }
+  }
+
+  function attempt() {
+    if (opened || givenUp) { return; }
+    if (typeof Izipay === 'undefined') {
+      loadSdk(openForm, function (error) { retry('sdk_load_failed', error); });
+    } else {
+      openForm();
+    }
+  }
+
+  attempt();
+})();
 </script>
 </body>
 </html>
@@ -886,12 +1053,11 @@ pub fn build_checkout_page(
         "config": config,
         "authorization": params.session_token,
         "keyRSA": params.key_rsa,
-        "sdkErrorUrl": result_url(return_url, "sdk_error")?,
+        "sdkErrorUrl": result_url(return_url, SDK_ERROR_RESULT)?,
+        "sdkUrl": params.environment.sdk_url(),
     });
 
-    Ok(CHECKOUT_PAGE_TEMPLATE
-        .replace("__SDK_URL__", params.environment.sdk_url())
-        .replace("__PAGE_DATA__", &json_for_script(&page_data)?))
+    Ok(CHECKOUT_PAGE_TEMPLATE.replace("__PAGE_DATA__", &json_for_script(&page_data)?))
 }
 
 /// Token/Generate answered: builds the redirect to the hosted checkout. `amount` is the same
@@ -1117,15 +1283,42 @@ impl TryFrom<PaymentsSyncResponseRouterData<IzipaySearchResponse>> for PaymentsS
             status => status,
         };
 
+        // The bridge page gave up opening the checkout and the buyer came back with
+        // `izipay_result=sdk_error`. Izipay's own answer always wins: only when it reports
+        // nothing paid is the attempt failed with a code we can find.
+        let sdk_error =
+            IzipaySdkError::from_return_query(item.data.request.encoded_data.as_deref())
+                .filter(|_| is_unpaid_status(status));
+        let status = if sdk_error.is_some() {
+            enums::AttemptStatus::Failure
+        } else {
+            status
+        };
+
         let payment_response = if status == enums::AttemptStatus::Failure {
+            let (code, message, reason) = match &sdk_error {
+                Some(sdk_error) => (
+                    SDK_ERROR_CODE.to_string(),
+                    format!(
+                        "The Izipay checkout page could not be opened ({})",
+                        sdk_error.reason
+                    ),
+                    sdk_error.detail.clone(),
+                ),
+                None => (
+                    response.code.clone(),
+                    response
+                        .user_message()
+                        .unwrap_or("Transaction declined")
+                        .to_string(),
+                    response.message.clone(),
+                ),
+            };
             Err(ErrorResponse {
                 status_code: item.http_code,
-                code: response.code.clone(),
-                message: response
-                    .user_message()
-                    .unwrap_or("Transaction declined")
-                    .to_string(),
-                reason: response.message.clone(),
+                code,
+                message,
+                reason,
                 attempt_status: Some(status),
                 connector_transaction_id: Some(resource_id),
                 network_advice_code: None,
@@ -2474,10 +2667,19 @@ mod tests {
                 );
                 match *redirection_data {
                     Some(RedirectForm::Html { html_data }) => {
+                        assert!(!html_data.contains("<script src="));
                         assert!(html_data.contains(
-                            r#"<script src="https://sandbox-checkout.izipay.pe/payments/v1/js/index.js"></script>"#
+                            r#""sdkUrl":"https://sandbox-checkout.izipay.pe/payments/v1/js/index.js""#
                         ));
-                        assert!(html_data.contains("Redirecting to Izipay"));
+                        assert!(html_data.contains("document.createElement('script')"));
+                        assert!(html_data.contains("var retryDelaysMs = [1000, 2000, 4000];"));
+                        assert!(html_data.contains("sdk_load_failed"));
+                        assert!(html_data.contains("sdk_init_failed"));
+                        assert!(html_data.contains("izipay_error_detail="));
+                        assert!(html_data.contains("Te estamos llevando a la página de pago"));
+                        assert!(html_data.contains("Taking you to the payment page"));
+                        assert!(html_data.contains("No pudimos abrir la página de pago"));
+                        assert!(html_data.contains("We couldn’t open the payment page"));
                         assert!(html_data.contains("new Izipay({ config: izipayData.config })"));
                         assert!(html_data.contains("LoadForm"));
                         assert!(html_data.contains(r#""typeForm":"redirect""#));
@@ -2520,8 +2722,9 @@ mod tests {
             } => match *redirection_data {
                 Some(RedirectForm::Html { html_data }) => {
                     assert!(html_data.contains(
-                        r#"<script src="https://checkout.izipay.pe/payments/v1/js/index.js"></script>"#
+                        r#""sdkUrl":"https://checkout.izipay.pe/payments/v1/js/index.js""#
                     ));
+                    assert!(!html_data.contains("sandbox-checkout"));
                     assert!(!html_data.contains("urlIPN"));
                     assert!(html_data.contains(&format!(
                         r#""onCancel":"{RETURN_URL}?a=b\u0026izipay_result=cancel""#
@@ -2531,6 +2734,124 @@ mod tests {
             },
             other => panic!("expected a TransactionResponse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn guest_texts_have_no_technical_wording() {
+        let page = authorize_page();
+        let guest_texts: Vec<&str> = page
+            .lines()
+            .filter(|line| {
+                let line = line.trim_start();
+                line.starts_with("loading:") || line.starts_with("failed:")
+            })
+            .collect();
+        assert_eq!(guest_texts.len(), 4, "two languages, two texts each");
+        for text in guest_texts {
+            let lowered = text.to_lowercase();
+            for word in [
+                "sdk",
+                "izipay",
+                "error",
+                "script",
+                "exception",
+                "javascript",
+            ] {
+                assert!(!lowered.contains(word), "{word} in guest text: {text}");
+            }
+        }
+    }
+
+    fn authorize_page() -> String {
+        let result = authorize_response(
+            token_response(),
+            authorize_router_data(),
+            200,
+            &amount("1.99"),
+        )
+        .unwrap();
+        match result.response.unwrap() {
+            PaymentsResponseData::TransactionResponse {
+                redirection_data, ..
+            } => match *redirection_data {
+                Some(RedirectForm::Html { html_data }) => html_data,
+                other => panic!("expected an html redirect form, got {other:?}"),
+            },
+            other => panic!("expected a TransactionResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn page_data_never_leaks_into_the_error_url_logic() {
+        // The error url only gets the machine code and the sanitized detail; the script strips
+        // the session token and the RSA key from the detail before sending it.
+        let page = authorize_page();
+        assert!(page.contains("[izipayData.authorization, izipayData.keyRSA]"));
+        assert!(page.contains(".slice(0, maxDetailLength)"));
+        assert!(page.contains("encodeURIComponent(describe(error))"));
+    }
+
+    #[test]
+    fn sdk_error_is_read_from_the_return_query() {
+        let parsed = IzipaySdkError::from_return_query(Some(
+            "izipay_result=sdk_error&izipay_error=sdk_load_failed&izipay_error_detail=script%20load%20timeout",
+        ))
+        .expect("sdk_error must be detected");
+        assert_eq!(parsed.reason, "sdk_load_failed");
+        assert_eq!(parsed.detail.as_deref(), Some("script load timeout"));
+
+        // The merchant's own query parameters may come first.
+        let with_prefix = IzipaySdkError::from_return_query(Some(
+            "a=b&izipay_result=sdk_error&izipay_error=sdk_init_failed",
+        ))
+        .unwrap();
+        assert_eq!(with_prefix.reason, "sdk_init_failed");
+        assert_eq!(with_prefix.detail, None);
+
+        let without_code =
+            IzipaySdkError::from_return_query(Some("izipay_result=sdk_error")).unwrap();
+        assert_eq!(without_code.reason, "unknown");
+
+        for query in [
+            None,
+            Some(""),
+            Some("izipay_result=success"),
+            Some("izipay_result=cancel&izipay_error=sdk_load_failed"),
+            Some("izipay_error=sdk_load_failed"),
+        ] {
+            assert_eq!(IzipaySdkError::from_return_query(query), None, "{query:?}");
+        }
+    }
+
+    #[test]
+    fn sdk_error_values_from_the_browser_are_sanitized() {
+        let long_detail = "x".repeat(500);
+        let query = format!(
+            "izipay_result=sdk_error&izipay_error=Bad%20Code%3Cscript%3E&izipay_error_detail={long_detail}"
+        );
+        let parsed = IzipaySdkError::from_return_query(Some(&query)).unwrap();
+        assert_eq!(parsed.reason, "unknown");
+        assert_eq!(char_len(parsed.detail.as_deref().unwrap()), 200);
+
+        let noisy = IzipaySdkError::from_return_query(Some(
+            "izipay_result=sdk_error&izipay_error=sdk_load_failed&izipay_error_detail=%0A%0DTypeError%3A%09%20x%20%20is%20not%20defined%00",
+        ))
+        .unwrap();
+        assert_eq!(noisy.detail.as_deref(), Some("TypeError: x is not defined"));
+
+        let too_long_reason = format!("izipay_result=sdk_error&izipay_error={}", "a".repeat(41));
+        assert_eq!(
+            IzipaySdkError::from_return_query(Some(&too_long_reason))
+                .unwrap()
+                .reason,
+            "unknown"
+        );
+
+        let blank = IzipaySdkError::from_return_query(Some(
+            "izipay_result=sdk_error&izipay_error_detail=%20%0A",
+        ))
+        .unwrap();
+        assert_eq!(blank.detail, None);
     }
 
     #[test]
@@ -2561,8 +2882,8 @@ mod tests {
         assert!(!html_data.contains('\u{2028}'));
         assert!(!html_data.contains('\u{2029}'));
         assert!(html_data.contains(r"\u2028\u2029 \u0026 co"));
-        // The only closing script tags are the two of the page itself.
-        assert_eq!(html_data.matches("</script>").count(), 2);
+        // The only closing script tag is the one of the page itself.
+        assert_eq!(html_data.matches("</script>").count(), 1);
     }
 
     #[test]
@@ -3122,6 +3443,94 @@ mod tests {
         assert_eq!(result.status, status_before);
     }
 
+    const SDK_ERROR_QUERY: &str =
+        "izipay_result=sdk_error&izipay_error=sdk_load_failed&izipay_error_detail=script%20load%20timeout";
+
+    fn sync_with_return_query(
+        body: &str,
+        query: &str,
+        status_before: enums::AttemptStatus,
+    ) -> PaymentsSyncRouterData {
+        let mut data = sync_router_data(None);
+        data.status = status_before;
+        data.request.encoded_data = Some(query.to_string());
+        let response: IzipaySearchResponse = serde_json::from_str(body).unwrap();
+        PaymentsSyncRouterData::try_from(ResponseRouterData {
+            response,
+            data,
+            http_code: 200,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn sdk_error_with_nothing_paid_fails_with_a_stable_code() {
+        // Izipay answers "transaction does not exist" in a 2xx: the attempt would keep its
+        // status, but the page already gave up, so it fails with the internal code.
+        let result = sync_with_return_query(
+            r#"{"code":"MC","message":"Transacción Invalido"}"#,
+            SDK_ERROR_QUERY,
+            enums::AttemptStatus::AuthenticationPending,
+        );
+        assert_eq!(result.status, enums::AttemptStatus::Failure);
+        let error = result.response.unwrap_err();
+        assert_eq!(error.code, SDK_ERROR_CODE);
+        assert_eq!(
+            error.message,
+            "The Izipay checkout page could not be opened (sdk_load_failed)"
+        );
+        assert_eq!(error.reason.as_deref(), Some("script load timeout"));
+        assert_eq!(error.attempt_status, Some(enums::AttemptStatus::Failure));
+
+        // A pending order (the buyer never paid) is treated the same way.
+        let pending = sync_with_return_query(
+            r#"{"code":"00","response":{"order":[{"orderNumber":"PX1790971180429","stateMessage":"Pendiente"}]}}"#,
+            SDK_ERROR_QUERY,
+            enums::AttemptStatus::AuthenticationPending,
+        );
+        assert_eq!(pending.response.unwrap_err().code, SDK_ERROR_CODE);
+    }
+
+    #[test]
+    fn a_paid_order_wins_over_the_sdk_error_marker() {
+        let result = sync_with_return_query(
+            SEARCH_APPROVED,
+            SDK_ERROR_QUERY,
+            enums::AttemptStatus::AuthenticationPending,
+        );
+        assert_eq!(result.status, enums::AttemptStatus::Charged);
+        assert!(result.response.is_ok());
+
+        // An attempt that already progressed (charged earlier) is never failed by a url param.
+        let already_charged = sync_with_return_query(
+            r#"{"code":"MC","message":"Transacción Invalido"}"#,
+            SDK_ERROR_QUERY,
+            enums::AttemptStatus::Charged,
+        );
+        assert_eq!(already_charged.status, enums::AttemptStatus::Charged);
+    }
+
+    #[test]
+    fn izipays_own_decline_keeps_its_code_over_the_sdk_error_marker() {
+        let result = sync_with_return_query(
+            r#"{"code":"05","message":"Operación Denegada"}"#,
+            SDK_ERROR_QUERY,
+            enums::AttemptStatus::AuthenticationPending,
+        );
+        assert_eq!(result.status, enums::AttemptStatus::Failure);
+        assert_eq!(result.response.unwrap_err().code, "05");
+    }
+
+    #[test]
+    fn other_return_markers_do_not_change_the_sync_outcome() {
+        let result = sync_with_return_query(
+            r#"{"code":"MC","message":"Transacción Invalido"}"#,
+            "izipay_result=cancel",
+            enums::AttemptStatus::AuthenticationPending,
+        );
+        assert_eq!(result.status, enums::AttemptStatus::AuthenticationPending);
+    }
+
     // ------------------------------------------------------------------
     // Post-capture void
     // ------------------------------------------------------------------
@@ -3239,8 +3648,9 @@ mod tests {
 
     #[test]
     fn cancel_request_rejects_a_partial_void() {
-        let error = IzipayCancelRequest::try_from(&void_router_data(Some(void_charged_metadata()), 100))
-            .expect_err("only the approved amount can be voided");
+        let error =
+            IzipayCancelRequest::try_from(&void_router_data(Some(void_charged_metadata()), 100))
+                .expect_err("only the approved amount can be voided");
         assert!(matches!(
             error.current_context(),
             errors::ConnectorError::NotSupported { .. }
