@@ -354,6 +354,32 @@ where
     json.parse_value(std::any::type_name::<T>()).switch()
 }
 
+/// Merges payment metadata sources into one flat JSON object so a connector can read
+/// processor-specific values from a connector-scoped object (`{ "<scope>": { .. } }`).
+/// `sources` go from lowest to highest precedence; within a source the scoped keys win
+/// over the flat ones. Null values and non-object sources are ignored. Returns `None`
+/// when no source is an object.
+pub(crate) fn merge_connector_scoped_metadata(
+    scope: &str,
+    sources: &[Option<&Value>],
+) -> Option<Value> {
+    let mut merged: Option<serde_json::Map<String, Value>> = None;
+    for object in sources
+        .iter()
+        .filter_map(|source| (*source).and_then(Value::as_object))
+    {
+        let target = merged.get_or_insert_with(serde_json::Map::new);
+        let scoped = object.get(scope).and_then(Value::as_object);
+        let flat = object.iter().filter(|(key, _)| key.as_str() != scope);
+        for (key, value) in flat.chain(scoped.into_iter().flatten()) {
+            if !value.is_null() {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    merged.map(Value::Object)
+}
+
 pub(crate) fn is_manual_capture(capture_method: Option<enums::CaptureMethod>) -> bool {
     capture_method == Some(enums::CaptureMethod::Manual)
         || capture_method == Some(enums::CaptureMethod::ManualMultiple)

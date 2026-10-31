@@ -154,6 +154,29 @@ impl TryFrom<&Option<SecretSerdeValue>> for MercadopagoMetadata {
     }
 }
 
+/// Key of the connector-scoped object inside the payment metadata.
+const MERCADOPAGO_METADATA_SCOPE: &str = "mercadopago";
+
+impl MercadopagoMetadata {
+    /// Resolves each key as `metadata.mercadopago.*`, then flat `metadata.*`, then the
+    /// same two lookups in `frm_metadata`.
+    fn resolve(
+        request_metadata: Option<&serde_json::Value>,
+        frm_metadata: &Option<SecretSerdeValue>,
+        config: &'static str,
+    ) -> Result<Self, error_stack::Report<errors::ConnectorError>> {
+        let merged = utils::merge_connector_scoped_metadata(
+            MERCADOPAGO_METADATA_SCOPE,
+            &[frm_metadata.as_ref().map(|m| m.peek()), request_metadata],
+        );
+        match merged {
+            Some(value) => serde_json::from_value::<Self>(value)
+                .map_err(|_| errors::ConnectorError::InvalidConnectorConfig { config }.into()),
+            None => Ok(Self::default()),
+        }
+    }
+}
+
 impl TryFrom<&Option<serde_json::Value>> for MercadopagoMetadata {
     type Error = error_stack::Report<errors::ConnectorError>;
     fn try_from(meta_data: &Option<serde_json::Value>) -> Result<Self, Self::Error> {
@@ -201,7 +224,8 @@ impl TryFrom<&TokenizationRouterData> for MercadopagoTokenRequest {
                 // Get metadata from frm_metadata field in RouterData
                 // This is a workaround since PaymentMethodTokenizationData doesn't have metadata field
                 // User should pass MercadoPago metadata in frm_metadata of the payment request
-                let metadata = MercadopagoMetadata::try_from(&item.frm_metadata)?;
+                let metadata =
+                    MercadopagoMetadata::resolve(None, &item.frm_metadata, "frm_metadata")?;
 
                 let cardholder_name = card
                     .card_holder_name
@@ -384,6 +408,21 @@ pub struct MercadopagoPaymentsRequest {
     pub application_fee: Option<f64>,
 }
 
+fn derive_credit_payment_method_id(payment_method_data: &PaymentMethodData) -> Option<String> {
+    let PaymentMethodData::Card(card) = payment_method_data else {
+        return None;
+    };
+    if !card.card_type.as_deref()?.eq_ignore_ascii_case("credit") {
+        return None;
+    }
+    match card.card_network.as_ref()? {
+        enums::CardNetwork::Visa => Some("visa".to_string()),
+        enums::CardNetwork::Mastercard => Some("master".to_string()),
+        enums::CardNetwork::AmericanExpress => Some("amex".to_string()),
+        _ => None,
+    }
+}
+
 impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for MercadopagoPaymentsRequest {
     type Error = error_stack::Report<errors::ConnectorError>;
 
@@ -406,22 +445,22 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
         };
 
         // Get metadata with MercadoPago-specific fields
-        // Try request.metadata first, then fall back to frm_metadata (for consistency with tokenization)
-        let metadata_from_request = MercadopagoMetadata::try_from(&router_data.request.metadata)?;
-        let metadata = if metadata_from_request.payment_method_id.is_some() {
-            metadata_from_request
-        } else {
-            // Fallback to frm_metadata if request.metadata doesn't have payment_method_id
-            MercadopagoMetadata::try_from(&router_data.frm_metadata)?
-        };
+        // Lookup order per key: metadata.mercadopago.*, flat metadata.*, then frm_metadata
+        let metadata = MercadopagoMetadata::resolve(
+            router_data.request.metadata.as_ref(),
+            &router_data.frm_metadata,
+            "metadata",
+        )?;
 
         // payment_method_id is required
-        let payment_method_id =
-            metadata
-                .payment_method_id
-                .ok_or(errors::ConnectorError::MissingRequiredField {
-                    field_name: "metadata.payment_method_id".into(),
-                })?;
+        // When absent, credit cards of the networks Mercado Pago names after the network
+        // can be derived; debit and local brands are never guessed.
+        let payment_method_id = metadata
+            .payment_method_id
+            .or_else(|| derive_credit_payment_method_id(&router_data.request.payment_method_data))
+            .ok_or(errors::ConnectorError::MissingRequiredField {
+                field_name: "metadata.payment_method_id".into(),
+            })?;
 
         let issuer_id = metadata
             .issuer_id
@@ -707,8 +746,10 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>>
 
         // Merge metadata: request.metadata first, frm_metadata as per-field fallback
         // (api2 sends the marketplace fee through frm_metadata, like the card flow).
-        let meta_request = MercadopagoMetadata::try_from(&router_data.request.metadata)?;
-        let meta_frm = MercadopagoMetadata::try_from(&router_data.frm_metadata)?;
+        let meta_request =
+            MercadopagoMetadata::resolve(router_data.request.metadata.as_ref(), &None, "metadata")?;
+        let meta_frm =
+            MercadopagoMetadata::resolve(None, &router_data.frm_metadata, "frm_metadata")?;
         let checkout_pro = meta_request
             .checkout_pro
             .or(meta_frm.checkout_pro)
@@ -1911,6 +1952,66 @@ mod tests {
         "sandbox_init_point": "https://sandbox.mercadopago.com.ar/checkout/v1/redirect?pref_id=x",
         "external_reference": "pay_abc_1"
     }"#;
+
+    #[test]
+    fn metadata_scoped_value_wins_over_flat() {
+        let request = serde_json::json!({
+            "payment_method_id": "master",
+            "installments": 3,
+            "mercadopago": { "payment_method_id": "visa", "issuer_id": "310" }
+        });
+        let meta = MercadopagoMetadata::resolve(Some(&request), &None, "metadata").unwrap();
+        assert_eq!(meta.payment_method_id.as_deref(), Some("visa"));
+        assert_eq!(meta.issuer_id.as_deref(), Some("310"));
+        // Keys missing from the scoped object still come from the flat ones.
+        assert_eq!(meta.installments, Some(3));
+    }
+
+    #[test]
+    fn metadata_flat_keys_still_work() {
+        let request = serde_json::json!({ "payment_method_id": "visa", "installments": 6 });
+        let meta = MercadopagoMetadata::resolve(Some(&request), &None, "metadata").unwrap();
+        assert_eq!(meta.payment_method_id.as_deref(), Some("visa"));
+        assert_eq!(meta.installments, Some(6));
+    }
+
+    #[test]
+    fn metadata_missing_values_stay_none() {
+        let request = serde_json::json!({ "other_connector": { "payment_method_id": 7 } });
+        let meta = MercadopagoMetadata::resolve(Some(&request), &None, "metadata").unwrap();
+        assert!(meta.payment_method_id.is_none());
+        let meta = MercadopagoMetadata::resolve(None, &None, "metadata").unwrap();
+        assert!(meta.payment_method_id.is_none());
+    }
+
+    #[test]
+    fn metadata_falls_back_to_frm_metadata() {
+        let frm = Some(Secret::new(serde_json::json!({
+            "payment_method_id": "amex",
+            "identification_type": "DNI"
+        })));
+        let request = serde_json::json!({ "installments": 2 });
+        let meta = MercadopagoMetadata::resolve(Some(&request), &frm, "metadata").unwrap();
+        assert_eq!(meta.payment_method_id.as_deref(), Some("amex"));
+        assert_eq!(meta.identification_type.as_deref(), Some("DNI"));
+        assert_eq!(meta.installments, Some(2));
+
+        let scoped_frm = Some(Secret::new(
+            serde_json::json!({ "mercadopago": { "identification_type": "CUIT" } }),
+        ));
+        let meta = MercadopagoMetadata::resolve(None, &scoped_frm, "frm_metadata").unwrap();
+        assert_eq!(meta.identification_type.as_deref(), Some("CUIT"));
+    }
+
+    #[test]
+    fn metadata_request_wins_over_frm_metadata() {
+        let frm = Some(Secret::new(
+            serde_json::json!({ "payment_method_id": "amex" }),
+        ));
+        let request = serde_json::json!({ "mercadopago": { "payment_method_id": "visa" } });
+        let meta = MercadopagoMetadata::resolve(Some(&request), &frm, "metadata").unwrap();
+        assert_eq!(meta.payment_method_id.as_deref(), Some("visa"));
+    }
 
     #[test]
     fn authorize_response_discriminates_payment_from_preference() {

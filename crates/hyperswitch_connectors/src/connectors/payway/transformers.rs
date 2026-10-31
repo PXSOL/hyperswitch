@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     types::{RefundsResponseRouterData, ResponseRouterData},
     utils,
-    utils::RouterData as _,
+    utils::{CardData as _, RouterData as _},
 };
 
 //TODO: Fill the struct with respective fields
@@ -152,7 +152,7 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
             }
         }
 
-        let meta = PaywayMetadataObject::try_from(&item.router_data.request.metadata)?;
+        let meta = PaywayMetadataObject::resolve(item.router_data.request.metadata.as_ref())?;
 
         let bill_to_meta =
             meta.bill_to
@@ -825,6 +825,32 @@ pub struct PaywayMetadataObject {
     pub bill_to: Option<PaywayBillTo>,
 }
 
+/// Key of the connector-scoped object inside the payment metadata.
+const PAYWAY_METADATA_SCOPE: &str = "payway";
+
+impl PaywayMetadataObject {
+    /// Resolves each key as `metadata.payway.*` first, then flat `metadata.*`.
+    fn resolve(
+        request_metadata: Option<&serde_json::Value>,
+    ) -> Result<Self, error_stack::Report<errors::ConnectorError>> {
+        let Some(mut value) =
+            utils::merge_connector_scoped_metadata(PAYWAY_METADATA_SCOPE, &[request_metadata])
+        else {
+            return Ok(Self::default());
+        };
+        // The billing fields are flat in the stored shape; also accept them grouped
+        // under a `bill_to` object, which wins over flat keys.
+        if let Some(object) = value.as_object_mut() {
+            if let Some(serde_json::Value::Object(bill_to)) = object.remove("bill_to") {
+                object.extend(bill_to);
+            }
+        }
+        serde_json::from_value::<Self>(value).map_err(|_e| {
+            errors::ConnectorError::InvalidConnectorConfig { config: "metadata" }.into()
+        })
+    }
+}
+
 impl TryFrom<&Option<SecretSerdeValue>> for PaywayMetadataObject {
     type Error = error_stack::Report<errors::ConnectorError>;
     fn try_from(meta_data: &Option<SecretSerdeValue>) -> Result<Self, Self::Error> {
@@ -858,7 +884,8 @@ impl TryFrom<&types::TokenizationRouterData> for PaywayTokenRequest {
             PaymentMethodData::Card(card) => Ok(Self {
                 card_number: card.card_number.clone(),
                 card_expiration_month: card.card_exp_month.clone(),
-                card_expiration_year: card.card_exp_year.clone(),
+                // Payway takes a 2-digit year; a 4-digit one (e.g. from a shared card form) is rejected.
+                card_expiration_year: card.get_card_expiry_year_2_digit()?,
                 card_holder_name: card
                     .card_holder_name
                     .clone()
@@ -947,5 +974,70 @@ impl<F, T> TryFrom<ResponseRouterData<F, PaywayAuthorizeResponse, T, PaymentsRes
             }),
             ..item.data
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_scoped_value_wins_over_flat() {
+        let request = serde_json::json!({
+            "payment_method_id": 1,
+            "installments": 3,
+            "country": "AR",
+            "city": "Flat City",
+            "payway": { "payment_method_id": 15, "city": "Scoped City" }
+        });
+        let meta = PaywayMetadataObject::resolve(Some(&request)).unwrap();
+        assert_eq!(meta.payment_method_id, Some(15));
+        assert_eq!(meta.installments, Some(3));
+        assert_eq!(
+            meta.bill_to.and_then(|b| b.city).as_deref(),
+            Some("Scoped City")
+        );
+    }
+
+    #[test]
+    fn metadata_nested_bill_to_is_accepted() {
+        let request = serde_json::json!({
+            "payway": {
+                "payment_method_id": 1,
+                "bill_to": { "country": "AR", "email": "a@b.com", "street1": "Calle 1" }
+            }
+        });
+        let meta = PaywayMetadataObject::resolve(Some(&request)).unwrap();
+        let bill_to = meta.bill_to.unwrap();
+        assert_eq!(bill_to.email.as_deref(), Some("a@b.com"));
+        assert_eq!(bill_to.street1.as_deref(), Some("Calle 1"));
+    }
+
+    #[test]
+    fn metadata_flat_keys_still_work() {
+        let request = serde_json::json!({
+            "payment_method_id": 1,
+            "installments": 6,
+            "country": "AR",
+            "email": "a@b.com"
+        });
+        let meta = PaywayMetadataObject::resolve(Some(&request)).unwrap();
+        assert_eq!(meta.payment_method_id, Some(1));
+        assert_eq!(meta.installments, Some(6));
+        assert_eq!(
+            meta.bill_to.and_then(|b| b.email).as_deref(),
+            Some("a@b.com")
+        );
+    }
+
+    #[test]
+    fn metadata_missing_values_stay_none() {
+        let request = serde_json::json!({ "mercadopago": { "payment_method_id": "visa" } });
+        let meta = PaywayMetadataObject::resolve(Some(&request)).unwrap();
+        assert!(meta.payment_method_id.is_none());
+        assert!(meta.bill_to.is_none());
+        let meta = PaywayMetadataObject::resolve(None).unwrap();
+        assert!(meta.payment_method_id.is_none());
+        assert!(meta.bill_to.is_none());
     }
 }
