@@ -693,11 +693,12 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Pay
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
 
-        let router_data = RouterData::try_from(ResponseRouterData {
+        let mut router_data = RouterData::try_from(ResponseRouterData {
             response: response.clone(),
             data: data.clone(),
             http_code: res.status_code,
         })?;
+        utils::keep_stored_metadata(&mut router_data, data.request.connector_meta.as_ref());
         Ok(payway::finish_payment_sync(
             router_data,
             data.status,
@@ -791,11 +792,13 @@ impl ConnectorIntegration<Capture, PaymentsCaptureData, PaymentsResponseData> fo
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
-        RouterData::try_from(ResponseRouterData {
+        let mut router_data = RouterData::try_from(ResponseRouterData {
             response,
             data: data.clone(),
             http_code: res.status_code,
-        })
+        })?;
+        utils::keep_stored_metadata(&mut router_data, data.request.connector_meta.as_ref());
+        Ok(router_data)
     }
 
     fn get_error_response(
@@ -1463,9 +1466,8 @@ mod payment_sync_tests {
         assert_eq!(only_refund(activity).0, "annulment_15403386");
     }
 
-    #[test]
-    fn the_response_keeps_no_issuer_data_of_status_details() {
-        let response = parse(json!({
+    fn real_status_details() -> serde_json::Value {
+        json!({
             "id": 15403386,
             "status": "approved",
             "status_details": {
@@ -1474,10 +1476,80 @@ mod payment_sync_tests {
                 "address_validation_code": "VTE0011",
                 "error": null
             }
-        }));
-        let kept = format!("{response:?} {}", serde_json::to_string(&response).unwrap());
-        for secret in ["1560", "180644", "VTE0011", "card_authorization_code"] {
-            assert!(!kept.contains(secret), "{secret} leaked: {kept}");
+        })
+    }
+
+    #[test]
+    fn the_issuer_data_never_reaches_the_debug_output_or_the_masked_event() {
+        let response = parse(real_status_details());
+        let debug = format!("{response:?}");
+        let masked = hyperswitch_masking::masked_serialize(&response)
+            .unwrap()
+            .to_string();
+        for secret in ["1560", "180644", "VTE0011"] {
+            assert!(!debug.contains(secret), "{secret} leaked in Debug: {debug}");
+            assert!(!masked.contains(secret), "{secret} leaked masked: {masked}");
+        }
+    }
+
+    #[test]
+    fn the_sync_response_carries_the_receipt_in_connector_metadata() {
+        let response = parse(real_status_details());
+        let router_data = RouterData::try_from(ResponseRouterData {
+            response,
+            data: sync_router_data(AttemptStatus::Pending),
+            http_code: 200,
+        })
+        .unwrap();
+        match router_data.response {
+            Ok(PaymentsResponseData::TransactionResponse {
+                connector_metadata, ..
+            }) => assert_eq!(
+                connector_metadata,
+                Some(json!({"authorization_code": "180644", "ticket_number": "1560"}))
+            ),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_authorize_response_carries_the_receipt_in_connector_metadata() {
+        let response: payway::PaywayAuthorizeResponse = serde_json::from_value(json!({
+            "id": 15403386,
+            "site_transaction_id": "pay_123_1",
+            "amount": 12050,
+            "currency": "ars",
+            "status": "approved",
+            "status_details": {"ticket": 1560, "card_authorization_code": "180644", "error": null}
+        }))
+        .unwrap();
+        let router_data = RouterData::try_from(ResponseRouterData {
+            response,
+            data: sync_router_data(AttemptStatus::Pending),
+            http_code: 200,
+        })
+        .unwrap();
+        match router_data.response {
+            Ok(PaymentsResponseData::TransactionResponse {
+                connector_metadata, ..
+            }) => assert_eq!(
+                connector_metadata,
+                Some(json!({"authorization_code": "180644", "ticket_number": "1560"}))
+            ),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bad_receipt_type_never_fails_the_response_and_stores_nothing() {
+        for details in [
+            json!({"ticket": {"x": 1}, "card_authorization_code": [1]}),
+            json!({"ticket": "  ", "card_authorization_code": null}),
+            json!({"ticket": true}),
+        ] {
+            let response = parse(json!({"id": 1, "status": "approved", "status_details": details}));
+            assert_eq!(response.payway_status(), PaywayStatus::Approved);
+            assert_eq!(response.receipt_metadata(), None);
         }
     }
 

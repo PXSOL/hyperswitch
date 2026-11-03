@@ -8478,3 +8478,229 @@ impl ExtendedAuthorizationData for PaymentsCancelData {
         None
     }
 }
+
+/// Receipt data a connector returned for a charge. The values are written to the
+/// attempt's `connector_metadata` under flat keys that the payment response reads back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReceiptMetadata {
+    pub authorization_code: Option<String>,
+    pub ticket_number: Option<String>,
+    pub reference_number: Option<String>,
+}
+
+impl ReceiptMetadata {
+    pub const AUTHORIZATION_CODE_KEY: &'static str = "authorization_code";
+    pub const TICKET_NUMBER_KEY: &'static str = "ticket_number";
+    pub const REFERENCE_NUMBER_KEY: &'static str = "reference_number";
+
+    fn entries(&self) -> Vec<(&'static str, Option<String>)> {
+        vec![
+            (
+                Self::AUTHORIZATION_CODE_KEY,
+                self.authorization_code.clone(),
+            ),
+            (Self::TICKET_NUMBER_KEY, self.ticket_number.clone()),
+            (Self::REFERENCE_NUMBER_KEY, self.reference_number.clone()),
+        ]
+    }
+}
+
+/// Inserts every entry that has a non-blank value into an existing connector metadata value.
+///
+/// - No entry has a value: the existing value is returned unchanged.
+/// - No existing value: a new object holding only the entries that have a value.
+/// - Existing object: the entries are inserted and every other key is kept.
+/// - Existing value that is not an object: returned unchanged, never overwritten.
+pub fn merge_string_entries_into_metadata(
+    existing: Option<Value>,
+    entries: Vec<(&'static str, Option<String>)>,
+) -> Option<Value> {
+    let present: Vec<(&'static str, String)> = entries
+        .into_iter()
+        .filter_map(|(key, value)| {
+            value
+                .map(|inner| inner.trim().to_owned())
+                .filter(|inner| !inner.is_empty())
+                .map(|inner| (key, inner))
+        })
+        .collect();
+    if present.is_empty() {
+        return existing;
+    }
+    match existing {
+        None | Some(Value::Null) => Some(Value::Object(
+            present
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), Value::String(value)))
+                .collect(),
+        )),
+        Some(Value::Object(mut object)) => {
+            for (key, value) in present {
+                object.insert(key.to_owned(), Value::String(value));
+            }
+            Some(Value::Object(object))
+        }
+        Some(other) => Some(other),
+    }
+}
+
+/// Merges a receipt into an existing connector metadata value. See
+/// [`merge_string_entries_into_metadata`] for the merge rules.
+pub fn merge_receipt_into_metadata(
+    existing: Option<Value>,
+    receipt: Option<ReceiptMetadata>,
+) -> Option<Value> {
+    match receipt {
+        Some(receipt) => merge_string_entries_into_metadata(existing, receipt.entries()),
+        None => existing,
+    }
+}
+
+/// Merges the metadata a response builds over the metadata the request stored.
+///
+/// A response that sets `connector_metadata` replaces the whole stored column, while `None`
+/// leaves it alone. So a response that only knows some keys (for example the receipt) must be
+/// merged over the stored value, or the keys it does not know are lost.
+///
+/// - Both are objects: every stored key survives and the response's values win.
+/// - The response has no metadata: `None`, which keeps the stored column untouched.
+/// - Nothing stored (or `null`): the response's value stands.
+/// - Anything else (a non-object on either side): `None`, so nothing stored is clobbered.
+pub fn merge_with_stored_metadata(stored: Option<&Value>, new: Option<Value>) -> Option<Value> {
+    match (stored, new) {
+        (_, None) => None,
+        (None | Some(Value::Null), new) => new,
+        (Some(Value::Object(stored)), Some(Value::Object(new))) => {
+            let mut merged = stored.clone();
+            merged.extend(new);
+            Some(Value::Object(merged))
+        }
+        _ => None,
+    }
+}
+
+/// Applies [`merge_with_stored_metadata`] to the metadata of a transaction response, using the
+/// metadata stored on the attempt (`request.connector_meta`).
+pub fn keep_stored_metadata<F, T>(
+    router_data: &mut ConnectorRouterData<F, T, PaymentsResponseData>,
+    stored: Option<&Value>,
+) {
+    if let Ok(PaymentsResponseData::TransactionResponse {
+        connector_metadata, ..
+    }) = router_data.response.as_mut()
+    {
+        *connector_metadata = merge_with_stored_metadata(stored, connector_metadata.take());
+    }
+}
+
+#[cfg(test)]
+mod receipt_metadata_tests {
+    use serde_json::json;
+
+    use serde_json::Value;
+
+    use super::{merge_receipt_into_metadata, merge_with_stored_metadata, ReceiptMetadata};
+
+    fn receipt() -> ReceiptMetadata {
+        ReceiptMetadata {
+            authorization_code: Some("180644".to_owned()),
+            ticket_number: None,
+            reference_number: Some("  ".to_owned()),
+        }
+    }
+
+    #[test]
+    fn no_receipt_keeps_existing() {
+        let existing = Some(json!({"a": 1}));
+        assert_eq!(
+            merge_receipt_into_metadata(existing.clone(), None),
+            existing
+        );
+        assert_eq!(merge_receipt_into_metadata(None, None), None);
+    }
+
+    #[test]
+    fn no_existing_builds_object_with_present_keys_only() {
+        assert_eq!(
+            merge_receipt_into_metadata(None, Some(receipt())),
+            Some(json!({"authorization_code": "180644"}))
+        );
+    }
+
+    #[test]
+    fn object_keeps_other_keys() {
+        let merged = merge_receipt_into_metadata(
+            Some(json!({"cardholderInfo": "x", "authorization_code": "old"})),
+            Some(receipt()),
+        );
+        assert_eq!(
+            merged,
+            Some(json!({"cardholderInfo": "x", "authorization_code": "180644"}))
+        );
+    }
+
+    #[test]
+    fn empty_receipt_leaves_existing_untouched() {
+        let existing = Some(json!({"authorization_code": "kept"}));
+        assert_eq!(
+            merge_receipt_into_metadata(existing.clone(), Some(ReceiptMetadata::default())),
+            existing
+        );
+    }
+
+    #[test]
+    fn non_object_existing_is_never_clobbered() {
+        let existing = Some(json!(["x"]));
+        assert_eq!(
+            merge_receipt_into_metadata(existing.clone(), Some(receipt())),
+            existing
+        );
+    }
+
+    #[test]
+    fn stored_keys_survive_and_new_values_win() {
+        let stored = json!({"responseCode3dSecure": "1", "authorization_code": "old"});
+        assert_eq!(
+            merge_with_stored_metadata(
+                Some(&stored),
+                Some(json!({"authorization_code": "new", "reference_number": "7"}))
+            ),
+            Some(json!({
+                "responseCode3dSecure": "1",
+                "authorization_code": "new",
+                "reference_number": "7"
+            }))
+        );
+    }
+
+    #[test]
+    fn no_response_metadata_stays_none() {
+        assert_eq!(
+            merge_with_stored_metadata(Some(&json!({"a": 1})), None),
+            None
+        );
+        assert_eq!(merge_with_stored_metadata(None, None), None);
+    }
+
+    #[test]
+    fn nothing_stored_lets_the_response_stand() {
+        let new = Some(json!({"a": 1}));
+        assert_eq!(merge_with_stored_metadata(None, new.clone()), new);
+        assert_eq!(
+            merge_with_stored_metadata(Some(&Value::Null), new.clone()),
+            new
+        );
+    }
+
+    #[test]
+    fn a_non_object_on_either_side_never_clobbers() {
+        assert_eq!(
+            merge_with_stored_metadata(Some(&json!("x")), Some(json!({"a": 1}))),
+            None
+        );
+        assert_eq!(
+            merge_with_stored_metadata(Some(&json!({"a": 1})), Some(json!(["y"]))),
+            None
+        );
+    }
+}

@@ -2367,7 +2367,15 @@ fn approved_sale_is_charged_with_its_transaction_id() {
     // recurrencia Visa no puede armarse con lo que hoy vuelve del gateway.
     assert_eq!(parsed.network_txn_id, &None);
     // Los dos BIN coinciden: no hubo sustitución por Network Token, así que no se afirma una.
-    assert_eq!(parsed.metadata, &None);
+    // Lo único que viaja en el metadata es el recibo del cobro aprobado.
+    assert_eq!(
+        parsed.metadata,
+        &Some(json!({
+            "authorization_code": "943616",
+            "reference_number": "000000019357",
+            "approval_code": "Y:943616:4667286258:PPXX:9476656675"
+        }))
+    );
 }
 
 #[test]
@@ -2394,7 +2402,10 @@ fn network_token_pairing_travels_in_connector_metadata() {
                 "networkTokenLast4": "7867",
                 "fundingCardBin": "462294",
                 "fundingCardLast4": "2366"
-            }
+            },
+            "authorization_code": "459498",
+            "reference_number": "000000018480",
+            "approval_code": "Y:459498:4667279454:PPXX:9437378384"
         }))
     );
 }
@@ -2405,7 +2416,12 @@ fn frictionless_3ds_code_travels_in_connector_metadata() {
     assert_eq!(data.status, enums::AttemptStatus::Charged);
     assert_eq!(
         parsed(&data).metadata,
-        &Some(json!({ "responseCode3dSecure": "1" }))
+        &Some(json!({
+            "responseCode3dSecure": "1",
+            "authorization_code": "594622",
+            "reference_number": "000000019373",
+            "approval_code": "Y:594622:4667286316:PPXX:9476976645"
+        }))
     );
 }
 

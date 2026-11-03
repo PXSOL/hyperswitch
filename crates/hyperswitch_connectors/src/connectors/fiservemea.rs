@@ -847,11 +847,13 @@ impl ConnectorIntegration<CompleteAuthorize, CompleteAuthorizeData, PaymentsResp
         // (hyperswitch_domain_models::router_request_types::CompleteAuthorizeData), so there is
         // nowhere to store it. If that field is added upstream, mirror the
         // `settlement_amount()` -> `get_authorise_integrity_object(...)` block used above.
-        RouterData::try_from(ResponseRouterData {
+        let mut router_data = RouterData::try_from(ResponseRouterData {
             response,
             data: data.clone(),
             http_code: res.status_code,
-        })
+        })?;
+        utils::keep_stored_metadata(&mut router_data, data.request.connector_meta.as_ref());
+        Ok(router_data)
     }
 
     fn get_error_response(
@@ -987,6 +989,7 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Fis
             http_code: res.status_code,
         })?;
         router_data.request.integrity_object = integrity_object;
+        utils::keep_stored_metadata(&mut router_data, data.request.connector_meta.as_ref());
         if attempt_is_settled {
             router_data = fiservemea::finish_settled_sync(
                 router_data,
@@ -1099,6 +1102,7 @@ impl ConnectorIntegration<Capture, PaymentsCaptureData, PaymentsResponseData> fo
             http_code: res.status_code,
         })?;
         router_data.request.integrity_object = integrity_object;
+        utils::keep_stored_metadata(&mut router_data, data.request.connector_meta.as_ref());
         Ok(router_data)
     }
 
@@ -1176,11 +1180,13 @@ impl ConnectorIntegration<Void, PaymentsCancelData, PaymentsResponseData> for Fi
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
-        RouterData::try_from(ResponseRouterData {
+        let mut router_data = RouterData::try_from(ResponseRouterData {
             response,
             data: data.clone(),
             http_code: res.status_code,
-        })
+        })?;
+        utils::keep_stored_metadata(&mut router_data, data.request.connector_meta.as_ref());
+        Ok(router_data)
     }
 
     fn get_error_response(

@@ -3456,6 +3456,24 @@ pub struct StripeAdditionalCardDetails {
     capture_before: Option<PrimitiveDateTime>,
     overcapture: Option<StripeOvercaptureResponse>,
     payment_account_reference: Option<String>,
+    /// Authorization code returned by the card issuer.
+    authorization_code: Option<String>,
+}
+
+/// Adds the authorization code of the charge to the connector metadata a response already
+/// builds. Without a code the metadata is returned unchanged.
+fn merge_card_receipt(
+    connector_metadata: Option<Value>,
+    authorization_code: Option<String>,
+) -> Option<Value> {
+    crate::utils::merge_receipt_into_metadata(
+        connector_metadata,
+        Some(crate::utils::ReceiptMetadata {
+            authorization_code,
+            ticket_number: None,
+            reference_number: None,
+        }),
+    )
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq, Serialize)]
@@ -3802,9 +3820,13 @@ where
             card_details_from_latest_charge.and_then(|card| card.network_transaction_id.clone());
         let payment_account_reference =
             card_details_from_latest_charge.and_then(|card| card.payment_account_reference.clone());
+        let authorization_code =
+            card_details_from_latest_charge.and_then(|card| card.authorization_code.clone());
 
-        let connector_metadata =
-            get_connector_metadata(item.response.next_action.as_ref(), item.response.amount)?;
+        let connector_metadata = merge_card_receipt(
+            get_connector_metadata(item.response.next_action.as_ref(), item.response.amount)?,
+            authorization_code,
+        );
 
         let status = get_stripe_payment_status(item.response.status, item.data.status);
 
@@ -4157,8 +4179,12 @@ where
             let network_transaction_id = card_details_from_latest_charge
                 .as_ref()
                 .and_then(|card| card.network_transaction_id.clone());
+            let authorization_code = card_details_from_latest_charge
+                .as_ref()
+                .and_then(|card| card.authorization_code.clone());
             let payment_account_reference =
                 card_details_from_latest_charge.and_then(|card| card.payment_account_reference);
+            let connector_metadata = merge_card_receipt(connector_metadata, authorization_code);
             let charges = item
                 .response
                 .latest_charge
@@ -6671,6 +6697,63 @@ mod external_refund_sync_tests {
             &ResponseId::ConnectorTransactionId(PI_ID.to_string()),
             reported,
         )
+    }
+
+    fn card_charge(authorization_code: Value) -> Value {
+        let mut charge = charge_with(vec![], false);
+        charge["payment_method_details"] = json!({
+            "type": "card",
+            "card": {"network_transaction_id": "ntx_1", "authorization_code": authorization_code}
+        });
+        charge
+    }
+
+    fn metadata_of(
+        data: &RouterData<PSync, PaymentsSyncData, PaymentsResponseData>,
+    ) -> Option<Value> {
+        match data.response.as_ref().unwrap() {
+            PaymentsResponseData::TransactionResponse {
+                connector_metadata, ..
+            } => connector_metadata.clone(),
+            _ => panic!("expected a transaction response"),
+        }
+    }
+
+    #[test]
+    fn sync_stores_the_authorization_code_of_the_latest_charge() {
+        let data = sync(
+            payment_intent("succeeded", card_charge(json!("123456"))),
+            AttemptStatus::Pending,
+        );
+        assert_eq!(
+            metadata_of(&data),
+            Some(json!({"authorization_code": "123456"}))
+        );
+    }
+
+    #[test]
+    fn sync_without_an_authorization_code_leaves_the_metadata_alone() {
+        for charge in [card_charge(Value::Null), charge_with(vec![], false)] {
+            let data = sync(payment_intent("succeeded", charge), AttemptStatus::Pending);
+            assert_eq!(metadata_of(&data), None);
+        }
+        let unexpanded = sync(
+            payment_intent("succeeded", json!("ch_3Pxyz")),
+            AttemptStatus::Pending,
+        );
+        assert_eq!(metadata_of(&unexpanded), None);
+    }
+
+    #[test]
+    fn card_receipt_is_merged_into_the_existing_metadata() {
+        assert_eq!(
+            merge_card_receipt(Some(json!({"k": 1})), Some("A1".to_string())),
+            Some(json!({"k": 1, "authorization_code": "A1"}))
+        );
+        assert_eq!(
+            merge_card_receipt(Some(json!({"k": 1})), None),
+            Some(json!({"k": 1}))
+        );
     }
 
     #[test]

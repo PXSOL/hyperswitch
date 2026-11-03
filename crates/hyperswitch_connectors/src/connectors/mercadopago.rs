@@ -498,6 +498,9 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Mer
             data: data.clone(),
             http_code: res.status_code,
         })?;
+        // Checkout Pro keeps its preference data in `connector_metadata`: the receipt of the
+        // payment is added on top of it instead of replacing it.
+        utils::keep_stored_metadata(&mut router_data, data.request.connector_meta.as_ref());
 
         if let Some(reported_activity) = reported_activity {
             // Merge into an existing `connector_response` (e.g. carried over
@@ -614,11 +617,13 @@ impl ConnectorIntegration<Capture, PaymentsCaptureData, PaymentsResponseData> fo
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
-        RouterData::try_from(ResponseRouterData {
+        let mut router_data = RouterData::try_from(ResponseRouterData {
             response,
             data: data.clone(),
             http_code: res.status_code,
-        })
+        })?;
+        utils::keep_stored_metadata(&mut router_data, data.request.connector_meta.as_ref());
+        Ok(router_data)
     }
 
     fn get_error_response(
@@ -704,11 +709,13 @@ impl ConnectorIntegration<Void, PaymentsCancelData, PaymentsResponseData> for Me
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
-        RouterData::try_from(ResponseRouterData {
+        let mut router_data = RouterData::try_from(ResponseRouterData {
             response,
             data: data.clone(),
             http_code: res.status_code,
-        })
+        })?;
+        utils::keep_stored_metadata(&mut router_data, data.request.connector_meta.as_ref());
+        Ok(router_data)
     }
 
     fn get_error_response(
