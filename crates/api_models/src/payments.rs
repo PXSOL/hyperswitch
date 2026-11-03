@@ -8195,6 +8195,76 @@ pub struct PaymentsResponse {
     )]
     #[smithy(value_type = "Option<String>")]
     pub sender_payment_instrument_id: Option<String>,
+
+    /// Receipt data returned by the payment provider for this charge, when available.
+    /// Omitted when the provider returned none of its fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<ConnectorReceipt>)]
+    pub connector_receipt: Option<ConnectorReceipt>,
+}
+
+/// Receipt data returned by the payment provider for a charge.
+/// Every field is optional because providers report different subsets.
+#[cfg(feature = "v1")]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct ConnectorReceipt {
+    /// Authorization code returned by the card issuer
+    #[schema(example = "180644")]
+    pub authorization_code: Option<String>,
+    /// Ticket number assigned by the acquirer. Only set when the provider calls it a ticket.
+    #[schema(example = "1560")]
+    pub ticket_number: Option<String>,
+    /// The provider's reference number for the charge
+    #[schema(example = "123456789012")]
+    pub reference_number: Option<String>,
+}
+
+#[cfg(feature = "v1")]
+impl ConnectorReceipt {
+    /// Metadata keys read from the attempt's `connector_metadata`.
+    pub const AUTHORIZATION_CODE_KEY: &'static str = "authorization_code";
+    pub const TICKET_NUMBER_KEY: &'static str = "ticket_number";
+    pub const REFERENCE_NUMBER_KEY: &'static str = "reference_number";
+
+    /// Builds a receipt, trimming every value and treating empty or whitespace-only
+    /// values as absent. Returns `None` when no value remains.
+    pub fn new(
+        authorization_code: Option<String>,
+        ticket_number: Option<String>,
+        reference_number: Option<String>,
+    ) -> Option<Self> {
+        fn clean(value: Option<String>) -> Option<String> {
+            value
+                .map(|inner| inner.trim().to_owned())
+                .filter(|inner| !inner.is_empty())
+        }
+        let receipt = Self {
+            authorization_code: clean(authorization_code),
+            ticket_number: clean(ticket_number),
+            reference_number: clean(reference_number),
+        };
+        (receipt.authorization_code.is_some()
+            || receipt.ticket_number.is_some()
+            || receipt.reference_number.is_some())
+        .then_some(receipt)
+    }
+
+    /// Reads the receipt from the three flat keys of a connector metadata value.
+    /// Other keys are ignored, and only JSON strings are accepted as values.
+    pub fn from_connector_metadata(metadata: &serde_json::Value) -> Option<Self> {
+        let object = metadata.as_object()?;
+        let read = |key: &str| {
+            object
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        Self::new(
+            read(Self::AUTHORIZATION_CODE_KEY),
+            read(Self::TICKET_NUMBER_KEY),
+            read(Self::REFERENCE_NUMBER_KEY),
+        )
+    }
 }
 
 #[cfg(feature = "v1")]
@@ -13551,6 +13621,82 @@ mod tests {
             serde_json::to_string(&mandate_type).unwrap(),
             r#"{"multi_use":null}"#
         )
+    }
+
+    #[cfg(feature = "v1")]
+    #[test]
+    fn connector_receipt_reads_the_three_keys() {
+        let metadata = serde_json::json!({
+            "authorization_code": "180644",
+            "ticket_number": "1560",
+            "reference_number": "9988"
+        });
+        let receipt = ConnectorReceipt::from_connector_metadata(&metadata).unwrap();
+        assert_eq!(receipt.authorization_code.as_deref(), Some("180644"));
+        assert_eq!(receipt.ticket_number.as_deref(), Some("1560"));
+        assert_eq!(receipt.reference_number.as_deref(), Some("9988"));
+    }
+
+    #[cfg(feature = "v1")]
+    #[test]
+    fn connector_receipt_ignores_other_keys() {
+        let metadata = serde_json::json!({
+            "cardholderInfo": "x",
+            "approval_code": "Y:123",
+            "authorization_code": "A1"
+        });
+        let receipt = ConnectorReceipt::from_connector_metadata(&metadata).unwrap();
+        assert_eq!(
+            receipt,
+            ConnectorReceipt {
+                authorization_code: Some("A1".to_owned()),
+                ticket_number: None,
+                reference_number: None,
+            }
+        );
+        assert!(ConnectorReceipt::from_connector_metadata(
+            &serde_json::json!({"approval_code": "1"})
+        )
+        .is_none());
+    }
+
+    #[cfg(feature = "v1")]
+    #[test]
+    fn connector_receipt_treats_empty_values_as_absent() {
+        let metadata = serde_json::json!({
+            "authorization_code": "  ",
+            "ticket_number": "",
+            "reference_number": " 77 "
+        });
+        let receipt = ConnectorReceipt::from_connector_metadata(&metadata).unwrap();
+        assert_eq!(receipt.authorization_code, None);
+        assert_eq!(receipt.ticket_number, None);
+        assert_eq!(receipt.reference_number.as_deref(), Some("77"));
+        assert!(ConnectorReceipt::new(Some(" ".into()), Some(String::new()), None).is_none());
+    }
+
+    #[cfg(feature = "v1")]
+    #[test]
+    fn connector_receipt_ignores_non_string_values() {
+        let metadata = serde_json::json!({
+            "authorization_code": 180644,
+            "ticket_number": null,
+            "reference_number": {"a": 1}
+        });
+        assert!(ConnectorReceipt::from_connector_metadata(&metadata).is_none());
+    }
+
+    #[cfg(feature = "v1")]
+    #[test]
+    fn connector_receipt_non_object_metadata_gives_none() {
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!("authorization_code"),
+            serde_json::json!(["authorization_code"]),
+            serde_json::json!(5),
+        ] {
+            assert!(ConnectorReceipt::from_connector_metadata(&value).is_none());
+        }
     }
 }
 
