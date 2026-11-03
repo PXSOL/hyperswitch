@@ -376,8 +376,11 @@ impl PaywayStatus {
 /// tolerated: a payment sync must never fail to parse because of a field it does not use.
 ///
 /// Only what the sync uses is typed. `status_details` also carries issuer data (authorization
-/// code, ticket, address validation) that must not reach the logs or the connector events, so
-/// only its `error` sub-object is kept.
+/// code, ticket, address validation) that must not reach the logs or the connector events.
+/// The authorization code and the ticket are kept because they are stored as receipt data; they
+/// are typed as `Secret` for that reason, so `Debug` prints them masked and the connector event
+/// (`set_response_body`, which serializes through `masked_serialize`) masks them. The address
+/// validation code is not kept.
 #[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct PaywayPaymentsResponse {
@@ -398,6 +401,29 @@ pub struct PaywayPaymentsResponse {
 pub struct PaywayStatusDetails {
     #[serde(deserialize_with = "lenient")]
     error: Option<PaywayStatusError>,
+    /// Authorization code returned by the card issuer.
+    #[serde(deserialize_with = "lenient_secret_text")]
+    card_authorization_code: Option<Secret<String>>,
+    /// Ticket of the payment at the acquirer.
+    #[serde(deserialize_with = "lenient_secret_text")]
+    ticket: Option<Secret<String>>,
+}
+
+impl PaywayStatusDetails {
+    /// Receipt data as connector metadata, `None` when Payway returned neither value.
+    fn receipt_metadata(&self) -> Option<serde_json::Value> {
+        utils::merge_receipt_into_metadata(
+            None,
+            Some(utils::ReceiptMetadata {
+                authorization_code: self
+                    .card_authorization_code
+                    .as_ref()
+                    .map(|code| code.peek().clone()),
+                ticket_number: self.ticket.as_ref().map(|ticket| ticket.peek().clone()),
+                reference_number: None,
+            }),
+        )
+    }
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -426,6 +452,22 @@ where
 {
     let value = Option::<serde_json::Value>::deserialize(deserializer)?;
     Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
+
+/// Text, or a number rendered as text, kept as a `Secret`; anything else (including blank text)
+/// is `None`, so a bad type never fails the whole response.
+fn lenient_secret_text<'de, D>(deserializer: D) -> Result<Option<Secret<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::String(text)) => Some(text.trim().to_owned()),
+        Some(serde_json::Value::Number(number)) => Some(number.to_string()),
+        _ => None,
+    }
+    .filter(|text| !text.is_empty())
+    .map(Secret::new))
 }
 
 /// Integer, float (rounded to the nearest unit) or numeric string; anything else is `None`.
@@ -490,6 +532,13 @@ impl PaywayPaymentsResponse {
             serde_json::Value::String(id) if !id.trim().is_empty() => Some(id.trim().to_string()),
             _ => None,
         }
+    }
+
+    /// Receipt data (authorization code and ticket) as connector metadata.
+    pub(super) fn receipt_metadata(&self) -> Option<serde_json::Value> {
+        self.status_details
+            .as_ref()
+            .and_then(PaywayStatusDetails::receipt_metadata)
     }
 
     pub fn payway_status(&self) -> PaywayStatus {
@@ -634,7 +683,7 @@ impl<F, T> TryFrom<ResponseRouterData<F, PaywayPaymentsResponse, T, PaymentsResp
                     .unwrap_or(ResponseId::NoResponseId),
                 redirection_data: Box::new(None),
                 mandate_reference: Box::new(None),
-                connector_metadata: None,
+                connector_metadata: item.response.receipt_metadata(),
                 network_txn_id: None,
                 connector_response_reference_id: item.response.site_transaction_id.clone(),
                 incremental_authorization_allowed: None,
@@ -943,6 +992,8 @@ pub struct PaywayAuthorizeResponse {
     pub amount: Option<i64>,
     pub currency: Option<String>,
     pub status: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub status_details: Option<PaywayStatusDetails>,
 }
 
 impl<F, T> TryFrom<ResponseRouterData<F, PaywayAuthorizeResponse, T, PaymentsResponseData>>
@@ -963,7 +1014,11 @@ impl<F, T> TryFrom<ResponseRouterData<F, PaywayAuthorizeResponse, T, PaymentsRes
                 resource_id: ResponseId::ConnectorTransactionId(item.response.id.to_string()),
                 redirection_data: Box::new(None),
                 mandate_reference: Box::new(None),
-                connector_metadata: None,
+                connector_metadata: item
+                    .response
+                    .status_details
+                    .as_ref()
+                    .and_then(PaywayStatusDetails::receipt_metadata),
                 network_txn_id: None,
                 connector_response_reference_id: item.response.site_transaction_id.clone(),
                 incremental_authorization_allowed: None,

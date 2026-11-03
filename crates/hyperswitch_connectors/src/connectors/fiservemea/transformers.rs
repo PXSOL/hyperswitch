@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     types::{RefundsResponseRouterData, ResponseRouterData},
     utils::{
-        CardData as _, CardIssuer, NetworkTokenData as _, PaymentsAuthorizeRequestData as _,
+        self, CardData as _, CardIssuer, NetworkTokenData as _, PaymentsAuthorizeRequestData as _,
         RouterData as _,
     },
 };
@@ -2309,6 +2309,27 @@ pub fn finish_settled_sync<F, T>(
     router_data
 }
 
+/// Key under which the raw `approvalCode` is stored in `connector_metadata`. It is kept for
+/// support and is not part of the receipt the payment response exposes.
+const APPROVAL_CODE_KEY: &str = "approval_code";
+
+/// Authorization code of an approved transaction. The `approvalCode` (`Y:<code>:...`) keeps the
+/// code as the issuer sent it, with its leading zeros, while `processor.authorizationCode` can
+/// arrive without them (`000035` against `35`). The code of the `approvalCode` wins when it is
+/// well formed; otherwise the processor's one is used.
+fn receipt_authorization_code(
+    approval_code: Option<&str>,
+    processor_code: Option<&String>,
+) -> Option<String> {
+    approval_code
+        .and_then(|approval| approval.strip_prefix("Y:"))
+        .and_then(|rest| rest.split(':').next())
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+        .map(str::to_owned)
+        .or_else(|| processor_code.cloned())
+}
+
 impl<F, T> TryFrom<ResponseRouterData<F, FiservemeaPaymentsResponse, T, PaymentsResponseData>>
     for RouterData<F, T, PaymentsResponseData>
 {
@@ -2377,6 +2398,13 @@ impl<F, T> TryFrom<ResponseRouterData<F, FiservemeaPaymentsResponse, T, Payments
             }
         };
 
+        let receipt_is_final = matches!(
+            status,
+            common_enums::AttemptStatus::Charged
+                | common_enums::AttemptStatus::PartialCharged
+                | common_enums::AttemptStatus::Authorized
+        );
+
         // Un rechazo de IPG llega con HTTP 2xx y sólo se distingue por el estado, así
         // que sin esto el pago quedaba en Failure sin código ni motivo. El código real
         // viene en `processor.responseCode` y el texto en `processor.responseMessage`;
@@ -2415,6 +2443,31 @@ impl<F, T> TryFrom<ResponseRouterData<F, FiservemeaPaymentsResponse, T, Payments
                 ..item.data
             });
         }
+
+        // Receipt data (authorization code, reference number) of an approved transaction, merged
+        // with the metadata built above. The raw `approvalCode` is kept for support only: it is
+        // not part of the receipt the payment response exposes. The failure path returned above,
+        // and responses that are not final (3DS pending...) carry no receipt.
+        let connector_metadata = if receipt_is_final {
+            let processor = item.response.processor.as_ref();
+            let with_receipt = utils::merge_receipt_into_metadata(
+                connector_metadata,
+                Some(utils::ReceiptMetadata {
+                    authorization_code: receipt_authorization_code(
+                        item.response.approval_code.as_deref(),
+                        processor.and_then(|p| p.authorization_code.as_ref()),
+                    ),
+                    ticket_number: None,
+                    reference_number: processor.and_then(|p| p.reference_number.clone()),
+                }),
+            );
+            utils::merge_string_entries_into_metadata(
+                with_receipt,
+                vec![(APPROVAL_CODE_KEY, item.response.approval_code.clone())],
+            )
+        } else {
+            connector_metadata
+        };
 
         Ok(Self {
             status,
@@ -4438,6 +4491,120 @@ mod tests {
             status_of(parse_response(real_cert_approved_sale())),
             common_enums::AttemptStatus::Charged
         );
+    }
+
+    fn converted(raw: serde_json::Value) -> RouterData<(), (), PaymentsResponseData> {
+        let data =
+            cert_router_data::<(), (), PaymentsResponseData>(CERT_STORE_AR, "PX-receipt", ());
+        RouterData::try_from(ResponseRouterData {
+            response: parse_response(raw),
+            data,
+            http_code: 200,
+        })
+        .unwrap()
+    }
+
+    fn metadata_of(data: &RouterData<(), (), PaymentsResponseData>) -> Option<serde_json::Value> {
+        match data.response.as_ref().unwrap() {
+            PaymentsResponseData::TransactionResponse {
+                connector_metadata, ..
+            } => connector_metadata.clone(),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn approved_sale_stores_the_receipt_and_the_raw_approval_code() {
+        assert_eq!(
+            metadata_of(&converted(real_cert_approved_sale())),
+            Some(serde_json::json!({
+                "authorization_code": "943616",
+                "reference_number": "000000019357",
+                "approval_code": "Y:943616:4667286258:PPXX:9476656675"
+            }))
+        );
+    }
+
+    #[test]
+    fn approved_sale_without_processor_block_takes_the_code_from_the_approval_code() {
+        let mut raw = real_cert_approved_sale();
+        raw.as_object_mut().unwrap().remove("processor");
+        assert_eq!(
+            metadata_of(&converted(raw)),
+            Some(serde_json::json!({
+                "authorization_code": "943616",
+                "approval_code": "Y:943616:4667286258:PPXX:9476656675"
+            }))
+        );
+    }
+
+    #[test]
+    fn declined_sale_stores_no_receipt() {
+        let mut raw = real_cert_approved_sale();
+        raw["transactionStatus"] = serde_json::json!("DECLINED");
+        raw["transactionResult"] = serde_json::json!("DECLINED");
+        raw["transactionState"] = serde_json::json!("DECLINED");
+        raw["approvalCode"] = serde_json::json!("N:05:Do not honour");
+        let data = converted(raw);
+        match data.response {
+            Err(error) => assert!(error.connector_metadata.is_none()),
+            Ok(_) => panic!("a declined sale must be an error"),
+        }
+    }
+
+    #[test]
+    fn a_sync_that_returns_the_receipt_keeps_the_stored_keys() {
+        let mut data = converted(real_cert_approved_sale());
+        let stored = serde_json::json!({
+            "responseCode3dSecure": "1",
+            "networkTokenPairing": {"networkTokenBin": "432312"},
+            "authorization_code": "OLD"
+        });
+        utils::keep_stored_metadata(&mut data, Some(&stored));
+        assert_eq!(
+            metadata_of(&data),
+            Some(serde_json::json!({
+                "responseCode3dSecure": "1",
+                "networkTokenPairing": {"networkTokenBin": "432312"},
+                "authorization_code": "943616",
+                "reference_number": "000000019357",
+                "approval_code": "Y:943616:4667286258:PPXX:9476656675"
+            }))
+        );
+    }
+
+    #[test]
+    fn the_zero_padded_approval_code_wins_over_the_processor_code() {
+        let mut raw = real_cert_approved_sale();
+        raw["approvalCode"] = serde_json::json!("Y:000035:4678776432:PPXX:3607891952");
+        raw["processor"]["authorizationCode"] = serde_json::json!("35");
+        let metadata = metadata_of(&converted(raw)).unwrap();
+        assert_eq!(metadata["authorization_code"], "000035");
+        assert_eq!(
+            metadata["approval_code"],
+            "Y:000035:4678776432:PPXX:3607891952"
+        );
+    }
+
+    #[test]
+    fn the_processor_code_is_used_without_a_usable_approval_code() {
+        for approval in [
+            None,
+            Some("N:05:Do not honour"),
+            Some("Y::123:PPXX"),
+            Some("garbage"),
+            Some(""),
+        ] {
+            let mut raw = real_cert_approved_sale();
+            match approval {
+                Some(value) => raw["approvalCode"] = serde_json::json!(value),
+                None => {
+                    raw.as_object_mut().unwrap().remove("approvalCode");
+                }
+            }
+            let metadata = metadata_of(&converted(raw)).unwrap();
+            assert_eq!(metadata["authorization_code"], "943616", "{approval:?}");
+        }
     }
 
     #[test]

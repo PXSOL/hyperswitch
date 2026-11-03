@@ -4366,6 +4366,11 @@ where
         let connector_response_metadata =
             payment_attempt.get_connector_response_metadata_from_attempt_metadata();
 
+        let connector_receipt = payment_attempt
+            .connector_metadata
+            .as_ref()
+            .and_then(api_models::payments::ConnectorReceipt::from_connector_metadata);
+
         let applied_offer = applied_offer_response(payment_attempt.applied_offer_details.clone());
         let masked_recipient_details = payment_intent
             .get_recipient_details()
@@ -4531,6 +4536,7 @@ where
             installment_data: payment_data.get_installment_details().cloned(),
             connector_response_metadata,
             sender_payment_instrument_id: payment_attempt.sender_payment_instrument_id.clone(),
+            connector_receipt,
         };
 
         services::ApplicationResponse::JsonWithHeaders((payments_response, headers))
@@ -5040,6 +5046,10 @@ impl ForeignFrom<(storage::PaymentIntent, storage::PaymentAttempt)> for api::Pay
             installment_options: pi.installment_options,
             installment_data: pa.installment_data,
             sender_payment_instrument_id: pa.sender_payment_instrument_id.clone(),
+            connector_receipt: pa
+                .connector_metadata
+                .as_ref()
+                .and_then(api_models::payments::ConnectorReceipt::from_connector_metadata),
         }
     }
 }

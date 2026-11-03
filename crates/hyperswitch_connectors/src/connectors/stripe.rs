@@ -1027,6 +1027,10 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Str
                 });
                 new_router_data.map(|mut router_data| {
                     router_data.request.integrity_object = Some(response_integrity_object);
+                    utils::keep_stored_metadata(
+                        &mut router_data,
+                        data.request.connector_meta.as_ref(),
+                    );
                     stripe::finish_payment_intent_sync(
                         router_data,
                         data.status,

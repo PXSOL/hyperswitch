@@ -1003,6 +1003,10 @@ pub struct MercadopagoPaymentsResponse {
     pub payment_method_id: Option<String>,
     #[serde(default)]
     pub payment_type_id: Option<String>,
+    /// Authorization code of the card issuer. Absent for non-card payments. A bad shape never
+    /// fails the parse.
+    #[serde(default, deserialize_with = "deserialize_lenient_code")]
+    pub authorization_code: Option<String>,
     /// Refunds Mercado Pago reports directly on the payment object. Kept as
     /// raw JSON: an unexpected shape (not an array, or a malformed entry in
     /// it) must never fail parsing the payment sync response — see
@@ -1092,6 +1096,18 @@ fn mercadopago_reported_dispute_status(status_detail: Option<&str>) -> enums::Di
 }
 
 impl MercadopagoPaymentsResponse {
+    /// Receipt data of this payment as connector metadata, `None` without an authorization code.
+    fn receipt_metadata(&self) -> Option<serde_json::Value> {
+        utils::merge_receipt_into_metadata(
+            None,
+            Some(utils::ReceiptMetadata {
+                authorization_code: self.authorization_code.clone(),
+                ticket_number: None,
+                reference_number: None,
+            }),
+        )
+    }
+
     /// Parses `refunds[]` leniently: an entry that fails to parse, or that
     /// has no usable id, is skipped and logged rather than failing the sync.
     fn reported_refunds(&self) -> Vec<MercadopagoPaymentRefundEntry> {
@@ -1213,7 +1229,7 @@ impl<F, T> TryFrom<ResponseRouterData<F, MercadopagoPaymentsResponse, T, Payment
                 resource_id: ResponseId::ConnectorTransactionId(connector_transaction_id.clone()),
                 redirection_data: Box::new(None),
                 mandate_reference: Box::new(None),
-                connector_metadata: None,
+                connector_metadata: item.response.receipt_metadata(),
                 network_txn_id: None,
                 connector_response_reference_id: item
                     .response
@@ -1654,6 +1670,20 @@ pub struct MercadopagoErrorCause {
     pub code: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+}
+
+/// Like `deserialize_code`, but a value that is neither text nor a number is `None` instead of
+/// an error, so an optional informative field can never fail the whole response.
+fn deserialize_lenient_code<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<serde_json::Value> = DeDeserialize::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::String(text)) => Some(text),
+        Some(serde_json::Value::Number(number)) => Some(number.to_string()),
+        _ => None,
+    })
 }
 
 fn deserialize_code<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -2219,6 +2249,35 @@ mod tests {
                 enums::AttemptStatus::from(status),
                 enums::AttemptStatus::Charged
             );
+        }
+    }
+
+    #[test]
+    fn payment_authorization_code_becomes_receipt_metadata() {
+        let payment: MercadopagoPaymentsResponse =
+            serde_json::from_str(r#"{"id":1,"status":"approved","authorization_code":"301299"}"#)
+                .unwrap();
+        assert_eq!(
+            payment.receipt_metadata(),
+            Some(serde_json::json!({"authorization_code": "301299"}))
+        );
+        let numeric: MercadopagoPaymentsResponse =
+            serde_json::from_str(r#"{"id":1,"status":"approved","authorization_code":301299}"#)
+                .unwrap();
+        assert_eq!(numeric.authorization_code.as_deref(), Some("301299"));
+    }
+
+    #[test]
+    fn missing_or_bad_authorization_code_never_fails_the_payment() {
+        for body in [
+            r#"{"id":1,"status":"approved"}"#,
+            r#"{"id":1,"status":"approved","authorization_code":null}"#,
+            r#"{"id":1,"status":"approved","authorization_code":" "}"#,
+            r#"{"id":1,"status":"approved","authorization_code":{"x":1}}"#,
+            r#"{"id":1,"status":"approved","authorization_code":true}"#,
+        ] {
+            let payment: MercadopagoPaymentsResponse = serde_json::from_str(body).unwrap();
+            assert_eq!(payment.receipt_metadata(), None, "{body}");
         }
     }
 
