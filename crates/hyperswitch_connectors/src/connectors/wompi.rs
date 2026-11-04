@@ -830,7 +830,7 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Wom
                 data.request.amount,
             );
         }
-        if data.payment_method == enums::PaymentMethod::Wallet {
+        let mut router_data = if data.payment_method == enums::PaymentMethod::Wallet {
             let response: wompi::WompiSearchResponse = res
                 .response
                 .parse_struct("WompiSearchResponse")
@@ -895,7 +895,9 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Wom
                         .ok_or_else(|| errors::ConnectorError::ResponseHandlingFailed.into())
                 },
             )
-        }
+        }?;
+        wompi::keep_stored_receipt(&mut router_data, data.request.connector_meta.as_ref());
+        Ok(router_data)
     }
 
     fn get_error_response(
