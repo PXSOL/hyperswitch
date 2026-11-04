@@ -354,6 +354,15 @@ where
     json.parse_value(std::any::type_name::<T>()).switch()
 }
 
+/// Top-level payment metadata keys that belong to one processor or to the routing rules.
+/// A connector that forwards the merchant's metadata as it comes has to leave them out:
+/// they are not its data, and a nested object can be too long for it to accept.
+const CONNECTOR_SCOPED_METADATA_KEYS: [&str; 3] = ["mercadopago", "payway", "routing_parameters"];
+
+pub(crate) fn is_connector_scoped_metadata_key(key: &str) -> bool {
+    CONNECTOR_SCOPED_METADATA_KEYS.contains(&key)
+}
+
 /// Merges payment metadata sources into one flat JSON object so a connector can read
 /// processor-specific values from a connector-scoped object (`{ "<scope>": { .. } }`).
 /// `sources` go from lowest to highest precedence; within a source the scoped keys win

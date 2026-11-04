@@ -52,8 +52,8 @@ use url::Url;
 use crate::{
     constants::headers::STRIPE_COMPATIBLE_CONNECT_ACCOUNT,
     utils::{
-        convert_uppercase, deserialize_zero_minor_amount_as_none, ApplePay,
-        PaymentMethodTokenizationRequestData, RouterData as OtherRouterData,
+        convert_uppercase, deserialize_zero_minor_amount_as_none, is_connector_scoped_metadata_key,
+        ApplePay, PaymentMethodTokenizationRequestData, RouterData as OtherRouterData,
     },
 };
 
@@ -5795,7 +5795,12 @@ fn get_transaction_metadata(
         let hashmap: HashMap<String, Value> =
             serde_json::from_str(&metadata.peek().to_string()).unwrap_or(HashMap::new());
 
-        for (key, value) in hashmap {
+        // Stripe takes 500 characters per value: another processor's object could make it
+        // reject the whole charge, besides not being its data.
+        for (key, value) in hashmap
+            .into_iter()
+            .filter(|(key, _)| !is_connector_scoped_metadata_key(key))
+        {
             let metadata_value = match value {
                 Value::String(string_value) => string_value,
                 value_data => value_data.to_string(),
@@ -6318,6 +6323,46 @@ impl<F, T>
                 ..item.data
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod test_transaction_metadata {
+    use hyperswitch_masking::Secret;
+
+    use super::get_transaction_metadata;
+
+    #[test]
+    fn leaves_out_what_belongs_to_other_processors_or_to_routing() {
+        let metadata = serde_json::json!({
+            "email": "guest@example.com",
+            "installments": 3,
+            "mercadopago": {"payer": {"first_name": "Ana"}},
+            "payway": {"bill_to": {"city": "Mendoza"}},
+            "routing_parameters": {"installments": "3"},
+        });
+
+        let sent = get_transaction_metadata(Some(Secret::new(metadata)), "order_1".to_string());
+
+        let mut keys: Vec<&str> = sent.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "metadata[email]",
+                "metadata[installments]",
+                "metadata[order_id]"
+            ]
+        );
+        assert_eq!(sent["metadata[installments]"], "3");
+    }
+
+    #[test]
+    fn keeps_the_order_id_without_metadata() {
+        let sent = get_transaction_metadata(None, "order_1".to_string());
+
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent["metadata[order_id]"], "order_1");
     }
 }
 
