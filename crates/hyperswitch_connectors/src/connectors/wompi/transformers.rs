@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     types::{RefundsResponseRouterData, ResponseRouterData},
-    utils::{PaymentsAuthorizeRequestData, RouterData as _},
+    utils::{self, PaymentsAuthorizeRequestData, RouterData as _},
 };
 
 // Wompi documents a 3-minute buyer retry window for hosted-checkout payments
@@ -660,6 +660,94 @@ pub struct WompiTransactionData {
     // (see `reclassify_external_void`).
     #[serde(default)]
     pub amount_in_cents: Option<i64>,
+    // Only on API responses: a `transaction.updated` webhook does not carry it. Read
+    // leniently so an unexpected shape costs the receipt, never the payment.
+    #[serde(default, deserialize_with = "lenient_payment_method")]
+    pub payment_method: Option<WompiTransactionPaymentMethod>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WompiTransactionPaymentMethod {
+    #[serde(default)]
+    pub extra: Option<WompiTransactionExtra>,
+}
+
+/// The only `payment_method.extra` fields kept. The rest (card holder, BIN, last four)
+/// is left out on purpose so it never reaches logs or events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WompiTransactionExtra {
+    #[serde(default)]
+    pub external_identifier: Option<Secret<String>>,
+    #[serde(default)]
+    pub authorizer_transaction_id: Option<Secret<String>>,
+}
+
+fn lenient_payment_method<'de, D>(
+    deserializer: D,
+) -> Result<Option<WompiTransactionPaymentMethod>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
+
+impl WompiTransactionData {
+    /// Receipt of a card payment, card only because other payment methods use
+    /// `external_identifier` for their own ids.
+    ///
+    /// Wompi does not document these two fields. They are read by their format: on
+    /// production approved cards they have 6 and 12 characters, the ISO 8583 lengths of
+    /// the approval code and the retrieval reference number, and declined cards have
+    /// neither. Correct the mapping here if Wompi says otherwise.
+    fn card_receipt(&self) -> Option<utils::ReceiptMetadata> {
+        if self.payment_method_type.as_deref() != Some("CARD") {
+            return None;
+        }
+        let extra = self.payment_method.as_ref()?.extra.as_ref()?;
+        Some(utils::ReceiptMetadata {
+            authorization_code: extra
+                .external_identifier
+                .as_ref()
+                .map(|code| code.peek().clone()),
+            ticket_number: None,
+            reference_number: extra
+                .authorizer_transaction_id
+                .as_ref()
+                .map(|reference| reference.peek().clone()),
+        })
+    }
+}
+
+/// A `transaction.updated` webhook has no `payment_method`, and a response that sets
+/// `connector_metadata` replaces the stored column. So the receipt an earlier sync stored
+/// is carried over, or a webhook arriving later would erase it. Only the receipt keys are
+/// carried: the rest of the stored value (such as a finished 3DS stash) stays replaced.
+pub(super) fn keep_stored_receipt<F, T>(
+    router_data: &mut RouterData<F, T, PaymentsResponseData>,
+    stored: Option<&serde_json::Value>,
+) {
+    let stored_text = |key: &str| {
+        stored
+            .and_then(|value| value.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    let stored_receipt = utils::merge_receipt_into_metadata(
+        None,
+        Some(utils::ReceiptMetadata {
+            authorization_code: stored_text(utils::ReceiptMetadata::AUTHORIZATION_CODE_KEY),
+            ticket_number: stored_text(utils::ReceiptMetadata::TICKET_NUMBER_KEY),
+            reference_number: stored_text(utils::ReceiptMetadata::REFERENCE_NUMBER_KEY),
+        }),
+    );
+    if let Ok(PaymentsResponseData::TransactionResponse {
+        connector_metadata, ..
+    }) = router_data.response.as_mut()
+    {
+        *connector_metadata =
+            utils::merge_with_stored_metadata(stored_receipt.as_ref(), connector_metadata.take());
+    }
 }
 
 /// A Wompi void has no partial mode (see the refunds section below): a payment
@@ -874,17 +962,19 @@ pub struct WompiPaymentMetadata {
     pub finalized_at: Option<String>,
 }
 
-/// Builds the `connector_metadata` for a Charged transaction. Effectively
-/// infallible (a two-`Option<String>`-field struct always serializes), but
-/// returns `Option` rather than panicking on the off chance it doesn't: a
-/// missing metadata blob just means a later refund falls back to the V2
-/// refunds API instead of void, never a hard failure of the payment itself.
+/// Builds the `connector_metadata` for a Charged transaction: how it was paid, plus
+/// the card receipt when Wompi reports one. Effectively infallible (a
+/// two-`Option<String>`-field struct always serializes), but returns `Option`
+/// rather than panicking on the off chance it doesn't: a missing metadata blob
+/// just means a later refund falls back to the V2 refunds API instead of void,
+/// never a hard failure of the payment itself.
 fn charged_connector_metadata(transaction: &WompiTransactionData) -> Option<serde_json::Value> {
-    serde_json::to_value(WompiPaymentMetadata {
+    let metadata = serde_json::to_value(WompiPaymentMetadata {
         payment_method_type: transaction.payment_method_type.clone(),
         finalized_at: transaction.finalized_at.clone(),
     })
-    .ok()
+    .ok();
+    utils::merge_receipt_into_metadata(metadata, transaction.card_receipt())
 }
 
 /// Builds the RouterData outcome for one Wompi transaction: Charged/Pending/
@@ -3019,6 +3109,7 @@ mod tests {
             finalized_at: finalized_at.map(|s| s.to_string()),
             payment_method_type: None,
             amount_in_cents: None,
+            payment_method: None,
         }
     }
 
@@ -4128,6 +4219,7 @@ mod tests {
             finalized_at: None,
             payment_method_type: None,
             amount_in_cents: None,
+            payment_method: None,
         };
         let result = transaction_to_router_data(transaction, router_data, 200);
         assert_eq!(result.status, enums::AttemptStatus::Failure);
@@ -4438,6 +4530,7 @@ mod tests {
             finalized_at: Some("2026-09-25T15:00:00Z".to_string()),
             payment_method_type: Some("CARD".to_string()),
             amount_in_cents: None,
+            payment_method: None,
         };
         let result = transaction_to_router_data(transaction, router_data, 200);
         assert_eq!(result.status, enums::AttemptStatus::Charged);
@@ -4455,6 +4548,232 @@ mod tests {
             }
             other => panic!("expected a TransactionResponse, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Card receipt (`card_receipt`, `keep_stored_receipt`)
+    // ------------------------------------------------------------------
+
+    /// Shape of a production `GET /transactions/{id}`, with made-up values.
+    fn approved_card_json() -> serde_json::Value {
+        serde_json::json!({
+            "id": "txn-receipt-1",
+            "reference": "ref-receipt-1",
+            "status": "APPROVED",
+            "status_message": null,
+            "finalized_at": "2026-09-25T15:00:00Z",
+            "payment_method_type": "CARD",
+            "payment_method": {
+                "type": "CARD",
+                "installments": 1,
+                "extra": {
+                    "bin": "400000",
+                    "brand": "VISA",
+                    "card_holder": "ANA PRUEBA",
+                    "last_four": "1111",
+                    "external_identifier": "A1B2C3",
+                    "authorizer_transaction_id": "000000123456",
+                    "processor_response_code": "00"
+                }
+            }
+        })
+    }
+
+    fn transaction_from(value: serde_json::Value) -> WompiTransactionData {
+        serde_json::from_value(value).expect("transaction must parse")
+    }
+
+    fn charged_router_data(reference: &str) -> PaymentsAuthorizeRouterData {
+        authorize_router_data(
+            authorize_request_data(
+                PaymentMethodData::Card(test_card()),
+                enums::Currency::COP,
+                100000,
+                Some(common_utils::pii::Email::from_str("buyer@example.com").unwrap()),
+                None,
+            ),
+            enums::AuthenticationType::NoThreeDs,
+            Some(packed_access_token()),
+            Some("tok_test_x".to_string()),
+            reference,
+        )
+    }
+
+    fn response_metadata<F, T>(
+        router_data: &RouterData<F, T, PaymentsResponseData>,
+    ) -> Option<serde_json::Value> {
+        match router_data.response.as_ref().expect("must be Ok") {
+            PaymentsResponseData::TransactionResponse {
+                connector_metadata, ..
+            } => connector_metadata.clone(),
+            other => panic!("expected a TransactionResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn approved_card_stores_the_receipt_next_to_the_payment_metadata() {
+        let result = transaction_to_router_data(
+            transaction_from(approved_card_json()),
+            charged_router_data("ref-receipt-1"),
+            200,
+        );
+        assert_eq!(result.status, enums::AttemptStatus::Charged);
+        assert_eq!(
+            response_metadata(&result),
+            Some(serde_json::json!({
+                "payment_method_type": "CARD",
+                "finalized_at": "2026-09-25T15:00:00Z",
+                "authorization_code": "A1B2C3",
+                "reference_number": "000000123456"
+            }))
+        );
+    }
+
+    #[test]
+    fn hosted_approved_card_carries_the_receipt() {
+        let outcome =
+            select_hosted_transaction(vec![transaction_from(approved_card_json())], now());
+        match outcome {
+            HostedSyncOutcome::Charged {
+                connector_metadata, ..
+            } => {
+                let metadata = connector_metadata.expect("charged must carry metadata");
+                assert_eq!(metadata["authorization_code"], "A1B2C3");
+                assert_eq!(metadata["reference_number"], "000000123456");
+            }
+            other => panic!("expected Charged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_card_payment_stores_no_receipt() {
+        let mut value = approved_card_json();
+        value["payment_method_type"] = serde_json::json!("NEQUI");
+        let metadata = charged_connector_metadata(&transaction_from(value))
+            .expect("charged must carry metadata");
+        assert!(metadata.get("authorization_code").is_none());
+        assert!(metadata.get("reference_number").is_none());
+        assert_eq!(metadata["payment_method_type"], "NEQUI");
+    }
+
+    #[test]
+    fn unexpected_payment_method_shape_costs_the_receipt_not_the_payment() {
+        for payment_method in [
+            serde_json::json!("not-an-object"),
+            serde_json::json!({ "extra": "not-an-object" }),
+            serde_json::json!({ "extra": { "external_identifier": 123456 } }),
+            serde_json::Value::Null,
+        ] {
+            let mut value = approved_card_json();
+            value["payment_method"] = payment_method;
+            let metadata = charged_connector_metadata(&transaction_from(value))
+                .expect("charged must carry metadata");
+            assert!(metadata.get("authorization_code").is_none());
+            assert_eq!(metadata["payment_method_type"], "CARD");
+        }
+    }
+
+    #[test]
+    fn blank_receipt_values_are_not_stored() {
+        let mut value = approved_card_json();
+        value["payment_method"]["extra"]["external_identifier"] = serde_json::json!("  ");
+        value["payment_method"]["extra"]["authorizer_transaction_id"] = serde_json::json!("");
+        let metadata = charged_connector_metadata(&transaction_from(value))
+            .expect("charged must carry metadata");
+        assert!(metadata.get("authorization_code").is_none());
+        assert!(metadata.get("reference_number").is_none());
+    }
+
+    #[test]
+    fn receipt_and_card_data_stay_out_of_debug_logs() {
+        let printed = format!("{:?}", transaction_from(approved_card_json()));
+        for value in ["A1B2C3", "000000123456", "ANA PRUEBA", "400000", "1111"] {
+            assert!(!printed.contains(value), "{value} leaked into Debug");
+        }
+    }
+
+    #[test]
+    fn metadata_with_a_receipt_still_allows_a_card_void() {
+        let metadata = charged_connector_metadata(&transaction_from(approved_card_json()));
+        assert!(validate_void_refund(
+            metadata.as_ref(),
+            MinorUnit::new(100000),
+            MinorUnit::new(100000),
+            enums::Currency::COP,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_later_webhook_does_not_erase_the_stored_receipt() {
+        let stored = charged_connector_metadata(&transaction_from(approved_card_json()));
+        // A webhook's transaction has no `payment_method`.
+        let mut webhook = approved_card_json();
+        webhook
+            .as_object_mut()
+            .expect("object")
+            .remove("payment_method");
+        let mut result = transaction_to_router_data(
+            transaction_from(webhook),
+            charged_router_data("ref-receipt-1"),
+            200,
+        );
+        keep_stored_receipt(&mut result, stored.as_ref());
+        assert_eq!(response_metadata(&result), stored);
+    }
+
+    #[test]
+    fn the_response_receipt_wins_over_the_stored_one() {
+        let stored = serde_json::json!({
+            "authorization_code": "OLD000",
+            "reference_number": "000000000001"
+        });
+        let mut result = transaction_to_router_data(
+            transaction_from(approved_card_json()),
+            charged_router_data("ref-receipt-1"),
+            200,
+        );
+        keep_stored_receipt(&mut result, Some(&stored));
+        let metadata = response_metadata(&result).expect("charged must carry metadata");
+        assert_eq!(metadata["authorization_code"], "A1B2C3");
+        assert_eq!(metadata["reference_number"], "000000123456");
+    }
+
+    #[test]
+    fn keeping_the_receipt_drops_other_stored_keys_and_leaves_none_alone() {
+        let stored = serde_json::json!({
+            "wompi_transaction_id": "txn-3ds",
+            "authorization_code": "A1B2C3"
+        });
+        let mut charged = transaction_to_router_data(
+            transaction_from(serde_json::json!({
+                "id": "txn-1",
+                "reference": "ref-1",
+                "status": "APPROVED",
+                "status_message": null,
+                "payment_method_type": "CARD"
+            })),
+            charged_router_data("ref-1"),
+            200,
+        );
+        keep_stored_receipt(&mut charged, Some(&stored));
+        let metadata = response_metadata(&charged).expect("charged must carry metadata");
+        assert_eq!(metadata["authorization_code"], "A1B2C3");
+        assert!(metadata.get("wompi_transaction_id").is_none());
+
+        // `None` means "keep the stored column", and must stay `None`.
+        let mut pending = transaction_to_router_data(
+            transaction_from(serde_json::json!({
+                "id": "txn-2",
+                "reference": "ref-2",
+                "status": "PENDING",
+                "status_message": null
+            })),
+            charged_router_data("ref-2"),
+            200,
+        );
+        keep_stored_receipt(&mut pending, Some(&stored));
+        assert_eq!(response_metadata(&pending), None);
     }
 
     #[test]
@@ -4482,6 +4801,7 @@ mod tests {
             finalized_at: None,
             payment_method_type: Some("CARD".to_string()),
             amount_in_cents: None,
+            payment_method: None,
         };
         let result = transaction_to_router_data(transaction, router_data, 200);
         match result.response.expect("pending must be Ok") {
@@ -4980,6 +5300,7 @@ mod tests {
             finalized_at: None,
             payment_method_type: Some("CARD".to_string()),
             amount_in_cents: None,
+            payment_method: None,
         };
 
         let result = three_ds_create_response(
@@ -5025,6 +5346,7 @@ mod tests {
             finalized_at: Some("2026-01-01T00:00:00Z".to_string()),
             payment_method_type: Some("CARD".to_string()),
             amount_in_cents: None,
+            payment_method: None,
         };
 
         let result = three_ds_create_response(
@@ -5234,6 +5556,7 @@ mod tests {
             finalized_at: Some("2026-01-01T00:00:00Z".to_string()),
             payment_method_type: Some("CARD".to_string()),
             amount_in_cents: None,
+            payment_method: None,
         }
     }
 
