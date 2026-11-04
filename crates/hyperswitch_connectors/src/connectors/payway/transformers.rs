@@ -132,6 +132,22 @@ pub struct PaywayPaymentsRequest {
     pub installments: i32,
     pub sub_payments: Vec<serde_json::Value>,
     pub fraud_detection: PaywayFraudDetectionAuth,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub establishment_name: Option<String>,
+}
+
+/// Maximum length of Payway's `establishment_name` (SDK guide: alphanumeric, 25 chars).
+const PAYWAY_ESTABLISHMENT_NAME_MAX_LEN: usize = 25;
+
+/// Returns the name only if Payway accepts it as is (trimmed, non-empty, at most 25
+/// characters, ASCII letters, digits and spaces). It omits instead of altering the value,
+/// so a rejected name can never block a charge.
+fn valid_establishment_name(statement_descriptor: Option<&str>) -> Option<String> {
+    let name = statement_descriptor?.trim();
+    let is_valid = !name.is_empty()
+        && name.chars().count() <= PAYWAY_ESTABLISHMENT_NAME_MAX_LEN
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ');
+    is_valid.then(|| name.to_string())
 }
 
 impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPaymentsRequest {
@@ -290,6 +306,13 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
             installments,
             sub_payments: vec![],
             fraud_detection,
+            establishment_name: valid_establishment_name(
+                item.router_data
+                    .request
+                    .billing_descriptor
+                    .as_ref()
+                    .and_then(|descriptor| descriptor.statement_descriptor.as_deref()),
+            ),
         })
     }
 }
@@ -1094,5 +1117,123 @@ mod tests {
         let meta = PaywayMetadataObject::resolve(None).unwrap();
         assert!(meta.payment_method_id.is_none());
         assert!(meta.bill_to.is_none());
+    }
+
+    #[test]
+    fn establishment_name_valid_is_kept() {
+        assert_eq!(
+            valid_establishment_name(Some("San Nicolas Plaza Hotel")).as_deref(),
+            Some("San Nicolas Plaza Hotel")
+        );
+    }
+
+    #[test]
+    fn establishment_name_is_trimmed() {
+        assert_eq!(
+            valid_establishment_name(Some("  Hotel Sol  ")).as_deref(),
+            Some("Hotel Sol")
+        );
+    }
+
+    #[test]
+    fn establishment_name_of_25_characters_is_kept() {
+        let name = "A".repeat(25);
+        assert_eq!(valid_establishment_name(Some(&name)), Some(name));
+    }
+
+    #[test]
+    fn establishment_name_of_26_characters_is_omitted() {
+        assert_eq!(valid_establishment_name(Some(&"A".repeat(26))), None);
+    }
+
+    #[test]
+    fn establishment_name_with_accent_is_omitted() {
+        assert_eq!(valid_establishment_name(Some("Hotel Nicol\u{e1}s")), None);
+    }
+
+    #[test]
+    fn establishment_name_with_symbol_is_omitted() {
+        assert_eq!(valid_establishment_name(Some("Hotel & Spa")), None);
+        assert_eq!(valid_establishment_name(Some("O'Hara")), None);
+    }
+
+    #[test]
+    fn establishment_name_empty_is_omitted() {
+        assert_eq!(valid_establishment_name(Some("")), None);
+        assert_eq!(valid_establishment_name(Some("   ")), None);
+    }
+
+    #[test]
+    fn establishment_name_without_descriptor_is_omitted() {
+        assert_eq!(valid_establishment_name(None), None);
+    }
+
+    fn payment_request(establishment_name: Option<String>) -> PaywayPaymentsRequest {
+        let item = || PaywayServicesItem {
+            code: "SERVICE".to_string(),
+            description: "Payment".to_string(),
+            name: "Payment service".to_string(),
+            sku: "SERVICE".to_string(),
+            total_amount: 10000,
+            quantity: 1,
+            unit_price: 10000,
+        };
+        PaywayPaymentsRequest {
+            site_transaction_id: "pay_1".to_string(),
+            token: "token".to_string(),
+            payment_method_id: 1,
+            bin: "450799".to_string(),
+            amount: 10000,
+            currency: "ARS".to_string(),
+            description: None,
+            payment_type: "single".to_string(),
+            installments: 1,
+            sub_payments: vec![],
+            fraud_detection: PaywayFraudDetectionAuth {
+                channel: "Web".to_string(),
+                send_to_cs: false,
+                device_unique_identifier: "pay_1".to_string(),
+                purchase_totals: PaywayPurchaseTotals {
+                    currency: "ARS".to_string(),
+                    amount: 10000,
+                },
+                bill_to: PaywayBillTo::default(),
+                customer_in_site: PaywayCustomerInSite {
+                    days_in_site: 1,
+                    is_guest: true,
+                    num_of_transactions: 0,
+                },
+                services_transaction_data: PaywayServicesTransactionData {
+                    service_type: "payment".to_string(),
+                    items: vec![item()],
+                },
+                retail_transaction_data: PaywayRetailTransactionData {
+                    ship_to: PaywayShipTo {
+                        country: "AR".to_string(),
+                        city: None,
+                        email: None,
+                        first_name: None,
+                        last_name: None,
+                        phone_number: None,
+                        postal_code: None,
+                        state: None,
+                        street1: None,
+                    },
+                    items: vec![item()],
+                },
+            },
+            establishment_name,
+        }
+    }
+
+    #[test]
+    fn payment_request_sends_establishment_name_only_when_present() {
+        let without = serde_json::to_value(payment_request(None)).unwrap();
+        assert!(without.get("establishment_name").is_none());
+
+        let with =
+            serde_json::to_value(payment_request(Some("San Nicolas Plaza Hotel".to_string())))
+                .unwrap();
+        assert_eq!(with["establishment_name"], "San Nicolas Plaza Hotel");
     }
 }
