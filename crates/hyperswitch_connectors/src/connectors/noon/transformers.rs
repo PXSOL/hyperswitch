@@ -400,7 +400,8 @@ impl TryFrom<&NoonRouterData<&PaymentsAuthorizeRouterData>> for NoonPaymentsRequ
                         | WalletData::WompiCheckout {}
                         | WalletData::StripeCheckout {}
                         | WalletData::IzipayCheckout {}
-                        | WalletData::MercadoPagoCheckoutPro {} => {
+                        | WalletData::MercadoPagoCheckoutPro {}
+                        | WalletData::MercadoPagoQr {} => {
                             Err(errors::ConnectorError::NotImplemented(
                                 utils::get_unimplemented_payment_method_error_message("Noon"),
                             ))

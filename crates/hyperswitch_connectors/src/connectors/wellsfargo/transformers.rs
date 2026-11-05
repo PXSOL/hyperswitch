@@ -245,11 +245,10 @@ impl TryFrom<&SetupMandateRouterData> for WellsfargoZeroMandateRequest {
                 | WalletData::WompiCheckout {}
                 | WalletData::StripeCheckout {}
                 | WalletData::IzipayCheckout {}
-                | WalletData::MercadoPagoCheckoutPro {} => {
-                    Err(errors::ConnectorError::NotImplemented(
-                        utils::get_unimplemented_payment_method_error_message("Wellsfargo"),
-                    ))?
-                }
+                | WalletData::MercadoPagoCheckoutPro {}
+                | WalletData::MercadoPagoQr {} => Err(errors::ConnectorError::NotImplemented(
+                    utils::get_unimplemented_payment_method_error_message("Wellsfargo"),
+                ))?,
             },
             PaymentMethodData::CardRedirect(_)
             | PaymentMethodData::PayLater(_)
@@ -1368,7 +1367,8 @@ impl TryFrom<&WellsfargoRouterData<&PaymentsAuthorizeRouterData>> for Wellsfargo
                         | WalletData::WompiCheckout {}
                         | WalletData::StripeCheckout {}
                         | WalletData::IzipayCheckout {}
-                        | WalletData::MercadoPagoCheckoutPro {} => {
+                        | WalletData::MercadoPagoCheckoutPro {}
+                        | WalletData::MercadoPagoQr {} => {
                             Err(errors::ConnectorError::NotImplemented(
                                 utils::get_unimplemented_payment_method_error_message("Wellsfargo"),
                             )

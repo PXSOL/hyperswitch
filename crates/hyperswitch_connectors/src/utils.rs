@@ -6879,6 +6879,7 @@ pub enum PaymentMethodDataType {
     PaypalSdk,
     MercadoPagoSdk,
     MercadoPagoCheckoutPro,
+    MercadoPagoQr,
     WompiCheckout,
     StripeCheckout,
     IzipayCheckout,
@@ -7043,6 +7044,7 @@ impl From<PaymentMethodData> for PaymentMethodDataType {
                 payment_method_data::WalletData::MercadoPagoCheckoutPro {} => {
                     Self::MercadoPagoCheckoutPro
                 }
+                payment_method_data::WalletData::MercadoPagoQr {} => Self::MercadoPagoQr,
                 payment_method_data::WalletData::WompiCheckout {} => Self::WompiCheckout,
                 payment_method_data::WalletData::StripeCheckout {} => Self::StripeCheckout,
                 payment_method_data::WalletData::IzipayCheckout {} => Self::IzipayCheckout,

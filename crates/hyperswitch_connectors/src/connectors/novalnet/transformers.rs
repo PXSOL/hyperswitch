@@ -442,6 +442,7 @@ impl TryFrom<&NovalnetRouterData<&PaymentsAuthorizeRouterData>> for NovalnetPaym
                     | WalletDataPaymentMethod::StripeCheckout {}
                     | WalletDataPaymentMethod::IzipayCheckout {}
                     | WalletDataPaymentMethod::MercadoPagoCheckoutPro {}
+                    | WalletDataPaymentMethod::MercadoPagoQr {}
                     | WalletDataPaymentMethod::Mifinity(_) => {
                         Err(errors::ConnectorError::NotImplemented(
                             utils::get_unimplemented_payment_method_error_message("novalnet"),
@@ -1931,6 +1932,7 @@ impl TryFrom<&SetupMandateRouterData> for NovalnetPaymentsRequest {
                 | WalletDataPaymentMethod::StripeCheckout {}
                 | WalletDataPaymentMethod::IzipayCheckout {}
                 | WalletDataPaymentMethod::MercadoPagoCheckoutPro {}
+                | WalletDataPaymentMethod::MercadoPagoQr {}
                 | WalletDataPaymentMethod::Mifinity(_) => {
                     Err(errors::ConnectorError::NotImplemented(
                         utils::get_unimplemented_payment_method_error_message("novalnet"),

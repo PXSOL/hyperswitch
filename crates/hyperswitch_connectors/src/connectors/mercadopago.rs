@@ -1,3 +1,4 @@
+pub mod orders;
 pub mod transformers;
 
 use common_enums::enums;
@@ -334,6 +335,9 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
                 "{}/checkout/preferences",
                 self.base_url(connectors)
             ))
+        } else if mercadopago::MercadopagoAuthorizeRequest::is_qr(&req.request.payment_method_data)
+        {
+            Ok(format!("{}/v1/orders", self.base_url(connectors)))
         } else {
             Ok(format!("{}/v1/payments", self.base_url(connectors)))
         }
@@ -384,6 +388,28 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         event_builder: Option<&mut ConnectorEvent>,
         res: Response,
     ) -> CustomResult<PaymentsAuthorizeRouterData, errors::ConnectorError> {
+        if mercadopago::MercadopagoAuthorizeRequest::is_qr(&data.request.payment_method_data) {
+            let response: orders::MercadopagoOrderResponse = res
+                .response
+                .parse_struct("MercadopagoOrderResponse")
+                .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+            event_builder.map(|i| i.set_response_body(&response));
+            router_env::logger::info!(order_id=%response.id, order_status=?response.status);
+            let requested_amount = utils::convert_amount(
+                self.amount_converter,
+                data.request.minor_amount,
+                data.request.currency,
+            )?;
+            return orders::authorize_order_response(
+                ResponseRouterData {
+                    response,
+                    data: data.clone(),
+                    http_code: res.status_code,
+                },
+                data.request.currency,
+                requested_amount,
+            );
+        }
         let response: mercadopago::MercadopagoAuthorizeResponse = res
             .response
             .parse_struct("MercadopagoAuthorizeResponse")
@@ -442,9 +468,11 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Mer
             .connector_transaction_id
             .get_connector_transaction_id()
         {
-            Ok(connector_payment_id) => {
-                Ok(format!("{base_url}/v1/payments/{connector_payment_id}"))
-            }
+            // An `ORD` id (QR) syncs the order, a numeric id the payment.
+            Ok(connector_payment_id) => Ok(format!(
+                "{base_url}{}",
+                orders::psync_path(&connector_payment_id)
+            )),
             Err(_) if req.payment_method == enums::PaymentMethod::Wallet => Ok(format!(
                 "{}/v1/payments/search?external_reference={}&sort=date_created&criteria=desc",
                 base_url, req.connector_request_reference_id
@@ -478,6 +506,40 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Mer
         event_builder: Option<&mut ConnectorEvent>,
         res: Response,
     ) -> CustomResult<PaymentsSyncRouterData, errors::ConnectorError> {
+        let is_order = data
+            .request
+            .connector_transaction_id
+            .get_connector_transaction_id()
+            .is_ok_and(|id| orders::is_order_id(&id));
+        if is_order {
+            let response: orders::MercadopagoOrderResponse = res
+                .response
+                .parse_struct("MercadopagoOrderResponse")
+                .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+            event_builder.map(|i| i.set_response_body(&response));
+            router_env::logger::info!(connector_response=?response);
+            let reported_activity = response.reported_activity(data.request.currency);
+            let mut router_data = orders::sync_order_response(ResponseRouterData {
+                response,
+                data: data.clone(),
+                http_code: res.status_code,
+            });
+            if let Some(reported_activity) = reported_activity {
+                match router_data.connector_response.as_mut() {
+                    Some(connector_response) => {
+                        connector_response.set_reported_activity(reported_activity);
+                    }
+                    None => {
+                        router_data.connector_response = Some(
+                            hyperswitch_domain_models::router_data::ConnectorResponseData::with_reported_activity(
+                                reported_activity,
+                            ),
+                        );
+                    }
+                }
+            }
+            return Ok(router_data);
+        }
         let response: mercadopago::MercadopagoPSyncResponse = res
             .response
             .parse_struct("MercadopagoPSyncResponse")
@@ -664,9 +726,9 @@ impl ConnectorIntegration<Void, PaymentsCancelData, PaymentsResponseData> for Me
         connectors: &Connectors,
     ) -> CustomResult<String, errors::ConnectorError> {
         Ok(format!(
-            "{}/v1/payments/{}",
+            "{}{}",
             self.base_url(connectors),
-            req.request.connector_transaction_id
+            orders::void_path(&req.request.connector_transaction_id)
         ))
     }
 
@@ -684,6 +746,17 @@ impl ConnectorIntegration<Void, PaymentsCancelData, PaymentsResponseData> for Me
         req: &PaymentsCancelRouterData,
         connectors: &Connectors,
     ) -> CustomResult<Option<Request>, errors::ConnectorError> {
+        // An order is cancelled with a bodyless POST; a payment with a PUT of its new status.
+        if orders::is_order_id(&req.request.connector_transaction_id) {
+            return Ok(Some(
+                RequestBuilder::new()
+                    .method(Method::Post)
+                    .url(&types::PaymentsVoidType::get_url(self, req, connectors)?)
+                    .attach_default_headers()
+                    .headers(types::PaymentsVoidType::get_headers(self, req, connectors)?)
+                    .build(),
+            ));
+        }
         Ok(Some(
             RequestBuilder::new()
                 .method(Method::Put)
@@ -703,6 +776,19 @@ impl ConnectorIntegration<Void, PaymentsCancelData, PaymentsResponseData> for Me
         event_builder: Option<&mut ConnectorEvent>,
         res: Response,
     ) -> CustomResult<PaymentsCancelRouterData, errors::ConnectorError> {
+        if orders::is_order_id(&data.request.connector_transaction_id) {
+            let response: orders::MercadopagoOrderResponse = res
+                .response
+                .parse_struct("MercadopagoOrderResponse")
+                .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+            event_builder.map(|i| i.set_response_body(&response));
+            router_env::logger::info!(connector_response=?response);
+            return Ok(orders::sync_order_response(ResponseRouterData {
+                response,
+                data: data.clone(),
+                http_code: res.status_code,
+            }));
+        }
         let response: mercadopago::MercadopagoPaymentsResponse = res
             .response
             .parse_struct("MercadopagoPaymentsResponse")
@@ -756,9 +842,9 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Mercado
         connectors: &Connectors,
     ) -> CustomResult<String, errors::ConnectorError> {
         Ok(format!(
-            "{}/v1/payments/{}/refunds",
+            "{}{}",
             self.base_url(connectors),
-            req.request.connector_transaction_id
+            orders::refund_path(&req.request.connector_transaction_id)
         ))
     }
 
@@ -774,6 +860,11 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Mercado
         )?;
 
         let connector_router_data = mercadopago::MercadopagoRouterData::from((refund_amount, req));
+        if orders::is_order_id(&req.request.connector_transaction_id) {
+            let connector_req =
+                orders::MercadopagoOrderRefundRequest::try_from(&connector_router_data)?;
+            return Ok(RequestContent::Json(Box::new(connector_req)));
+        }
         let connector_req =
             mercadopago::MercadopagoRefundRequest::try_from(&connector_router_data)?;
         Ok(RequestContent::Json(Box::new(connector_req)))
@@ -804,6 +895,19 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for Mercado
         event_builder: Option<&mut ConnectorEvent>,
         res: Response,
     ) -> CustomResult<RefundsRouterData<Execute>, errors::ConnectorError> {
+        if orders::is_order_id(&data.request.connector_transaction_id) {
+            let response: orders::MercadopagoOrderResponse = res
+                .response
+                .parse_struct("MercadopagoOrderResponse")
+                .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+            event_builder.map(|i| i.set_response_body(&response));
+            router_env::logger::info!(connector_response=?response);
+            return RouterData::try_from(crate::types::RefundsResponseRouterData {
+                response,
+                data: data.clone(),
+                http_code: res.status_code,
+            });
+        }
         let response: mercadopago::RefundResponse = res
             .response
             .parse_struct("MercadopagoRefundResponse")
@@ -850,10 +954,12 @@ impl ConnectorIntegration<RSync, RefundsData, RefundsResponseData> for Mercadopa
         connectors: &Connectors,
     ) -> CustomResult<String, errors::ConnectorError> {
         Ok(format!(
-            "{}/v1/payments/{}/refunds/{}",
+            "{}{}",
             self.base_url(connectors),
-            req.request.connector_transaction_id,
-            req.request.get_connector_refund_id()?
+            orders::refund_sync_path(
+                &req.request.connector_transaction_id,
+                &req.request.get_connector_refund_id()?
+            )
         ))
     }
 
@@ -878,6 +984,19 @@ impl ConnectorIntegration<RSync, RefundsData, RefundsResponseData> for Mercadopa
         event_builder: Option<&mut ConnectorEvent>,
         res: Response,
     ) -> CustomResult<RefundSyncRouterData, errors::ConnectorError> {
+        if orders::is_order_id(&data.request.connector_transaction_id) {
+            let response: orders::MercadopagoOrderResponse = res
+                .response
+                .parse_struct("MercadopagoOrderResponse")
+                .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+            event_builder.map(|i| i.set_response_body(&response));
+            router_env::logger::info!(connector_response=?response);
+            return RouterData::try_from(crate::types::RefundsResponseRouterData {
+                response,
+                data: data.clone(),
+                http_code: res.status_code,
+            });
+        }
         let response: mercadopago::RefundResponse = res
             .response
             .parse_struct("MercadopagoRefundResponse")
@@ -917,6 +1036,13 @@ fn extract_ipn_id_from_query(query_params: &str) -> Option<String> {
     None
 }
 
+fn extract_query_param(query_params: &str, wanted: &str) -> Option<String> {
+    query_params.split('&').find_map(|param| {
+        let (key, value) = param.split_once('=')?;
+        (key == wanted && !value.is_empty()).then(|| value.to_string())
+    })
+}
+
 /// Extract the topic from query params (for IPN legacy notifications)
 fn extract_topic_from_query(query_params: &str) -> Option<String> {
     for param in query_params.split('&') {
@@ -943,6 +1069,13 @@ fn classify_mercadopago_webhook(
         .parse_struct::<mercadopago::MercadopagoWebhookBodyEnum>("MercadopagoWebhookBodyEnum")
     {
         return webhook_body.classify();
+    }
+
+    // Orders API delivery: ?type=order&data.id=ORD...&data.external_reference=...
+    if extract_query_param(&request.query_params, "type").as_deref() == Some("order") {
+        if let Some(order_id) = extract_query_param(&request.query_params, "data.id") {
+            return mercadopago::MercadopagoWebhookNotification::Order { order_id };
+        }
     }
 
     // IPN legacy URL format: ?topic=payment&id=123456789
@@ -1230,5 +1363,130 @@ mod tests {
                 api_models::webhooks::IncomingWebhookEvent::EventNotSupported
             );
         }
+    }
+
+    const ORDER_ID: &str = "ORDTST00000000000000000000000BBB";
+
+    fn order_webhook_body(action: &str, status: &str) -> String {
+        serde_json::json!({
+            "action": action,
+            "api_version": "v1",
+            "application_id": "1111111111111111",
+            "data": {
+                "currency_id": "ARS",
+                "external_reference": "pxs_1_1",
+                "id": ORDER_ID,
+                "status": status,
+                "status_detail": status,
+                "transactions": {"payments": [{"amount": "150.00", "id": "PAY1", "status": status}]},
+                "type": "qr",
+                "version": 3
+            },
+            "date_created": "2026-11-04T17:16:50.061675458Z",
+            "live_mode": false,
+            "type": "order",
+            "user_id": "2222222222"
+        })
+        .to_string()
+    }
+
+    fn classify_body(
+        body: &str,
+        query_params: &str,
+    ) -> mercadopago::MercadopagoWebhookNotification {
+        let headers = actix_web::http::header::HeaderMap::new();
+        let request = webhooks::IncomingWebhookRequestDetails {
+            method: http::Method::POST,
+            uri: "/webhooks/mercadopago".parse().expect("valid test uri"),
+            headers: &headers,
+            body: body.as_bytes(),
+            query_params: query_params.to_string(),
+        };
+        classify_mercadopago_webhook(&request)
+    }
+
+    #[test]
+    fn every_order_action_resyncs_the_order_id() {
+        for (action, status) in [
+            ("order.processed", "processed"),
+            ("order.failed", "failed"),
+            ("order.canceled", "canceled"),
+            ("order.expired", "expired"),
+            ("order.action_required", "action_required"),
+            ("order.refunded", "refunded"),
+            ("order.created", "created"),
+        ] {
+            let notification = classify_body(
+                &order_webhook_body(action, status),
+                &format!("data.external_reference=pxs_1_1&data.id={ORDER_ID}&type=order"),
+            );
+            assert_eq!(
+                notification,
+                mercadopago::MercadopagoWebhookNotification::Order {
+                    order_id: ORDER_ID.to_string()
+                },
+                "{action}"
+            );
+            assert_eq!(notification.payment_id_to_sync(), Some(ORDER_ID));
+            assert_eq!(
+                api_models::webhooks::IncomingWebhookEvent::from(&notification),
+                api_models::webhooks::IncomingWebhookEvent::PaymentIntentProcessing
+            );
+        }
+    }
+
+    #[test]
+    fn order_webhook_reference_id_is_the_connector_transaction_id() {
+        let headers = actix_web::http::header::HeaderMap::new();
+        let body = order_webhook_body("order.processed", "processed");
+        let request = webhooks::IncomingWebhookRequestDetails {
+            method: http::Method::POST,
+            uri: "/webhooks/mercadopago".parse().expect("valid test uri"),
+            headers: &headers,
+            body: body.as_bytes(),
+            query_params: String::new(),
+        };
+        let reference = webhooks::IncomingWebhook::get_webhook_object_reference_id(
+            Mercadopago::new(),
+            &request,
+        )
+        .expect("order webhooks carry a reference");
+        assert!(matches!(
+            reference,
+            api_models::webhooks::ObjectReferenceId::PaymentId(
+                api_models::payments::PaymentIdType::ConnectorTransactionId(ref id)
+            ) if id == ORDER_ID
+        ));
+    }
+
+    #[test]
+    fn order_webhook_status_in_the_body_is_never_trusted() {
+        // Whatever the body claims, the notification only names the order to read back.
+        let notification = classify_body(&order_webhook_body("order.processed", "failed"), "");
+        assert_eq!(notification.payment_id_to_sync(), Some(ORDER_ID));
+    }
+
+    #[test]
+    fn order_query_params_are_enough_when_the_body_is_empty() {
+        let notification = classify_body(
+            "",
+            &format!("data.external_reference=pxs_1_1&data.id={ORDER_ID}&type=order"),
+        );
+        assert_eq!(notification.payment_id_to_sync(), Some(ORDER_ID));
+        assert_eq!(
+            classify_body("", "type=order"),
+            mercadopago::MercadopagoWebhookNotification::Unknown
+        );
+    }
+
+    #[test]
+    fn payment_webhooks_are_unaffected_by_order_support() {
+        let body = r#"{"action":"payment.updated","api_version":"v1","data":{"id":"150211668619"},"live_mode":true,"type":"payment","date_created":"2026-11-04T00:00:00Z"}"#;
+        assert_eq!(
+            classify_body(body, ""),
+            mercadopago::MercadopagoWebhookNotification::Payment {
+                payment_id: "150211668619".to_string()
+            }
+        );
     }
 }

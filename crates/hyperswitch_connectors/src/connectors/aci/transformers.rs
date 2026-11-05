@@ -242,9 +242,10 @@ impl TryFrom<(&WalletData, &PaymentsAuthorizeRouterData)> for PaymentDetails {
             | WalletData::WompiCheckout {}
             | WalletData::StripeCheckout {}
             | WalletData::IzipayCheckout {}
-            | WalletData::MercadoPagoCheckoutPro {} => Err(
-                errors::ConnectorError::NotImplemented("Payment method".to_string()),
-            )?,
+            | WalletData::MercadoPagoCheckoutPro {}
+            | WalletData::MercadoPagoQr {} => Err(errors::ConnectorError::NotImplemented(
+                "Payment method".to_string(),
+            ))?,
         };
         Ok(payment_data)
     }

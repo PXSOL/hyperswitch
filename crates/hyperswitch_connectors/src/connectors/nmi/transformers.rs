@@ -839,11 +839,10 @@ impl TryFrom<(&PaymentMethodData, Option<&PaymentsAuthorizeRouterData>)> for Pay
                 | WalletData::WompiCheckout {}
                 | WalletData::StripeCheckout {}
                 | WalletData::IzipayCheckout {}
-                | WalletData::MercadoPagoCheckoutPro {} => {
-                    Err(report!(ConnectorError::NotImplemented(
-                        get_unimplemented_payment_method_error_message("nmi"),
-                    )))
-                }
+                | WalletData::MercadoPagoCheckoutPro {}
+                | WalletData::MercadoPagoQr {} => Err(report!(ConnectorError::NotImplemented(
+                    get_unimplemented_payment_method_error_message("nmi"),
+                ))),
             },
             PaymentMethodData::CardRedirect(_)
             | PaymentMethodData::PayLater(_)

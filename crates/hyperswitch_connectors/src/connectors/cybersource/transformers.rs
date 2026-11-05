@@ -435,6 +435,7 @@ impl TryFrom<&SetupMandateRouterData> for CybersourceZeroMandateRequest {
                     | WalletData::StripeCheckout {}
                     | WalletData::IzipayCheckout {}
                     | WalletData::MercadoPagoCheckoutPro {}
+                    | WalletData::MercadoPagoQr {}
                     | WalletData::RevolutPay(_) => Err(errors::ConnectorError::NotImplemented(
                         utils::get_unimplemented_payment_method_error_message("Cybersource"),
                     ))?,
@@ -2774,7 +2775,8 @@ impl TryFrom<&CybersourceRouterData<&PaymentsAuthorizeRouterData>> for Cybersour
                         | WalletData::WompiCheckout {}
                         | WalletData::StripeCheckout {}
                         | WalletData::IzipayCheckout {}
-                        | WalletData::MercadoPagoCheckoutPro {} => {
+                        | WalletData::MercadoPagoCheckoutPro {}
+                        | WalletData::MercadoPagoQr {} => {
                             Err(errors::ConnectorError::NotImplemented(
                                 utils::get_unimplemented_payment_method_error_message(
                                     "Cybersource",

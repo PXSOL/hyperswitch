@@ -1420,7 +1420,8 @@ fn get_stripe_payment_method_type_from_wallet_data(
         | WalletData::WompiCheckout {}
         | WalletData::StripeCheckout {}
         | WalletData::IzipayCheckout {}
-        | WalletData::MercadoPagoCheckoutPro {} => Err(ConnectorError::NotImplemented(
+        | WalletData::MercadoPagoCheckoutPro {}
+        | WalletData::MercadoPagoQr {} => Err(ConnectorError::NotImplemented(
             get_unimplemented_payment_method_error_message("stripe"),
         )),
     }
@@ -1970,7 +1971,8 @@ impl
             | WalletData::WompiCheckout {}
             | WalletData::StripeCheckout {}
             | WalletData::IzipayCheckout {}
-            | WalletData::MercadoPagoCheckoutPro {} => Err(ConnectorError::NotImplemented(
+            | WalletData::MercadoPagoCheckoutPro {}
+            | WalletData::MercadoPagoQr {} => Err(ConnectorError::NotImplemented(
                 get_unimplemented_payment_method_error_message("stripe"),
             )
             .into()),
