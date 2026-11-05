@@ -124,6 +124,8 @@ impl From<Flow> for ApiIdentifier {
             | Flow::MerchantConnectorsRetrieve
             | Flow::MerchantConnectorsUpdate
             | Flow::MerchantConnectorsDelete
+            | Flow::MerchantConnectorMercadopagoPosSetup
+            | Flow::MerchantConnectorMercadopagoPosList
             | Flow::MerchantConnectorsList => Self::MerchantConnector,
             Flow::ConfigKeyCreate
             | Flow::ConfigKeyFetch

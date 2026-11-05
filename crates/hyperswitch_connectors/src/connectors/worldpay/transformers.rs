@@ -195,7 +195,8 @@ fn fetch_payment_instrument(
             | WalletData::WompiCheckout {}
             | WalletData::StripeCheckout {}
             | WalletData::IzipayCheckout {}
-            | WalletData::MercadoPagoCheckoutPro {} => Err(errors::ConnectorError::NotImplemented(
+            | WalletData::MercadoPagoCheckoutPro {}
+            | WalletData::MercadoPagoQr {} => Err(errors::ConnectorError::NotImplemented(
                 utils::get_unimplemented_payment_method_error_message("worldpay"),
             )
             .into()),

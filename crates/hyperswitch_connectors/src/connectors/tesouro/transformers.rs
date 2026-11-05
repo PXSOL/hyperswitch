@@ -882,6 +882,7 @@ impl TryFrom<&TesouroRouterData<&PaymentsAuthorizeRouterData>> for TesouroAuthor
                 | WalletData::RevolutPay(_)
                 | WalletData::MercadoPagoSdk(_)
                 | WalletData::MercadoPagoCheckoutPro {}
+                | WalletData::MercadoPagoQr {}
                 | WalletData::WompiCheckout {}
                 | WalletData::StripeCheckout {}
                 | WalletData::IzipayCheckout {}

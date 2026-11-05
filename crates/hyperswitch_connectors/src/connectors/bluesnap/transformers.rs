@@ -412,11 +412,10 @@ impl TryFrom<&BluesnapRouterData<&types::PaymentsAuthorizeRouterData>> for Blues
                 | WalletData::WompiCheckout {}
                 | WalletData::StripeCheckout {}
                 | WalletData::IzipayCheckout {}
-                | WalletData::MercadoPagoCheckoutPro {} => {
-                    Err(errors::ConnectorError::NotImplemented(
-                        utils::get_unimplemented_payment_method_error_message("bluesnap"),
-                    ))
-                }
+                | WalletData::MercadoPagoCheckoutPro {}
+                | WalletData::MercadoPagoQr {} => Err(errors::ConnectorError::NotImplemented(
+                    utils::get_unimplemented_payment_method_error_message("bluesnap"),
+                )),
             },
             PaymentMethodData::PayLater(_)
             | PaymentMethodData::BankRedirect(_)

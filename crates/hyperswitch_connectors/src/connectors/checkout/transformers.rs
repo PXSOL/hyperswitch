@@ -154,12 +154,11 @@ impl TryFrom<&TokenizationRouterData> for TokenRequest {
                 | WalletData::WompiCheckout {}
                 | WalletData::StripeCheckout {}
                 | WalletData::IzipayCheckout {}
-                | WalletData::MercadoPagoCheckoutPro {} => {
-                    Err(errors::ConnectorError::NotImplemented(
-                        utils::get_unimplemented_payment_method_error_message("checkout"),
-                    )
-                    .into())
-                }
+                | WalletData::MercadoPagoCheckoutPro {}
+                | WalletData::MercadoPagoQr {} => Err(errors::ConnectorError::NotImplemented(
+                    utils::get_unimplemented_payment_method_error_message("checkout"),
+                )
+                .into()),
             },
             PaymentMethodData::Card(_)
             | PaymentMethodData::PayLater(_)

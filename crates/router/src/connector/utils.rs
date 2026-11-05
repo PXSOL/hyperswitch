@@ -2408,6 +2408,7 @@ pub enum PaymentMethodDataType {
     PaypalSdk,
     MercadoPagoSdk,
     MercadoPagoCheckoutPro,
+    MercadoPagoQr,
     WompiCheckout,
     StripeCheckout,
     IzipayCheckout,

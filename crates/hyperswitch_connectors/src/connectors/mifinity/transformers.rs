@@ -197,12 +197,11 @@ impl TryFrom<&MifinityRouterData<&types::PaymentsAuthorizeRouterData>> for Mifin
                 | WalletData::WompiCheckout {}
                 | WalletData::StripeCheckout {}
                 | WalletData::IzipayCheckout {}
-                | WalletData::MercadoPagoCheckoutPro {} => {
-                    Err(errors::ConnectorError::NotImplemented(
-                        utils::get_unimplemented_payment_method_error_message("Mifinity"),
-                    )
-                    .into())
-                }
+                | WalletData::MercadoPagoCheckoutPro {}
+                | WalletData::MercadoPagoQr {} => Err(errors::ConnectorError::NotImplemented(
+                    utils::get_unimplemented_payment_method_error_message("Mifinity"),
+                )
+                .into()),
             },
             PaymentMethodData::Card(_)
             | PaymentMethodData::CardRedirect(_)

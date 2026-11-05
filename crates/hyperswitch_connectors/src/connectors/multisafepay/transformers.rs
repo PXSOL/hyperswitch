@@ -430,11 +430,10 @@ impl TryFrom<&MultisafepayRouterData<&types::PaymentsAuthorizeRouterData>>
                 | WalletData::WompiCheckout {}
                 | WalletData::StripeCheckout {}
                 | WalletData::IzipayCheckout {}
-                | WalletData::MercadoPagoCheckoutPro {} => {
-                    Err(errors::ConnectorError::NotImplemented(
-                        utils::get_unimplemented_payment_method_error_message("multisafepay"),
-                    ))?
-                }
+                | WalletData::MercadoPagoCheckoutPro {}
+                | WalletData::MercadoPagoQr {} => Err(errors::ConnectorError::NotImplemented(
+                    utils::get_unimplemented_payment_method_error_message("multisafepay"),
+                ))?,
             },
             PaymentMethodData::BankRedirect(ref bank_data) => match bank_data {
                 BankRedirectData::Giropay { .. } => Type::Redirect,
@@ -511,11 +510,10 @@ impl TryFrom<&MultisafepayRouterData<&types::PaymentsAuthorizeRouterData>>
                 | WalletData::WompiCheckout {}
                 | WalletData::StripeCheckout {}
                 | WalletData::IzipayCheckout {}
-                | WalletData::MercadoPagoCheckoutPro {} => {
-                    Err(errors::ConnectorError::NotImplemented(
-                        utils::get_unimplemented_payment_method_error_message("multisafepay"),
-                    ))?
-                }
+                | WalletData::MercadoPagoCheckoutPro {}
+                | WalletData::MercadoPagoQr {} => Err(errors::ConnectorError::NotImplemented(
+                    utils::get_unimplemented_payment_method_error_message("multisafepay"),
+                ))?,
             }),
             PaymentMethodData::BankRedirect(ref bank_data) => Some(match bank_data {
                 BankRedirectData::Giropay { .. } => Gateway::Giropay,
@@ -704,11 +702,10 @@ impl TryFrom<&MultisafepayRouterData<&types::PaymentsAuthorizeRouterData>>
                 | WalletData::WompiCheckout {}
                 | WalletData::StripeCheckout {}
                 | WalletData::IzipayCheckout {}
-                | WalletData::MercadoPagoCheckoutPro {} => {
-                    Err(errors::ConnectorError::NotImplemented(
-                        utils::get_unimplemented_payment_method_error_message("multisafepay"),
-                    ))?
-                }
+                | WalletData::MercadoPagoCheckoutPro {}
+                | WalletData::MercadoPagoQr {} => Err(errors::ConnectorError::NotImplemented(
+                    utils::get_unimplemented_payment_method_error_message("multisafepay"),
+                ))?,
             },
             PaymentMethodData::PayLater(ref paylater) => {
                 Some(GatewayInfo::PayLater(PayLaterInfo {

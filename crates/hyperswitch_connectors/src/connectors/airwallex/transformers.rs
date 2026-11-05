@@ -964,6 +964,7 @@ fn get_wallet_details(
         | WalletData::StripeCheckout {}
         | WalletData::IzipayCheckout {}
         | WalletData::MercadoPagoCheckoutPro {}
+        | WalletData::MercadoPagoQr {}
         | WalletData::RevolutPay(_) => Err(errors::ConnectorError::NotImplemented(
             utils::get_unimplemented_payment_method_error_message("airwallex"),
         ))?,

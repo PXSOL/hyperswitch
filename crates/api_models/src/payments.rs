@@ -3897,7 +3897,7 @@ impl GetPaymentMethodType for WalletData {
             Self::MbWayRedirect(_) => api_enums::PaymentMethodType::MbWay,
             Self::MobilePayRedirect(_) => api_enums::PaymentMethodType::MobilePay,
             Self::PaypalRedirect(_) | Self::PaypalSdk(_) => api_enums::PaymentMethodType::Paypal,
-            Self::MercadoPagoSdk(_) | Self::MercadoPagoCheckoutPro {} => {
+            Self::MercadoPagoSdk(_) | Self::MercadoPagoCheckoutPro {} | Self::MercadoPagoQr {} => {
                 api_enums::PaymentMethodType::MercadoPago
             }
             Self::WompiCheckout {} => api_enums::PaymentMethodType::Wompi,
@@ -5400,6 +5400,9 @@ pub enum WalletData {
     /// The wallet data for Mercado Pago Checkout Pro (hosted checkout redirect)
     #[schema(title = "MercadoPagoCheckoutPro")]
     MercadoPagoCheckoutPro {},
+    /// The wallet data for Mercado Pago in-person dynamic QR (Orders API)
+    #[schema(title = "MercadoPagoQr")]
+    MercadoPagoQr {},
     /// The wallet data for Wompi's hosted checkout redirect (Wompi Colombia)
     #[schema(title = "WompiCheckout")]
     WompiCheckout {},
@@ -5509,6 +5512,7 @@ impl GetAddressFromPaymentMethodData for WalletData {
             | Self::PaypalSdk(_)
             | Self::MercadoPagoSdk(_)
             | Self::MercadoPagoCheckoutPro {}
+            | Self::MercadoPagoQr {}
             | Self::WompiCheckout {}
             | Self::StripeCheckout {}
             | Self::IzipayCheckout {}

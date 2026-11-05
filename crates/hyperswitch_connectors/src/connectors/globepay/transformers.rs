@@ -95,11 +95,10 @@ impl TryFrom<&GlobepayRouterData<&types::PaymentsAuthorizeRouterData>> for Globe
                 | WalletData::WompiCheckout {}
                 | WalletData::StripeCheckout {}
                 | WalletData::IzipayCheckout {}
-                | WalletData::MercadoPagoCheckoutPro {} => {
-                    Err(errors::ConnectorError::NotImplemented(
-                        get_unimplemented_payment_method_error_message("globepay"),
-                    ))?
-                }
+                | WalletData::MercadoPagoCheckoutPro {}
+                | WalletData::MercadoPagoQr {} => Err(errors::ConnectorError::NotImplemented(
+                    get_unimplemented_payment_method_error_message("globepay"),
+                ))?,
             },
             PaymentMethodData::Card(_)
             | PaymentMethodData::CardRedirect(_)

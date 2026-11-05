@@ -32,7 +32,7 @@ use crate::{
     utils::{self, RouterData as _},
 };
 
-const MAX_APPLICATION_FEE_RATIO: f64 = 0.007;
+pub(super) const MAX_APPLICATION_FEE_RATIO: f64 = 0.007;
 
 pub struct MercadopagoRouterData<T> {
     pub amount: FloatMajorUnit,
@@ -118,6 +118,9 @@ pub struct MercadopagoMetadata {
     /// Marketplace commission — absolute amount in the transaction currency
     #[serde(skip_serializing_if = "Option::is_none")]
     pub application_fee: Option<f64>,
+    /// Mercado Pago QR mode: `dynamic` (default) or `hybrid`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qr_mode: Option<String>,
     /// Checkout Pro (hosted checkout) options
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkout_pro: Option<MercadopagoCheckoutProOptions>,
@@ -160,7 +163,7 @@ const MERCADOPAGO_METADATA_SCOPE: &str = "mercadopago";
 impl MercadopagoMetadata {
     /// Resolves each key as `metadata.mercadopago.*`, then flat `metadata.*`, then the
     /// same two lookups in `frm_metadata`.
-    fn resolve(
+    pub(super) fn resolve(
         request_metadata: Option<&serde_json::Value>,
         frm_metadata: &Option<SecretSerdeValue>,
         config: &'static str,
@@ -873,6 +876,8 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>>
 pub enum MercadopagoAuthorizeRequest {
     Preference(Box<MercadopagoPreferenceRequest>),
     Payment(Box<MercadopagoPaymentsRequest>),
+    /// In-person dynamic QR: POST /v1/orders
+    Order(Box<super::orders::MercadopagoQrOrderRequest>),
 }
 
 impl MercadopagoAuthorizeRequest {
@@ -881,6 +886,10 @@ impl MercadopagoAuthorizeRequest {
             payment_method_data,
             PaymentMethodData::Wallet(WalletData::MercadoPagoCheckoutPro {})
         )
+    }
+
+    pub fn is_qr(payment_method_data: &PaymentMethodData) -> bool {
+        super::orders::is_qr_wallet(payment_method_data)
     }
 }
 
@@ -893,6 +902,10 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
         if Self::is_checkout_pro(&item.router_data.request.payment_method_data) {
             Ok(Self::Preference(Box::new(
                 MercadopagoPreferenceRequest::try_from(item)?,
+            )))
+        } else if Self::is_qr(&item.router_data.request.payment_method_data) {
+            Ok(Self::Order(Box::new(
+                super::orders::MercadopagoQrOrderRequest::try_from(item)?,
             )))
         } else {
             Ok(Self::Payment(Box::new(
@@ -1434,7 +1447,7 @@ fn keep_waiting_for_buyer<F, T>(
     }
 }
 
-fn get_mercadopago_error_message(status_detail: &str) -> String {
+pub(super) fn get_mercadopago_error_message(status_detail: &str) -> String {
     match status_detail {
         // Card rejections - bad filled data
         "cc_rejected_bad_filled_card_number" => "The card number is incorrect".to_string(),
@@ -1662,6 +1675,10 @@ pub struct MercadopagoErrorResponse {
     pub status: Option<i32>,
     #[serde(default)]
     pub cause: Option<Vec<MercadopagoErrorCause>>,
+    /// Orders API shape: `{"errors":[{"code","message","details":[...]}]}`. Kept untyped so an
+    /// unexpected value can never fail the parse of an error response.
+    #[serde(default)]
+    pub errors: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1701,6 +1718,18 @@ where
 }
 
 impl MercadopagoErrorResponse {
+    fn order_error(&self) -> Option<&serde_json::Value> {
+        self.errors.as_ref()?.as_array()?.first()
+    }
+
+    fn order_error_text(&self, key: &str) -> Option<String> {
+        self.order_error()?
+            .get(key)?
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    }
+
     pub fn get_error_code(&self) -> String {
         self.error
             .clone()
@@ -1710,10 +1739,15 @@ impl MercadopagoErrorResponse {
                     .and_then(|c| c.first())
                     .and_then(|c| c.code.clone())
             })
+            .or_else(|| self.order_error_text("code"))
             .unwrap_or_else(|| "UNKNOWN_ERROR".to_string())
     }
 
     pub fn get_error_message(&self) -> String {
+        if let Some(message) = self.order_error_text("message") {
+            return message;
+        }
+
         let error_code = self.error.as_deref().unwrap_or("");
         let cause_code = self
             .cause
@@ -1734,6 +1768,22 @@ impl MercadopagoErrorResponse {
     }
 
     pub fn get_detailed_reason(&self) -> Option<String> {
+        let order_details = self
+            .order_error()
+            .and_then(|error| error.get("details"))
+            .and_then(serde_json::Value::as_array)
+            .map(|details| {
+                details
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+            .filter(|joined| !joined.is_empty());
+        if order_details.is_some() {
+            return order_details;
+        }
+
         self.cause
             .as_ref()
             .map(|causes| {
@@ -1855,6 +1905,14 @@ impl MercadopagoWebhookBody {
             return chargeback_notification(self.data.payment_id.as_deref());
         }
 
+        // Orders API (QR, Point): every `order.*` action only signals that the order changed;
+        // the state is read back with a live sync of the order, never taken from this body.
+        if self.webhook_type.as_deref() == Some("order") {
+            return MercadopagoWebhookNotification::Order {
+                order_id: self.data.id.clone(),
+            };
+        }
+
         match self.action.as_deref() {
             Some("payment.created") | Some("payment.updated") => {
                 MercadopagoWebhookNotification::Payment {
@@ -1930,6 +1988,10 @@ pub enum MercadopagoWebhookNotification {
     /// nothing safe to sync against a chargeback id alone — never treat a
     /// chargeback id as a payment id.
     ChargebackWithoutPayment,
+    /// An Orders API notification (`type: order`): PSync the order id.
+    Order {
+        order_id: String,
+    },
     /// A refund notification: refund state is read from the payment's own
     /// PSync response, never from here.
     Refund,
@@ -1943,6 +2005,7 @@ impl MercadopagoWebhookNotification {
             Self::Payment { payment_id } | Self::ChargebackWithPayment { payment_id } => {
                 Some(payment_id.as_str())
             }
+            Self::Order { order_id } => Some(order_id.as_str()),
             Self::ChargebackWithoutPayment | Self::Refund | Self::Unknown => None,
         }
     }
@@ -1952,6 +2015,7 @@ impl From<&MercadopagoWebhookNotification> for api_models::webhooks::IncomingWeb
     fn from(notification: &MercadopagoWebhookNotification) -> Self {
         match notification {
             MercadopagoWebhookNotification::Payment { .. }
+            | MercadopagoWebhookNotification::Order { .. }
             | MercadopagoWebhookNotification::ChargebackWithPayment { .. } => {
                 Self::PaymentIntentProcessing
             }
@@ -1967,6 +2031,31 @@ mod tests {
     use common_utils::types::MinorUnit;
 
     use super::*;
+
+    #[test]
+    fn orders_api_error_keeps_its_code_message_and_details() {
+        // Real answer of POST /v1/orders for an unknown POS.
+        let error: MercadopagoErrorResponse = serde_json::from_str(
+            r#"{"errors":[{"code":"pos_not_found","message":"External POS id not found",
+                "details":["$.config.qr.external_pos_id NOEXISTE00 was not found"]}]}"#,
+        )
+        .expect("the Orders error shape parses");
+        assert_eq!(error.get_error_code(), "pos_not_found");
+        assert_eq!(error.get_error_message(), "External POS id not found");
+        assert_eq!(
+            error.get_detailed_reason().as_deref(),
+            Some("$.config.qr.external_pos_id NOEXISTE00 was not found")
+        );
+    }
+
+    #[test]
+    fn an_unexpected_errors_value_does_not_fail_the_error_parse() {
+        let error: MercadopagoErrorResponse =
+            serde_json::from_str(r#"{"message":"bad","error":"bad_request","errors":"nope"}"#)
+                .expect("an unknown errors value is tolerated");
+        assert_eq!(error.get_error_code(), "bad_request");
+        assert!(error.get_detailed_reason().is_none());
+    }
 
     const PAYMENT_JSON: &str = r#"{
         "id": 123456789,
