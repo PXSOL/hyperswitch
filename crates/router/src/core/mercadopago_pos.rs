@@ -316,6 +316,18 @@ pub(crate) struct PosRequest<'a> {
     external_id: String,
 }
 
+/// `PUT /pos/{id}` body that adopts a POS: Mercado Pago's quality measurement requires every POS to
+/// be closed-amount, so the flag travels with the `external_id`.
+fn adoption_body(external_id: &str) -> Value {
+    serde_json::json!({ "external_id": external_id, "fixed_amount": true })
+}
+
+/// `PUT /pos/{id}` body that closes the amount of a POS. `POST /v2/pos` rejects `fixed_amount`, so
+/// it can only be applied after creation.
+fn closed_amount_body() -> Value {
+    serde_json::json!({ "fixed_amount": true })
+}
+
 /// The POS saved in the account metadata, if it belongs to this seller. An account reconnected
 /// with another Mercado Pago user needs its own store and POS.
 pub(crate) fn existing_pos(metadata: Option<&Value>, seller_id: &str) -> Option<MercadopagoQrPos> {
@@ -550,7 +562,21 @@ impl MpClient<'_> {
                 Method::Put,
                 &format!("/pos/{pos_id}"),
                 None,
-                Some(serde_json::json!({ "external_id": external_id })),
+                Some(adoption_body(external_id)),
+            )
+            .await?,
+        )
+        .map(|_| ())
+    }
+
+    /// Makes a POS closed-amount. Idempotent, so a retry after a partial failure can repeat it.
+    async fn close_pos_amount(&self, pos_id: &str) -> RouterResult<()> {
+        Self::success_or_failure(
+            self.call(
+                Method::Put,
+                &format!("/pos/{pos_id}"),
+                None,
+                Some(closed_amount_body()),
             )
             .await?,
         )
@@ -612,8 +638,16 @@ impl MpClient<'_> {
         Err(report!(failure.into_api_error()))
     }
 
-    /// Creates the POS, or reuses the one that already has this `external_id` in the store.
+    /// Creates the POS, or reuses the one that already has this `external_id` in the store, and
+    /// leaves it closed-amount either way. A failure closing it fails the setup; the retry finds
+    /// the POS by its `external_id` and applies it again.
     async fn ensure_pos(&self, request: &PosRequest<'_>) -> RouterResult<CreatedPos> {
+        let created = self.create_or_find_pos(request).await?;
+        self.close_pos_amount(&created.id).await?;
+        Ok(created)
+    }
+
+    async fn create_or_find_pos(&self, request: &PosRequest<'_>) -> RouterResult<CreatedPos> {
         let body = serde_json::to_value(request)
             .change_context(errors::ApiErrorResponse::InternalServerError)?;
         // A fresh key per call: a retry after a failure has to reach Mercado Pago again, and a
@@ -953,6 +987,30 @@ mod tests {
             body,
             json!({"name": "Recepcion", "store_id": "1001", "external_id": "PXSOLPOSmcaabc"})
         );
+    }
+
+    #[test]
+    fn pos_request_does_not_send_fixed_amount() {
+        let body = serde_json::to_value(PosRequest {
+            name: "Recepcion",
+            store_id: "1001",
+            external_id: external_pos_id("mca_abc"),
+        })
+        .unwrap();
+        assert!(body.get("fixed_amount").is_none());
+    }
+
+    #[test]
+    fn adoption_sets_the_external_id_and_closes_the_amount() {
+        assert_eq!(
+            adoption_body("PXSOLPOSmcaabc"),
+            json!({"external_id": "PXSOLPOSmcaabc", "fixed_amount": true})
+        );
+    }
+
+    #[test]
+    fn closing_the_amount_sends_only_fixed_amount() {
+        assert_eq!(closed_amount_body(), json!({"fixed_amount": true}));
     }
 
     #[test]
