@@ -108,6 +108,8 @@ pub enum Flow {
     MerchantConnectorWebhookRegister,
     /// Mercado Pago store and POS setup flow.
     MerchantConnectorMercadopagoPosSetup,
+    /// Mercado Pago POS list flow.
+    MerchantConnectorMercadopagoPosList,
     /// Merchant Connector Webhook list flow.
     MerchantConnectorWebhookList,
     /// Merchant Connector Webhook HMAC key generation flow.

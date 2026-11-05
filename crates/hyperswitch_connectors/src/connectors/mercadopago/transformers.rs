@@ -118,6 +118,9 @@ pub struct MercadopagoMetadata {
     /// Marketplace commission — absolute amount in the transaction currency
     #[serde(skip_serializing_if = "Option::is_none")]
     pub application_fee: Option<f64>,
+    /// Mercado Pago QR mode: `dynamic` (default) or `hybrid`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qr_mode: Option<String>,
     /// Checkout Pro (hosted checkout) options
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkout_pro: Option<MercadopagoCheckoutProOptions>,

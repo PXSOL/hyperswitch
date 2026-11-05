@@ -41,7 +41,9 @@ use crate::{
         ListHierarchicalResourcesResponse, UploadCertificateRequest, UploadCertificateResponse,
     },
     mandates::*,
-    mercadopago_pos::{MercadopagoPosSetupRequest, MercadopagoPosSetupResponse},
+    mercadopago_pos::{
+        MercadopagoPosListResponse, MercadopagoPosSetupRequest, MercadopagoPosSetupResponse,
+    },
     merchant_connector_webhook_management::*,
     organization::{
         ConvertOrganizationToPlatformRequest, ConvertOrganizationToPlatformResponse,
@@ -96,6 +98,7 @@ impl_api_event_type!(
         RegisterConnectorWebhookResponse,
         MercadopagoPosSetupRequest,
         MercadopagoPosSetupResponse,
+        MercadopagoPosListResponse,
         ProfileResponse,
         ProfileUpdate,
         ProfileCreate,

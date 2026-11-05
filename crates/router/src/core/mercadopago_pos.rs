@@ -4,8 +4,11 @@
 //! direct HTTP call (no connector flow) and saved in the connector account metadata, where
 //! the connector reads the `external_pos_id` of every QR order.
 
+use std::collections::HashMap;
+
 use api_models::mercadopago_pos::{
-    MercadopagoPosLocation, MercadopagoPosSetupRequest, MercadopagoPosSetupResponse,
+    MercadopagoPosListResponse, MercadopagoPosLocation, MercadopagoPosSetupRequest,
+    MercadopagoPosSetupResponse, MercadopagoPosSummary,
 };
 use common_utils::{
     id_type,
@@ -72,12 +75,236 @@ pub(crate) struct StoreRequest<'a> {
 }
 
 impl<'a> StoreRequest<'a> {
-    fn new(req: &'a MercadopagoPosSetupRequest, merchant_connector_id: &str) -> Self {
+    fn new(fields: &CreateFields<'a>, merchant_connector_id: &str) -> Self {
         Self {
-            name: &req.store_name,
+            name: fields.store_name,
             external_id: external_store_id(merchant_connector_id),
-            location: &req.location,
+            location: fields.location,
         }
+    }
+}
+
+/// The fields a new store and POS need, all present and non-empty.
+pub(crate) struct CreateFields<'a> {
+    store_name: &'a str,
+    pos_name: &'a str,
+    location: &'a MercadopagoPosLocation,
+}
+
+impl<'a> CreateFields<'a> {
+    pub(crate) fn from_request(req: &'a MercadopagoPosSetupRequest) -> RouterResult<Self> {
+        let required = |value: &'a Option<String>, field_name: &'static str| {
+            value
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+                .ok_or_else(|| {
+                    report!(errors::ApiErrorResponse::MissingRequiredField {
+                        field_name: field_name.into()
+                    })
+                })
+        };
+        Ok(Self {
+            store_name: required(&req.store_name, "store_name")?,
+            pos_name: required(&req.pos_name, "pos_name")?,
+            location: req.location.as_ref().ok_or_else(|| {
+                report!(errors::ApiErrorResponse::MissingRequiredField {
+                    field_name: "location".into()
+                })
+            })?,
+        })
+    }
+}
+
+/// What a setup call does, decided before any call to Mercado Pago beyond `/users/me`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SetupPath {
+    /// A POS of this seller is already saved and no other one was asked for.
+    ReturnSaved(Box<MercadopagoQrPos>),
+    /// Use the seller's own POS with this id, whatever is saved.
+    Adopt(String),
+    /// Create the store and POS.
+    Create,
+}
+
+/// A blank `existing_pos_id` counts as absent. Anything else must be digits only, since it
+/// goes into a Mercado Pago path.
+pub(crate) fn normalize_existing_pos_id(
+    existing_pos_id: Option<&str>,
+) -> Result<Option<String>, errors::ApiErrorResponse> {
+    match existing_pos_id.map(str::trim).filter(|id| !id.is_empty()) {
+        None => Ok(None),
+        Some(id) if id.chars().all(|c| c.is_ascii_digit()) => Ok(Some(id.to_string())),
+        Some(_) => Err(errors::ApiErrorResponse::InvalidRequestData {
+            message: "existing_pos_id must contain digits only".to_string(),
+        }),
+    }
+}
+
+pub(crate) fn choose_setup_path(
+    metadata: Option<&Value>,
+    seller_id: &str,
+    existing_pos_id: Option<String>,
+) -> SetupPath {
+    match existing_pos_id {
+        Some(id) => SetupPath::Adopt(id),
+        None => match existing_pos(metadata, seller_id) {
+            Some(pos) => SetupPath::ReturnSaved(Box::new(pos)),
+            None => SetupPath::Create,
+        },
+    }
+}
+
+/// A POS of another Mercado Pago user is reported like one that does not exist. A body
+/// without `user_id` passes: the seller's token only reads the seller's own POS.
+pub(crate) fn check_pos_owner(pos: &Value, seller_id: &str) -> Result<(), MpFailure> {
+    match pos.get("user_id").and_then(id_to_string) {
+        Some(owner) if owner != seller_id => Err(MpFailure {
+            status: 404,
+            code: "pos_not_found".to_string(),
+            message: "The point of sale does not belong to this Mercado Pago account".to_string(),
+            reason: None,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// The `external_id` the adopted POS ends up with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExternalPosId {
+    /// The POS has one: it is not touched.
+    Keep(String),
+    /// The POS has none: this deterministic id is set with `PUT /pos/{id}`.
+    Assign(String),
+}
+
+impl ExternalPosId {
+    pub(crate) fn choose(pos: &Value, merchant_connector_id: &str) -> Self {
+        match pos
+            .get("external_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            Some(existing) => Self::Keep(existing.to_string()),
+            None => Self::Assign(external_pos_id(merchant_connector_id)),
+        }
+    }
+
+    fn into_id(self) -> String {
+        match self {
+            Self::Keep(id) | Self::Assign(id) => id,
+        }
+    }
+}
+
+/// QR URLs of a POS: `qr_response` on `POST /v2/pos`, `qr` on the reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PosQr {
+    pub image: Option<String>,
+    pub template_document: Option<String>,
+    pub template_image: Option<String>,
+}
+
+impl PosQr {
+    pub(crate) fn from_pos(pos: &Value) -> Self {
+        let qr = pos
+            .get("qr_response")
+            .filter(|qr| qr.is_object())
+            .or_else(|| pos.get("qr").filter(|qr| qr.is_object()));
+        let url = |key: &str| {
+            qr.and_then(|qr| qr.get(key))
+                .and_then(Value::as_str)
+                .filter(|url| !url.is_empty())
+                .map(str::to_string)
+        };
+        Self {
+            image: url("image"),
+            template_document: url("template_document"),
+            template_image: url("template_image"),
+        }
+    }
+}
+
+/// `external_id` of the store with this id, from a stores search.
+pub(crate) fn store_external_id_of(stores: &Value, store_id: &str) -> Option<String> {
+    stores
+        .get("results")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|store| store.get("id").and_then(id_to_string).as_deref() == Some(store_id))
+        .and_then(|store| store.get("external_id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+/// Store names by store id, from a stores search.
+pub(crate) fn store_names(stores: &Value) -> HashMap<String, String> {
+    stores
+        .get("results")
+        .and_then(Value::as_array)
+        .map(|results| {
+            results
+                .iter()
+                .filter_map(|store| {
+                    Some((
+                        store.get("id").and_then(id_to_string)?,
+                        store
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .filter(|name| !name.is_empty())?
+                            .to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The POS list of `GET /pos`; an entry without an id is skipped.
+pub(crate) fn parse_pos_list(
+    pos_list: &Value,
+    store_names: &HashMap<String, String>,
+) -> Vec<MercadopagoPosSummary> {
+    pos_list
+        .get("results")
+        .and_then(Value::as_array)
+        .map(|results| {
+            results
+                .iter()
+                .filter_map(|pos| {
+                    let store_id = pos.get("store_id").and_then(id_to_string);
+                    Some(MercadopagoPosSummary {
+                        pos_id: pos.get("id").and_then(id_to_string)?,
+                        name: pos.get("name").and_then(Value::as_str).map(str::to_string),
+                        store_name: store_id
+                            .as_ref()
+                            .and_then(|id| store_names.get(id))
+                            .cloned(),
+                        store_id,
+                        has_external_id: pos
+                            .get("external_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| !id.is_empty()),
+                        qr_image: PosQr::from_pos(pos).image,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A POS as answered by `POST /v2/pos` or found by its `external_id`.
+pub(crate) struct CreatedPos {
+    id: String,
+    qr: PosQr,
+}
+
+impl CreatedPos {
+    fn from_body(body: &Value) -> Option<Self> {
+        Some(Self {
+            id: body.get("id").and_then(id_to_string)?,
+            qr: PosQr::from_pos(body),
+        })
     }
 }
 
@@ -293,6 +520,43 @@ impl MpClient<'_> {
         })
     }
 
+    async fn get_pos(&self, pos_id: &str) -> RouterResult<Value> {
+        Self::success_or_failure(
+            self.call(Method::Get, &format!("/pos/{pos_id}"), None, None)
+                .await?,
+        )
+    }
+
+    async fn list_pos(&self) -> RouterResult<Value> {
+        Self::success_or_failure(self.call(Method::Get, "/pos?limit=50", None, None).await?)
+    }
+
+    async fn search_stores(&self, user_id: &str) -> RouterResult<Value> {
+        Self::success_or_failure(
+            self.call(
+                Method::Get,
+                &format!("/users/{user_id}/stores/search?limit=50"),
+                None,
+                None,
+            )
+            .await?,
+        )
+    }
+
+    /// Adopts a POS made by hand. Mercado Pago does not clear the id afterwards.
+    async fn assign_pos_external_id(&self, pos_id: &str, external_id: &str) -> RouterResult<()> {
+        Self::success_or_failure(
+            self.call(
+                Method::Put,
+                &format!("/pos/{pos_id}"),
+                None,
+                Some(serde_json::json!({ "external_id": external_id })),
+            )
+            .await?,
+        )
+        .map(|_| ())
+    }
+
     /// Creates the store, or reuses the one that already has this `external_id` (a second call
     /// after a partial failure, or a store lock that has not expired yet).
     async fn ensure_store(
@@ -349,7 +613,7 @@ impl MpClient<'_> {
     }
 
     /// Creates the POS, or reuses the one that already has this `external_id` in the store.
-    async fn ensure_pos(&self, request: &PosRequest<'_>) -> RouterResult<String> {
+    async fn ensure_pos(&self, request: &PosRequest<'_>) -> RouterResult<CreatedPos> {
         let body = serde_json::to_value(request)
             .change_context(errors::ApiErrorResponse::InternalServerError)?;
         // A fresh key per call: a retry after a failure has to reach Mercado Pago again, and a
@@ -359,14 +623,10 @@ impl MpClient<'_> {
             .call(Method::Post, "/v2/pos", Some(&idempotency_key), Some(body))
             .await?;
         if (200..300).contains(&response.status) {
-            return response
-                .body
-                .get("id")
-                .and_then(id_to_string)
-                .ok_or_else(|| {
-                    report!(errors::ApiErrorResponse::InternalServerError)
-                        .attach_printable("Mercado Pago created a POS without an id")
-                });
+            return CreatedPos::from_body(&response.body).ok_or_else(|| {
+                report!(errors::ApiErrorResponse::InternalServerError)
+                    .attach_printable("Mercado Pago created a POS without an id")
+            });
         }
 
         let failure = MpFailure::from_response(response.status, &response.body);
@@ -385,8 +645,8 @@ impl MpClient<'_> {
                     let same_store = pos.get("store_id").and_then(id_to_string).as_deref()
                         == Some(request.store_id);
                     if same_store {
-                        if let Some(id) = pos.get("id").and_then(id_to_string) {
-                            return Ok(id);
+                        if let Some(created) = CreatedPos::from_body(pos) {
+                            return Ok(created);
                         }
                     }
                 }
@@ -400,22 +660,17 @@ impl MpClient<'_> {
 // Core
 // ============================================================================
 
-fn require_non_empty(value: &str, field_name: &'static str) -> RouterResult<()> {
-    if value.trim().is_empty() {
-        return Err(report!(errors::ApiErrorResponse::MissingRequiredField {
-            field_name: field_name.into()
-        }));
-    }
-    Ok(())
-}
-
-pub async fn setup_mercadopago_pos(
-    state: SessionState,
+/// The connector account and the seller's token, after the checks every call needs.
+async fn load_account(
+    state: &SessionState,
     merchant_id: &id_type::MerchantId,
     profile_id: Option<id_type::ProfileId>,
     merchant_connector_id: &id_type::MerchantConnectorAccountId,
-    req: MercadopagoPosSetupRequest,
-) -> RouterResponse<MercadopagoPosSetupResponse> {
+) -> RouterResult<(
+    hyperswitch_domain_models::merchant_key_store::MerchantKeyStore,
+    hyperswitch_domain_models::merchant_connector_account::MerchantConnectorAccount,
+    Secret<String>,
+)> {
     let db = state.store.as_ref();
     let key_store = db
         .get_merchant_key_store_by_merchant_id(merchant_id, &db.get_master_key().to_vec().into())
@@ -452,6 +707,44 @@ pub async fn setup_mercadopago_pos(
             }))
         }
     };
+    Ok((key_store, mca, token))
+}
+
+pub async fn list_mercadopago_pos(
+    state: SessionState,
+    merchant_id: &id_type::MerchantId,
+    profile_id: Option<id_type::ProfileId>,
+    merchant_connector_id: &id_type::MerchantConnectorAccountId,
+) -> RouterResponse<MercadopagoPosListResponse> {
+    let (_, _, token) =
+        load_account(&state, merchant_id, profile_id, merchant_connector_id).await?;
+    let client = MpClient {
+        state: &state,
+        base_url: state.conf.connectors.mercadopago.base_url.as_ref(),
+        token,
+    };
+    let user_id = client.seller_user_id().await?;
+    let pos_list = client.list_pos().await?;
+    // Store names are a convenience: without them the POS are still listed.
+    let names = match client.search_stores(&user_id).await {
+        Ok(stores) => store_names(&stores),
+        Err(_) => HashMap::new(),
+    };
+    Ok(ApplicationResponse::Json(MercadopagoPosListResponse {
+        pos: parse_pos_list(&pos_list, &names),
+    }))
+}
+
+pub async fn setup_mercadopago_pos(
+    state: SessionState,
+    merchant_id: &id_type::MerchantId,
+    profile_id: Option<id_type::ProfileId>,
+    merchant_connector_id: &id_type::MerchantConnectorAccountId,
+    req: MercadopagoPosSetupRequest,
+) -> RouterResponse<MercadopagoPosSetupResponse> {
+    let db = state.store.as_ref();
+    let (key_store, mca, token) =
+        load_account(&state, merchant_id, profile_id, merchant_connector_id).await?;
 
     let client = MpClient {
         state: &state,
@@ -460,35 +753,71 @@ pub async fn setup_mercadopago_pos(
     };
     let connector_account_id = merchant_connector_id.get_string_repr();
 
+    let existing_pos_id = normalize_existing_pos_id(req.existing_pos_id.as_deref())
+        .map_err(|error| report!(error))?;
     let user_id = client.seller_user_id().await?;
 
-    // Already set up for this seller: nothing to create.
     let current_metadata = mca.get_metadata().map(ExposeInterface::expose);
-    if let Some(pos) = existing_pos(current_metadata.as_ref(), &user_id) {
-        return Ok(ApplicationResponse::Json(response_from(pos)));
-    }
+    let pos = match choose_setup_path(current_metadata.as_ref(), &user_id, existing_pos_id) {
+        // Already set up for this seller: nothing to create.
+        SetupPath::ReturnSaved(pos) => {
+            return Ok(ApplicationResponse::Json(response_from(*pos)));
+        }
+        SetupPath::Adopt(pos_id) => {
+            let body = client.get_pos(&pos_id).await?;
+            check_pos_owner(&body, &user_id)
+                .map_err(|failure| report!(failure.into_api_error()))?;
+            let external_pos_id = ExternalPosId::choose(&body, connector_account_id);
+            if let ExternalPosId::Assign(id) = &external_pos_id {
+                client.assign_pos_external_id(&pos_id, id).await?;
+            }
+            let store_id = body.get("store_id").and_then(id_to_string).ok_or_else(|| {
+                report!(errors::ApiErrorResponse::InternalServerError)
+                    .attach_printable("The Mercado Pago POS has no store")
+            })?;
+            // A store without an external id is fine: the connector only reads the POS's.
+            let external_store_id = client
+                .search_stores(&user_id)
+                .await
+                .ok()
+                .and_then(|stores| store_external_id_of(&stores, &store_id))
+                .unwrap_or_default();
+            let qr = PosQr::from_pos(&body);
+            MercadopagoQrPos {
+                seller_id: user_id,
+                store_id,
+                external_store_id,
+                pos_id,
+                external_pos_id: external_pos_id.into_id(),
+                qr_image: qr.image,
+                qr_template_document: qr.template_document,
+                qr_template_image: qr.template_image,
+            }
+        }
+        SetupPath::Create => {
+            let fields = CreateFields::from_request(&req)?;
+            let store_request = StoreRequest::new(&fields, connector_account_id);
+            let external_store_id = store_request.external_id.clone();
+            let store_id = client.ensure_store(&user_id, &store_request).await?;
 
-    require_non_empty(&req.store_name, "store_name")?;
-    require_non_empty(&req.pos_name, "pos_name")?;
-
-    let store_request = StoreRequest::new(&req, connector_account_id);
-    let external_store_id = store_request.external_id.clone();
-    let store_id = client.ensure_store(&user_id, &store_request).await?;
-
-    let pos_request = PosRequest {
-        name: &req.pos_name,
-        store_id: &store_id,
-        external_id: external_pos_id(connector_account_id),
-    };
-    let external_pos_id = pos_request.external_id.clone();
-    let pos_id = client.ensure_pos(&pos_request).await?;
-
-    let pos = MercadopagoQrPos {
-        seller_id: user_id,
-        store_id,
-        external_store_id,
-        pos_id,
-        external_pos_id,
+            let pos_request = PosRequest {
+                name: fields.pos_name,
+                store_id: &store_id,
+                external_id: external_pos_id(connector_account_id),
+            };
+            let external_pos_id = pos_request.external_id.clone();
+            let created = client.ensure_pos(&pos_request).await?;
+            MercadopagoQrPos {
+                seller_id: user_id,
+                store_id,
+                external_store_id,
+                pos_id: created.id,
+                external_pos_id,
+                qr_image: created.qr.image,
+                qr_template_document: created.qr.template_document,
+                qr_template_image: created.qr.template_image,
+            }
+        }
     };
 
     // Only the metadata changes: the encrypted credentials are never rewritten.
@@ -516,6 +845,9 @@ fn response_from(pos: MercadopagoQrPos) -> MercadopagoPosSetupResponse {
         external_store_id: pos.external_store_id,
         pos_id: pos.pos_id,
         external_pos_id: pos.external_pos_id,
+        qr_image: pos.qr_image,
+        qr_template_document: pos.qr_template_document,
+        qr_template_image: pos.qr_template_image,
     }
 }
 
@@ -539,9 +871,10 @@ mod tests {
 
     fn setup_request() -> MercadopagoPosSetupRequest {
         MercadopagoPosSetupRequest {
-            store_name: "Hotel Prueba".to_string(),
-            pos_name: "Recepcion".to_string(),
-            location: location(),
+            store_name: Some("Hotel Prueba".to_string()),
+            pos_name: Some("Recepcion".to_string()),
+            location: Some(location()),
+            existing_pos_id: None,
         }
     }
 
@@ -554,6 +887,9 @@ mod tests {
             external_store_id: "PXSOLSTabc".to_string(),
             pos_id: "2002".to_string(),
             external_pos_id: "PXSOLPOSabc".to_string(),
+            qr_image: Some("https://mp.test/qr.png".to_string()),
+            qr_template_document: None,
+            qr_template_image: None,
         }
     }
 
@@ -579,7 +915,8 @@ mod tests {
     #[test]
     fn store_request_has_no_category_and_omits_an_empty_reference() {
         let request = setup_request();
-        let body = serde_json::to_value(StoreRequest::new(&request, "mca_abc")).unwrap();
+        let fields = CreateFields::from_request(&request).unwrap();
+        let body = serde_json::to_value(StoreRequest::new(&fields, "mca_abc")).unwrap();
         assert_eq!(
             body,
             json!({
@@ -598,8 +935,9 @@ mod tests {
         assert!(body.get("category").is_none());
 
         let mut with_reference = setup_request();
-        with_reference.location.reference = Some("Lobby".to_string());
-        let body = serde_json::to_value(StoreRequest::new(&with_reference, "mca_abc")).unwrap();
+        with_reference.location.as_mut().unwrap().reference = Some("Lobby".to_string());
+        let fields = CreateFields::from_request(&with_reference).unwrap();
+        let body = serde_json::to_value(StoreRequest::new(&fields, "mca_abc")).unwrap();
         assert_eq!(body["location"]["reference"], "Lobby");
     }
 
@@ -757,5 +1095,169 @@ mod tests {
         );
         assert!(find_by_external_id(&results, "MISSING").is_none());
         assert!(find_by_external_id(&json!({}), "PXSOLSTabc").is_none());
+    }
+
+    #[test]
+    fn creating_needs_every_field_and_location() {
+        assert!(CreateFields::from_request(&setup_request()).is_ok());
+        let mut no_store = setup_request();
+        no_store.store_name = Some("  ".to_string());
+        let mut no_pos = setup_request();
+        no_pos.pos_name = None;
+        let mut no_location = setup_request();
+        no_location.location = None;
+        for (request, field) in [
+            (no_store, "store_name"),
+            (no_pos, "pos_name"),
+            (no_location, "location"),
+        ] {
+            let error = CreateFields::from_request(&request)
+                .err()
+                .expect("rejected");
+            assert!(matches!(
+                error.current_context(),
+                errors::ApiErrorResponse::MissingRequiredField { field_name } if field_name == field
+            ));
+        }
+    }
+
+    #[test]
+    fn existing_pos_id_is_digits_only_and_blank_means_absent() {
+        assert_eq!(normalize_existing_pos_id(None).unwrap(), None);
+        assert_eq!(normalize_existing_pos_id(Some("  ")).unwrap(), None);
+        assert_eq!(
+            normalize_existing_pos_id(Some(" 123 ")).unwrap(),
+            Some("123".to_string())
+        );
+        for bad in ["12/../3", "12a", "-1", "1 2"] {
+            assert!(normalize_existing_pos_id(Some(bad)).is_err());
+        }
+    }
+
+    #[test]
+    fn the_setup_path_follows_the_request_and_the_saved_pos() {
+        let saved = merge_pos_into_metadata(None, &pos()).unwrap();
+        // Nothing asked: today's short-circuit for the same seller, a fresh create otherwise.
+        assert_eq!(
+            choose_setup_path(Some(&saved), SELLER, None),
+            SetupPath::ReturnSaved(Box::new(pos()))
+        );
+        assert_eq!(
+            choose_setup_path(Some(&saved), "888", None),
+            SetupPath::Create
+        );
+        assert_eq!(choose_setup_path(None, SELLER, None), SetupPath::Create);
+        // An existing POS wins over the saved one, including a different id for the same seller.
+        for metadata in [Some(&saved), None] {
+            assert_eq!(
+                choose_setup_path(metadata, SELLER, Some("3003".to_string())),
+                SetupPath::Adopt("3003".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn a_pos_of_another_user_is_reported_as_not_found() {
+        assert!(check_pos_owner(&json!({"user_id": 777}), SELLER).is_ok());
+        assert!(check_pos_owner(&json!({"user_id": "777"}), SELLER).is_ok());
+        assert!(check_pos_owner(&json!({"id": 1}), SELLER).is_ok());
+        let failure = check_pos_owner(&json!({"user_id": 888}), SELLER).unwrap_err();
+        assert_eq!(failure.client_status(), 404);
+        assert_eq!(failure.code, "pos_not_found");
+    }
+
+    #[test]
+    fn an_existing_external_id_is_kept_and_a_missing_one_is_assigned() {
+        assert_eq!(
+            ExternalPosId::choose(&json!({"external_id": "HANDMADE1"}), "mca_abc"),
+            ExternalPosId::Keep("HANDMADE1".to_string())
+        );
+        for body in [
+            json!({}),
+            json!({"external_id": null}),
+            json!({"external_id": ""}),
+        ] {
+            assert_eq!(
+                ExternalPosId::choose(&body, "mca_abc"),
+                ExternalPosId::Assign("PXSOLPOSmcaabc".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn both_qr_keys_are_read() {
+        let urls = json!({"image": "i", "template_document": "d", "template_image": "t"});
+        let expected = PosQr {
+            image: Some("i".to_string()),
+            template_document: Some("d".to_string()),
+            template_image: Some("t".to_string()),
+        };
+        assert_eq!(PosQr::from_pos(&json!({"id": 1, "qr": urls})), expected);
+        assert_eq!(
+            PosQr::from_pos(&json!({"id": 1, "qr_response": urls})),
+            expected
+        );
+        assert_eq!(PosQr::from_pos(&json!({"id": 1})), PosQr::default());
+        assert_eq!(PosQr::from_pos(&json!({"qr": null})), PosQr::default());
+        let created = CreatedPos::from_body(&json!({"id": 5, "qr_response": urls})).unwrap();
+        assert_eq!((created.id.as_str(), created.qr), ("5", expected));
+    }
+
+    #[test]
+    fn the_pos_list_joins_store_names_and_flags_external_ids() {
+        let stores = json!({"results": [
+            {"id": 11, "name": "Hotel Uno", "external_id": "PXSOLSTx"},
+            {"id": "12", "name": "Hotel Dos", "external_id": null}
+        ]});
+        let pos_list = json!({"results": [
+            {"id": 1, "name": "Caja", "external_id": "A1", "store_id": 11,
+             "qr": {"image": "https://mp.test/1.png"}},
+            {"id": 2, "name": "Bar", "external_id": null, "store_id": "12"},
+            {"id": 3, "store_id": 99},
+            {"name": "no id"}
+        ]});
+        let names = store_names(&stores);
+        let listed = parse_pos_list(&pos_list, &names);
+        assert_eq!(listed.len(), 3);
+        assert_eq!(
+            listed[0],
+            MercadopagoPosSummary {
+                pos_id: "1".to_string(),
+                name: Some("Caja".to_string()),
+                store_id: Some("11".to_string()),
+                store_name: Some("Hotel Uno".to_string()),
+                has_external_id: true,
+                qr_image: Some("https://mp.test/1.png".to_string()),
+            }
+        );
+        assert!(!listed[1].has_external_id);
+        assert_eq!(listed[1].store_name.as_deref(), Some("Hotel Dos"));
+        assert_eq!(listed[2].store_name, None);
+        assert!(parse_pos_list(&json!({}), &names).is_empty());
+
+        assert_eq!(
+            store_external_id_of(&stores, "11").as_deref(),
+            Some("PXSOLSTx")
+        );
+        assert_eq!(store_external_id_of(&stores, "12"), None);
+        assert_eq!(store_external_id_of(&stores, "99"), None);
+    }
+
+    #[test]
+    fn a_pos_saved_without_qr_urls_still_loads_and_switching_replaces_it() {
+        let old = json!({QR_POS_METADATA_KEY: {
+            "seller_id": SELLER, "store_id": "1", "external_store_id": "S",
+            "pos_id": "2", "external_pos_id": "P"
+        }, "keep": true});
+        let loaded = existing_pos(Some(&old), SELLER).expect("old metadata parses");
+        assert_eq!(loaded.qr_image, None);
+
+        let merged = merge_pos_into_metadata(Some(old), &pos()).unwrap();
+        assert_eq!(merged["keep"], true);
+        assert_eq!(merged[QR_POS_METADATA_KEY]["pos_id"], "2002");
+        assert_eq!(
+            merged[QR_POS_METADATA_KEY]["qr_image"],
+            "https://mp.test/qr.png"
+        );
     }
 }

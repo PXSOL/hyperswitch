@@ -97,6 +97,14 @@ pub struct MercadopagoQrPos {
     pub external_store_id: String,
     pub pos_id: String,
     pub external_pos_id: String,
+    /// Plain URLs Mercado Pago serves for the POS's fixed QR. Absent in metadata saved
+    /// before they were stored.
+    #[serde(default)]
+    pub qr_image: Option<String>,
+    #[serde(default)]
+    pub qr_template_document: Option<String>,
+    #[serde(default)]
+    pub qr_template_image: Option<String>,
 }
 
 /// The `external_pos_id` of the seller's POS, from the connector account metadata.
@@ -120,6 +128,33 @@ fn qr_external_pos_id(
 /// Mercado Pago Orders takes amounts as decimal strings.
 fn format_amount(amount: FloatMajorUnit) -> String {
     format!("{:.2}", amount.get_amount_as_f64())
+}
+
+/// Longest `description` and item `title` Mercado Pago accepts.
+const MAX_DESCRIPTION_CHARS: usize = 150;
+
+fn truncate_chars(text: &str) -> String {
+    text.chars().take(MAX_DESCRIPTION_CHARS).collect()
+}
+
+/// QR modes this connector can create. `static` is left out: the connector needs the
+/// `qr_data` that only `dynamic` and `hybrid` return.
+const QR_MODE_DYNAMIC: &str = "dynamic";
+const QR_MODE_HYBRID: &str = "hybrid";
+
+/// The order `config.qr.mode` for the `qr_mode` metadata value: `dynamic` by default,
+/// `hybrid` on request, an error for anything else (before any call to Mercado Pago).
+fn resolve_qr_mode(
+    qr_mode: Option<&str>,
+) -> Result<&'static str, error_stack::Report<errors::ConnectorError>> {
+    match qr_mode {
+        None | Some(QR_MODE_DYNAMIC) => Ok(QR_MODE_DYNAMIC),
+        Some(QR_MODE_HYBRID) => Ok(QR_MODE_HYBRID),
+        Some(_) => Err(errors::ConnectorError::InvalidDataFormat {
+            field_name: "qr_mode (only dynamic and hybrid are supported)".into(),
+        }
+        .into()),
+    }
 }
 
 /// Applies the 0.7% marketplace fee cap shared with the other flows. `None` when there is
@@ -159,6 +194,9 @@ pub struct MercadopagoQrOrderRequest {
     pub currency: enums::Currency,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// One entry carrying the description, so the loaded order does not show "default item".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items: Option<Vec<MercadopagoOrderItem>>,
     pub external_reference: String,
     pub expiration_time: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -166,6 +204,14 @@ pub struct MercadopagoQrOrderRequest {
     pub integration_data: MercadopagoIntegrationData,
     pub config: MercadopagoOrderConfig,
     pub transactions: MercadopagoOrderPaymentsRequest,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MercadopagoOrderItem {
+    pub title: String,
+    pub unit_price: String,
+    pub quantity: u32,
+    pub unit_measure: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -202,13 +248,27 @@ impl MercadopagoQrOrderRequest {
         external_reference: String,
         application_fee: Option<f64>,
         external_pos_id: String,
+        qr_mode: Option<&str>,
     ) -> Result<Self, error_stack::Report<errors::ConnectorError>> {
+        let mode = resolve_qr_mode(qr_mode)?;
         let total_amount = format_amount(amount);
+        let description = description
+            .filter(|text| !text.is_empty())
+            .map(|text| truncate_chars(&text));
+        let items = description.as_ref().map(|title| {
+            vec![MercadopagoOrderItem {
+                title: title.clone(),
+                unit_price: total_amount.clone(),
+                quantity: 1,
+                unit_measure: "unit",
+            }]
+        });
         Ok(Self {
             order_type: "qr",
             total_amount: total_amount.clone(),
             currency,
             description,
+            items,
             external_reference,
             expiration_time: QR_ORDER_EXPIRATION_TIME,
             marketplace_fee: resolve_marketplace_fee(application_fee, amount)?,
@@ -218,7 +278,7 @@ impl MercadopagoQrOrderRequest {
             config: MercadopagoOrderConfig {
                 qr: MercadopagoQrConfig {
                     external_pos_id,
-                    mode: "dynamic",
+                    mode,
                 },
             },
             transactions: MercadopagoOrderPaymentsRequest {
@@ -255,6 +315,7 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
         let meta_frm =
             MercadopagoMetadata::resolve(None, &router_data.frm_metadata, "frm_metadata")?;
         let application_fee = meta_request.application_fee.or(meta_frm.application_fee);
+        let qr_mode = meta_request.qr_mode.or(meta_frm.qr_mode);
 
         let external_pos_id = qr_external_pos_id(
             router_data
@@ -270,6 +331,7 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
             router_data.connector_request_reference_id.clone(),
             application_fee,
             external_pos_id,
+            qr_mode.as_deref(),
         )
     }
 }
@@ -769,7 +831,24 @@ mod tests {
             "pay_ref_1".to_string(),
             fee,
             qr_external_pos_id(Some(&pos_metadata()))?,
+            None,
         )
+    }
+
+    fn build_with(
+        description: Option<&str>,
+        qr_mode: Option<&str>,
+    ) -> Result<serde_json::Value, error_stack::Report<errors::ConnectorError>> {
+        MercadopagoQrOrderRequest::build(
+            amount(10_000),
+            enums::Currency::ARS,
+            description.map(str::to_string),
+            "pay_ref_1".to_string(),
+            None,
+            "PXSOLPOS1".to_string(),
+            qr_mode,
+        )
+        .map(|request| serde_json::to_value(request).expect("serializes"))
     }
 
     const QR_RESPONSE: &str = r#"{
@@ -846,6 +925,12 @@ mod tests {
                 "total_amount": "100.00",
                 "currency": "ARS",
                 "description": "Reservation 42",
+                "items": [{
+                    "title": "Reservation 42",
+                    "unit_price": "100.00",
+                    "quantity": 1,
+                    "unit_measure": "unit"
+                }],
                 "external_reference": "pay_ref_1",
                 "expiration_time": "PT30M",
                 "marketplace_fee": "0.70",
@@ -854,6 +939,55 @@ mod tests {
                 "transactions": {"payments": [{"amount": "100.00"}]}
             })
         );
+    }
+
+    #[test]
+    fn items_follow_the_description_and_are_truncated_with_it() {
+        let body = build_with(Some("Reserva #48213 - Hotel"), None).unwrap();
+        assert_eq!(body["items"][0]["title"], "Reserva #48213 - Hotel");
+        assert_eq!(body["items"][0]["unit_price"], "100.00");
+        assert_eq!(body["items"][0]["quantity"], 1);
+        assert_eq!(body["items"][0]["unit_measure"], "unit");
+
+        let long = "ñ".repeat(200);
+        let body = build_with(Some(&long), None).unwrap();
+        assert_eq!(body["description"].as_str().unwrap().chars().count(), 150);
+        assert_eq!(body["items"][0]["title"], body["description"]);
+
+        for none in [None, Some("")] {
+            let body = build_with(none, None).unwrap();
+            assert!(body.get("items").is_none());
+            assert!(body.get("description").is_none());
+        }
+    }
+
+    #[test]
+    fn qr_mode_defaults_to_dynamic_accepts_hybrid_and_rejects_the_rest() {
+        let mode = |value| build_with(None, value).map(|body| body["config"]["qr"]["mode"].clone());
+        assert_eq!(mode(None).unwrap(), "dynamic");
+        assert_eq!(mode(Some("dynamic")).unwrap(), "dynamic");
+        assert_eq!(mode(Some("hybrid")).unwrap(), "hybrid");
+        for other in ["static", "Hybrid", ""] {
+            assert!(matches!(
+                mode(Some(other)).unwrap_err().current_context(),
+                errors::ConnectorError::InvalidDataFormat { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn qr_mode_is_resolved_like_the_fee() {
+        let request = serde_json::json!({"mercadopago": {"qr_mode": "hybrid"}});
+        let frm = Some(hyperswitch_masking::Secret::new(
+            serde_json::json!({"qr_mode": "dynamic"}),
+        ));
+        let from_request = MercadopagoMetadata::resolve(Some(&request), &None, "metadata").unwrap();
+        let from_frm = MercadopagoMetadata::resolve(None, &frm, "frm_metadata").unwrap();
+        assert_eq!(
+            from_request.qr_mode.or(from_frm.qr_mode.clone()).as_deref(),
+            Some("hybrid")
+        );
+        assert_eq!(from_frm.qr_mode.as_deref(), Some("dynamic"));
     }
 
     #[test]
@@ -952,6 +1086,9 @@ mod tests {
             external_store_id: "PXSOLSTORE".into(),
             pos_id: "2002".into(),
             external_pos_id: "PXSOLPOS1".into(),
+            qr_image: Some("https://mp.test/qr.png".into()),
+            qr_template_document: None,
+            qr_template_image: None,
         };
         let metadata = serde_json::json!({ QR_POS_METADATA_KEY: pos });
         assert_eq!(qr_external_pos_id(Some(&metadata)).unwrap(), "PXSOLPOS1");

@@ -2236,6 +2236,7 @@ impl MerchantConnectorAccount {
                     web::resource(
                         "/{merchant_id}/connectors/mercadopago/pos/{merchant_connector_id}",
                     )
+                    .route(web::get().to(mercadopago_pos_list))
                     .route(web::post().to(mercadopago_pos_setup)),
                 );
         }
