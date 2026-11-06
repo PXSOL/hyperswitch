@@ -1231,5 +1231,5 @@ endpoint = "http://localhost:8081"
 token = "unused"
 org_id = "pxsol"
 workspace_id = "default"
-polling_interval = 3600
+polling_interval_milliseconds = 3600000
 backup_file_path = "/local/config/superposition_seed.toml"

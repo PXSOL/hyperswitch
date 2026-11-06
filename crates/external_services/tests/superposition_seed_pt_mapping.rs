@@ -23,8 +23,8 @@ async fn connector_overrides_apply_and_other_connectors_keep_default() {
         token: Secret::new("unused".to_string()),
         org_id: "pxsol".to_string(),
         workspace_id: "default".to_string(),
-        polling_interval: 3600,
-        request_timeout: Some(2),
+        polling_interval_milliseconds: 3_600_000,
+        request_timeout_milliseconds: Some(2_000),
         backup_file_path: Some(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../config/superposition_seed.toml"),
