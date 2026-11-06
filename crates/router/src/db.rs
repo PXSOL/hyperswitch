@@ -1,4 +1,5 @@
 pub mod address;
+pub mod analytics_report;
 pub mod api_keys;
 pub mod authentication;
 pub mod authorization;
@@ -10,13 +11,13 @@ pub mod business_profile;
 pub mod callback_mapper;
 pub mod capture;
 pub mod card_issuer;
+pub mod client_secret;
 pub mod configs;
 pub mod customers;
 pub mod dashboard_metadata;
 pub mod diagnostic;
 pub mod dispute;
 pub mod dynamic_routing_stats;
-pub mod ephemeral_key;
 pub mod events;
 pub mod file;
 pub mod fraud_check;
@@ -111,8 +112,7 @@ pub trait StorageInterface:
     + customers::CustomerInterface<Error = StorageError>
     + dashboard_metadata::DashboardMetadataInterface
     + dispute::DisputeInterface
-    + ephemeral_key::EphemeralKeyInterface
-    + ephemeral_key::ClientSecretInterface
+    + client_secret::ClientSecretInterface
     + events::EventInterface
     + file::FileMetadataInterface
     + FraudCheckInterface
@@ -124,6 +124,7 @@ pub trait StorageInterface:
     + PaymentAttemptInterface<Error = StorageError>
     + PaymentIntentInterface<Error = StorageError>
     + PaymentMethodInterface<Error = StorageError>
+    + analytics_report::AnalyticsReportInterface
     + blocklist::BlocklistInterface
     + blocklist_fingerprint::BlocklistFingerprintInterface
     + batch_blocklist_job::BatchBlocklistJobInterface
@@ -243,6 +244,7 @@ pub trait AccountsStorageInterface:
     + merchant_key_store::MerchantKeyStoreInterface<Error = StorageError>
     + hierarchical_resource::HierarchicalResourceInterface<Error = StorageError>
     + dashboard_metadata::DashboardMetadataInterface
+    + RequestIdStore
     + 'static
 {
 }
@@ -370,6 +372,15 @@ pub trait RequestIdStore {
     fn get_request_id(&self) -> Option<String> {
         None
     }
+
+    /// Hand this store the session's read ledger, so what it reads is weighed
+    /// against what the session already read. One ledger per session, attached
+    /// to each of its stores.
+    fn attach_read_ledger(
+        &mut self,
+        _read_ledger: std::sync::Arc<common_utils::read_ledger::ReadLedger>,
+    ) {
+    }
 }
 
 impl RequestIdStore for MockDb {}
@@ -392,6 +403,21 @@ impl RequestIdStore for Store {
 
     fn get_request_id(&self) -> Option<String> {
         self.request_id.clone()
+    }
+
+    fn attach_read_ledger(
+        &mut self,
+        read_ledger: std::sync::Arc<common_utils::read_ledger::ReadLedger>,
+    ) {
+        // Both direct and KV-delegated reads use the ledger in `RouterStore`.
+        #[cfg(feature = "kv_store")]
+        {
+            self.router_store.read_ledger = Some(read_ledger);
+        }
+        #[cfg(not(feature = "kv_store"))]
+        {
+            self.read_ledger = Some(read_ledger);
+        }
     }
 }
 
@@ -418,6 +444,13 @@ dyn_clone::clone_trait_object!(AccountsStorageInterface);
 impl RequestIdStore for KafkaStore {
     fn add_request_id(&mut self, request_id: String) {
         self.diesel_store.add_request_id(request_id)
+    }
+
+    fn attach_read_ledger(
+        &mut self,
+        read_ledger: std::sync::Arc<common_utils::read_ledger::ReadLedger>,
+    ) {
+        self.diesel_store.attach_read_ledger(read_ledger)
     }
 }
 

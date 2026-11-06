@@ -138,6 +138,20 @@ impl api::PayoutFulfill for Paypal {}
 impl api::PayoutSync for Paypal {}
 
 impl Paypal {
+    fn get_client_metadata_id_header(
+        metadata: Option<&api_models::payments::ConnectorMetadata>,
+    ) -> Option<(String, Maskable<String>)> {
+        metadata
+            .and_then(|metadata| metadata.paypal.as_ref())
+            .and_then(|paypal| paypal.paypal_client_metadata_id.as_ref())
+            .map(|metadata_id| {
+                (
+                    auth_headers::PAYPAL_CLIENT_METADATA_ID.to_string(),
+                    metadata_id.peek().clone().into_masked(),
+                )
+            })
+    }
+
     pub fn get_order_error_response(
         &self,
         res: Response,
@@ -1211,7 +1225,13 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         req: &PaymentsAuthorizeRouterData,
         connectors: &Connectors,
     ) -> CustomResult<Vec<(String, Maskable<String>)>, errors::ConnectorError> {
-        self.build_headers(req, connectors)
+        let mut headers = self.build_headers(req, connectors)?;
+        if let Some(header) =
+            Self::get_client_metadata_id_header(req.request.connector_intent_metadata.as_ref())
+        {
+            headers.push(header);
+        }
+        Ok(headers)
     }
 
     fn get_content_type(&self) -> &'static str {
@@ -1441,6 +1461,14 @@ impl ConnectorIntegration<CreateOrder, CreateOrderRequestData, PaymentsResponseD
     }
 }
 
+/// PreAuthenticate serves two PayPal calls: the fork's BCDC card confirm (`confirm-guest-payment`
+/// on the order created by CreateOrder) and upstream's Set Transaction Context (STC) for PayPal
+/// wallet payments of merchants with `enable_stc`. STC only runs for the PayPal wallet, so a card
+/// is only ever pre-authenticated by BCDC.
+fn is_bcdc_pre_authenticate(req: &PaymentsPreAuthenticateRouterData) -> bool {
+    matches!(req.request.payment_method_data, PaymentMethodData::Card(_))
+}
+
 impl ConnectorIntegration<PreAuthenticate, PaymentsPreAuthenticateData, PaymentsResponseData>
     for Paypal
 {
@@ -1450,11 +1478,13 @@ impl ConnectorIntegration<PreAuthenticate, PaymentsPreAuthenticateData, Payments
         connectors: &Connectors,
     ) -> CustomResult<Vec<(String, Maskable<String>)>, errors::ConnectorError> {
         let mut headers = self.build_headers(req, connectors)?;
-        // PayPal ties the device fingerprint of the guest payment to the order.
-        headers.push((
-            auth_headers::PAYPAL_CLIENT_METADATA_ID.to_string(),
-            get_bcdc_order_id(req)?.into_masked(),
-        ));
+        if is_bcdc_pre_authenticate(req) {
+            // PayPal ties the device fingerprint of the guest payment to the order.
+            headers.push((
+                auth_headers::PAYPAL_CLIENT_METADATA_ID.to_string(),
+                get_bcdc_order_id(req)?.into_masked(),
+            ));
+        }
         Ok(headers)
     }
 
@@ -1467,11 +1497,18 @@ impl ConnectorIntegration<PreAuthenticate, PaymentsPreAuthenticateData, Payments
         req: &PaymentsPreAuthenticateRouterData,
         connectors: &Connectors,
     ) -> CustomResult<String, errors::ConnectorError> {
-        Ok(format!(
-            "{}v1/aggregator/partner-checkout/orders/{}/confirm-guest-payment",
-            self.base_url(connectors),
-            get_bcdc_order_id(req)?
-        ))
+        if is_bcdc_pre_authenticate(req) {
+            Ok(format!(
+                "{}v1/aggregator/partner-checkout/orders/{}/confirm-guest-payment",
+                self.base_url(connectors),
+                get_bcdc_order_id(req)?
+            ))
+        } else {
+            Ok(format!(
+                "{}v1/risk/transaction-contexts",
+                self.base_url(connectors)
+            ))
+        }
     }
 
     fn get_request_body(
@@ -1479,8 +1516,13 @@ impl ConnectorIntegration<PreAuthenticate, PaymentsPreAuthenticateData, Payments
         req: &PaymentsPreAuthenticateRouterData,
         _connectors: &Connectors,
     ) -> CustomResult<RequestContent, errors::ConnectorError> {
-        let connector_req = paypal::PaypalBcdcConfirmRequest::try_from(req)?;
-        Ok(RequestContent::Json(Box::new(connector_req)))
+        if is_bcdc_pre_authenticate(req) {
+            let connector_req = paypal::PaypalBcdcConfirmRequest::try_from(req)?;
+            Ok(RequestContent::Json(Box::new(connector_req)))
+        } else {
+            let connector_req = paypal::PaypalSetTransactionContextRequest::build(req)?;
+            Ok(RequestContent::Json(Box::new(connector_req)))
+        }
     }
 
     fn build_request(
@@ -1511,19 +1553,54 @@ impl ConnectorIntegration<PreAuthenticate, PaymentsPreAuthenticateData, Payments
         event_builder: Option<&mut ConnectorEvent>,
         res: Response,
     ) -> CustomResult<PaymentsPreAuthenticateRouterData, errors::ConnectorError> {
-        let response: paypal::PaypalBcdcConfirmResponse = res
-            .response
-            .parse_struct("paypal PaypalBcdcConfirmResponse")
-            .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
-        event_builder.map(|i| i.set_response_body(&response));
-        router_env::logger::info!(connector_response=?response);
-        RouterData::try_from(ResponseRouterData {
-            response,
-            data: data.clone(),
-            http_code: res.status_code,
+        if is_bcdc_pre_authenticate(data) {
+            let response: paypal::PaypalBcdcConfirmResponse = res
+                .response
+                .parse_struct("paypal PaypalBcdcConfirmResponse")
+                .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+            event_builder.map(|i| i.set_response_body(&response));
+            router_env::logger::info!(connector_response=?response);
+            return RouterData::try_from(ResponseRouterData {
+                response,
+                data: data.clone(),
+                http_code: res.status_code,
+            });
+        }
+        // The Set Transaction Context API can respond with an empty body or a body echoing back
+        // the transaction context. Either way, the response contents are informational only -
+        // the fraud risk assessment is performed by PayPal during payment authorization.
+        let connector_response_reference_id = if res.response.is_empty() {
+            None
+        } else {
+            let response: paypal::PaypalSetTransactionContextResponse = res
+                .response
+                .parse_struct("paypal PaypalSetTransactionContextResponse")
+                .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+            event_builder.map(|i| i.set_response_body(&response));
+            router_env::logger::info!(connector_response=?response);
+            response.tracking_id
+        };
+
+        Ok(PaymentsPreAuthenticateRouterData {
+            response: Ok(PaymentsResponseData::TransactionResponse {
+                resource_id: ResponseId::NoResponseId,
+                redirection_data: Box::new(None),
+                mandate_reference: Box::new(None),
+                connector_metadata: None,
+                network_txn_id: None,
+                network_txn_link_id: None,
+                connector_response_reference_id,
+                incremental_authorization_allowed: None,
+                authentication_data: None,
+                charges: None,
+                payment_account_reference: None,
+            }),
+            ..data.clone()
         })
     }
 
+    // The error has no request to tell the two calls apart. Both endpoints answer with PayPal's
+    // common REST error envelope (name, message, debug_id, details), which the orders parser reads.
     fn get_error_response(
         &self,
         res: Response,
@@ -1858,7 +1935,13 @@ impl ConnectorIntegration<CompleteAuthorize, CompleteAuthorizeData, PaymentsResp
         req: &PaymentsCompleteAuthorizeRouterData,
         connectors: &Connectors,
     ) -> CustomResult<Vec<(String, Maskable<String>)>, errors::ConnectorError> {
-        self.build_headers(req, connectors)
+        let mut headers = self.build_headers(req, connectors)?;
+        if let Some(header) =
+            Self::get_client_metadata_id_header(req.request.connector_intent_metadata.as_ref())
+        {
+            headers.push(header);
+        }
+        Ok(headers)
     }
 
     fn get_content_type(&self) -> &'static str {
@@ -3070,8 +3153,37 @@ impl ConnectorSpecifications for Paypal {
         is_bcdc_authorize(&current_flow)
     }
 
+    /// Pre-authentication runs for two PayPal calls (see `is_bcdc_pre_authenticate`):
+    /// - BCDC card payments confirm the card on the order created by CreateOrder.
+    /// - The Set Transaction Context (STC) call to PayPal's Risk-as-a-Service API is required for
+    ///   paypal wallet payments (redirect, sdk and saved-token payments by a returning customer,
+    ///   where the payment method data is `MandatePayment`) when the merchant has opted in via
+    ///   `enable_stc` in the merchant connector account metadata.
     fn is_pre_authentication_flow_required(&self, current_flow: api::CurrentFlowInfo) -> bool {
-        is_bcdc_authorize(&current_flow)
+        if is_bcdc_authorize(&current_flow) {
+            return true;
+        }
+        match current_flow {
+            api::CurrentFlowInfo::Authorize {
+                request_data,
+                connector_meta_data,
+                auth_type: _,
+            } => {
+                // Match on payment method type so that both fresh paypal wallet
+                // (PaypalRedirect / PaypalSdk) payments and returning-customer payments with a
+                // saved paypal token (PaymentMethodData::MandatePayment) are covered.
+                let is_paypal_pm = matches!(
+                    request_data.payment_method_type,
+                    Some(enums::PaymentMethodType::Paypal)
+                );
+                is_paypal_pm && paypal::is_stc_enabled(&connector_meta_data)
+            }
+            api::CurrentFlowInfo::CompleteAuthorize { .. }
+            | api::CurrentFlowInfo::SetupMandate { .. }
+            | api::CurrentFlowInfo::Psync { .. }
+            | api::CurrentFlowInfo::UpdatePostConfirm { .. }
+            | api::CurrentFlowInfo::ConnectorWebhookRegister { .. } => false,
+        }
     }
 
     fn is_post_authentication_flow_required(&self, current_flow: api::CurrentFlowInfo) -> bool {
