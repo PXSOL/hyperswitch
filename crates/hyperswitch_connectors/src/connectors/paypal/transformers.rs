@@ -5936,6 +5936,10 @@ mod external_refund_sync_tests {
             capture_method: Some(enums::CaptureMethod::Automatic),
             additional_payment_method_data: None,
             payment_connector_request_reference_id: None,
+            payment_method_data: None,
+            mandate_id: None,
+            payment_feature_metadata: None,
+            feature_metadata: None,
         });
         let executed =
             RefundsRouterData::<Execute>::try_from(RefundsResponseRouterData::<Execute, _> {
@@ -6376,7 +6380,7 @@ mod bcdc_tests {
             minor_amount: MinorUnit::new(10_000),
             capture_method: Some(enums::CaptureMethod::Automatic),
             webhook_url: None,
-            complete_authorize_url: Some("https://hs.example/complete".to_string()),
+            complete_authorize_url: Some(Secret::new("https://hs.example/complete".to_string())),
             browser_info: None,
             order_details: None,
             order_category: None,
@@ -6419,6 +6423,9 @@ mod bcdc_tests {
             recipient_details: None,
             business_country: None,
             connector_intent_metadata: None,
+            enable_avs_check: None,
+            enable_account_name_verification: None,
+            router_notification_url: None,
         }
     }
 
@@ -6426,6 +6433,7 @@ mod bcdc_tests {
         CurrentFlowInfo::Authorize {
             auth_type: enums::AuthenticationType::NoThreeDs,
             request_data: Box::new(request),
+            connector_meta_data: None,
         }
     }
 
@@ -6470,6 +6478,13 @@ mod bcdc_tests {
             order_id: None,
             force_3ds_challenge: None,
             enable_overcapture: None,
+            customer_id: None,
+            billing_descriptor: None,
+            payment_channel: None,
+            enable_partial_authorization: None,
+            order_details: None,
+            feature_metadata: None,
+            enable_account_name_verification: None,
         }
     }
 
@@ -6524,7 +6539,10 @@ mod bcdc_tests {
     fn the_hooks_are_off_for_a_wallet_even_with_the_selector() {
         let paypal = Paypal::new();
         let wallet = PaymentMethodData::Wallet(WalletData::PaypalRedirect(
-            hyperswitch_domain_models::payment_method_data::PaypalRedirection { email: None },
+            hyperswitch_domain_models::payment_method_data::PaypalRedirection {
+                email: None,
+                payer_id: None,
+            },
         ));
         let flow = authorize_flow(authorize_data(wallet, bcdc_metadata()));
         assert!(!paypal.is_order_create_flow_required(flow.clone()));
@@ -6648,7 +6666,7 @@ mod bcdc_tests {
             currency: Some(enums::Currency::USD),
             payment_method_type: None,
             router_return_url: None,
-            complete_authorize_url: Some("https://hs.example/complete".to_string()),
+            complete_authorize_url: Some(Secret::new("https://hs.example/complete".to_string())),
             browser_info: None,
             enrolled_for_3ds: false,
             customer_name: None,
@@ -6972,13 +6990,16 @@ mod bcdc_tests {
                         form_fields,
                     }) => {
                         assert_eq!(
-                            endpoint,
+                            endpoint.peek(),
                             "https://www.sandbox.paypal.com/heliosnext/threeDS"
                         );
                         assert_eq!(method, Method::Get);
-                        assert_eq!(form_fields["cart_id"], ORDER_ID);
-                        assert_eq!(form_fields["flow"], "3ds");
-                        assert_eq!(form_fields["redirect_uri"], "https://hs.example/complete");
+                        assert_eq!(form_fields["cart_id"].peek(), ORDER_ID);
+                        assert_eq!(form_fields["flow"].peek(), "3ds");
+                        assert_eq!(
+                            form_fields["redirect_uri"].peek(),
+                            "https://hs.example/complete"
+                        );
                     }
                     other => panic!("unexpected redirection {other:?}"),
                 }

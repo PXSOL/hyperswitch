@@ -2093,7 +2093,7 @@ mod tests {
             currency: enums::Currency::PEN,
             confirm: true,
             capture_method: Some(enums::CaptureMethod::Automatic),
-            router_return_url: Some(RETURN_URL.to_string()),
+            router_return_url: Some(Secret::new(RETURN_URL.to_string())),
             webhook_url: Some("https://hyperswitch.example/webhooks/merchant_1/mca_1".to_string()),
             complete_authorize_url: None,
             setup_future_usage: None,
@@ -2145,6 +2145,9 @@ mod tests {
             is_account_funded_transaction: None,
             recipient_details: None,
             business_country: None,
+            enable_avs_check: None,
+            enable_account_name_verification: None,
+            router_notification_url: None,
         }
     }
 
@@ -2282,6 +2285,10 @@ mod tests {
             payment_connector_request_reference_id: None,
             capture_method: None,
             additional_payment_method_data: None,
+            payment_method_data: None,
+            mandate_id: None,
+            payment_feature_metadata: None,
+            feature_metadata: None,
         }
     }
 
@@ -2670,6 +2677,7 @@ mod tests {
                 );
                 match *redirection_data {
                     Some(RedirectForm::Html { html_data }) => {
+                        let html_data = html_data.expose();
                         assert!(!html_data.contains("<script src="));
                         assert!(html_data.contains(
                             r#""sdkUrl":"https://sandbox-checkout.izipay.pe/payments/v1/js/index.js""#
@@ -2716,7 +2724,7 @@ mod tests {
         let mut router_data = authorize_router_data();
         router_data.test_mode = Some(false);
         router_data.request.webhook_url = None;
-        router_data.request.router_return_url = Some(format!("{RETURN_URL}?a=b"));
+        router_data.request.router_return_url = Some(Secret::new(format!("{RETURN_URL}?a=b")));
         let result =
             authorize_response(token_response(), router_data, 200, &amount("1.99")).unwrap();
         match result.response.unwrap() {
@@ -2724,6 +2732,7 @@ mod tests {
                 redirection_data, ..
             } => match *redirection_data {
                 Some(RedirectForm::Html { html_data }) => {
+                    let html_data = html_data.expose();
                     assert!(html_data.contains(
                         r#""sdkUrl":"https://checkout.izipay.pe/payments/v1/js/index.js""#
                     ));
@@ -2777,7 +2786,7 @@ mod tests {
             PaymentsResponseData::TransactionResponse {
                 redirection_data, ..
             } => match *redirection_data {
-                Some(RedirectForm::Html { html_data }) => html_data,
+                Some(RedirectForm::Html { html_data }) => html_data.expose(),
                 other => panic!("expected an html redirect form, got {other:?}"),
             },
             other => panic!("expected a TransactionResponse, got {other:?}"),
@@ -2877,6 +2886,7 @@ mod tests {
         let Some(RedirectForm::Html { html_data }) = *redirection_data else {
             panic!("expected an html redirect form");
         };
+        let html_data = html_data.expose();
         // The name is 34 characters long, so it is valid and has to appear escaped.
         assert!(!html_data.contains("alert(1)</script>"));
         assert!(
@@ -3577,6 +3587,9 @@ mod tests {
                 cancellation_reason: None,
                 connector_meta,
                 minor_amount: Some(MinorUnit::new(minor_amount)),
+                capture_method: None,
+                payment_method_data: None,
+                mandate_id: None,
             },
             PaymentAddress::default(),
             "PX1790971180429",

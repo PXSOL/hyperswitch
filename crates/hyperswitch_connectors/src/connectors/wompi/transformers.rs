@@ -3936,7 +3936,7 @@ mod tests {
             currency,
             confirm: true,
             capture_method: Some(enums::CaptureMethod::Automatic),
-            router_return_url,
+            router_return_url: router_return_url.map(Secret::new),
             webhook_url: None,
             complete_authorize_url: None,
             setup_future_usage: None,
@@ -3985,6 +3985,9 @@ mod tests {
             is_account_funded_transaction: None,
             recipient_details: None,
             business_country: None,
+            enable_avs_check: None,
+            enable_account_name_verification: None,
+            router_notification_url: None,
         }
     }
 
@@ -4291,22 +4294,23 @@ mod tests {
                     method,
                     form_fields,
                 }) => {
-                    assert_eq!(endpoint, WOMPI_CHECKOUT_ENDPOINT);
+                    assert_eq!(endpoint.peek(), WOMPI_CHECKOUT_ENDPOINT);
                     assert_eq!(method, Method::Get);
                     assert_eq!(
-                        form_fields.get("public-key"),
+                        form_fields.get("public-key").map(PeekInterface::peek),
                         Some(&"pub_test_x".to_string())
                     );
                     assert_eq!(
-                        form_fields.get("amount-in-cents"),
+                        form_fields.get("amount-in-cents").map(PeekInterface::peek),
                         Some(&"150000".to_string())
                     );
                     assert_eq!(
-                        form_fields.get("reference"),
+                        form_fields.get("reference").map(PeekInterface::peek),
                         Some(&"wompi-test-ref-7".to_string())
                     );
                     let expiration_time = form_fields
                         .get("expiration-time")
+                        .map(PeekInterface::peek)
                         .expect("the hosted checkout must expire");
                     let expires_at = time::OffsetDateTime::parse(
                         expiration_time,
@@ -4326,11 +4330,13 @@ mod tests {
                     )
                     .unwrap();
                     assert_eq!(
-                        form_fields.get("signature:integrity"),
+                        form_fields
+                            .get("signature:integrity")
+                            .map(PeekInterface::peek),
                         Some(&expected_signature)
                     );
                     assert_eq!(
-                        form_fields.get("redirect-url"),
+                        form_fields.get("redirect-url").map(PeekInterface::peek),
                         Some(&"https://example.com/return".to_string())
                     );
                 }
@@ -4374,6 +4380,10 @@ mod tests {
             capture_method: None,
             additional_payment_method_data: None,
             payment_connector_request_reference_id: None,
+            payment_method_data: None,
+            mandate_id: None,
+            payment_feature_metadata: None,
+            feature_metadata: None,
         }
     }
 
@@ -5115,10 +5125,10 @@ mod tests {
             browser_info: None,
             connector_transaction_id: None,
             connector_meta,
-            complete_authorize_url: Some(
+            complete_authorize_url: Some(Secret::new(
                 "https://hyperswitch.example.com/payments/redirect/pay_1/merchant_1/wompi"
                     .to_string(),
-            ),
+            )),
             metadata: None,
             customer_acceptance: None,
             minor_amount: MinorUnit::new(100000),
@@ -5139,6 +5149,13 @@ mod tests {
             order_id: None,
             force_3ds_challenge: None,
             enable_overcapture: None,
+            customer_id: None,
+            billing_descriptor: None,
+            payment_channel: None,
+            enable_partial_authorization: None,
+            order_details: None,
+            feature_metadata: None,
+            enable_account_name_verification: None,
         };
 
         RouterData {

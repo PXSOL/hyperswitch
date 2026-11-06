@@ -1751,6 +1751,10 @@ mod tests {
             capture_method: Some(enums::CaptureMethod::Automatic),
             additional_payment_method_data: None,
             payment_connector_request_reference_id: None,
+            payment_method_data: None,
+            mandate_id: None,
+            payment_feature_metadata: None,
+            feature_metadata: None,
         }
     }
 

@@ -3374,7 +3374,7 @@ mod tests {
         };
         match auth.to_redirection(None) {
             Some(RedirectForm::Html { html_data }) => {
-                assert_eq!(html_data, "<form id=\"tds\"></form>");
+                assert_eq!(html_data.peek(), "<form id=\"tds\"></form>");
             }
             other => panic!("expected Html redirect, got {other:?}"),
         }
@@ -3399,11 +3399,16 @@ mod tests {
                 method,
                 form_fields,
             }) => {
-                assert_eq!(endpoint, "https://acs.example.com/challenge");
+                assert_eq!(endpoint.peek(), "https://acs.example.com/challenge");
                 assert_eq!(method, Method::Post);
-                assert_eq!(form_fields.get("creq"), Some(&"creq_value".to_string()));
                 assert_eq!(
-                    form_fields.get("threeDSSessionData"),
+                    form_fields.get("creq").map(PeekInterface::peek),
+                    Some(&"creq_value".to_string())
+                );
+                assert_eq!(
+                    form_fields
+                        .get("threeDSSessionData")
+                        .map(PeekInterface::peek),
                     Some(&"session_value".to_string())
                 );
             }
@@ -3441,7 +3446,7 @@ mod tests {
         let auth: FiservemeaAuthenticationResponse = serde_json::from_value(json).unwrap();
         match auth.to_redirection(None) {
             Some(RedirectForm::Html { html_data }) => {
-                assert_eq!(html_data, "<form id=\"tds-alt\"></form>");
+                assert_eq!(html_data.peek(), "<form id=\"tds-alt\"></form>");
             }
             other => panic!("expected Html redirect, got {other:?}"),
         }
@@ -3466,7 +3471,9 @@ mod tests {
         match auth.to_redirection(None) {
             Some(RedirectForm::Form { form_fields, .. }) => {
                 assert_eq!(
-                    form_fields.get("threeDSSessionData"),
+                    form_fields
+                        .get("threeDSSessionData")
+                        .map(PeekInterface::peek),
                     Some(&"session_value".to_string())
                 );
             }
@@ -3699,7 +3706,8 @@ mod tests {
             common_enums::Currency::ARS,
             metadata,
         );
-        request.complete_authorize_url = Some(THREE_DS_COMPLETE_AUTHORIZE_URL.to_string());
+        request.complete_authorize_url =
+            Some(Secret::new(THREE_DS_COMPLETE_AUTHORIZE_URL.to_string()));
         let mut router_data: PaymentsAuthorizeRouterData =
             cert_router_data(CERT_STORE_AR, "PX-3ds-checklist", request);
         router_data.auth_type = common_enums::AuthenticationType::ThreeDs;
@@ -4187,7 +4195,7 @@ mod tests {
         match auth.to_redirection(None) {
             Some(RedirectForm::Html { html_data }) => {
                 assert_eq!(
-                    html_data,
+                    html_data.peek(),
                     "<form name=\"frm\" method=\"POST\"><iframe hidden></iframe></form>"
                 );
             }
@@ -4230,14 +4238,19 @@ mod tests {
                 method,
                 form_fields,
             }) => {
-                assert_eq!(endpoint, "https://3ds-acs.test.modirum.com/mdpayacs/pareq");
+                assert_eq!(
+                    endpoint.peek(),
+                    "https://3ds-acs.test.modirum.com/mdpayacs/pareq"
+                );
                 assert_eq!(method, Method::Post);
                 assert_eq!(
-                    form_fields.get("creq"),
+                    form_fields.get("creq").map(PeekInterface::peek),
                     Some(&"ewogICAiYWNzVHJhbCIgOiA...wMDAtMDAwMDAwMDA0MWE5Igp9".to_string())
                 );
                 assert_eq!(
-                    form_fields.get("threeDSSessionData"),
+                    form_fields
+                        .get("threeDSSessionData")
+                        .map(PeekInterface::peek),
                     Some(&"50F2156E03083CA665BCB4..".to_string())
                 );
             }
@@ -4887,14 +4900,18 @@ mod tests {
 
         match auth.to_redirection(Some(TEST_RETURN_URL)) {
             Some(RedirectForm::Html { html_data }) => {
-                assert!(html_data.contains("window.setTimeout(continueAuthentication"))
+                assert!(html_data
+                    .peek()
+                    .contains("window.setTimeout(continueAuthentication"))
             }
             other => panic!("se esperaba el wrapper, salió {other:?}"),
         }
         // Sin URL de retorno se devuelve el form crudo: es el comportamiento anterior, peor pero
         // no una regresión respecto de no responder nada.
         match auth.to_redirection(None) {
-            Some(RedirectForm::Html { html_data }) => assert_eq!(html_data, CERT_METHOD_FORM),
+            Some(RedirectForm::Html { html_data }) => {
+                assert_eq!(html_data.peek(), CERT_METHOD_FORM)
+            }
             other => panic!("se esperaba el form crudo, salió {other:?}"),
         }
     }
@@ -5330,6 +5347,9 @@ mod tests {
             is_account_funded_transaction: None,
             recipient_details: None,
             business_country: None,
+            enable_avs_check: None,
+            enable_account_name_verification: None,
+            router_notification_url: None,
         }
     }
 
@@ -5657,6 +5677,8 @@ mod tests {
                     is_account_funded_transaction: None,
                     recipient_details: None,
                     business_country: None,
+                    enable_avs_check: None,
+                    enable_account_name_verification: None,
                 },
             );
         let request = FiservemeaPaymentsRequest::try_from(&router_data).unwrap();
@@ -5714,6 +5736,10 @@ mod tests {
                 capture_method: Some(common_enums::CaptureMethod::Automatic),
                 additional_payment_method_data: None,
                 payment_connector_request_reference_id: None,
+                payment_method_data: None,
+                mandate_id: None,
+                payment_feature_metadata: None,
+                feature_metadata: None,
             },
         );
         let amount = StringMajorUnitForConnector
@@ -5892,6 +5918,8 @@ mod tests {
                     is_account_funded_transaction: None,
                     recipient_details: None,
                     business_country: None,
+                    enable_avs_check: None,
+                    enable_account_name_verification: None,
                 },
             );
         let request = FiservemeaPaymentsRequest::try_from(&zero_auth).unwrap();
@@ -6530,6 +6558,10 @@ mod tests {
                 capture_method: Some(common_enums::CaptureMethod::Automatic),
                 additional_payment_method_data: None,
                 payment_connector_request_reference_id: None,
+                payment_method_data: None,
+                mandate_id: None,
+                payment_feature_metadata: None,
+                feature_metadata: None,
             },
         );
         let executed =

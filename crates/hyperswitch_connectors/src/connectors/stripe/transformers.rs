@@ -6996,6 +6996,10 @@ mod external_refund_sync_tests {
             capture_method: Some(enums::CaptureMethod::Automatic),
             additional_payment_method_data: None,
             payment_connector_request_reference_id: None,
+            payment_method_data: None,
+            mandate_id: None,
+            payment_feature_metadata: None,
+            feature_metadata: None,
         });
         let executed =
             RefundsRouterData::<Execute>::try_from(RefundsResponseRouterData::<Execute, _> {
@@ -7276,6 +7280,7 @@ mod test_stripe_checkout {
         let RedirectForm::Html { html_data } = build_checkout_redirect_form(CHECKOUT_URL) else {
             panic!("expected an Html redirect form");
         };
+        let html_data = html_data.expose();
         let expected = format!("window.location.replace(\"{CHECKOUT_URL}\")");
         assert!(html_data.contains(&expected), "{html_data}");
         assert!(html_data.contains("#fidkdWxOYHwnPyd1blpxYHZxWjA0"));
@@ -7288,6 +7293,7 @@ mod test_stripe_checkout {
         else {
             panic!("expected an Html redirect form");
         };
+        let html_data = html_data.expose();
         // Neither the script nor the fallback link can be broken out of.
         assert!(html_data.contains("\\u003c"));
         assert!(html_data.contains("a=1\\u0026b="));
@@ -7381,6 +7387,7 @@ mod test_stripe_checkout {
         let Some(RedirectForm::Html { html_data }) = *redirection_data else {
             panic!("expected an Html redirect form");
         };
+        let html_data = html_data.expose();
         assert!(html_data.contains(CHECKOUT_URL));
     }
 
@@ -7529,7 +7536,7 @@ mod test_stripe_checkout {
             currency,
             confirm: true,
             capture_method: Some(enums::CaptureMethod::Automatic),
-            router_return_url,
+            router_return_url: router_return_url.map(Secret::new),
             webhook_url: None,
             complete_authorize_url: None,
             setup_future_usage: None,
@@ -7578,6 +7585,9 @@ mod test_stripe_checkout {
             is_account_funded_transaction: None,
             recipient_details: None,
             business_country: None,
+            enable_avs_check: None,
+            enable_account_name_verification: None,
+            router_notification_url: None,
         }
     }
 
