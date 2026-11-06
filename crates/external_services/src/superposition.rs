@@ -785,9 +785,14 @@ impl SuperpositionClient {
                     return Err(error_stack::report!(SuperpositionError::ClientInitError(
                         "Failed to initialize Superposition provider".to_string(),
                     ))
-                    .attach_printable(format!(
-                        "HTTP initialization failed and no backup file is configured: {http_error}"
-                    )));
+                    .attach_printable(match &config.backup_file_path {
+                        Some(path) => format!(
+                            "HTTP initialization failed and the backup file {path:?} could not be loaded: {http_error}"
+                        ),
+                        None => format!(
+                            "HTTP initialization failed and no backup file is configured: {http_error}"
+                        ),
+                    }));
                 };
                 router_env::logger::warn!(
                     "Superposition HTTP initialization failed ({http_error}); serving the backup file only, without experiments"
