@@ -22,7 +22,7 @@ use hyperswitch_domain_models::{
     },
 };
 use hyperswitch_interfaces::errors;
-use hyperswitch_masking::{PeekInterface, Secret};
+use hyperswitch_masking::{ExposeInterface, PeekInterface, Secret};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -734,7 +734,7 @@ fn validate_authorize_request(
         },
     )?;
     // Fails early when the return url cannot carry the result marker.
-    result_url(&return_url, "success")?;
+    result_url(return_url.peek(), "success")?;
 
     let billing = build_billing(router_data)?;
 
@@ -749,7 +749,7 @@ fn validate_authorize_request(
     Ok(IzipayCheckoutData {
         billing,
         merchant_buyer_id,
-        return_url,
+        return_url: return_url.expose(),
     })
 }
 
@@ -1109,7 +1109,9 @@ pub fn authorize_response(
         status: enums::AttemptStatus::AuthenticationPending,
         response: Ok(PaymentsResponseData::TransactionResponse {
             resource_id: ResponseId::ConnectorTransactionId(order_number.clone()),
-            redirection_data: Box::new(Some(RedirectForm::Html { html_data: page })),
+            redirection_data: Box::new(Some(RedirectForm::Html {
+                html_data: Secret::new(page),
+            })),
             mandate_reference: Box::new(None),
             connector_metadata: Some(serde_json::json!({
                 "transaction_id": transaction_id,

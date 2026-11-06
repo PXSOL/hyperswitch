@@ -789,14 +789,18 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>>
         // (router_return_url), which triggers PSync and only then forwards to the
         // merchant's return_url. Mercado Pago rejects localhost back_urls, so in
         // that case the preference is created without them (webhook/PSync only).
-        let back_urls =
-            filter_public_url(router_data.request.router_return_url.as_ref()).map(|return_url| {
-                MercadopagoBackUrls {
-                    success: return_url.clone(),
-                    pending: return_url.clone(),
-                    failure: return_url,
-                }
-            });
+        let back_urls = filter_public_url(
+            router_data
+                .request
+                .router_return_url
+                .as_ref()
+                .map(PeekInterface::peek),
+        )
+        .map(|return_url| MercadopagoBackUrls {
+            success: return_url.clone(),
+            pending: return_url.clone(),
+            failure: return_url,
+        });
         let auto_return = back_urls.as_ref().map(|_| "approved".to_string());
 
         let notification_url = filter_public_url(router_data.request.webhook_url.as_ref());
@@ -1312,7 +1316,7 @@ impl<F, T> TryFrom<ResponseRouterData<F, MercadopagoAuthorizeResponse, T, Paymen
                 // page: no transaction id yet. PSync finds it by external_reference
                 // and its resource_id promotion persists the real id on the attempt.
                 let redirection_data = RedirectForm::Form {
-                    endpoint: preference.init_point.clone(),
+                    endpoint: Secret::new(preference.init_point.clone()),
                     method: Method::Get,
                     form_fields: HashMap::new(),
                 };

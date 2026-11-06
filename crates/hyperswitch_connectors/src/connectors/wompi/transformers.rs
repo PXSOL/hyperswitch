@@ -1138,7 +1138,7 @@ impl
         // merchant, so the payment is confirmed against Wompi's API rather
         // than trusted from the redirect's `?id=` query string.
         if let Some(redirect_url) = item.data.request.router_return_url.clone() {
-            form_fields.insert("redirect-url".to_string(), redirect_url);
+            form_fields.insert("redirect-url".to_string(), redirect_url.expose());
         }
         if let Some(email) = item.data.request.get_optional_email() {
             form_fields.insert("customer-data:email".to_string(), email.peek().to_string());
@@ -1154,9 +1154,12 @@ impl
         }
 
         let redirection_data = RedirectForm::Form {
-            endpoint: WOMPI_CHECKOUT_ENDPOINT.to_string(),
+            endpoint: Secret::new(WOMPI_CHECKOUT_ENDPOINT.to_string()),
             method: Method::Get,
-            form_fields,
+            form_fields: form_fields
+                .into_iter()
+                .map(|(key, value)| (key, Secret::new(value)))
+                .collect(),
         };
 
         Ok(Self {
@@ -1724,7 +1727,9 @@ pub(super) fn three_ds_create_response<F, T>(
         status: enums::AttemptStatus::AuthenticationPending,
         response: Ok(PaymentsResponseData::TransactionResponse {
             resource_id: ResponseId::ConnectorTransactionId(transaction.id),
-            redirection_data: Box::new(Some(RedirectForm::Html { html_data: page })),
+            redirection_data: Box::new(Some(RedirectForm::Html {
+                html_data: Secret::new(page),
+            })),
             mandate_reference: Box::new(None),
             connector_metadata: Some(connector_metadata),
             network_txn_id: None,
@@ -1778,7 +1783,9 @@ pub(super) fn three_ds_poll_response<F, T>(
         status: enums::AttemptStatus::AuthenticationPending,
         response: Ok(PaymentsResponseData::TransactionResponse {
             resource_id: ResponseId::ConnectorTransactionId(transaction.id),
-            redirection_data: Box::new(Some(RedirectForm::Html { html_data: page })),
+            redirection_data: Box::new(Some(RedirectForm::Html {
+                html_data: Secret::new(page),
+            })),
             mandate_reference: Box::new(None),
             connector_metadata: Some(connector_metadata),
             network_txn_id: None,
@@ -1919,14 +1926,16 @@ pub(super) fn build_card_three_ds_authorize_response(
             field_name: "complete_authorize_url".into(),
         },
     )?;
-    let page = build_browser_info_collection_page(&complete_authorize_url);
+    let page = build_browser_info_collection_page(complete_authorize_url.peek());
     let reference = item.data.connector_request_reference_id.clone();
 
     Ok(PaymentsAuthorizeRouterData {
         status: enums::AttemptStatus::AuthenticationPending,
         response: Ok(PaymentsResponseData::TransactionResponse {
             resource_id: ResponseId::NoResponseId,
-            redirection_data: Box::new(Some(RedirectForm::Html { html_data: page })),
+            redirection_data: Box::new(Some(RedirectForm::Html {
+                html_data: Secret::new(page),
+            })),
             mandate_reference: Box::new(None),
             connector_metadata: Some(connector_metadata),
             network_txn_id: None,

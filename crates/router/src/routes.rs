@@ -104,8 +104,8 @@ pub use self::app::{
     FeatureMatrix, Files, Forex, Gsm, Health, Hypersense, Mandates, MerchantAccount,
     MerchantConnectorAccount, OfferEngine, Oidc, PaymentLink, PaymentMethods, Payments, Poll,
     ProcessTracker, ProcessTrackerDeprecated, Profile, ProfileAcquirer, ProfileNew, Refunds, Relay,
-    RelayWebhooks, SdkConfig, SessionState, SuperpositionProxy, TelephoneOrder, ThreeDsDecisionRule,
-    User, UserDeprecated, Webhooks,
+    RelayWebhooks, SdkConfig, SessionState, SuperpositionProxy, TelephoneOrder,
+    ThreeDsDecisionRule, User, UserDeprecated, Webhooks,
 };
 #[cfg(feature = "olap")]
 pub use self::app::{

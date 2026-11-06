@@ -602,7 +602,6 @@ impl Feature<api::Authorize, types::PaymentsAuthorizeData> for types::PaymentsAu
                     _ => false,
                 },
                 api_models::enums::Connector::Shift4 => true,
-                api_models::enums::Connector::Paypal => true,
                 // Nuvei: never run the next leg after a failed initPayment
                 api_models::enums::Connector::Nuvei => authorize_router_data.response.is_ok(),
                 // Paysafe card + 3DS: PreAuthenticate mints the handle. When Paysafe returns no ACS
@@ -631,18 +630,29 @@ impl Feature<api::Authorize, types::PaymentsAuthorizeData> for types::PaymentsAu
                     }) => redirection_data.is_none(),
                     _ => false,
                 },
-                // PayPal BCDC (guest card checkout) only: PreAuthenticate confirms the card on the
-                // order. When PayPal approves it without a 3DS challenge, continue straight to the
-                // capture/authorize Authorize call; when it asks for 3DS, break so the shopper
-                // completes it and CompleteAuthorize settles the order. Without the BCDC selector
-                // PayPal never runs this leg, so its other payments are not affected.
-                api_models::enums::Connector::Paypal => match &authorize_router_data.response {
-                    Ok(types::PaymentsResponseData::TransactionResponse {
-                        redirection_data,
-                        ..
-                    }) => redirection_data.is_none(),
-                    _ => false,
-                },
+                // PayPal runs PreAuthenticate for two calls:
+                // - BCDC (guest card checkout): it confirms the card on the order. When PayPal
+                //   approves it without a 3DS challenge, continue straight to the capture/authorize
+                //   Authorize call; when it asks for 3DS, break so the shopper completes it and
+                //   CompleteAuthorize settles the order.
+                // - Set Transaction Context (STC) for PayPal wallet payments of merchants with
+                //   `enable_stc`: informational only, so the Authorize call always follows.
+                api_models::enums::Connector::Paypal => {
+                    if matches!(
+                        authorize_router_data.request.payment_method_data,
+                        hyperswitch_domain_models::payment_method_data::PaymentMethodData::Card(_)
+                    ) {
+                        match &authorize_router_data.response {
+                            Ok(types::PaymentsResponseData::TransactionResponse {
+                                redirection_data,
+                                ..
+                            }) => redirection_data.is_none(),
+                            _ => false,
+                        }
+                    } else {
+                        true
+                    }
+                }
                 _ => false,
             };
             Ok((authorize_router_data, should_continue_after_preauthenticate))

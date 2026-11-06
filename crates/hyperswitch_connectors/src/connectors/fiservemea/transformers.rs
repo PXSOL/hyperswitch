@@ -609,7 +609,7 @@ pub(super) fn wrap_three_ds_method_redirection(router_data: &mut PaymentsAuthori
         return;
     };
     // La ventana principal vuelve por la termURL, que es la que lleva el PATCH de continuación.
-    let Ok(return_url) = build_three_ds_callback_url(&url, THREE_DS_CALLBACK_TERM) else {
+    let Ok(return_url) = build_three_ds_callback_url(url.peek(), THREE_DS_CALLBACK_TERM) else {
         return;
     };
     if let Ok(PaymentsResponseData::TransactionResponse {
@@ -619,7 +619,10 @@ pub(super) fn wrap_three_ds_method_redirection(router_data: &mut PaymentsAuthori
     {
         if let Some(RedirectForm::Html { html_data }) = redirection_data.as_ref() {
             **redirection_data = Some(RedirectForm::Html {
-                html_data: build_three_ds_method_wrapper(html_data, &return_url),
+                html_data: Secret::new(build_three_ds_method_wrapper(
+                    html_data.peek(),
+                    &return_url,
+                )),
             });
         }
     }
@@ -1027,8 +1030,8 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
                     // dentro del iframe oculto y no puede continuar la autenticación; el retorno
                     // del navegador por la termURL sí.
                     Some(FiservemeaAuthenticationRequest::new(
-                        build_three_ds_callback_url(&return_url, THREE_DS_CALLBACK_TERM)?,
-                        build_three_ds_callback_url(&return_url, THREE_DS_CALLBACK_METHOD)?,
+                        build_three_ds_callback_url(return_url.peek(), THREE_DS_CALLBACK_TERM)?,
+                        build_three_ds_callback_url(return_url.peek(), THREE_DS_CALLBACK_METHOD)?,
                         &fiservemea_meta,
                         is_mastercard,
                     )?)
@@ -1878,10 +1881,10 @@ impl FiservemeaAuthenticationResponse {
             .and_then(|method| method.method_form.clone())
         {
             return Some(RedirectForm::Html {
-                html_data: match return_url {
+                html_data: Secret::new(match return_url {
                     Some(url) => build_three_ds_method_wrapper(&method_form, url),
                     None => method_form,
-                },
+                }),
             });
         }
 
@@ -1889,13 +1892,13 @@ impl FiservemeaAuthenticationResponse {
         let acs_url = params.acs_url.clone()?;
         let mut form_fields = HashMap::new();
         if let Some(c_req) = params.c_req.clone() {
-            form_fields.insert("creq".to_string(), c_req);
+            form_fields.insert("creq".to_string(), Secret::new(c_req));
         }
         if let Some(sessiondata) = params.sessiondata.clone() {
-            form_fields.insert("threeDSSessionData".to_string(), sessiondata);
+            form_fields.insert("threeDSSessionData".to_string(), Secret::new(sessiondata));
         }
         Some(RedirectForm::Form {
-            endpoint: acs_url,
+            endpoint: Secret::new(acs_url),
             method: Method::Post,
             form_fields,
         })

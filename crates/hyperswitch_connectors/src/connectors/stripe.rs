@@ -19,7 +19,7 @@ use common_utils::{
 };
 use error_stack::ResultExt;
 use hyperswitch_domain_models::{
-    payment_method_data::{PaymentMethodData, WalletData},
+    payment_method_data::PaymentMethodData,
     router_data::{AccessToken, ConnectorAuthType, ErrorResponse, RouterData},
     router_flow_types::{
         Accept, AccessTokenAuth, Authorize, Capture, CreateConnectorCustomer, Evidence, Execute,
@@ -108,7 +108,9 @@ pub struct Stripe {
 fn is_stripe_checkout(payment_method_data: &PaymentMethodData) -> bool {
     matches!(
         payment_method_data,
-        PaymentMethodData::Wallet(WalletData::StripeCheckout {})
+        PaymentMethodData::Wallet(
+            hyperswitch_domain_models::payment_method_data::WalletData::StripeCheckout {}
+        )
     )
 }
 

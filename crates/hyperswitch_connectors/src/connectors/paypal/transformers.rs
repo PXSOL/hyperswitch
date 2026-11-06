@@ -179,7 +179,6 @@ pub mod auth_headers {
     pub const PAYPAL_REQUEST_ID: &str = "PayPal-Request-Id";
     pub const PAYPAL_CLIENT_METADATA_ID: &str = "PAYPAL-CLIENT-METADATA-ID";
     pub const PAYPAL_AUTH_ASSERTION: &str = "PayPal-Auth-Assertion";
-    pub const PAYPAL_CLIENT_METADATA_ID: &str = "PayPal-Client-Metadata-Id";
 }
 
 const ORDER_QUANTITY: u16 = 1;

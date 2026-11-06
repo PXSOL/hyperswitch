@@ -367,11 +367,13 @@ impl PaymentAttempt {
             query = FilterDsl::filter(query, dsl::profile_id.eq(pid.to_string()));
         }
 
-        LimitDsl::limit(query, MAX_DIAGNOSTIC_ROWS)
-            .get_results_async(conn.raw_connection())
-            .await
-            .change_context(DatabaseError::Others)
-            .attach_printable("Error querying failed payment attempts for diagnostic")
+        conn.track_get_results::<<Self as HasTable>::Table, _, Self>(
+            db_metrics::DatabaseOperation::Filter,
+            LimitDsl::limit(query, MAX_DIAGNOSTIC_ROWS),
+        )
+        .await
+        .change_context(DatabaseError::Others)
+        .attach_printable("Error querying failed payment attempts for diagnostic")
     }
 
     /// Cuenta payment attempts exitosos (Charged, PartialCharged) en la ventana temporal.
@@ -407,11 +409,13 @@ impl PaymentAttempt {
             query = FilterDsl::filter(query, dsl::profile_id.eq(pid.to_string()));
         }
 
-        query
-            .get_result_async::<i64>(conn.raw_connection())
-            .await
-            .change_context(DatabaseError::Others)
-            .attach_printable("Error counting successful payment attempts for diagnostic")
+        conn.track_get_result::<<Self as HasTable>::Table, _, i64>(
+            db_metrics::DatabaseOperation::Count,
+            query,
+        )
+        .await
+        .change_context(DatabaseError::Others)
+        .attach_printable("Error counting successful payment attempts for diagnostic")
     }
 
     #[cfg(feature = "v1")]

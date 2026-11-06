@@ -1373,9 +1373,9 @@ impl<F: Clone> PostUpdateTracker<F, PaymentData<F>, types::PaymentsSyncData> for
             // The reconciliation's outgoing webhooks need the merchant pairing of this payment.
             let platform = domain::Platform::new(
                 provider.get_account().clone(),
-                provider.get_key_store().clone(),
+                provider.get_key_store().inner().clone(),
                 processor.get_account().clone(),
-                processor.get_key_store().clone(),
+                processor.get_key_store().inner().clone(),
                 None,
             );
             if let Err(error) = reconcile_connector_reported_activity(
@@ -2002,6 +2002,10 @@ async fn create_reported_refund(
         total_amount: payment_attempt.get_total_amount(),
         currency,
         refund_amount: amount,
+        // A refund made outside Hyperswitch has no surcharge part: its net amount is the amount.
+        refund_surcharge_amount: None,
+        net_refund_amount: Some(amount),
+        feature_metadata: None,
         refund_status: status,
         sent_to_gateway: true,
         metadata: None,

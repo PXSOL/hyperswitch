@@ -8602,9 +8602,7 @@ pub fn keep_stored_metadata<F, T>(
 
 #[cfg(test)]
 mod receipt_metadata_tests {
-    use serde_json::json;
-
-    use serde_json::Value;
+    use serde_json::{json, Value};
 
     use super::{merge_receipt_into_metadata, merge_with_stored_metadata, ReceiptMetadata};
 

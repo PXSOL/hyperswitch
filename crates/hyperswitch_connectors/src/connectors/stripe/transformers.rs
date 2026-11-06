@@ -6193,7 +6193,7 @@ impl TryFrom<(&PaymentsAuthorizeRouterData, MinorUnit)> for StripeCheckoutSessio
             amount,
             currency: item.request.currency.to_string(),
             description: item.description.clone(),
-            return_url,
+            return_url: return_url.expose(),
             order_id: item.connector_request_reference_id.clone(),
             email: item
                 .request
@@ -6276,13 +6276,13 @@ pub fn build_checkout_redirect_form(checkout_url: &str) -> RedirectForm {
         .replace('<', "&lt;")
         .replace('>', "&gt;");
     RedirectForm::Html {
-        html_data: format!(
+        html_data: Secret::new(format!(
             "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
              <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
              <title>Stripe Checkout</title></head><body>\
              <noscript><a href=\"{href}\">Continue to Stripe Checkout</a></noscript>\
              <script>window.location.replace({js_url});</script></body></html>"
-        ),
+        )),
     }
 }
 

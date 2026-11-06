@@ -6800,26 +6800,27 @@ impl<F: Clone> TryFrom<PaymentAdditionalData<'_, F>> for types::PaymentsPostSess
         let description = payment_data.payment_intent.description.clone();
         // Only used to describe the connector's order items: an entry that does not parse is skipped
         // instead of failing the whole session-token request.
-        let order_details = payment_data
-            .payment_intent
-            .order_details
-            .as_ref()
-            .map(|order_details| {
-                order_details
-                    .iter()
-                    .filter_map(|data| {
-                        data.to_owned()
-                            .parse_value("OrderDetailsWithAmount")
-                            .inspect_err(|error| {
-                                crate::logger::warn!(
-                                    ?error,
-                                    "Skipping an order_details entry that does not parse"
-                                );
-                            })
-                            .ok()
-                    })
-                    .collect::<Vec<_>>()
-            });
+        let order_details =
+            payment_data
+                .payment_intent
+                .order_details
+                .as_ref()
+                .map(|order_details| {
+                    order_details
+                        .iter()
+                        .filter_map(|data| {
+                            data.to_owned()
+                                .parse_value("OrderDetailsWithAmount")
+                                .inspect_err(|error| {
+                                    crate::logger::warn!(
+                                        ?error,
+                                        "Skipping an order_details entry that does not parse"
+                                    );
+                                })
+                                .ok()
+                        })
+                        .collect::<Vec<_>>()
+                });
         Ok(Self {
             amount, //need to change after we move to connector module
             order_amount: payment_data.payment_intent.amount,

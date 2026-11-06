@@ -1,6 +1,5 @@
 pub mod admin;
 pub mod analytics;
-pub mod diagnostic;
 pub mod api_keys;
 pub mod apple_pay_certificates_migration;
 pub mod authentication;
@@ -15,6 +14,7 @@ pub mod connector_onboarding;
 pub mod consts;
 pub mod currency;
 pub mod customers;
+pub mod diagnostic;
 pub mod disputes;
 pub mod enums;
 #[cfg(feature = "errors")]
