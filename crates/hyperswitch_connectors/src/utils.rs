@@ -2525,14 +2525,14 @@ pub trait PaymentsAuthorizeRequestData {
     fn is_customer_initiated_mandate_payment(&self) -> bool;
     fn get_webhook_url(&self) -> Result<String, Error>;
     fn get_optional_webhook_url(&self) -> Option<String>;
-    fn get_router_return_url(&self) -> Result<String, Error>;
+    fn get_router_return_url(&self) -> Result<Secret<String>, Error>;
     fn is_wallet(&self) -> bool;
     fn is_card(&self) -> bool;
     fn is_mit_payment(&self) -> bool;
     fn get_payment_method_type(&self) -> Result<enums::PaymentMethodType, Error>;
     fn get_connector_mandate_id(&self) -> Result<String, Error>;
     fn get_connector_mandate_data(&self) -> Option<mandates::ConnectorMandateReferenceId>;
-    fn get_complete_authorize_url(&self) -> Result<String, Error>;
+    fn get_complete_authorize_url(&self) -> Result<Secret<String>, Error>;
     fn get_ip_address_as_optional(&self) -> Option<Secret<String, IpAddress>>;
     fn get_ip_address(&self) -> Result<Secret<String, IpAddress>, Error>;
     fn get_optional_user_agent(&self) -> Option<String>;
@@ -2600,7 +2600,7 @@ impl PaymentsAuthorizeRequestData for PaymentsAuthorizeData {
         }
     }
 
-    fn get_complete_authorize_url(&self) -> Result<String, Error> {
+    fn get_complete_authorize_url(&self) -> Result<Secret<String>, Error> {
         self.complete_authorize_url
             .clone()
             .ok_or_else(missing_field_err("complete_authorize_url"))
@@ -2636,7 +2636,7 @@ impl PaymentsAuthorizeRequestData for PaymentsAuthorizeData {
     fn get_optional_webhook_url(&self) -> Option<String> {
         self.webhook_url.clone()
     }
-    fn get_router_return_url(&self) -> Result<String, Error> {
+    fn get_router_return_url(&self) -> Result<Secret<String>, Error> {
         self.router_return_url
             .clone()
             .ok_or_else(missing_field_err("return_url"))
@@ -3089,12 +3089,12 @@ impl RefundsRequestData for RefundsData {
 pub trait PaymentsSetupMandateRequestData {
     fn get_browser_info(&self) -> Result<BrowserInformation, Error>;
     fn get_email(&self) -> Result<Email, Error>;
-    fn get_router_return_url(&self) -> Result<String, Error>;
+    fn get_router_return_url(&self) -> Result<Secret<String>, Error>;
     fn is_card(&self) -> bool;
-    fn get_return_url(&self) -> Result<String, Error>;
+    fn get_return_url(&self) -> Result<Secret<String>, Error>;
     fn get_webhook_url(&self) -> Result<String, Error>;
     fn get_optional_language_from_browser_info(&self) -> Option<String>;
-    fn get_complete_authorize_url(&self) -> Result<String, Error>;
+    fn get_complete_authorize_url(&self) -> Result<Secret<String>, Error>;
     fn is_auto_capture(&self) -> Result<bool, Error>;
     fn is_customer_initiated_mandate_payment(&self) -> bool;
 }
@@ -3108,7 +3108,7 @@ impl PaymentsSetupMandateRequestData for SetupMandateRequestData {
     fn get_email(&self) -> Result<Email, Error> {
         self.email.clone().ok_or_else(missing_field_err("email"))
     }
-    fn get_router_return_url(&self) -> Result<String, Error> {
+    fn get_router_return_url(&self) -> Result<Secret<String>, Error> {
         self.router_return_url
             .clone()
             .ok_or_else(missing_field_err("router_return_url"))
@@ -3116,7 +3116,7 @@ impl PaymentsSetupMandateRequestData for SetupMandateRequestData {
     fn is_card(&self) -> bool {
         matches!(self.payment_method_data, PaymentMethodData::Card(_))
     }
-    fn get_return_url(&self) -> Result<String, Error> {
+    fn get_return_url(&self) -> Result<Secret<String>, Error> {
         self.router_return_url
             .clone()
             .ok_or_else(missing_field_err("return_url"))
@@ -3131,7 +3131,7 @@ impl PaymentsSetupMandateRequestData for SetupMandateRequestData {
             .clone()
             .and_then(|browser_info| browser_info.language)
     }
-    fn get_complete_authorize_url(&self) -> Result<String, Error> {
+    fn get_complete_authorize_url(&self) -> Result<Secret<String>, Error> {
         self.complete_authorize_url
             .clone()
             .ok_or_else(missing_field_err("complete_authorize_url"))
@@ -3155,7 +3155,7 @@ pub trait PaymentMethodTokenizationRequestData {
     fn get_browser_info(&self) -> Result<BrowserInformation, Error>;
     fn get_optional_ip_address(&self) -> Option<Secret<String, IpAddress>>;
     fn get_optional_user_agent(&self) -> Option<String>;
-    fn get_router_return_url(&self) -> Result<String, Error>;
+    fn get_router_return_url(&self) -> Result<Secret<String>, Error>;
     fn is_mandate_payment(&self) -> bool;
     fn is_customer_initiated_mandate_payment(&self) -> bool;
     fn is_stripe_split_payment(&self) -> bool;
@@ -3181,7 +3181,7 @@ impl PaymentMethodTokenizationRequestData for PaymentMethodTokenizationData {
             .and_then(|browser_info| browser_info.user_agent.clone())
     }
 
-    fn get_router_return_url(&self) -> Result<String, Error> {
+    fn get_router_return_url(&self) -> Result<Secret<String>, Error> {
         self.router_return_url
             .clone()
             .ok_or_else(missing_field_err("router_return_url"))
@@ -3211,14 +3211,14 @@ pub trait PaymentsCompleteAuthorizeRequestData {
     fn is_auto_capture(&self) -> Result<bool, Error>;
     fn get_email(&self) -> Result<Email, Error>;
     fn get_redirect_response_payload(&self) -> Result<pii::SecretSerdeValue, Error>;
-    fn get_complete_authorize_url(&self) -> Result<String, Error>;
+    fn get_complete_authorize_url(&self) -> Result<Secret<String>, Error>;
     fn is_mandate_payment(&self) -> bool;
     fn get_connector_mandate_request_reference_id(&self) -> Result<String, Error>;
     fn is_cit_mandate_payment(&self) -> bool;
     fn get_browser_info(&self) -> Result<BrowserInformation, Error>;
     fn get_threeds_method_comp_ind(&self) -> Result<payments::ThreeDsCompletionIndicator, Error>;
     fn get_connector_mandate_id(&self) -> Option<String>;
-    fn get_router_return_url(&self) -> Result<String, Error>;
+    fn get_router_return_url(&self) -> Result<Secret<String>, Error>;
 }
 
 impl PaymentsCompleteAuthorizeRequestData for CompleteAuthorizeData {
@@ -3231,7 +3231,7 @@ impl PaymentsCompleteAuthorizeRequestData for CompleteAuthorizeData {
             Some(_) => Err(errors::ConnectorError::CaptureMethodNotSupported.into()),
         }
     }
-    fn get_router_return_url(&self) -> Result<String, Error> {
+    fn get_router_return_url(&self) -> Result<Secret<String>, Error> {
         self.router_return_url
             .clone()
             .ok_or_else(missing_field_err("router_return_url"))
@@ -3250,7 +3250,7 @@ impl PaymentsCompleteAuthorizeRequestData for CompleteAuthorizeData {
                 .into(),
             )
     }
-    fn get_complete_authorize_url(&self) -> Result<String, Error> {
+    fn get_complete_authorize_url(&self) -> Result<Secret<String>, Error> {
         self.complete_authorize_url
             .clone()
             .ok_or_else(missing_field_err("complete_authorize_url"))
@@ -3385,7 +3385,7 @@ impl PaymentsPreAuthenticateRequestData for PaymentsPreAuthenticateData {
 pub trait PaymentsAuthenticateRequestData {
     fn is_auto_capture(&self) -> Result<bool, Error>;
     fn get_payment_method_data(&self) -> Result<PaymentMethodData, Error>;
-    fn get_complete_authorize_url(&self) -> Result<String, Error>;
+    fn get_complete_authorize_url(&self) -> Result<Secret<String>, Error>;
     fn get_browser_info(&self) -> Result<BrowserInformation, Error>;
 }
 
@@ -3408,7 +3408,7 @@ impl PaymentsAuthenticateRequestData for PaymentsAuthenticateData {
             .ok_or_else(missing_field_err("payment_method_data"))
     }
 
-    fn get_complete_authorize_url(&self) -> Result<String, Error> {
+    fn get_complete_authorize_url(&self) -> Result<Secret<String>, Error> {
         self.complete_authorize_url
             .clone()
             .ok_or_else(missing_field_err("complete_authorize_url"))
@@ -6778,14 +6778,7 @@ impl QrImage {
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::utils;
-    #[test]
-    fn test_image_data_source_url() {
-        let qr_image_data_source_url = utils::QrImage::new_from_data("Hyperswitch".to_string());
-        assert!(qr_image_data_source_url.is_ok());
-    }
-}
+mod tests;
 
 pub fn get_mandate_details(
     setup_mandate_details: Option<mandates::MandateData>,
@@ -7768,6 +7761,7 @@ pub(crate) fn convert_setup_mandate_router_data_to_authorize_router_data(
         setup_future_usage: data.request.setup_future_usage,
         off_session: data.request.off_session,
         setup_mandate_details: data.request.setup_mandate_details.clone(),
+        router_notification_url: None,
         router_return_url: data.request.router_return_url.clone(),
         email: data.request.email.clone(),
         customer_name: data.request.customer_name.clone(),
@@ -7822,6 +7816,8 @@ pub(crate) fn convert_setup_mandate_router_data_to_authorize_router_data(
         recipient_details: data.request.recipient_details.clone(),
         business_country: data.request.business_country,
         connector_intent_metadata: data.request.connector_intent_metadata.clone(),
+        enable_avs_check: data.request.enable_avs_check,
+        enable_account_name_verification: None,
     }
 }
 
@@ -8606,9 +8602,7 @@ pub fn keep_stored_metadata<F, T>(
 
 #[cfg(test)]
 mod receipt_metadata_tests {
-    use serde_json::json;
-
-    use serde_json::Value;
+    use serde_json::{json, Value};
 
     use super::{merge_receipt_into_metadata, merge_with_stored_metadata, ReceiptMetadata};
 
@@ -8714,4 +8708,16 @@ mod receipt_metadata_tests {
             None
         );
     }
+}
+
+/// Append a connector query parameter without replacing callback credentials.
+pub fn append_url_query_param(
+    value: &Secret<String>,
+    key: &str,
+    parameter: &str,
+) -> CustomResult<Secret<String>, errors::ConnectorError> {
+    let mut url = url::Url::parse(value.peek())
+        .change_context(errors::ConnectorError::RequestEncodingFailed)?;
+    url.query_pairs_mut().append_pair(key, parameter);
+    Ok(Secret::new(url.to_string()))
 }

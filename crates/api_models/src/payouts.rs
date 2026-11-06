@@ -126,10 +126,9 @@ pub struct PayoutCreateRequest {
     #[schema(value_type = Option<CustomerDetails>)]
     pub customer: Option<payments::CustomerDetails>,
 
-    /// It's a token used for client side verification.
-    #[schema(value_type = Option<String>, example = "pay_U42c409qyHwOkWo3vK60_secret_el9ksDkiB8hi6j9N78yo")]
-    #[remove_in(PayoutsCreateRequest)]
-    #[mandatory_in(PayoutConfirmRequest = String)]
+    /// Deprecated. Payout execution requires an API key; this value is not used for authentication.
+    #[schema(deprecated, value_type = Option<String>, example = "pay_U42c409qyHwOkWo3vK60_secret_el9ksDkiB8hi6j9N78yo")]
+    #[remove_in(PayoutsCreateRequest, PayoutUpdateRequest, PayoutConfirmRequest)]
     pub client_secret: Option<String>,
 
     /// The URL to redirect after the completion of the operation
@@ -184,8 +183,7 @@ pub struct PayoutCreateRequest {
     #[schema(value_type = Option<PayoutCreatePayoutLinkConfig>)]
     pub payout_link_config: Option<PayoutCreatePayoutLinkConfig>,
 
-    /// Will be used to expire client secret after certain amount of time to be supplied in seconds
-    /// (900) for 15 mins
+    /// Lifetime of the payout link in seconds, for example 900 for 15 minutes.
     #[schema(value_type = Option<u32>, example = 900)]
     pub session_expiry: Option<u32>,
 
@@ -677,8 +675,17 @@ pub struct TedBankTransfer {
 pub enum Wallet {
     ApplePayDecrypt(ApplePayDecrypt),
     GooglePayDecrypt(GooglePayDecrypt),
+    Mifinity(Mifinity),
     Paypal(Paypal),
     Venmo(Venmo),
+}
+
+#[derive(Default, Eq, PartialEq, Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Mifinity {
+    /// The recipient's MiFinity wallet identifier. This can be an email address
+    /// or a MiFinity account number.
+    #[schema(value_type = String, example = "john.doe@example.com")]
+    pub destination_account: Secret<String>,
 }
 
 #[derive(Eq, PartialEq, Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -929,7 +936,7 @@ pub struct PayoutCreateResponse {
     #[schema(value_type = Option<CustomerDetailsResponse>)]
     pub customer: Option<payments::CustomerDetailsResponse>,
 
-    /// It's a token used for client side verification.
+    /// Legacy client secret retained for compatibility. Payout execution requires an API key.
     #[schema(value_type = String, example = "pay_U42c409qyHwOkWo3vK60_secret_el9ksDkiB8hi6j9N78yo")]
     pub client_secret: Option<String>,
 
@@ -1183,9 +1190,18 @@ pub struct PayoutVendorDetails {
 pub struct PayoutIndividualDetails {
     pub tos_acceptance_date: Option<i64>,
     pub tos_acceptance_ip: Option<Secret<String>>,
+    /// Deprecated. Use `date_of_birth`.
+    #[schema(deprecated, value_type = Option<String>)]
     pub individual_dob_day: Option<Secret<String>>,
+    /// Deprecated. Use `date_of_birth`.
+    #[schema(deprecated, value_type = Option<String>)]
     pub individual_dob_month: Option<Secret<String>>,
+    /// Deprecated. Use `date_of_birth`.
+    #[schema(deprecated, value_type = Option<String>)]
     pub individual_dob_year: Option<Secret<String>>,
+    /// The individual's date of birth.
+    #[schema(value_type = Option<time::Date>, example = "1990-01-31")]
+    pub date_of_birth: Option<Secret<time::Date>>,
     pub individual_id_number: Option<Secret<String>>,
     pub individual_ssn_last_4: Option<Secret<String>>,
     pub external_account_account_holder_type: Option<String>,
@@ -1719,6 +1735,11 @@ impl From<Wallet> for payout_method_utils::WalletAdditionalData {
                     telephone_number: telephone_number.map(From::from),
                 }))
             }
+            Wallet::Mifinity(Mifinity {
+                destination_account,
+            }) => Self::Mifinity(Box::new(payout_method_utils::MifinityAdditionalData {
+                destination_account: destination_account.into(),
+            })),
             Wallet::GooglePayDecrypt(GooglePayDecrypt {
                 expiry_month,
                 expiry_year,
@@ -1888,6 +1909,7 @@ impl From<&PayoutMethodData> for api_enums::PaymentMethodType {
                 Wallet::Paypal(_) => Self::Paypal,
                 Wallet::Venmo(_) => Self::Venmo,
                 Wallet::GooglePayDecrypt(_) => Self::GooglePay,
+                Wallet::Mifinity(_) => Self::Mifinity,
             },
             PayoutMethodData::BankRedirect(bank_redirect) => match bank_redirect {
                 BankRedirect::Interac(_) => Self::Interac,

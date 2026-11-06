@@ -1,5 +1,7 @@
 pub mod transformers;
 
+use std::sync::LazyLock;
+
 use api_models::webhooks::IncomingWebhookEvent;
 use common_enums::enums;
 use common_utils::{
@@ -50,7 +52,6 @@ use hyperswitch_interfaces::{
     webhooks::{IncomingWebhook, IncomingWebhookRequestDetails, WebhookContext},
 };
 use hyperswitch_masking::{Mask, PeekInterface};
-use std::sync::LazyLock;
 use transformers as wompi;
 
 use crate::{
@@ -704,7 +705,7 @@ impl ConnectorIntegration<CompleteAuthorize, CompleteAuthorizeData, PaymentsResp
                 res.status_code,
                 &public_key,
                 polling_host,
-                &complete_authorize_url,
+                complete_authorize_url.peek(),
             ),
             wompi::WompiCompleteAuthorizeStage::Poll { keep_polling, .. } => {
                 wompi::three_ds_poll_response(
@@ -714,7 +715,7 @@ impl ConnectorIntegration<CompleteAuthorize, CompleteAuthorizeData, PaymentsResp
                     keep_polling,
                     &public_key,
                     polling_host,
-                    &complete_authorize_url,
+                    complete_authorize_url.peek(),
                 )
             }
         }

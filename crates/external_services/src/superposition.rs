@@ -718,6 +718,24 @@ pub struct SuperpositionClient {
 }
 
 impl SuperpositionClient {
+    /// The backup file as a data source, when `backup_file_path` is configured and readable.
+    fn backup_file_source(
+        backup_file_path: Option<&std::path::PathBuf>,
+    ) -> Option<Box<dyn superposition_provider::data_source::SuperpositionDataSource>> {
+        let backup_path = backup_file_path?;
+        router_env::logger::info!(
+            "Configuring Superposition file source: path={:?}",
+            backup_path
+        );
+        match superposition_provider::data_source::file::FileDataSource::new(backup_path.clone()) {
+            Ok(source) => Some(Box::new(source)),
+            Err(e) => {
+                router_env::logger::warn!("Failed to create Superposition file source: {e}");
+                None
+            }
+        }
+    }
+
     /// Create a new Superposition client.
     pub async fn new(
         config: SuperpositionClientConfig,
@@ -725,69 +743,76 @@ impl SuperpositionClient {
     ) -> CustomResult<Self, SuperpositionError> {
         let token_value = config.token.expose();
 
-        let refresh_strategy = superposition_provider::RefreshStrategy::Polling(
-            superposition_provider::PollingStrategy {
-                interval: config.polling_interval,
-                timeout: config.request_timeout,
-            },
-        );
+        let polling_strategy =
+            superposition_provider::PollingStrategy::new(config.polling_interval_milliseconds);
+        let polling_strategy = match config.request_timeout_milliseconds {
+            Some(timeout_milliseconds) => polling_strategy.with_timeout(timeout_milliseconds),
+            None => polling_strategy,
+        };
+        let refresh_strategy = superposition_provider::RefreshStrategy::Polling(polling_strategy);
 
         // --- Build HTTP (primary) data source ---
         let http_source = superposition_provider::data_source::http::HttpDataSource::new(
             superposition_provider::types::SuperpositionOptions::new(
                 config.endpoint.clone(),
-                token_value.clone(),
+                superposition_provider::AuthMethod::Token(token_value.clone()),
                 config.org_id.clone(),
                 config.workspace_id.clone(),
             ),
         );
 
-        // --- Build File (fallback) data source if backup_file_path is configured ---
-        let fallback_source: Option<
-            Box<dyn superposition_provider::data_source::SuperpositionDataSource>,
-        > = match &config.backup_file_path {
-            Some(backup_path) => {
-                router_env::logger::info!(
-                    "Configuring Superposition file fallback: path={:?}",
-                    backup_path
-                );
-                match superposition_provider::data_source::file::FileDataSource::new(
-                    backup_path.clone(),
-                ) {
-                    Ok(source) => {
-                        let boxed: Box<
-                            dyn superposition_provider::data_source::SuperpositionDataSource,
-                        > = Box::new(source);
-                        Some(boxed)
-                    }
-                    Err(e) => {
-                        router_env::logger::warn!(
-                            "Failed to create Superposition file fallback source: {e}"
-                        );
-                        None
-                    }
-                }
-            }
-            None => None,
-        };
-
         // --- Build LocalResolutionProvider with HTTP primary and optional file fallback ---
         let provider = superposition_provider::local_provider::LocalResolutionProvider::new(
             Box::new(http_source),
-            fallback_source,
-            refresh_strategy,
+            Self::backup_file_source(config.backup_file_path.as_ref()),
+            refresh_strategy.clone(),
         );
 
         // Initialize provider - this will try HTTP first, then fallback to file if configured
-        provider
+        let provider = match provider
             .init(open_feature::EvaluationContext::default())
             .await
-            .change_context(SuperpositionError::ClientInitError(
-                "Failed to initialize Superposition provider".to_string(),
-            ))
-            .attach_printable(
-                "Both HTTP and file fallback (if configured) initialization failed",
-            )?;
+        {
+            Ok(()) => provider,
+            // PXSOL: superposition_provider 0.118 fails the whole init when the HTTP endpoint is
+            // down and the fallback is a file, because a file holds no experiments (0.115 logged a
+            // warning and served the file's config). Without a Superposition service, as in
+            // PXSOL's deployments, the router would not start. Serve the backup file as the
+            // primary source instead: its config, no experiments, as before the upgrade.
+            Err(http_error) => {
+                let Some(file_source) = Self::backup_file_source(config.backup_file_path.as_ref())
+                else {
+                    return Err(error_stack::report!(SuperpositionError::ClientInitError(
+                        "Failed to initialize Superposition provider".to_string(),
+                    ))
+                    .attach_printable(match &config.backup_file_path {
+                        Some(path) => format!(
+                            "HTTP initialization failed and the backup file {path:?} could not be loaded: {http_error}"
+                        ),
+                        None => format!(
+                            "HTTP initialization failed and no backup file is configured: {http_error}"
+                        ),
+                    }));
+                };
+                router_env::logger::warn!(
+                    "Superposition HTTP initialization failed ({http_error}); serving the backup file only, without experiments"
+                );
+                let file_provider =
+                    superposition_provider::local_provider::LocalResolutionProvider::new(
+                        file_source,
+                        None,
+                        refresh_strategy,
+                    );
+                file_provider
+                    .init(open_feature::EvaluationContext::default())
+                    .await
+                    .change_context(SuperpositionError::ClientInitError(
+                        "Failed to initialize Superposition provider".to_string(),
+                    ))
+                    .attach_printable("Both HTTP and file fallback initialization failed")?;
+                file_provider
+            }
+        };
 
         // Initialize OpenFeature API and set provider
         let mut api = open_feature::OpenFeature::singleton_mut().await;
@@ -985,7 +1010,7 @@ impl SuperpositionClient {
                     use superposition_provider::data_source::SuperpositionDataSource;
                     let response = self
                         .provider
-                        .fetch_filtered_config(dimension_filter, prefix_filter, None)
+                        .fetch_filtered_config(dimension_filter, prefix_filter, None, None)
                         .await
                         .map_err(|e| {
                             report!(SuperpositionError::ProviderError(format!(
@@ -1011,7 +1036,7 @@ impl SuperpositionClient {
             use superposition_provider::data_source::SuperpositionDataSource;
             let response = self
                 .provider
-                .fetch_filtered_config(dimension_filter, prefix_filter, None)
+                .fetch_filtered_config(dimension_filter, prefix_filter, None, None)
                 .await
                 .map_err(|e| {
                     report!(SuperpositionError::ProviderError(format!(

@@ -609,7 +609,7 @@ pub(super) fn wrap_three_ds_method_redirection(router_data: &mut PaymentsAuthori
         return;
     };
     // La ventana principal vuelve por la termURL, que es la que lleva el PATCH de continuación.
-    let Ok(return_url) = build_three_ds_callback_url(&url, THREE_DS_CALLBACK_TERM) else {
+    let Ok(return_url) = build_three_ds_callback_url(url.peek(), THREE_DS_CALLBACK_TERM) else {
         return;
     };
     if let Ok(PaymentsResponseData::TransactionResponse {
@@ -619,7 +619,10 @@ pub(super) fn wrap_three_ds_method_redirection(router_data: &mut PaymentsAuthori
     {
         if let Some(RedirectForm::Html { html_data }) = redirection_data.as_ref() {
             **redirection_data = Some(RedirectForm::Html {
-                html_data: build_three_ds_method_wrapper(html_data, &return_url),
+                html_data: Secret::new(build_three_ds_method_wrapper(
+                    html_data.peek(),
+                    &return_url,
+                )),
             });
         }
     }
@@ -1027,8 +1030,8 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
                     // dentro del iframe oculto y no puede continuar la autenticación; el retorno
                     // del navegador por la termURL sí.
                     Some(FiservemeaAuthenticationRequest::new(
-                        build_three_ds_callback_url(&return_url, THREE_DS_CALLBACK_TERM)?,
-                        build_three_ds_callback_url(&return_url, THREE_DS_CALLBACK_METHOD)?,
+                        build_three_ds_callback_url(return_url.peek(), THREE_DS_CALLBACK_TERM)?,
+                        build_three_ds_callback_url(return_url.peek(), THREE_DS_CALLBACK_METHOD)?,
                         &fiservemea_meta,
                         is_mastercard,
                     )?)
@@ -1878,10 +1881,10 @@ impl FiservemeaAuthenticationResponse {
             .and_then(|method| method.method_form.clone())
         {
             return Some(RedirectForm::Html {
-                html_data: match return_url {
+                html_data: Secret::new(match return_url {
                     Some(url) => build_three_ds_method_wrapper(&method_form, url),
                     None => method_form,
-                },
+                }),
             });
         }
 
@@ -1889,13 +1892,13 @@ impl FiservemeaAuthenticationResponse {
         let acs_url = params.acs_url.clone()?;
         let mut form_fields = HashMap::new();
         if let Some(c_req) = params.c_req.clone() {
-            form_fields.insert("creq".to_string(), c_req);
+            form_fields.insert("creq".to_string(), Secret::new(c_req));
         }
         if let Some(sessiondata) = params.sessiondata.clone() {
-            form_fields.insert("threeDSSessionData".to_string(), sessiondata);
+            form_fields.insert("threeDSSessionData".to_string(), Secret::new(sessiondata));
         }
         Some(RedirectForm::Form {
-            endpoint: acs_url,
+            endpoint: Secret::new(acs_url),
             method: Method::Post,
             form_fields,
         })
@@ -3371,7 +3374,7 @@ mod tests {
         };
         match auth.to_redirection(None) {
             Some(RedirectForm::Html { html_data }) => {
-                assert_eq!(html_data, "<form id=\"tds\"></form>");
+                assert_eq!(html_data.peek(), "<form id=\"tds\"></form>");
             }
             other => panic!("expected Html redirect, got {other:?}"),
         }
@@ -3396,11 +3399,16 @@ mod tests {
                 method,
                 form_fields,
             }) => {
-                assert_eq!(endpoint, "https://acs.example.com/challenge");
+                assert_eq!(endpoint.peek(), "https://acs.example.com/challenge");
                 assert_eq!(method, Method::Post);
-                assert_eq!(form_fields.get("creq"), Some(&"creq_value".to_string()));
                 assert_eq!(
-                    form_fields.get("threeDSSessionData"),
+                    form_fields.get("creq").map(PeekInterface::peek),
+                    Some(&"creq_value".to_string())
+                );
+                assert_eq!(
+                    form_fields
+                        .get("threeDSSessionData")
+                        .map(PeekInterface::peek),
                     Some(&"session_value".to_string())
                 );
             }
@@ -3438,7 +3446,7 @@ mod tests {
         let auth: FiservemeaAuthenticationResponse = serde_json::from_value(json).unwrap();
         match auth.to_redirection(None) {
             Some(RedirectForm::Html { html_data }) => {
-                assert_eq!(html_data, "<form id=\"tds-alt\"></form>");
+                assert_eq!(html_data.peek(), "<form id=\"tds-alt\"></form>");
             }
             other => panic!("expected Html redirect, got {other:?}"),
         }
@@ -3463,7 +3471,9 @@ mod tests {
         match auth.to_redirection(None) {
             Some(RedirectForm::Form { form_fields, .. }) => {
                 assert_eq!(
-                    form_fields.get("threeDSSessionData"),
+                    form_fields
+                        .get("threeDSSessionData")
+                        .map(PeekInterface::peek),
                     Some(&"session_value".to_string())
                 );
             }
@@ -3696,7 +3706,8 @@ mod tests {
             common_enums::Currency::ARS,
             metadata,
         );
-        request.complete_authorize_url = Some(THREE_DS_COMPLETE_AUTHORIZE_URL.to_string());
+        request.complete_authorize_url =
+            Some(Secret::new(THREE_DS_COMPLETE_AUTHORIZE_URL.to_string()));
         let mut router_data: PaymentsAuthorizeRouterData =
             cert_router_data(CERT_STORE_AR, "PX-3ds-checklist", request);
         router_data.auth_type = common_enums::AuthenticationType::ThreeDs;
@@ -4184,7 +4195,7 @@ mod tests {
         match auth.to_redirection(None) {
             Some(RedirectForm::Html { html_data }) => {
                 assert_eq!(
-                    html_data,
+                    html_data.peek(),
                     "<form name=\"frm\" method=\"POST\"><iframe hidden></iframe></form>"
                 );
             }
@@ -4227,14 +4238,19 @@ mod tests {
                 method,
                 form_fields,
             }) => {
-                assert_eq!(endpoint, "https://3ds-acs.test.modirum.com/mdpayacs/pareq");
+                assert_eq!(
+                    endpoint.peek(),
+                    "https://3ds-acs.test.modirum.com/mdpayacs/pareq"
+                );
                 assert_eq!(method, Method::Post);
                 assert_eq!(
-                    form_fields.get("creq"),
+                    form_fields.get("creq").map(PeekInterface::peek),
                     Some(&"ewogICAiYWNzVHJhbCIgOiA...wMDAtMDAwMDAwMDA0MWE5Igp9".to_string())
                 );
                 assert_eq!(
-                    form_fields.get("threeDSSessionData"),
+                    form_fields
+                        .get("threeDSSessionData")
+                        .map(PeekInterface::peek),
                     Some(&"50F2156E03083CA665BCB4..".to_string())
                 );
             }
@@ -4884,14 +4900,18 @@ mod tests {
 
         match auth.to_redirection(Some(TEST_RETURN_URL)) {
             Some(RedirectForm::Html { html_data }) => {
-                assert!(html_data.contains("window.setTimeout(continueAuthentication"))
+                assert!(html_data
+                    .peek()
+                    .contains("window.setTimeout(continueAuthentication"))
             }
             other => panic!("se esperaba el wrapper, salió {other:?}"),
         }
         // Sin URL de retorno se devuelve el form crudo: es el comportamiento anterior, peor pero
         // no una regresión respecto de no responder nada.
         match auth.to_redirection(None) {
-            Some(RedirectForm::Html { html_data }) => assert_eq!(html_data, CERT_METHOD_FORM),
+            Some(RedirectForm::Html { html_data }) => {
+                assert_eq!(html_data.peek(), CERT_METHOD_FORM)
+            }
             other => panic!("se esperaba el form crudo, salió {other:?}"),
         }
     }
@@ -5327,6 +5347,9 @@ mod tests {
             is_account_funded_transaction: None,
             recipient_details: None,
             business_country: None,
+            enable_avs_check: None,
+            enable_account_name_verification: None,
+            router_notification_url: None,
         }
     }
 
@@ -5654,6 +5677,8 @@ mod tests {
                     is_account_funded_transaction: None,
                     recipient_details: None,
                     business_country: None,
+                    enable_avs_check: None,
+                    enable_account_name_verification: None,
                 },
             );
         let request = FiservemeaPaymentsRequest::try_from(&router_data).unwrap();
@@ -5711,6 +5736,10 @@ mod tests {
                 capture_method: Some(common_enums::CaptureMethod::Automatic),
                 additional_payment_method_data: None,
                 payment_connector_request_reference_id: None,
+                payment_method_data: None,
+                mandate_id: None,
+                payment_feature_metadata: None,
+                feature_metadata: None,
             },
         );
         let amount = StringMajorUnitForConnector
@@ -5889,6 +5918,8 @@ mod tests {
                     is_account_funded_transaction: None,
                     recipient_details: None,
                     business_country: None,
+                    enable_avs_check: None,
+                    enable_account_name_verification: None,
                 },
             );
         let request = FiservemeaPaymentsRequest::try_from(&zero_auth).unwrap();
@@ -6527,6 +6558,10 @@ mod tests {
                 capture_method: Some(common_enums::CaptureMethod::Automatic),
                 additional_payment_method_data: None,
                 payment_connector_request_reference_id: None,
+                payment_method_data: None,
+                mandate_id: None,
+                payment_feature_metadata: None,
+                feature_metadata: None,
             },
         );
         let executed =

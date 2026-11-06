@@ -2460,7 +2460,7 @@ fn waiting_with_method_form_is_authentication_pending_with_an_html_redirect() {
     assert_eq!(data.status, enums::AttemptStatus::AuthenticationPending);
     match parsed(&data).redirection {
         Some(RedirectForm::Html { html_data }) => {
-            assert!(html_data.contains("mdpayacs/3ds-method"));
+            assert!(html_data.peek().contains("mdpayacs/3ds-method"));
         }
         other => panic!("se esperaba un redirect HTML, salió {other:?}"),
     }
@@ -2481,7 +2481,9 @@ fn waiting_with_challenge_params_posts_the_creq_to_the_acs() {
             method,
             form_fields,
         }) => {
-            assert!(endpoint.starts_with("https://3ds-acs.test.modirum.com/mdpayacs/creq;token="));
+            assert!(endpoint
+                .peek()
+                .starts_with("https://3ds-acs.test.modirum.com/mdpayacs/creq;token="));
             assert_eq!(*method, common_utils::request::Method::Post);
             assert!(form_fields.contains_key("creq"));
             // El gateway de cert no manda `sessionData`, así que el campo no debe inventarse.

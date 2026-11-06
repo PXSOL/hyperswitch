@@ -103,6 +103,29 @@ impl GetRequestIncrementalAuthorization for PaymentsSyncData {
     }
 }
 
+/// Connector level metadata for Paypal, validated at the time of merchant connector account
+/// creation. Contains the `enable_stc` switch for the Set Transaction Context (STC)
+/// preprocessing call (PayPal's Risk-as-a-Service API).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PaypalConnectorMetadataObject {
+    pub enable_stc: Option<bool>,
+}
+
+impl TryFrom<&Option<common_utils::pii::SecretSerdeValue>> for PaypalConnectorMetadataObject {
+    type Error = error_stack::Report<errors::ConnectorError>;
+    fn try_from(
+        meta_data: &Option<common_utils::pii::SecretSerdeValue>,
+    ) -> Result<Self, Self::Error> {
+        match meta_data {
+            Some(metadata) => utils::to_connector_meta_from_secret::<Self>(Some(metadata.clone()))
+                .change_context(errors::ConnectorError::InvalidConnectorConfig {
+                    config: "metadata",
+                }),
+            None => Ok(Self::default()),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct PaypalRouterData<T> {
     pub amount: StringMajorUnit,
@@ -154,8 +177,8 @@ pub mod auth_headers {
     pub const PAYPAL_PARTNER_ATTRIBUTION_ID_VALUE: &str = "PXSOL_SP_CMReservas";
     pub const PREFER: &str = "Prefer";
     pub const PAYPAL_REQUEST_ID: &str = "PayPal-Request-Id";
+    pub const PAYPAL_CLIENT_METADATA_ID: &str = "PAYPAL-CLIENT-METADATA-ID";
     pub const PAYPAL_AUTH_ASSERTION: &str = "PayPal-Auth-Assertion";
-    pub const PAYPAL_CLIENT_METADATA_ID: &str = "PayPal-Client-Metadata-Id";
 }
 
 const ORDER_QUANTITY: u16 = 1;
@@ -524,6 +547,31 @@ pub struct CustomerRequestData {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BillingAgreementStruct {
     billing_agreement_id: Secret<String>,
+    payment_initiator: PaymentInitiator,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PaymentInitiator {
+    Customer,
+    Merchant,
+}
+
+impl From<Option<bool>> for PaymentInitiator {
+    fn from(off_session: Option<bool>) -> Self {
+        match off_session {
+            Some(true) => Self::Merchant,
+            Some(false) | None => Self::Customer,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct PaypalVaultRequest {
+    vault_id: Secret<String>,
+    payment_initiator: PaymentInitiator,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attributes: Option<VaultRequestAttributes>,
 }
 
 impl BillingAgreementStruct {
@@ -572,9 +620,9 @@ pub struct RedirectRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ContextStruct {
     #[serde(skip_serializing_if = "Option::is_none")]
-    return_url: Option<String>,
+    return_url: Option<Secret<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cancel_url: Option<String>,
+    cancel_url: Option<Secret<String>>,
     user_action: Option<UserAction>,
     shipping_preference: ShippingPreference,
 }
@@ -603,8 +651,30 @@ pub enum ShippingPreference {
 #[serde(untagged)]
 pub enum PaypalRedirectionRequest {
     PaypalRedirectionStruct(PaypalRedirectionStruct),
-    PaypalVaultStruct(VaultStruct),
+    PaypalVaultStruct(PaypalVaultRequest),
     BillingAgreementStruct(BillingAgreementStruct),
+}
+
+impl PaypalRedirectionRequest {
+    fn from_mandate_id(
+        source_payment_instrument_id: String,
+        attributes: Option<VaultRequestAttributes>,
+        off_session: Option<bool>,
+    ) -> Self {
+        let payment_initiator = PaymentInitiator::from(off_session);
+        if BillingAgreementStruct::is_billing_agreement_id(&source_payment_instrument_id) {
+            Self::BillingAgreementStruct(BillingAgreementStruct {
+                billing_agreement_id: source_payment_instrument_id.into(),
+                payment_initiator,
+            })
+        } else {
+            Self::PaypalVaultStruct(PaypalVaultRequest {
+                vault_id: source_payment_instrument_id.into(),
+                payment_initiator,
+                attributes,
+            })
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1371,26 +1441,17 @@ impl TryFrom<&PaypalRouterData<&PaymentsAuthorizeRouterData>> for PaypalPayments
                         }),
                     ))),
                     enums::PaymentMethodType::Paypal => Ok(Some(PaymentSourceItem::Paypal(
-                        if BillingAgreementStruct::is_billing_agreement_id(&connector_mandate_id) {
-                            PaypalRedirectionRequest::BillingAgreementStruct(
-                                BillingAgreementStruct {
-                                    billing_agreement_id: connector_mandate_id.into(),
-                                },
-                            )
-                        } else {
-                            PaypalRedirectionRequest::PaypalVaultStruct(VaultStruct {
-                                vault_id: connector_mandate_id.into(),
-                                attributes: item
-                                    .router_data
-                                    .get_optional_customer_id()
-                                    .as_ref()
-                                    .map(|customer_id| VaultRequestAttributes {
-                                        customer: Some(CustomerRequestData {
-                                            merchant_customer_id: Some(customer_id.clone()),
-                                        }),
+                        PaypalRedirectionRequest::from_mandate_id(
+                            connector_mandate_id,
+                            item.router_data.get_optional_customer_id().as_ref().map(
+                                |customer_id| VaultRequestAttributes {
+                                    customer: Some(CustomerRequestData {
+                                        merchant_customer_id: Some(customer_id.clone()),
                                     }),
-                            })
-                        },
+                                },
+                            ),
+                            item.router_data.request.off_session,
+                        ),
                     ))),
                     enums::PaymentMethodType::Ach
                     | enums::PaymentMethodType::Affirm
@@ -3142,6 +3203,94 @@ impl
 #[derive(Debug, Serialize)]
 pub struct PaypalEmptyRequest {}
 
+// Keys of the sender profile data dictionary expected by PayPal's Risk-as-a-Service API
+pub const STC_SENDER_ACCOUNT_ID: &str = "sender_account_id";
+pub const STC_SENDER_FIRST_NAME: &str = "sender_first_name";
+pub const STC_SENDER_LAST_NAME: &str = "sender_last_name";
+pub const STC_SENDER_EMAIL: &str = "sender_email";
+pub const STC_SENDER_PHONE: &str = "sender_phone";
+pub const STC_SENDER_COUNTRY_CODE: &str = "sender_country_code";
+
+/// Request for PayPal's Risk-as-a-Service Set Transaction Context (STC) API
+/// Ref: https://developer.paypal.com/api/limited-release/raas/v1/#transaction-contexts_set
+#[derive(Debug, Serialize)]
+pub struct PaypalSetTransactionContextRequest {
+    pub tracking_id: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub additional_data: Vec<PaypalAdditionalDataItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaypalAdditionalDataItem {
+    pub key: String,
+    pub value: Secret<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaypalSetTransactionContextResponse {
+    pub tracking_id: Option<String>,
+    pub additional_data: Option<Vec<PaypalAdditionalDataItem>>,
+}
+
+/// Whether the Set Transaction Context (STC) preprocessing call is enabled for the merchant
+/// (via the `enable_stc` flag in the merchant connector account metadata).
+pub fn is_stc_enabled(connector_meta_data: &Option<common_utils::pii::SecretSerdeValue>) -> bool {
+    PaypalConnectorMetadataObject::try_from(connector_meta_data)
+        .ok()
+        .and_then(|metadata| metadata.enable_stc)
+        .unwrap_or(false)
+}
+
+impl PaypalSetTransactionContextRequest {
+    pub fn build(
+        router_data: &PaymentsPreAuthenticateRouterData,
+    ) -> Result<Self, error_stack::Report<errors::ConnectorError>> {
+        let sender_account_id = router_data
+            .customer_id
+            .as_ref()
+            .map(|customer_id| customer_id.get_string_repr().to_string());
+        let sender_first_name = router_data.get_optional_billing_first_name();
+        let sender_last_name = router_data.get_optional_billing_last_name();
+        let sender_email = router_data
+            .get_optional_billing_email()
+            .or_else(|| router_data.request.email.clone());
+        let sender_phone = router_data.get_optional_billing_phone_number();
+        let sender_country_code = router_data.get_optional_billing_country();
+
+        let mut additional_data = Vec::new();
+        let mut push = |key: &str, value: Option<String>| {
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                additional_data.push(PaypalAdditionalDataItem {
+                    key: key.to_string(),
+                    value: Secret::new(value),
+                });
+            }
+        };
+        push(STC_SENDER_ACCOUNT_ID, sender_account_id);
+        push(
+            STC_SENDER_FIRST_NAME,
+            sender_first_name.map(|name| name.peek().clone()),
+        );
+        push(
+            STC_SENDER_LAST_NAME,
+            sender_last_name.map(|name| name.peek().clone()),
+        );
+        push(
+            STC_SENDER_EMAIL,
+            sender_email.map(|email| email.peek().clone()),
+        );
+        push(STC_SENDER_PHONE, sender_phone.map(|phone| phone.expose()));
+        push(
+            STC_SENDER_COUNTRY_CODE,
+            sender_country_code.map(|country| country.to_string()),
+        );
+        Ok(Self {
+            tracking_id: router_data.connector_request_reference_id.clone(),
+            additional_data,
+        })
+    }
+}
+
 fn get_id_based_on_intent(
     intent: &PaypalPaymentIntent,
     purchase_unit: &PurchaseUnitItem,
@@ -3347,6 +3496,10 @@ where
                 payment_account_reference: None,
             }),
             connector_response,
+            connector_returned_payment_method_details: get_connector_disclosed_paypal_details(
+                item.data.payment_method_type,
+                item.response.payer.as_ref(),
+            ),
             sender_payment_instrument_id: item
                 .response
                 .payer
@@ -3731,7 +3884,7 @@ impl TryFrom<PaymentsResponseRouterData<PaypalThreeDsResponse>> for PaymentsAuth
 }
 
 fn paypal_threeds_link(
-    (redirect_url, complete_auth_url): (Option<Url>, Option<String>),
+    (redirect_url, complete_auth_url): (Option<Url>, Option<Secret<String>>),
 ) -> CustomResult<RedirectForm, errors::ConnectorError> {
     let mut redirect_url =
         redirect_url.ok_or(errors::ConnectorError::ResponseDeserializationFailed)?;
@@ -3742,7 +3895,7 @@ fn paypal_threeds_link(
     let mut form_fields = std::collections::HashMap::from_iter(
         redirect_url
             .query_pairs()
-            .map(|(key, value)| (key.to_string(), value.to_string())),
+            .map(|(key, value)| (key.to_string(), value.to_string().into())),
     );
 
     // paypal requires return url to be passed as a field along with payer_action_url
@@ -3752,7 +3905,7 @@ fn paypal_threeds_link(
     redirect_url.set_query(None);
 
     Ok(RedirectForm::Form {
-        endpoint: redirect_url.to_string(),
+        endpoint: redirect_url.to_string().into(),
         method: Method::Get,
         form_fields,
     })
@@ -3792,6 +3945,10 @@ impl<F, T> TryFrom<ResponseRouterData<F, PaypalPaymentsSyncResponse, T, Payments
                 payment_account_reference: None,
             }),
             connector_response: get_connector_response_with_payer_details(
+                item.data.payment_method_type,
+                item.response.payer.as_ref(),
+            ),
+            connector_returned_payment_method_details: get_connector_disclosed_paypal_details(
                 item.data.payment_method_type,
                 item.response.payer.as_ref(),
             ),
@@ -3940,6 +4097,10 @@ impl TryFrom<&PaypalRouterData<&PayoutsRouterData<PoFulfill>>> for PaypalPayoutI
                 })?,
                 WalletPayout::GooglePayDecrypt(_) => Err(errors::ConnectorError::NotSupported {
                     message: "GooglePayDecrypt PayoutMethodType is not supported".to_string(),
+                    connector: "Paypal".into(),
+                })?,
+                WalletPayout::Mifinity(_) => Err(errors::ConnectorError::NotSupported {
+                    message: "MiFinity PayoutMethodType is not supported".to_string(),
                     connector: "Paypal".into(),
                 })?,
             },
@@ -4169,7 +4330,28 @@ impl Payer {
     }
 }
 
-/// Builds the connector response with the payer details received from paypal.
+/// Discloses PayPal wallet details for the shared payment-method response update.
+fn get_connector_disclosed_paypal_details(
+    payment_method_type: Option<common_enums::PaymentMethodType>,
+    payer: Option<&Payer>,
+) -> Option<PaymentMethodData> {
+    match (payment_method_type, payer) {
+        (Some(common_enums::PaymentMethodType::Paypal), Some(payer))
+            if payer.email_address.is_some() || payer.payer_id.is_some() =>
+        {
+            Some(PaymentMethodData::Wallet(WalletData::PaypalRedirect(
+                hyperswitch_domain_models::payment_method_data::PaypalRedirection {
+                    email: payer.email_address.clone(),
+                    payer_id: payer.payer_id.clone(),
+                },
+            )))
+        }
+        _ => None,
+    }
+}
+
+/// Builds the connector response with the payer details received from PayPal.
+/// Reads email and the PayPal identifier only from `payer.email_address` and `payer.payer_id`.
 /// This should only be populated for paypal wallet payments (PaypalRedirect and PaypalSdk
 /// flows, both of which use `PaymentMethodType::Paypal`), and not for payments processed
 /// via paypal as a card processor.
@@ -5754,6 +5936,10 @@ mod external_refund_sync_tests {
             capture_method: Some(enums::CaptureMethod::Automatic),
             additional_payment_method_data: None,
             payment_connector_request_reference_id: None,
+            payment_method_data: None,
+            mandate_id: None,
+            payment_feature_metadata: None,
+            feature_metadata: None,
         });
         let executed =
             RefundsRouterData::<Execute>::try_from(RefundsResponseRouterData::<Execute, _> {
@@ -6194,7 +6380,7 @@ mod bcdc_tests {
             minor_amount: MinorUnit::new(10_000),
             capture_method: Some(enums::CaptureMethod::Automatic),
             webhook_url: None,
-            complete_authorize_url: Some("https://hs.example/complete".to_string()),
+            complete_authorize_url: Some(Secret::new("https://hs.example/complete".to_string())),
             browser_info: None,
             order_details: None,
             order_category: None,
@@ -6237,6 +6423,9 @@ mod bcdc_tests {
             recipient_details: None,
             business_country: None,
             connector_intent_metadata: None,
+            enable_avs_check: None,
+            enable_account_name_verification: None,
+            router_notification_url: None,
         }
     }
 
@@ -6244,6 +6433,7 @@ mod bcdc_tests {
         CurrentFlowInfo::Authorize {
             auth_type: enums::AuthenticationType::NoThreeDs,
             request_data: Box::new(request),
+            connector_meta_data: None,
         }
     }
 
@@ -6288,6 +6478,13 @@ mod bcdc_tests {
             order_id: None,
             force_3ds_challenge: None,
             enable_overcapture: None,
+            customer_id: None,
+            billing_descriptor: None,
+            payment_channel: None,
+            enable_partial_authorization: None,
+            order_details: None,
+            feature_metadata: None,
+            enable_account_name_verification: None,
         }
     }
 
@@ -6342,7 +6539,10 @@ mod bcdc_tests {
     fn the_hooks_are_off_for_a_wallet_even_with_the_selector() {
         let paypal = Paypal::new();
         let wallet = PaymentMethodData::Wallet(WalletData::PaypalRedirect(
-            hyperswitch_domain_models::payment_method_data::PaypalRedirection { email: None },
+            hyperswitch_domain_models::payment_method_data::PaypalRedirection {
+                email: None,
+                payer_id: None,
+            },
         ));
         let flow = authorize_flow(authorize_data(wallet, bcdc_metadata()));
         assert!(!paypal.is_order_create_flow_required(flow.clone()));
@@ -6466,7 +6666,7 @@ mod bcdc_tests {
             currency: Some(enums::Currency::USD),
             payment_method_type: None,
             router_return_url: None,
-            complete_authorize_url: Some("https://hs.example/complete".to_string()),
+            complete_authorize_url: Some(Secret::new("https://hs.example/complete".to_string())),
             browser_info: None,
             enrolled_for_3ds: false,
             customer_name: None,
@@ -6790,13 +6990,16 @@ mod bcdc_tests {
                         form_fields,
                     }) => {
                         assert_eq!(
-                            endpoint,
+                            endpoint.peek(),
                             "https://www.sandbox.paypal.com/heliosnext/threeDS"
                         );
                         assert_eq!(method, Method::Get);
-                        assert_eq!(form_fields["cart_id"], ORDER_ID);
-                        assert_eq!(form_fields["flow"], "3ds");
-                        assert_eq!(form_fields["redirect_uri"], "https://hs.example/complete");
+                        assert_eq!(form_fields["cart_id"].peek(), ORDER_ID);
+                        assert_eq!(form_fields["flow"].peek(), "3ds");
+                        assert_eq!(
+                            form_fields["redirect_uri"].peek(),
+                            "https://hs.example/complete"
+                        );
                     }
                     other => panic!("unexpected redirection {other:?}"),
                 }

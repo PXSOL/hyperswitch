@@ -73,17 +73,16 @@ impl PaymentAttemptDiagnosticInterface for Store {
             .await
             .change_context(errors::StorageError::DatabaseConnectionError)?;
 
-        let attempts = PaymentAttempt::find_failures_in_window(
-            &conn,
-            window_minutes,
-            merchant_id,
-            profile_id,
-        )
-        .await
-        .change_context(errors::StorageError::DatabaseConnectionError)?;
+        let attempts =
+            PaymentAttempt::find_failures_in_window(&conn, window_minutes, merchant_id, profile_id)
+                .await
+                .change_context(errors::StorageError::DatabaseConnectionError)?;
 
         let data: Vec<FailureAttemptData> = attempts.iter().map(FailureAttemptData::from).collect();
-        logger::debug!(count = data.len(), "Retrieved failed payment attempts for diagnostic");
+        logger::debug!(
+            count = data.len(),
+            "Retrieved failed payment attempts for diagnostic"
+        );
         Ok(data)
     }
 

@@ -130,7 +130,8 @@ fn authorize_data(
         capture_method: Some(enums::CaptureMethod::Automatic),
         router_return_url: None,
         webhook_url: None,
-        complete_authorize_url: three_ds.then(|| "https://www.pxsol.com/3ds/return".to_string()),
+        complete_authorize_url: three_ds
+            .then(|| Secret::new("https://www.pxsol.com/3ds/return".to_string())),
         setup_future_usage: None,
         mandate_id: None,
         off_session: None,
@@ -177,6 +178,9 @@ fn authorize_data(
         is_account_funded_transaction: None,
         recipient_details: None,
         business_country: None,
+        enable_avs_check: None,
+        enable_account_name_verification: None,
+        router_notification_url: None,
     }
 }
 
@@ -397,6 +401,8 @@ fn dump_phase1_payloads() {
             is_account_funded_transaction: None,
             recipient_details: None,
             business_country: None,
+            enable_avs_check: None,
+            enable_account_name_verification: None,
         };
         let rd: RouterData<SetupMandate, _, _> = router_data(request, STORE_AR, &oid, false, None);
         let req = fiservemea::FiservemeaPaymentsRequest::try_from(&rd).unwrap();
@@ -581,7 +587,9 @@ fn dump_phase5_continuation_templates() {
             browser_info: None,
             connector_transaction_id: Some("TEMPLATE".to_string()),
             connector_meta: None,
-            complete_authorize_url: Some("https://www.pxsol.com/3ds/return".to_string()),
+            complete_authorize_url: Some(Secret::new(
+                "https://www.pxsol.com/3ds/return".to_string(),
+            )),
             metadata: None,
             customer_acceptance: None,
             minor_amount: MinorUnit::new(100_000),
@@ -602,6 +610,13 @@ fn dump_phase5_continuation_templates() {
             order_id: None,
             force_3ds_challenge: None,
             enable_overcapture: None,
+            customer_id: None,
+            billing_descriptor: None,
+            payment_channel: None,
+            enable_partial_authorization: None,
+            order_details: None,
+            feature_metadata: None,
+            enable_account_name_verification: None,
         };
         let rd: RouterData<CompleteAuthorize, _, _> =
             router_data(request, STORE_AR, case, true, None);
@@ -689,7 +704,9 @@ fn dump_phase3_continuations() {
             browser_info: None,
             connector_transaction_id: Some(ipg.clone()),
             connector_meta: None,
-            complete_authorize_url: Some("https://www.pxsol.com/3ds/return".to_string()),
+            complete_authorize_url: Some(Secret::new(
+                "https://www.pxsol.com/3ds/return".to_string(),
+            )),
             metadata: None,
             customer_acceptance: None,
             minor_amount: MinorUnit::new(100_000),
@@ -710,6 +727,13 @@ fn dump_phase3_continuations() {
             order_id: None,
             force_3ds_challenge: None,
             enable_overcapture: None,
+            customer_id: None,
+            billing_descriptor: None,
+            payment_channel: None,
+            enable_partial_authorization: None,
+            order_details: None,
+            feature_metadata: None,
+            enable_account_name_verification: None,
         };
         let rd: RouterData<CompleteAuthorize, _, _> = router_data(
             request,
@@ -865,6 +889,11 @@ fn dump_phase7_preauth_capture() {
         order_tax_amount: None,
         merchant_order_reference_id: None,
         is_overcapture_enabled: None,
+        payment_method_data: None,
+        mandate_id: None,
+        payment_feature_metadata: None,
+        feature_metadata: None,
+        connector_intent_metadata: None,
     };
     let crd3: RouterData<Capture, _, PaymentsResponseData> =
         router_data(capture_request, STORE_AR, "capture", false, None);
@@ -893,6 +922,8 @@ fn dump_phase7_preauth_capture() {
         merchant_order_reference_id: None,
         payment_method_type: None,
         feature_metadata: None,
+        payment_method_data: None,
+        mandate_id: None,
     };
     let rd4: RouterData<Void, _, _> =
         router_data(cancel_request, STORE_AR, "void-preauth", false, None);
@@ -964,6 +995,8 @@ fn dump_phase4_void_refund() {
             merchant_order_reference_id: None,
             payment_method_type: None,
             feature_metadata: None,
+            payment_method_data: None,
+            mandate_id: None,
         };
         let rd: RouterData<Void, _, _> = router_data(request, STORE_AR, "void-op", false, None);
         let req = fiservemea::FiservemeaVoidRequest::try_from(&rd).unwrap();
@@ -999,6 +1032,10 @@ fn dump_phase4_void_refund() {
                 capture_method: Some(enums::CaptureMethod::Automatic),
                 additional_payment_method_data: None,
                 payment_connector_request_reference_id: None,
+                payment_method_data: None,
+                mandate_id: None,
+                payment_feature_metadata: None,
+                feature_metadata: None,
             };
             let rd: RouterData<Execute, _, _> = router_data(request, STORE_AR, key, false, None);
             let amount = crate::utils::convert_amount(

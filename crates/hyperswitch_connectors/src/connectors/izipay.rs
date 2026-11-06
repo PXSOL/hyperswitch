@@ -1,5 +1,7 @@
 pub mod transformers;
 
+use std::sync::LazyLock;
+
 use api_models::webhooks::IncomingWebhookEvent;
 use common_enums::enums;
 use common_utils::{
@@ -50,7 +52,6 @@ use hyperswitch_interfaces::{
     webhooks::{IncomingWebhook, IncomingWebhookRequestDetails, WebhookContext},
 };
 use hyperswitch_masking::{Mask, PeekInterface, Secret};
-use std::sync::LazyLock;
 use transformers as izipay;
 
 use crate::{
