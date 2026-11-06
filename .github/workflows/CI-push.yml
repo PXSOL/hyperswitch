@@ -37,7 +37,7 @@ env:
 jobs:
   formatting:
     name: Check formatting
-    runs-on: hypersage-runners
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -54,7 +54,7 @@ jobs:
 
   check-msrv:
     name: Check compilation on MSRV toolchain
-    runs-on: hyperswitch-runners-merge
+    runs-on: ubuntu-latest
 
     env:
       # sccache restored as one archive instead of S3 — avoids per-object round trips.
@@ -247,7 +247,7 @@ jobs:
 
   typos:
     name: Spell check
-    runs-on: hypersage-runners
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -257,7 +257,7 @@ jobs:
 
   typos-required:
     name: Spell check specific critical directories
-    runs-on: hypersage-runners
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7

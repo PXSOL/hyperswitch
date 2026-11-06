@@ -10,7 +10,7 @@ on:
 jobs:
   typos:
     name: Spell check PR title
-    runs-on: hypersage-runners
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7

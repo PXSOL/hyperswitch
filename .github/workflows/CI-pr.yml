@@ -23,7 +23,7 @@ env:
 jobs:
   formatting:
     name: Check formatting
-    runs-on: hypersage-runners
+    runs-on: ubuntu-latest
     steps:
       - name: Generate a token
         if: ${{ github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name }}
@@ -74,7 +74,7 @@ jobs:
 
   check-msrv:
     name: Check compilation on MSRV toolchain
-    runs-on: hyperswitch-runners
+    runs-on: ubuntu-latest
     if: ${{ ! startsWith(github.event.pull_request.base.ref, 'hotfix-') }}
 
     env:
@@ -278,7 +278,7 @@ jobs:
 
   typos:
     name: Spell check
-    runs-on: hypersage-runners
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -288,7 +288,7 @@ jobs:
 
   typos-required:
     name: Spell check specific critical directories
-    runs-on: hypersage-runners
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
