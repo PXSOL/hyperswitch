@@ -1599,14 +1599,25 @@ impl ConnectorIntegration<PreAuthenticate, PaymentsPreAuthenticateData, Payments
         })
     }
 
-    // The error has no request to tell the two calls apart. Both endpoints answer with PayPal's
-    // common REST error envelope (name, message, debug_id, details), which the orders parser reads.
+    // The error carries no request to tell the two calls apart, so the body decides: the BCDC
+    // orders call answers with the orders error envelope; anything that does not parse as one
+    // (e.g. an STC error whose `details[]` lacks `description`) goes through the payments parser,
+    // as upstream reads STC errors.
     fn get_error_response(
         &self,
         res: Response,
         event_builder: Option<&mut ConnectorEvent>,
     ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
-        self.get_order_error_response(res, event_builder)
+        let is_order_error = res.response.is_empty()
+            || res
+                .response
+                .parse_struct::<paypal::PaypalOrderErrorResponse>("PaypalOrderErrorResponse")
+                .is_ok();
+        if is_order_error {
+            self.get_order_error_response(res, event_builder)
+        } else {
+            self.build_error_response(res, event_builder)
+        }
     }
 }
 
@@ -3224,6 +3235,50 @@ impl ConnectorSpecifications for Paypal {
         &self,
     ) -> Vec<enums::PaymentMethodType> {
         vec![enums::PaymentMethodType::Paypal]
+    }
+}
+
+#[cfg(test)]
+mod pre_authenticate_error_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn pre_authenticate_error(body: &str) -> ErrorResponse {
+        <Paypal as ConnectorIntegration<
+            PreAuthenticate,
+            PaymentsPreAuthenticateData,
+            PaymentsResponseData,
+        >>::get_error_response(
+            Paypal::new(),
+            Response {
+                headers: None,
+                response: bytes::Bytes::from(body.to_owned()),
+                status_code: 422,
+            },
+            None,
+        )
+        .expect("the error body must be read, not fail the flow")
+    }
+
+    // BCDC's confirm-guest-payment answers with the orders error envelope.
+    #[test]
+    fn an_orders_error_is_read() {
+        let error = pre_authenticate_error(
+            r#"{"name":"UNPROCESSABLE_ENTITY","message":"The requested action could not be performed.","debug_id":"d1","details":[{"issue":"CARD_EXPIRED","description":"The card is expired."}]}"#,
+        );
+        assert_eq!(error.status_code, 422);
+        assert_eq!(error.code, "CARD_EXPIRED");
+    }
+
+    // Upstream's STC call can answer without `details[].description`, which the orders
+    // parser requires: the payments parser reads it instead of failing the payment.
+    #[test]
+    fn an_error_without_detail_descriptions_is_read() {
+        let error = pre_authenticate_error(
+            r#"{"name":"INVALID_REQUEST","message":"Request is not well-formed.","debug_id":"d2","details":[{"issue":"MISSING_REQUIRED_PARAMETER"}]}"#,
+        );
+        assert_eq!(error.status_code, 422);
     }
 }
 
