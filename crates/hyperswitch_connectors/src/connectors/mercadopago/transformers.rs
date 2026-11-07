@@ -83,19 +83,6 @@ pub struct MercadopagoPayerInfo {
     pub zip_code: Option<Secret<String>>,
 }
 
-impl MercadopagoPayerInfo {
-    /// First and last name joined, skipping the blank ones.
-    fn full_name(&self) -> Option<Secret<String>> {
-        let parts: Vec<&str> = [&self.first_name, &self.last_name]
-            .into_iter()
-            .flatten()
-            .map(|name| name.peek().trim())
-            .filter(|name| !name.is_empty())
-            .collect();
-        (!parts.is_empty()).then(|| Secret::new(parts.join(" ")))
-    }
-}
-
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct MercadopagoItemInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -267,13 +254,6 @@ pub struct MercadopagoCardholder {
     pub identification: Option<MercadopagoCardholderIdentification>,
 }
 
-/// Mercado Pago sandbox magic cardholder name ("approve"); see the tokenization request.
-const LAST_RESORT_CARDHOLDER_NAME: &str = "APRO";
-
-fn non_blank(name: Option<Secret<String>>) -> Option<Secret<String>> {
-    name.filter(|name| !name.peek().trim().is_empty())
-}
-
 #[derive(Debug, Serialize)]
 pub struct MercadopagoTokenRequest {
     pub card_number: cards::CardNumber,
@@ -295,13 +275,13 @@ impl TryFrom<&TokenizationRouterData> for MercadopagoTokenRequest {
                     MercadopagoMetadata::resolve(None, &item.frm_metadata, "frm_metadata")?;
 
                 // "APRO" is the cardholder name Mercado Pago's SANDBOX reads as "approve this
-                // payment": a test magic value that names nobody. It stays only as the last
-                // resort because Mercado Pago requires a name to tokenize, and failing here
-                // would start declining charges that api2 sends today without any name.
-                let cardholder_name = non_blank(card.card_holder_name.clone())
-                    .or_else(|| non_blank(item.get_optional_billing_full_name()))
-                    .or_else(|| metadata.payer.as_ref().and_then(|p| p.full_name()))
-                    .unwrap_or_else(|| Secret::new(LAST_RESORT_CARDHOLDER_NAME.to_string()));
+                // payment". It is not replaced by the billing or payer name: api2 reaches this
+                // with cards stored without a holder, and what those charges send is api2's
+                // decision, not this connector's.
+                let cardholder_name = card
+                    .card_holder_name
+                    .clone()
+                    .unwrap_or_else(|| Secret::new("APRO".to_string()));
 
                 // Build identification for cardholder if provided in metadata
                 let identification =
@@ -635,8 +615,9 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
                         });
 
                 // Hospitality industry data: the guest goes in `passenger`. A passenger given in
-                // the metadata wins; otherwise the payer is the passenger (when named), with the
-                // payer's document.
+                // the metadata wins; otherwise the payer is the passenger (when named), by name
+                // only. The payer's document is not borrowed: it can be the cardholder's while
+                // the name is the guest's (a hotel charging a reservation).
                 let given_passenger = metadata
                     .item
                     .as_ref()
@@ -650,12 +631,7 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
                         .map(|p| MercadopagoPassenger {
                             first_name: p.first_name.clone(),
                             last_name: p.last_name.clone(),
-                            identification: payer_identification.as_ref().map(|id| {
-                                MercadopagoPassengerIdentification {
-                                    id_type: id.id_type.clone(),
-                                    number: id.number.clone(),
-                                }
-                            }),
+                            identification: None,
                         })
                 };
                 let category_descriptor = given_passenger
@@ -2898,7 +2874,14 @@ mod tests {
 
     /// Serializes the card charge body by the same path as `get_request_body`.
     fn card_charge_body(metadata: serde_json::Value) -> serde_json::Value {
-        let router_data = test_support::authorize_router_data(Some(metadata), None);
+        card_charge_body_with(Some(metadata), None)
+    }
+
+    fn card_charge_body_with(
+        metadata: Option<serde_json::Value>,
+        frm_metadata: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let router_data = test_support::authorize_router_data(metadata, frm_metadata);
         let amount = FloatMajorUnitForConnector
             .convert(
                 router_data.request.minor_amount,
@@ -2989,32 +2972,50 @@ mod tests {
     }
 
     #[test]
-    fn default_passenger_is_the_payer_with_the_payer_identification() {
+    fn default_passenger_is_the_payer_by_name_only() {
+        // The payer's document can be the cardholder's while the name is the guest's (a hotel
+        // charging a reservation), so the default passenger never borrows it. A passenger with
+        // a document goes only when the metadata gives one.
         let body = card_charge_body(stay_metadata(json!({ "title": "Hotel stay" })));
         assert_eq!(
             body["additional_info"]["items"][0]["category_descriptor"],
-            json!({
-                "passenger": {
-                    "first_name": "Ana",
-                    "last_name": "Gomez",
-                    "identification": { "type": "DNI", "number": "30111222" }
-                }
-            })
+            json!({ "passenger": { "first_name": "Ana", "last_name": "Gomez" } })
         );
     }
 
     #[test]
-    fn default_passenger_without_a_payer_identification_carries_only_the_name() {
-        let body = card_charge_body(json!({
-            "mercadopago": {
-                "payment_method_id": "visa",
-                "payer": { "first_name": "Ana", "last_name": "Gomez" },
-                "item": { "title": "Hotel stay" }
+    fn frm_metadata_card_charge_keeps_its_additional_info() {
+        // A caller that sends every Mercado Pago key flat in frm_metadata and no event date or
+        // passenger (api2's card flow) gets the item it got before these keys were read.
+        let frm_metadata = json!({
+            "payment_method_id": "visa",
+            "installments": 1,
+            "identification_type": "DNI",
+            "identification_number": "30111222",
+            "device_id": "device-1",
+            "payer": { "first_name": "Ana", "last_name": "Gomez" },
+            "item": {
+                "title": "Reserva #1 - Hotel",
+                "description": "Alojamiento para la reserva #1",
+                "category_id": "services"
             }
-        }));
+        });
+        let body = card_charge_body_with(None, Some(frm_metadata));
+        let item = &body["additional_info"]["items"][0];
         assert_eq!(
-            body["additional_info"]["items"][0]["category_descriptor"],
+            item["category_descriptor"],
             json!({ "passenger": { "first_name": "Ana", "last_name": "Gomez" } })
+        );
+        assert_eq!(item["category_id"], "services");
+        assert!(
+            item["event_date"]
+                .as_str()
+                .is_some_and(|date| date.ends_with('Z')),
+            "{item}"
+        );
+        assert_eq!(
+            body["payer"]["identification"],
+            json!({ "type": "DNI", "number": "30111222" })
         );
     }
 
@@ -3096,7 +3097,7 @@ mod tests {
     }
 
     #[test]
-    fn tokenization_sends_the_card_holder_name_first() {
+    fn tokenization_sends_the_card_holder_name_as_given() {
         assert_eq!(
             tokenized_holder_name(
                 Some("ANA GOMEZ"),
@@ -3105,43 +3106,29 @@ mod tests {
             ),
             "ANA GOMEZ"
         );
+        // A blank name goes as given, as it always did.
+        assert_eq!(
+            tokenized_holder_name(
+                Some("  "),
+                test_support::billing("Luis", "Perez"),
+                payer_frm_metadata()
+            ),
+            "  "
+        );
     }
 
     #[test]
-    fn tokenization_falls_back_to_the_billing_full_name() {
+    fn tokenization_without_a_holder_name_keeps_sending_the_sandbox_name() {
+        // Neither the billing name nor the payer name replaces it: a card stored without a
+        // holder reaches this from api2, and what those charges send is api2's decision.
         assert_eq!(
             tokenized_holder_name(
                 None,
                 test_support::billing("Luis", "Perez"),
                 payer_frm_metadata()
             ),
-            "Luis Perez"
+            "APRO"
         );
-        // A blank holder name is no name.
-        assert_eq!(
-            tokenized_holder_name(Some("  "), test_support::billing("Luis", "Perez"), None),
-            "Luis Perez"
-        );
-    }
-
-    #[test]
-    fn tokenization_falls_back_to_the_metadata_payer_name() {
-        assert_eq!(
-            tokenized_holder_name(None, PaymentAddress::default(), payer_frm_metadata()),
-            "Marta Lopez"
-        );
-        assert_eq!(
-            tokenized_holder_name(
-                None,
-                PaymentAddress::default(),
-                Some(json!({ "payer": { "first_name": "Marta" } }))
-            ),
-            "Marta"
-        );
-    }
-
-    #[test]
-    fn tokenization_keeps_the_sandbox_name_only_as_the_last_resort() {
         assert_eq!(
             tokenized_holder_name(None, PaymentAddress::default(), None),
             "APRO"
