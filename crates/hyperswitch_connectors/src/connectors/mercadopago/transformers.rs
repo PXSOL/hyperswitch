@@ -83,6 +83,19 @@ pub struct MercadopagoPayerInfo {
     pub zip_code: Option<Secret<String>>,
 }
 
+impl MercadopagoPayerInfo {
+    /// First and last name joined, skipping the blank ones.
+    fn full_name(&self) -> Option<Secret<String>> {
+        let parts: Vec<&str> = [&self.first_name, &self.last_name]
+            .into_iter()
+            .flatten()
+            .map(|name| name.peek().trim())
+            .filter(|name| !name.is_empty())
+            .collect();
+        (!parts.is_empty()).then(|| Secret::new(parts.join(" ")))
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct MercadopagoItemInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -91,6 +104,21 @@ pub struct MercadopagoItemInfo {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category_id: Option<String>,
+    /// When the purchased service happens, sent as given (for lodging, the check-in, e.g.
+    /// `2026-12-20T00:00:00.000Z`). Without it the request timestamp is sent, as before.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient"
+    )]
+    pub event_date: Option<String>,
+    /// Who uses the purchased service (for lodging, the guest). Without it the payer is sent.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient"
+    )]
+    pub passenger: Option<MercadopagoPassenger>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -178,6 +206,35 @@ impl MercadopagoMetadata {
             None => Ok(Self::default()),
         }
     }
+
+    /// Resolves only `device_id`, with the precedence of [`Self::resolve`]. Reading the key
+    /// alone (instead of the whole metadata) keeps the anti-fraud session header from being
+    /// dropped by an unrelated key of an unexpected type.
+    pub(super) fn resolve_device_id(
+        request_metadata: Option<&serde_json::Value>,
+        frm_metadata: &Option<SecretSerdeValue>,
+    ) -> Option<Secret<String>> {
+        let merged = utils::merge_connector_scoped_metadata(
+            MERCADOPAGO_METADATA_SCOPE,
+            &[frm_metadata.as_ref().map(|m| m.peek()), request_metadata],
+        )?;
+        merged
+            .get("device_id")
+            .and_then(serde_json::Value::as_str)
+            .map(|device_id| Secret::new(device_id.to_string()))
+    }
+}
+
+/// Reads an optional value and treats one of an unexpected shape as absent. Used for keys that
+/// were ignored before the connector read them, so reading them can never turn a charge that
+/// used to go through into a configuration error.
+fn deserialize_lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value: Option<serde_json::Value> = DeDeserialize::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 impl TryFrom<&Option<serde_json::Value>> for MercadopagoMetadata {
@@ -210,6 +267,13 @@ pub struct MercadopagoCardholder {
     pub identification: Option<MercadopagoCardholderIdentification>,
 }
 
+/// Mercado Pago sandbox magic cardholder name ("approve"); see the tokenization request.
+const LAST_RESORT_CARDHOLDER_NAME: &str = "APRO";
+
+fn non_blank(name: Option<Secret<String>>) -> Option<Secret<String>> {
+    name.filter(|name| !name.peek().trim().is_empty())
+}
+
 #[derive(Debug, Serialize)]
 pub struct MercadopagoTokenRequest {
     pub card_number: cards::CardNumber,
@@ -230,10 +294,14 @@ impl TryFrom<&TokenizationRouterData> for MercadopagoTokenRequest {
                 let metadata =
                     MercadopagoMetadata::resolve(None, &item.frm_metadata, "frm_metadata")?;
 
-                let cardholder_name = card
-                    .card_holder_name
-                    .clone()
-                    .unwrap_or_else(|| Secret::new("APRO".to_string()));
+                // "APRO" is the cardholder name Mercado Pago's SANDBOX reads as "approve this
+                // payment": a test magic value that names nobody. It stays only as the last
+                // resort because Mercado Pago requires a name to tokenize, and failing here
+                // would start declining charges that api2 sends today without any name.
+                let cardholder_name = non_blank(card.card_holder_name.clone())
+                    .or_else(|| non_blank(item.get_optional_billing_full_name()))
+                    .or_else(|| metadata.payer.as_ref().and_then(|p| p.full_name()))
+                    .unwrap_or_else(|| Secret::new(LAST_RESORT_CARDHOLDER_NAME.to_string()));
 
                 // Build identification for cardholder if provided in metadata
                 let identification =
@@ -347,12 +415,30 @@ pub struct MercadopagoAdditionalInfoPayer {
     pub address: Option<MercadopagoAdditionalInfoPayerAddress>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// `category_descriptor.passenger` of Mercado Pago's industry data: the traveller or the guest.
+/// Read from `metadata.item.passenger` with this same shape.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct MercadopagoPassenger {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub first_name: Option<String>,
+    pub first_name: Option<Secret<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_name: Option<String>,
+    pub last_name: Option<Secret<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identification: Option<MercadopagoPassengerIdentification>,
+}
+
+impl MercadopagoPassenger {
+    fn is_empty(&self) -> bool {
+        self.first_name.is_none() && self.last_name.is_none() && self.identification.is_none()
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct MercadopagoPassengerIdentification {
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub id_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub number: Option<Secret<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -548,20 +634,40 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
                             },
                         });
 
-                let category_descriptor = metadata.payer.as_ref().and_then(|p| {
-                    if p.first_name.is_some() || p.last_name.is_some() {
-                        Some(MercadopagoCategoryDescriptor {
-                            passenger: Some(MercadopagoPassenger {
-                                first_name: p.first_name.as_ref().map(|s| s.peek().to_string()),
-                                last_name: p.last_name.as_ref().map(|s| s.peek().to_string()),
+                // Hospitality industry data: the guest goes in `passenger`. A passenger given in
+                // the metadata wins; otherwise the payer is the passenger (when named), with the
+                // payer's document.
+                let given_passenger = metadata
+                    .item
+                    .as_ref()
+                    .and_then(|i| i.passenger.clone())
+                    .filter(|p| !p.is_empty());
+                let payer_passenger = || {
+                    metadata
+                        .payer
+                        .as_ref()
+                        .filter(|p| p.first_name.is_some() || p.last_name.is_some())
+                        .map(|p| MercadopagoPassenger {
+                            first_name: p.first_name.clone(),
+                            last_name: p.last_name.clone(),
+                            identification: payer_identification.as_ref().map(|id| {
+                                MercadopagoPassengerIdentification {
+                                    id_type: id.id_type.clone(),
+                                    number: id.number.clone(),
+                                }
                             }),
                         })
-                    } else {
-                        None
-                    }
-                });
+                };
+                let category_descriptor = given_passenger
+                    .or_else(payer_passenger)
+                    .map(|p| MercadopagoCategoryDescriptor { passenger: Some(p) });
 
-                let event_date = common_utils::date_time::date_as_yyyymmddthhmmssmmmz().ok();
+                let event_date = metadata
+                    .item
+                    .as_ref()
+                    .and_then(|i| i.event_date.clone())
+                    .filter(|date| !date.trim().is_empty())
+                    .or_else(|| common_utils::date_time::date_as_yyyymmddthhmmssmmmz().ok());
 
                 let additional_items = metadata.item.as_ref().map(|i| {
                     vec![MercadopagoAdditionalInfoItem {
@@ -2030,9 +2136,226 @@ impl From<&MercadopagoWebhookNotification> for api_models::webhooks::IncomingWeb
     }
 }
 
+/// Builders shared by the transformer tests and the connector (header) tests.
+#[cfg(test)]
+pub(super) mod test_support {
+    use std::marker::PhantomData;
+
+    use common_utils::types::MinorUnit;
+    use hyperswitch_domain_models::{
+        address::{Address, AddressDetails},
+        payment_address::PaymentAddress,
+        payment_method_data::Card,
+        router_request_types::{PaymentMethodTokenizationData, PaymentsAuthorizeData},
+    };
+
+    use super::*;
+
+    pub(crate) const MINOR_AMOUNT: i64 = 15000;
+
+    pub(crate) fn card(holder_name: Option<&str>) -> PaymentMethodData {
+        PaymentMethodData::Card(Card {
+            card_number: "4509953566233704".parse().unwrap(),
+            card_exp_month: Secret::new("11".to_string()),
+            card_exp_year: Secret::new("2030".to_string()),
+            card_cvc: Secret::new("123".to_string()),
+            card_holder_name: holder_name.map(|name| Secret::new(name.to_string())),
+            ..Default::default()
+        })
+    }
+
+    /// The billing a connector reads (`payment_method_data.billing`), with only a name.
+    pub(crate) fn billing(first_name: &str, last_name: &str) -> PaymentAddress {
+        let billing = Address {
+            address: Some(AddressDetails {
+                first_name: Some(Secret::new(first_name.to_string())),
+                last_name: Some(Secret::new(last_name.to_string())),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        PaymentAddress::new(None, None, Some(billing), None)
+    }
+
+    /// A minimal but complete `RouterData`: only the fields the connector reads are set.
+    pub(crate) fn router_data<Flow, Req, Res>(
+        request: Req,
+        frm_metadata: Option<serde_json::Value>,
+        address: PaymentAddress,
+    ) -> RouterData<Flow, Req, Res> {
+        RouterData {
+            flow: PhantomData,
+            merchant_id: common_utils::id_type::MerchantId::default(),
+            customer_id: None,
+            connector_customer: None,
+            connector: "mercadopago".to_string(),
+            payment_id: "pay_mp_1".to_string(),
+            attempt_id: "pay_mp_1_1".to_string(),
+            tenant_id: common_utils::id_type::TenantId::try_from_string("public".to_string())
+                .unwrap(),
+            status: enums::AttemptStatus::Pending,
+            payment_method: enums::PaymentMethod::Card,
+            connector_auth_type: ConnectorAuthType::HeaderKey {
+                api_key: Secret::new("TEST-access-token".to_string()),
+            },
+            description: None,
+            address,
+            auth_type: enums::AuthenticationType::NoThreeDs,
+            connector_meta_data: None,
+            connector_wallets_details: None,
+            amount_captured: None,
+            access_token: None,
+            session_token: None,
+            reference_id: None,
+            payment_method_token: Some(
+                hyperswitch_domain_models::router_data::PaymentMethodToken::Token(Secret::new(
+                    "card-token-1".to_string(),
+                )),
+            ),
+            recurring_mandate_payment_data: None,
+            preprocessing_id: None,
+            payment_method_balance: None,
+            connector_api_version: None,
+            request,
+            response: Err(ErrorResponse::default()),
+            connector_request_reference_id: "pxs_mp_1".to_string(),
+            #[cfg(feature = "payouts")]
+            payout_method_data: None,
+            #[cfg(feature = "payouts")]
+            quote_id: None,
+            test_mode: Some(true),
+            connector_http_status_code: None,
+            external_latency: None,
+            apple_pay_flow: None,
+            frm_metadata: frm_metadata.map(Secret::new),
+            dispute_id: None,
+            refund_id: None,
+            connector_response: None,
+            payment_method_status: None,
+            minor_amount_captured: None,
+            minor_amount_capturable: None,
+            integrity_check: Ok(()),
+            additional_merchant_data: None,
+            header_payload: None,
+            connector_mandate_request_reference_id: None,
+            l2_l3_data: None,
+            authentication_id: None,
+            psd2_sca_exemption_type: None,
+            raw_connector_response: None,
+            is_payment_id_from_merchant: None,
+            payment_method_type: None,
+            payout_id: None,
+            authorized_amount: None,
+            accept_amount_mismatch: None,
+            customer_document_details: None,
+            customer_date_of_birth: None,
+            feature_data: None,
+            sender_payment_instrument_id: None,
+            connector_returned_payment_method_details: None,
+        }
+    }
+
+    /// A card charge (`POST /v1/payments`) with the given payment metadata.
+    pub(crate) fn authorize_router_data(
+        metadata: Option<serde_json::Value>,
+        frm_metadata: Option<serde_json::Value>,
+    ) -> PaymentsAuthorizeRouterData {
+        let request = PaymentsAuthorizeData {
+            payment_method_data: card(Some("ANA GOMEZ")),
+            amount: MINOR_AMOUNT,
+            order_tax_amount: None,
+            email: None,
+            customer_name: None,
+            currency: enums::Currency::ARS,
+            confirm: true,
+            capture_method: Some(enums::CaptureMethod::Automatic),
+            router_return_url: None,
+            webhook_url: None,
+            complete_authorize_url: None,
+            setup_future_usage: None,
+            mandate_id: None,
+            off_session: None,
+            customer_acceptance: None,
+            setup_mandate_details: None,
+            browser_info: None,
+            order_details: None,
+            order_category: None,
+            session_token: None,
+            enrolled_for_3ds: false,
+            related_transaction_id: None,
+            payment_experience: None,
+            payment_method_type: None,
+            surcharge_details: None,
+            customer_id: None,
+            request_incremental_authorization: false,
+            metadata,
+            authentication_data: None,
+            request_extended_authorization: None,
+            split_payments: None,
+            minor_amount: MinorUnit::new(MINOR_AMOUNT),
+            merchant_order_reference_id: None,
+            integrity_object: None,
+            shipping_cost: None,
+            additional_payment_method_data: None,
+            merchant_account_id: None,
+            merchant_config_currency: None,
+            connector_testing_data: None,
+            order_id: None,
+            locale: None,
+            payment_channel: None,
+            enable_partial_authorization: None,
+            enable_overcapture: None,
+            ucs_authentication_data: None,
+            force_3ds_challenge: None,
+            guest_customer: None,
+            is_stored_credential: None,
+            mit_category: None,
+            billing_descriptor: None,
+            tokenization: None,
+            partner_merchant_identifier_details: None,
+            feature_metadata: None,
+            installment_details: None,
+            connector_intent_metadata: None,
+            is_account_funded_transaction: None,
+            recipient_details: None,
+            business_country: None,
+            enable_avs_check: None,
+            enable_account_name_verification: None,
+            router_notification_url: None,
+        };
+        router_data(request, frm_metadata, PaymentAddress::default())
+    }
+
+    /// Server-side card tokenization (`POST /v1/card_tokens`), which sees only
+    /// `frm_metadata` (the tokenization request carries no payment metadata).
+    pub(crate) fn tokenization_router_data(
+        holder_name: Option<&str>,
+        address: PaymentAddress,
+        frm_metadata: Option<serde_json::Value>,
+    ) -> TokenizationRouterData {
+        let request = PaymentMethodTokenizationData {
+            payment_method_data: card(holder_name),
+            payment_method_type: None,
+            browser_info: None,
+            currency: enums::Currency::ARS,
+            amount: Some(MINOR_AMOUNT),
+            split_payments: None,
+            customer_acceptance: None,
+            setup_future_usage: None,
+            setup_mandate_details: None,
+            mandate_id: None,
+            router_return_url: None,
+            capture_method: None,
+        };
+        router_data(request, frm_metadata, address)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use common_utils::types::MinorUnit;
+    use common_utils::types::{AmountConvertor, MinorUnit};
+    use hyperswitch_domain_models::payment_address::PaymentAddress;
+    use serde_json::json;
 
     use super::*;
 
@@ -2569,5 +2892,259 @@ mod tests {
             serde_json::from_str(r#"{"id":1,"status":"in_mediation","transaction_amount":100.0}"#)
                 .unwrap();
         assert!(payment.reported_activity(enums::Currency::ARS).is_none());
+    }
+
+    // ---- Card charge: anti-fraud industry data (hospitality) -------------------------
+
+    /// Serializes the card charge body by the same path as `get_request_body`.
+    fn card_charge_body(metadata: serde_json::Value) -> serde_json::Value {
+        let router_data = test_support::authorize_router_data(Some(metadata), None);
+        let amount = FloatMajorUnitForConnector
+            .convert(
+                router_data.request.minor_amount,
+                router_data.request.currency,
+            )
+            .unwrap();
+        let request = MercadopagoPaymentsRequest::try_from(&MercadopagoRouterData::from((
+            amount,
+            &router_data,
+        )))
+        .unwrap();
+        serde_json::to_value(&request).unwrap()
+    }
+
+    /// The metadata PPS sends for a lodging stay, with the given `item`.
+    fn stay_metadata(item: serde_json::Value) -> serde_json::Value {
+        json!({
+            "device_id": "device-1",
+            "mercadopago": {
+                "payment_method_id": "visa",
+                "identification_type": "DNI",
+                "identification_number": "30111222",
+                "payer": { "first_name": "Ana", "last_name": "Gomez" },
+                "item": item
+            }
+        })
+    }
+
+    #[test]
+    fn card_charge_sends_the_event_date_given_in_metadata() {
+        let body = card_charge_body(stay_metadata(json!({
+            "title": "Hotel stay",
+            "category_id": "accommodations",
+            "event_date": "2026-12-20T00:00:00.000Z"
+        })));
+        assert_eq!(
+            body["additional_info"]["items"][0]["event_date"],
+            "2026-12-20T00:00:00.000Z"
+        );
+
+        // Flat metadata (no `mercadopago` scope) is read the same way.
+        let body = card_charge_body(json!({
+            "payment_method_id": "visa",
+            "item": { "title": "Hotel stay", "event_date": "2027-01-05T00:00:00.000Z" }
+        }));
+        assert_eq!(
+            body["additional_info"]["items"][0]["event_date"],
+            "2027-01-05T00:00:00.000Z"
+        );
+    }
+
+    #[test]
+    fn card_charge_without_an_event_date_keeps_the_request_timestamp() {
+        let before = common_utils::date_time::date_as_yyyymmddthhmmssmmmz().unwrap();
+        let body = card_charge_body(stay_metadata(json!({ "title": "Hotel stay" })));
+        let after = common_utils::date_time::date_as_yyyymmddthhmmssmmmz().unwrap();
+
+        let event_date = body["additional_info"]["items"][0]["event_date"]
+            .as_str()
+            .expect("an item always carries an event_date");
+        // Same fixed-width format, so the text order is the time order.
+        assert!(
+            before.as_str() <= event_date && event_date <= after.as_str(),
+            "{before} <= {event_date} <= {after}"
+        );
+    }
+
+    #[test]
+    fn card_charge_sends_the_passenger_given_in_metadata() {
+        let body = card_charge_body(stay_metadata(json!({
+            "title": "Hotel stay",
+            "passenger": {
+                "first_name": "Luis",
+                "last_name": "Perez",
+                "identification": { "type": "CPF", "number": "12345678909" }
+            }
+        })));
+        assert_eq!(
+            body["additional_info"]["items"][0]["category_descriptor"],
+            json!({
+                "passenger": {
+                    "first_name": "Luis",
+                    "last_name": "Perez",
+                    "identification": { "type": "CPF", "number": "12345678909" }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn default_passenger_is_the_payer_with_the_payer_identification() {
+        let body = card_charge_body(stay_metadata(json!({ "title": "Hotel stay" })));
+        assert_eq!(
+            body["additional_info"]["items"][0]["category_descriptor"],
+            json!({
+                "passenger": {
+                    "first_name": "Ana",
+                    "last_name": "Gomez",
+                    "identification": { "type": "DNI", "number": "30111222" }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn default_passenger_without_a_payer_identification_carries_only_the_name() {
+        let body = card_charge_body(json!({
+            "mercadopago": {
+                "payment_method_id": "visa",
+                "payer": { "first_name": "Ana", "last_name": "Gomez" },
+                "item": { "title": "Hotel stay" }
+            }
+        }));
+        assert_eq!(
+            body["additional_info"]["items"][0]["category_descriptor"],
+            json!({ "passenger": { "first_name": "Ana", "last_name": "Gomez" } })
+        );
+    }
+
+    #[test]
+    fn card_charge_without_item_keeps_the_previous_additional_info() {
+        let body = card_charge_body(json!({
+            "mercadopago": {
+                "payment_method_id": "visa",
+                "identification_type": "DNI",
+                "identification_number": "30111222",
+                "payer": {
+                    "first_name": "Ana",
+                    "last_name": "Gomez",
+                    "phone": "1144445555",
+                    "address": "Calle Falsa 123",
+                    "zip_code": "1000"
+                }
+            }
+        }));
+        assert_eq!(
+            body["additional_info"],
+            json!({
+                "payer": {
+                    "first_name": "Ana",
+                    "last_name": "Gomez",
+                    "phone": { "number": "1144445555" },
+                    "address": { "street_name": "Calle Falsa 123", "zip_code": "1000" }
+                }
+            })
+        );
+        assert_eq!(
+            body["payer"]["identification"],
+            json!({ "type": "DNI", "number": "30111222" })
+        );
+
+        let body = card_charge_body(json!({ "payment_method_id": "visa" }));
+        assert!(body.get("additional_info").is_none(), "{body}");
+    }
+
+    #[test]
+    fn an_unexpected_event_date_or_passenger_shape_never_fails_the_charge() {
+        // Before these keys were read they were ignored whatever their type; reading them
+        // must not turn a charge that used to go through into a configuration error.
+        let body = card_charge_body(stay_metadata(json!({
+            "title": "Hotel stay",
+            "event_date": 20261220,
+            "passenger": "Luis Perez"
+        })));
+        let item = &body["additional_info"]["items"][0];
+        assert!(
+            item["event_date"]
+                .as_str()
+                .is_some_and(|date| date.ends_with('Z')),
+            "{item}"
+        );
+        assert_eq!(
+            item["category_descriptor"]["passenger"]["first_name"],
+            "Ana"
+        );
+    }
+
+    // ---- Card tokenization: cardholder name ------------------------------------------
+
+    fn tokenized_holder_name(
+        holder_name: Option<&str>,
+        address: PaymentAddress,
+        frm_metadata: Option<serde_json::Value>,
+    ) -> String {
+        let router_data =
+            test_support::tokenization_router_data(holder_name, address, frm_metadata);
+        let request = MercadopagoTokenRequest::try_from(&router_data).unwrap();
+        request.cardholder.name.peek().clone()
+    }
+
+    fn payer_frm_metadata() -> Option<serde_json::Value> {
+        Some(json!({
+            "mercadopago": { "payer": { "first_name": "Marta", "last_name": "Lopez" } }
+        }))
+    }
+
+    #[test]
+    fn tokenization_sends_the_card_holder_name_first() {
+        assert_eq!(
+            tokenized_holder_name(
+                Some("ANA GOMEZ"),
+                test_support::billing("Luis", "Perez"),
+                payer_frm_metadata()
+            ),
+            "ANA GOMEZ"
+        );
+    }
+
+    #[test]
+    fn tokenization_falls_back_to_the_billing_full_name() {
+        assert_eq!(
+            tokenized_holder_name(
+                None,
+                test_support::billing("Luis", "Perez"),
+                payer_frm_metadata()
+            ),
+            "Luis Perez"
+        );
+        // A blank holder name is no name.
+        assert_eq!(
+            tokenized_holder_name(Some("  "), test_support::billing("Luis", "Perez"), None),
+            "Luis Perez"
+        );
+    }
+
+    #[test]
+    fn tokenization_falls_back_to_the_metadata_payer_name() {
+        assert_eq!(
+            tokenized_holder_name(None, PaymentAddress::default(), payer_frm_metadata()),
+            "Marta Lopez"
+        );
+        assert_eq!(
+            tokenized_holder_name(
+                None,
+                PaymentAddress::default(),
+                Some(json!({ "payer": { "first_name": "Marta" } }))
+            ),
+            "Marta"
+        );
+    }
+
+    #[test]
+    fn tokenization_keeps_the_sandbox_name_only_as_the_last_resort() {
+        assert_eq!(
+            tokenized_holder_name(None, PaymentAddress::default(), None),
+            "APRO"
+        );
     }
 }
