@@ -1549,8 +1549,21 @@ mod tests {
         );
         let request = serde_json::json!({ "device_id": "dev-request" });
         assert_eq!(
-            device_session_header(Some(request), Some(frm)).as_deref(),
+            device_session_header(Some(request), Some(frm.clone())).as_deref(),
             Some("dev-request")
+        );
+
+        // api2's direct card flow (and the PMS charge): request metadata with the guest's
+        // keys but no device id, the device id flat in frm_metadata.
+        let guest = serde_json::json!({
+            "email": "guest@example.com",
+            "first_name": "Ana",
+            "installments_info": { "original_amount": 1000 },
+            "psp": { "name": "mercadopago", "metadata": {} }
+        });
+        assert_eq!(
+            device_session_header(Some(guest), Some(frm)).as_deref(),
+            Some("dev-frm")
         );
     }
 
