@@ -2155,9 +2155,10 @@ impl From<&MercadopagoWebhookNotification> for api_models::webhooks::IncomingWeb
     }
 }
 
-/// Builders shared by the transformer tests and the connector (header) tests.
+/// Builders shared by the transformer tests, the connector (header) tests and other
+/// connectors' transformer tests that need a card charge `RouterData`.
 #[cfg(test)]
-pub(super) mod test_support {
+pub(crate) mod test_support {
     use std::marker::PhantomData;
 
     use common_utils::types::MinorUnit;
