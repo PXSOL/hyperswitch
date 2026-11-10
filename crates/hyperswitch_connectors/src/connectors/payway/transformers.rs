@@ -899,9 +899,82 @@ pub struct PaywayTokenRequest {
     card_expiration_year: Secret<String>,
     card_holder_name: Secret<String>,
     security_code: Secret<String>,
-    #[serde(default)]
-    card_holder_identification: Vec<serde_json::Value>,
+    /// The cardholder's document, or the empty list every token request sent before one was
+    /// read (see `card_holder_identification`).
+    #[serde(serialize_with = "serialize_card_holder_identification")]
+    card_holder_identification: Option<PaywayCardHolderIdentification>,
     fraud_detection: FraudDetection,
+}
+
+/// `card_holder_identification` of `POST /tokens`. Optional for Payway; Visa uses it for its
+/// additional data validation (VTE), whose result is only advisory.
+#[derive(Debug, Serialize)]
+pub struct PaywayCardHolderIdentification {
+    #[serde(rename = "type")]
+    identification_type: &'static str,
+    number: Secret<String>,
+}
+
+fn serialize_card_holder_identification<S>(
+    identification: &Option<PaywayCardHolderIdentification>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match identification {
+        Some(identification) => identification.serialize(serializer),
+        None => serializer.collect_seq(std::iter::empty::<()>()),
+    }
+}
+
+/// Payway's identification type for a document type as the caller names it, compared without
+/// case, accents or punctuation (`"D.N.I."` is `dni`). Only the values Payway's SDKs send are
+/// mapped: `dni` (every SDK) and `cuil` (the JavaScript SDK token table, "dni/DNI, cuil/CUIL").
+fn payway_identification_type(doc_type: &str) -> Option<&'static str> {
+    let key: String = doc_type
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(|c| match c {
+            'á' | 'à' | 'â' | 'ä' => 'a',
+            'é' | 'è' | 'ê' | 'ë' => 'e',
+            'í' | 'ì' | 'î' | 'ï' => 'i',
+            'ó' | 'ò' | 'ô' | 'ö' => 'o',
+            'ú' | 'ù' | 'û' | 'ü' => 'u',
+            other => other,
+        })
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    match key.as_str() {
+        "dni" => Some("dni"),
+        "cuil" => Some("cuil"),
+        _ => None,
+    }
+}
+
+/// A trimmed, non-blank text value of `metadata[key]`.
+fn metadata_text<'a>(metadata: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    metadata
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// The cardholder's document from `frm_metadata` `doc_type` and `doc_number` (`payway.*`
+/// first, then flat keys). The token request sees no payment metadata, so the document comes
+/// from `frm_metadata`. `None` when either key is missing, not text or blank, or the type is
+/// not one Payway takes.
+fn card_holder_identification(
+    frm_metadata: Option<&serde_json::Value>,
+) -> Option<PaywayCardHolderIdentification> {
+    let metadata = utils::merge_connector_scoped_metadata(PAYWAY_METADATA_SCOPE, &[frm_metadata])?;
+    let identification_type = payway_identification_type(metadata_text(&metadata, "doc_type")?)?;
+    let number = metadata_text(&metadata, "doc_number")?;
+    Some(PaywayCardHolderIdentification {
+        identification_type,
+        number: Secret::new(number.to_string()),
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -984,7 +1057,9 @@ impl TryFrom<&types::TokenizationRouterData> for PaywayTokenRequest {
                     .clone()
                     .unwrap_or_else(|| Secret::new("".to_string())),
                 security_code: card.card_cvc,
-                card_holder_identification: vec![],
+                card_holder_identification: card_holder_identification(
+                    item.frm_metadata.as_ref().map(|metadata| metadata.peek()),
+                ),
                 fraud_detection: FraudDetection {
                     device_unique_identifier: device_id,
                 },
@@ -1398,5 +1473,87 @@ mod tests {
                 "{error:?}"
             );
         }
+    }
+
+    /// The token request (`POST /tokens`) built with the given `frm_metadata`.
+    fn token_request_sent_for(frm_metadata: Option<serde_json::Value>) -> serde_json::Value {
+        let router_data = test_support::tokenization_router_data(
+            Some("ANA GOMEZ"),
+            hyperswitch_domain_models::payment_address::PaymentAddress::default(),
+            frm_metadata,
+        );
+        serde_json::to_value(PaywayTokenRequest::try_from(&router_data).unwrap()).unwrap()
+    }
+
+    fn identification_sent_for(frm_metadata: Option<serde_json::Value>) -> serde_json::Value {
+        token_request_sent_for(frm_metadata)
+            .get("card_holder_identification")
+            .cloned()
+            .unwrap()
+    }
+
+    #[test]
+    fn token_request_sends_the_cardholder_document() {
+        for (doc_type, sent_type) in [
+            ("DNI", "dni"),
+            ("dni", "dni"),
+            (" D.N.I. ", "dni"),
+            ("CUIL", "cuil"),
+            ("Cu\u{ed}l", "cuil"),
+        ] {
+            assert_eq!(
+                identification_sent_for(Some(serde_json::json!({
+                    "doc_type": doc_type,
+                    "doc_number": " 30111222 "
+                }))),
+                serde_json::json!({ "type": sent_type, "number": "30111222" }),
+                "{doc_type:?}"
+            );
+        }
+        // Keys under `payway` win over flat ones, as in the payment metadata.
+        assert_eq!(
+            identification_sent_for(Some(serde_json::json!({
+                "doc_type": "CUIL",
+                "doc_number": "20301112223",
+                "payway": { "doc_type": "DNI", "doc_number": "30111222" }
+            }))),
+            serde_json::json!({ "type": "dni", "number": "30111222" })
+        );
+    }
+
+    #[test]
+    fn token_request_without_a_usable_document_sends_the_empty_list() {
+        for frm_metadata in [
+            serde_json::json!({}),
+            serde_json::json!({ "device_id": "device-1" }),
+            serde_json::json!({ "doc_type": "Pasaporte", "doc_number": "AA123456" }),
+            serde_json::json!({ "doc_type": "CUIT", "doc_number": "20301112223" }),
+            serde_json::json!({ "doc_type": "", "doc_number": "30111222" }),
+            serde_json::json!({ "doc_type": "DNI", "doc_number": "  " }),
+            serde_json::json!({ "doc_type": "DNI" }),
+            serde_json::json!({ "doc_type": "DNI", "doc_number": 30111222 }),
+        ] {
+            assert_eq!(
+                identification_sent_for(Some(frm_metadata.clone())),
+                serde_json::json!([]),
+                "{frm_metadata}"
+            );
+        }
+    }
+
+    #[test]
+    fn token_request_without_frm_metadata_is_the_same_as_before() {
+        assert_eq!(
+            token_request_sent_for(None),
+            serde_json::json!({
+                "card_number": "4509953566233704",
+                "card_expiration_month": "11",
+                "card_expiration_year": "30",
+                "card_holder_name": "ANA GOMEZ",
+                "security_code": "123",
+                "card_holder_identification": [],
+                "fraud_detection": { "device_unique_identifier": "pxs_mp_1" }
+            })
+        );
     }
 }
