@@ -288,25 +288,13 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
             "x-platform-id".to_string(),
             hyperswitch_masking::Secret::new(PXSOL_PLATFORM_ID.to_string()).into_masked(),
         ));
-        // Add X-meli-session-id header if device_id is provided in metadata or frm_metadata (for anti-fraud)
-        let device_id = req
-            .request
-            .metadata
-            .as_ref()
-            .and_then(|m| {
-                serde_json::from_value::<mercadopago::MercadopagoMetadata>(m.clone()).ok()
-            })
-            .and_then(|mp| mp.device_id)
-            .or_else(|| {
-                // Fallback to frm_metadata
-                req.frm_metadata
-                    .as_ref()
-                    .and_then(|m| {
-                        serde_json::from_value::<mercadopago::MercadopagoMetadata>(m.peek().clone())
-                            .ok()
-                    })
-                    .and_then(|mp| mp.device_id)
-            });
+        // Device fingerprint from Mercado Pago's SDK, for anti-fraud. Resolved like every other
+        // Mercado Pago key (scoped `metadata.mercadopago.device_id` first, then flat, then
+        // frm_metadata), but on its own: the header is absent only when there is no device id.
+        let device_id = mercadopago::MercadopagoMetadata::resolve_device_id(
+            req.request.metadata.as_ref(),
+            &req.frm_metadata,
+        );
 
         if let Some(device_id) = device_id {
             headers.push((
@@ -1476,6 +1464,106 @@ mod tests {
         assert_eq!(
             classify_body("", "type=order"),
             mercadopago::MercadopagoWebhookNotification::Unknown
+        );
+    }
+
+    /// The `X-meli-session-id` header (Mercado Pago's device fingerprint for anti-fraud) of
+    /// a card charge with the given metadata, if any.
+    fn device_session_header(
+        metadata: Option<serde_json::Value>,
+        frm_metadata: Option<serde_json::Value>,
+    ) -> Option<String> {
+        let router_data = mercadopago::test_support::authorize_router_data(metadata, frm_metadata);
+        let headers =
+            ConnectorIntegration::<Authorize, PaymentsAuthorizeData, PaymentsResponseData>::get_headers(
+                Mercadopago::new(),
+                &router_data,
+                &Connectors::default(),
+            )
+            .expect("authorize headers build");
+        headers
+            .into_iter()
+            .find(|(name, _)| name == "X-meli-session-id")
+            .map(|(_, value)| value.into_inner())
+    }
+
+    #[test]
+    fn device_session_header_reads_the_scoped_device_id() {
+        // What api2 sends.
+        let scoped = serde_json::json!({ "mercadopago": { "device_id": "dev-scoped" } });
+        assert_eq!(
+            device_session_header(Some(scoped), None).as_deref(),
+            Some("dev-scoped")
+        );
+
+        // The scoped value wins over the flat one, like every other Mercado Pago key.
+        let both = serde_json::json!({
+            "device_id": "dev-flat",
+            "mercadopago": { "device_id": "dev-scoped" }
+        });
+        assert_eq!(
+            device_session_header(Some(both), None).as_deref(),
+            Some("dev-scoped")
+        );
+    }
+
+    #[test]
+    fn device_session_header_reads_the_flat_device_id() {
+        // What PPS sends: the device id flat, next to the scoped Mercado Pago object.
+        let flat = serde_json::json!({
+            "device_id": "dev-flat",
+            "mercadopago": { "payment_method_id": "visa" }
+        });
+        assert_eq!(
+            device_session_header(Some(flat), None).as_deref(),
+            Some("dev-flat")
+        );
+    }
+
+    #[test]
+    fn device_session_header_is_absent_without_a_device_id() {
+        assert_eq!(device_session_header(None, None), None);
+        let without = serde_json::json!({ "mercadopago": { "payment_method_id": "visa" } });
+        assert_eq!(device_session_header(Some(without), None), None);
+    }
+
+    #[test]
+    fn device_session_header_survives_an_unrelated_key_of_unexpected_type() {
+        let metadata = serde_json::json!({
+            "device_id": "dev-flat",
+            "installments": "three",
+            "item": "not an object"
+        });
+        assert_eq!(
+            device_session_header(Some(metadata), None).as_deref(),
+            Some("dev-flat")
+        );
+    }
+
+    #[test]
+    fn device_session_header_falls_back_to_frm_metadata() {
+        let frm = serde_json::json!({ "device_id": "dev-frm" });
+        assert_eq!(
+            device_session_header(None, Some(frm.clone())).as_deref(),
+            Some("dev-frm")
+        );
+        let request = serde_json::json!({ "device_id": "dev-request" });
+        assert_eq!(
+            device_session_header(Some(request), Some(frm.clone())).as_deref(),
+            Some("dev-request")
+        );
+
+        // api2's direct card flow (and the PMS charge): request metadata with the guest's
+        // keys but no device id, the device id flat in frm_metadata.
+        let guest = serde_json::json!({
+            "email": "guest@example.com",
+            "first_name": "Ana",
+            "installments_info": { "original_amount": 1000 },
+            "psp": { "name": "mercadopago", "metadata": {} }
+        });
+        assert_eq!(
+            device_session_header(Some(guest), Some(frm)).as_deref(),
+            Some("dev-frm")
         );
     }
 

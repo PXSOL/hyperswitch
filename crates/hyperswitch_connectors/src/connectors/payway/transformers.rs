@@ -150,6 +150,25 @@ fn valid_establishment_name(statement_descriptor: Option<&str>) -> Option<String
     is_valid.then(|| name.to_string())
 }
 
+/// Country sent in `bill_to` and `ship_to` when the payer's is not usable (and for every
+/// charge before the payer's country was read).
+const PAYWAY_DEFAULT_COUNTRY: &str = "AR";
+
+/// The payer's country (`metadata.country`) as Payway takes it: an ISO 3166-1 alpha-2 code,
+/// uppercased. A name, a numeric or three-letter code, a blank or an unknown code keeps
+/// `PAYWAY_DEFAULT_COUNTRY`, so a bad value can never block a charge.
+fn payway_country(country: &str) -> String {
+    Some(country.trim())
+        .filter(|code| code.len() == 2 && code.chars().all(|c| c.is_ascii_alphabetic()))
+        .and_then(|code| {
+            code.to_ascii_uppercase()
+                .parse::<enums::CountryAlpha2>()
+                .ok()
+        })
+        .map(|country| country.to_string())
+        .unwrap_or_else(|| PAYWAY_DEFAULT_COUNTRY.to_string())
+}
+
 impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPaymentsRequest {
     type Error = error_stack::Report<errors::ConnectorError>;
     fn try_from(
@@ -185,8 +204,10 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
             device_id.clone()
         };
 
+        let country = payway_country(&bill_to_meta.country);
+
         let bill_to = PaywayBillTo {
-            country: "AR".to_string(),
+            country: country.clone(),
             city: bill_to_meta.city.clone(),
             customer_id: Some(customer_id),
             email: bill_to_meta.email.clone(),
@@ -227,7 +248,7 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
         };
 
         let ship_to = PaywayShipTo {
-            country: "AR".to_string(),
+            country,
             city: bill_to_meta.city.clone(),
             email: bill_to_meta.email.clone(),
             first_name: bill_to_meta.first_name.clone(),
@@ -878,9 +899,82 @@ pub struct PaywayTokenRequest {
     card_expiration_year: Secret<String>,
     card_holder_name: Secret<String>,
     security_code: Secret<String>,
-    #[serde(default)]
-    card_holder_identification: Vec<serde_json::Value>,
+    /// The cardholder's document, or the empty list every token request sent before one was
+    /// read (see `card_holder_identification`).
+    #[serde(serialize_with = "serialize_card_holder_identification")]
+    card_holder_identification: Option<PaywayCardHolderIdentification>,
     fraud_detection: FraudDetection,
+}
+
+/// `card_holder_identification` of `POST /tokens`. Optional for Payway; Visa uses it for its
+/// additional data validation (VTE), whose result is only advisory.
+#[derive(Debug, Serialize)]
+pub struct PaywayCardHolderIdentification {
+    #[serde(rename = "type")]
+    identification_type: &'static str,
+    number: Secret<String>,
+}
+
+fn serialize_card_holder_identification<S>(
+    identification: &Option<PaywayCardHolderIdentification>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match identification {
+        Some(identification) => identification.serialize(serializer),
+        None => serializer.collect_seq(std::iter::empty::<()>()),
+    }
+}
+
+/// Payway's identification type for a document type as the caller names it, compared without
+/// case, accents or punctuation (`"D.N.I."` is `dni`). Only the values Payway's SDKs send are
+/// mapped: `dni` (every SDK) and `cuil` (the JavaScript SDK token table, "dni/DNI, cuil/CUIL").
+fn payway_identification_type(doc_type: &str) -> Option<&'static str> {
+    let key: String = doc_type
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(|c| match c {
+            'á' | 'à' | 'â' | 'ä' => 'a',
+            'é' | 'è' | 'ê' | 'ë' => 'e',
+            'í' | 'ì' | 'î' | 'ï' => 'i',
+            'ó' | 'ò' | 'ô' | 'ö' => 'o',
+            'ú' | 'ù' | 'û' | 'ü' => 'u',
+            other => other,
+        })
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    match key.as_str() {
+        "dni" => Some("dni"),
+        "cuil" => Some("cuil"),
+        _ => None,
+    }
+}
+
+/// A trimmed, non-blank text value of `metadata[key]`.
+fn metadata_text<'a>(metadata: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    metadata
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// The cardholder's document from `frm_metadata` `doc_type` and `doc_number` (`payway.*`
+/// first, then flat keys). The token request sees no payment metadata, so the document comes
+/// from `frm_metadata`. `None` when either key is missing, not text or blank, or the type is
+/// not one Payway takes.
+fn card_holder_identification(
+    frm_metadata: Option<&serde_json::Value>,
+) -> Option<PaywayCardHolderIdentification> {
+    let metadata = utils::merge_connector_scoped_metadata(PAYWAY_METADATA_SCOPE, &[frm_metadata])?;
+    let identification_type = payway_identification_type(metadata_text(&metadata, "doc_type")?)?;
+    let number = metadata_text(&metadata, "doc_number")?;
+    Some(PaywayCardHolderIdentification {
+        identification_type,
+        number: Secret::new(number.to_string()),
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -963,7 +1057,9 @@ impl TryFrom<&types::TokenizationRouterData> for PaywayTokenRequest {
                     .clone()
                     .unwrap_or_else(|| Secret::new("".to_string())),
                 security_code: card.card_cvc,
-                card_holder_identification: vec![],
+                card_holder_identification: card_holder_identification(
+                    item.frm_metadata.as_ref().map(|metadata| metadata.peek()),
+                ),
                 fraud_detection: FraudDetection {
                     device_unique_identifier: device_id,
                 },
@@ -1057,7 +1153,10 @@ impl<F, T> TryFrom<ResponseRouterData<F, PaywayAuthorizeResponse, T, PaymentsRes
 
 #[cfg(test)]
 mod tests {
+    use common_utils::types::{AmountConvertor, StringMinorUnitForConnector};
+
     use super::*;
+    use crate::connectors::mercadopago::transformers::test_support;
 
     #[test]
     fn metadata_scoped_value_wins_over_flat() {
@@ -1235,5 +1334,226 @@ mod tests {
             serde_json::to_value(payment_request(Some("San Nicolas Plaza Hotel".to_string())))
                 .unwrap();
         assert_eq!(with["establishment_name"], "San Nicolas Plaza Hotel");
+    }
+
+    /// The amount of a card charge, as the connector receives it.
+    fn charge_amount(router_data: &PaymentsAuthorizeRouterData) -> StringMinorUnit {
+        StringMinorUnitForConnector
+            .convert(
+                router_data.request.minor_amount,
+                router_data.request.currency,
+            )
+            .unwrap()
+    }
+
+    /// What a card charge builds from the given payment metadata.
+    fn charge_request(
+        metadata: serde_json::Value,
+    ) -> Result<PaywayPaymentsRequest, error_stack::Report<errors::ConnectorError>> {
+        let router_data = test_support::authorize_router_data(Some(metadata), None);
+        let amount = charge_amount(&router_data);
+        PaywayPaymentsRequest::try_from(&PaywayRouterData::from((amount, &router_data)))
+    }
+
+    /// The text at `pointer` in a serialized charge.
+    fn text_at(request: &serde_json::Value, pointer: &str) -> String {
+        request
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_string()
+    }
+
+    /// The `(bill_to, ship_to)` countries a card charge sends for the given payer country.
+    fn countries_sent_for(country: &str) -> (String, String) {
+        let request = serde_json::to_value(
+            charge_request(billing_metadata(serde_json::json!(country)))
+                .expect("the charge must build"),
+        )
+        .unwrap();
+        (
+            text_at(&request, "/fraud_detection/bill_to/country"),
+            text_at(
+                &request,
+                "/fraud_detection/retail_transaction_data/ship_to/country",
+            ),
+        )
+    }
+
+    /// The flat billing metadata api2 sends, with the given `country`.
+    fn billing_metadata(country: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "payment_method_id": 1,
+            "installments": 1,
+            "country": country,
+            "city": "Mendoza",
+            "email": "guest@example.com",
+            "first_name": "Ana",
+            "last_name": "Gomez",
+            "phone_number": "5492610000000",
+            "postal_code": "5500",
+            "state": "M",
+            "street1": "Calle 1"
+        })
+    }
+
+    #[test]
+    fn charge_sends_the_payer_country_uppercased() {
+        for (given, sent) in [("uy", "UY"), ("Br", "BR"), (" cl ", "CL"), ("US", "US")] {
+            assert_eq!(
+                countries_sent_for(given),
+                (sent.to_string(), sent.to_string()),
+                "{given:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn charge_keeps_ar_for_an_unusable_payer_country() {
+        for given in ["", "  ", "Uruguay", "URY", "858", "U1", "XX", "\u{d1}U"] {
+            assert_eq!(
+                countries_sent_for(given),
+                ("AR".to_string(), "AR".to_string()),
+                "{given:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn charge_for_an_argentine_payer_sends_the_same_billing_as_before() {
+        let request = serde_json::to_value(
+            charge_request(billing_metadata(serde_json::json!("AR"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            request.pointer("/fraud_detection/bill_to"),
+            Some(&serde_json::json!({
+                "country": "AR",
+                "city": "Mendoza",
+                "customer_id": "pxs_mp_1",
+                "email": "guest@example.com",
+                "first_name": "Ana",
+                "last_name": "Gomez",
+                "phone_number": "5492610000000",
+                "postal_code": "5500",
+                "state": "M",
+                "street1": "Calle 1"
+            }))
+        );
+        assert_eq!(
+            request.pointer("/fraud_detection/retail_transaction_data/ship_to"),
+            Some(&serde_json::json!({
+                "country": "AR",
+                "city": "Mendoza",
+                "email": "guest@example.com",
+                "first_name": "Ana",
+                "last_name": "Gomez",
+                "phone_number": "5492610000000",
+                "postal_code": "5500",
+                "state": "M",
+                "street1": "Calle 1"
+            }))
+        );
+    }
+
+    #[test]
+    fn charge_without_a_payer_country_still_reports_missing_billing() {
+        // The country is what makes the flat billing keys a `bill_to`; without it the charge
+        // fails as before instead of going out with the default country.
+        let mut without_country = billing_metadata(serde_json::Value::Null);
+        without_country.as_object_mut().unwrap().remove("country");
+        for metadata in [without_country, billing_metadata(serde_json::Value::Null)] {
+            let error = charge_request(metadata).expect_err("billing is required");
+            assert!(
+                matches!(
+                    error.current_context(),
+                    errors::ConnectorError::MissingRequiredField { field_name }
+                        if field_name == "metadata.bill_to"
+                ),
+                "{error:?}"
+            );
+        }
+    }
+
+    /// The token request (`POST /tokens`) built with the given `frm_metadata`.
+    fn token_request_sent_for(frm_metadata: Option<serde_json::Value>) -> serde_json::Value {
+        let router_data = test_support::tokenization_router_data(
+            Some("ANA GOMEZ"),
+            hyperswitch_domain_models::payment_address::PaymentAddress::default(),
+            frm_metadata,
+        );
+        serde_json::to_value(PaywayTokenRequest::try_from(&router_data).unwrap()).unwrap()
+    }
+
+    fn identification_sent_for(frm_metadata: Option<serde_json::Value>) -> serde_json::Value {
+        token_request_sent_for(frm_metadata)
+            .get("card_holder_identification")
+            .cloned()
+            .unwrap()
+    }
+
+    #[test]
+    fn token_request_sends_the_cardholder_document() {
+        for (doc_type, sent_type) in [
+            ("DNI", "dni"),
+            ("dni", "dni"),
+            (" D.N.I. ", "dni"),
+            ("CUIL", "cuil"),
+            ("Cu\u{ed}l", "cuil"),
+        ] {
+            assert_eq!(
+                identification_sent_for(Some(serde_json::json!({
+                    "doc_type": doc_type,
+                    "doc_number": " 30111222 "
+                }))),
+                serde_json::json!({ "type": sent_type, "number": "30111222" }),
+                "{doc_type:?}"
+            );
+        }
+        // Keys under `payway` win over flat ones, as in the payment metadata.
+        assert_eq!(
+            identification_sent_for(Some(serde_json::json!({
+                "doc_type": "CUIL",
+                "doc_number": "20301112223",
+                "payway": { "doc_type": "DNI", "doc_number": "30111222" }
+            }))),
+            serde_json::json!({ "type": "dni", "number": "30111222" })
+        );
+    }
+
+    #[test]
+    fn token_request_without_a_usable_document_sends_the_empty_list() {
+        for frm_metadata in [
+            serde_json::json!({}),
+            serde_json::json!({ "device_id": "device-1" }),
+            serde_json::json!({ "doc_type": "Pasaporte", "doc_number": "AA123456" }),
+            serde_json::json!({ "doc_type": "CUIT", "doc_number": "20301112223" }),
+            serde_json::json!({ "doc_type": "", "doc_number": "30111222" }),
+            serde_json::json!({ "doc_type": "DNI", "doc_number": "  " }),
+            serde_json::json!({ "doc_type": "DNI" }),
+            serde_json::json!({ "doc_type": "DNI", "doc_number": 30111222 }),
+        ] {
+            assert_eq!(
+                identification_sent_for(Some(frm_metadata.clone())),
+                serde_json::json!([]),
+                "{frm_metadata}"
+            );
+        }
+    }
+
+    #[test]
+    fn token_request_without_frm_metadata_is_the_same_as_before() {
+        assert_eq!(
+            token_request_sent_for(None),
+            serde_json::json!({
+                "card_number": "4509953566233704",
+                "card_expiration_month": "11",
+                "card_expiration_year": "30",
+                "card_holder_name": "ANA GOMEZ",
+                "security_code": "123",
+                "card_holder_identification": [],
+                "fraud_detection": { "device_unique_identifier": "pxs_mp_1" }
+            })
+        );
     }
 }

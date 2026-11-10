@@ -680,6 +680,27 @@ pub struct WompiTransactionExtra {
     pub external_identifier: Option<Secret<String>>,
     #[serde(default)]
     pub authorizer_transaction_id: Option<Secret<String>>,
+    /// Response code of the processor or card issuer (`"51"` for insufficient funds), which
+    /// Wompi recommends reading instead of `status_message`. Read leniently: an unexpected
+    /// shape costs the code, never the rest of `extra`.
+    #[serde(default, deserialize_with = "lenient_response_code")]
+    pub processor_response_code: Option<String>,
+}
+
+/// A response code given as text or as a number; anything else, or a blank value, is `None`.
+fn lenient_response_code<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let code = match value {
+        Some(serde_json::Value::String(code)) => Some(code),
+        Some(serde_json::Value::Number(code)) => Some(code.to_string()),
+        _ => None,
+    };
+    Ok(code
+        .map(|code| code.trim().to_string())
+        .filter(|code| !code.is_empty()))
 }
 
 fn lenient_payment_method<'de, D>(
@@ -716,6 +737,17 @@ impl WompiTransactionData {
                 .as_ref()
                 .map(|reference| reference.peek().clone()),
         })
+    }
+
+    /// `payment_method.extra.processor_response_code`, the issuer's or processor's reason
+    /// for a decline, so decline rules can match it as the network decline code.
+    fn processor_response_code(&self) -> Option<String> {
+        self.payment_method
+            .as_ref()?
+            .extra
+            .as_ref()?
+            .processor_response_code
+            .clone()
     }
 }
 
@@ -980,9 +1012,10 @@ fn charged_connector_metadata(transaction: &WompiTransactionData) -> Option<serd
 /// Builds the RouterData outcome for one Wompi transaction: Charged/Pending/
 /// Voided become a `TransactionResponse`, DECLINED/ERROR become an `Err`
 /// carrying the connector's own reason so it is never lost even though Wompi
-/// answers a decline with HTTP 2xx. Shared with the card sync-by-reference path
-/// in wompi.rs (`card_sync_by_reference_response` below), not just the two
-/// `TryFrom` impls in this file.
+/// answers a decline with HTTP 2xx, with `processor_response_code` as the
+/// network decline code when Wompi reports one. Shared with the card
+/// sync-by-reference path in wompi.rs (`card_sync_by_reference_response`
+/// below), not just the two `TryFrom` impls in this file.
 pub(super) fn transaction_to_router_data<F, T>(
     transaction: WompiTransactionData,
     data: RouterData<F, T, PaymentsResponseData>,
@@ -993,6 +1026,7 @@ pub(super) fn transaction_to_router_data<F, T>(
         .then(|| charged_connector_metadata(&transaction))
         .flatten();
     let response = if matches!(status, enums::AttemptStatus::Failure) {
+        let network_decline_code = transaction.processor_response_code();
         Err(ErrorResponse {
             status_code: http_code,
             code: format!("{:?}", transaction.status).to_uppercase(),
@@ -1004,7 +1038,7 @@ pub(super) fn transaction_to_router_data<F, T>(
             attempt_status: Some(status),
             connector_transaction_id: Some(transaction.id),
             network_advice_code: None,
-            network_decline_code: None,
+            network_decline_code,
             network_error_message: None,
             connector_metadata: None,
             connector_response_reference_id: None,
@@ -4701,6 +4735,149 @@ mod tests {
             .expect("charged must carry metadata");
         assert!(metadata.get("authorization_code").is_none());
         assert!(metadata.get("reference_number").is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Decline code (`processor_response_code` -> `network_decline_code`)
+    // ------------------------------------------------------------------
+
+    /// A declined card as Wompi answers it (`POST /transactions`, `GET /transactions/{id}`,
+    /// the reference search), with the given `payment_method.extra`.
+    fn declined_card_json(extra: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": "txn-declined-1",
+            "reference": "ref-declined-1",
+            "status": "DECLINED",
+            "status_message": "Fondos Insuficientes",
+            "finalized_at": "2026-09-25T15:00:00Z",
+            "payment_method_type": "CARD",
+            "amount_in_cents": 100000,
+            "payment_method": {
+                "type": "CARD",
+                "installments": 1,
+                "extra": extra
+            }
+        })
+    }
+
+    /// The error of a card Authorize answered with `transaction`.
+    fn authorize_decline(transaction: serde_json::Value) -> ErrorResponse {
+        let result = PaymentsAuthorizeRouterData::try_from(ResponseRouterData {
+            response: WompiTransactionResponse {
+                data: transaction_from(transaction),
+            },
+            data: charged_router_data("ref-declined-1"),
+            http_code: 201,
+        })
+        .expect("a declined card must convert");
+        assert_eq!(result.status, enums::AttemptStatus::Failure);
+        result.response.expect_err("a declined card must be an Err")
+    }
+
+    /// The errors of a card PSync answered with `transaction`, by id and by reference.
+    fn sync_declines(transaction: serde_json::Value) -> Vec<ErrorResponse> {
+        let by_id = sync_with_external_void(
+            vec![transaction_from(transaction.clone())],
+            charged_sync_router_data(enums::AttemptStatus::Pending),
+            Some("txn-declined-1"),
+            MinorUnit::new(100000),
+            |transactions, data| {
+                transactions
+                    .into_iter()
+                    .next()
+                    .map(|transaction| transaction_to_router_data(transaction, data, 200))
+                    .ok_or_else(|| errors::ConnectorError::ResponseHandlingFailed.into())
+            },
+        )
+        .expect("sync by id must succeed");
+        let by_reference = sync_with_external_void(
+            vec![transaction_from(transaction)],
+            charged_sync_router_data(enums::AttemptStatus::Pending),
+            None,
+            MinorUnit::new(100000),
+            |transactions, data| Ok(card_sync_by_reference_response(transactions, data, 200)),
+        )
+        .expect("sync by reference must succeed");
+        [by_id, by_reference]
+            .into_iter()
+            .map(|result| {
+                assert_eq!(result.status, enums::AttemptStatus::Failure);
+                result.response.expect_err("a declined card must be an Err")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn authorize_decline_carries_the_processor_response_code() {
+        for code in [serde_json::json!("51"), serde_json::json!(51)] {
+            let error = authorize_decline(declined_card_json(serde_json::json!({
+                "processor_response_code": code
+            })));
+            assert_eq!(error.network_decline_code.as_deref(), Some("51"));
+            assert_eq!(error.code, "DECLINED");
+            assert_eq!(error.message, "Fondos Insuficientes");
+            assert_eq!(error.reason.as_deref(), Some("Fondos Insuficientes"));
+        }
+    }
+
+    #[test]
+    fn sync_decline_carries_the_processor_response_code() {
+        let errors = sync_declines(declined_card_json(serde_json::json!({
+            "processor_response_code": "05"
+        })));
+        for error in errors {
+            assert_eq!(error.network_decline_code.as_deref(), Some("05"));
+            assert_eq!(error.code, "DECLINED");
+            assert_eq!(error.message, "Fondos Insuficientes");
+            assert_eq!(
+                error.connector_transaction_id.as_deref(),
+                Some("txn-declined-1")
+            );
+        }
+    }
+
+    #[test]
+    fn decline_without_a_processor_response_code_keeps_the_previous_error() {
+        let mut without_payment_method = declined_card_json(serde_json::json!({}));
+        without_payment_method
+            .as_object_mut()
+            .unwrap()
+            .remove("payment_method");
+        for transaction in [
+            without_payment_method,
+            declined_card_json(serde_json::json!({})),
+            declined_card_json(serde_json::json!({ "processor_response_code": "" })),
+            declined_card_json(serde_json::json!({ "processor_response_code": "  " })),
+            declined_card_json(serde_json::json!({ "processor_response_code": null })),
+            declined_card_json(serde_json::json!({ "processor_response_code": { "x": 1 } })),
+        ] {
+            let mut errors = sync_declines(transaction.clone());
+            errors.push(authorize_decline(transaction.clone()));
+            for error in errors {
+                assert_eq!(error.network_decline_code, None, "{transaction}");
+                assert_eq!(error.code, "DECLINED");
+                assert_eq!(error.message, "Fondos Insuficientes");
+                assert_eq!(error.reason.as_deref(), Some("Fondos Insuficientes"));
+            }
+        }
+    }
+
+    #[test]
+    fn an_unexpected_processor_response_code_costs_only_the_code() {
+        let mut value = approved_card_json();
+        *value
+            .pointer_mut("/payment_method/extra/processor_response_code")
+            .unwrap() = serde_json::json!(["00"]);
+        let metadata = charged_connector_metadata(&transaction_from(value))
+            .expect("charged must carry metadata");
+        assert_eq!(
+            metadata.get("authorization_code"),
+            Some(&serde_json::json!("A1B2C3"))
+        );
+        assert_eq!(
+            metadata.get("reference_number"),
+            Some(&serde_json::json!("000000123456"))
+        );
     }
 
     #[test]
