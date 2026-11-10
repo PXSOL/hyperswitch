@@ -88,6 +88,84 @@ pub struct FiservemeaOrder {
     /// `order.tokenCryptogram: size must be between 20 and 256`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token_cryptogram: Option<Secret<String>>,
+    /// The payer's billing data (see `FiservemeaBilling`). `None` when the router has none,
+    /// which leaves the request exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    billing: Option<FiservemeaBilling>,
+}
+
+/// `order.billing` of a primary transaction, as the IPG REST v2 guide (Argentina 2026) lists
+/// it: `name`, `contact` (`phone`, `email`) and `address` (`address1`, `city`, `region`,
+/// `postalCode`, `country`). The country goes as ISO 3166-1 alpha-3, like the guide's request
+/// examples (`ARG`). Only the fields the router has are sent.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FiservemeaBilling {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<Secret<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    contact: Option<FiservemeaBillingContact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    address: Option<FiservemeaBillingAddress>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FiservemeaBillingContact {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    phone: Option<Secret<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    email: Option<common_utils::pii::Email>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FiservemeaBillingAddress {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    address1: Option<Secret<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    city: Option<Secret<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    region: Option<Secret<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    postal_code: Option<Secret<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    country: Option<common_enums::CountryAlpha3>,
+}
+
+impl FiservemeaBilling {
+    /// The billing data of the payment (its billing address, phone and email), or `None` when
+    /// it has none. Blank values are left out rather than sent empty.
+    fn from_router_data(router_data: &PaymentsAuthorizeRouterData) -> Option<Self> {
+        let non_blank =
+            |value: Option<Secret<String>>| value.filter(|value| !value.peek().trim().is_empty());
+        let address = FiservemeaBillingAddress {
+            address1: non_blank(router_data.get_optional_billing_line1()),
+            city: non_blank(router_data.get_optional_billing_city().map(Secret::new)),
+            region: non_blank(router_data.get_optional_billing_state()),
+            postal_code: non_blank(router_data.get_optional_billing_zip()),
+            country: router_data
+                .get_optional_billing_country()
+                .map(common_enums::CountryAlpha2::from_alpha2_to_alpha3),
+        };
+        let has_address = address.address1.is_some()
+            || address.city.is_some()
+            || address.region.is_some()
+            || address.postal_code.is_some()
+            || address.country.is_some();
+        let contact = FiservemeaBillingContact {
+            phone: non_blank(router_data.get_optional_billing_phone_number()),
+            email: router_data.get_optional_billing_email(),
+        };
+        let has_contact = contact.phone.is_some() || contact.email.is_some();
+        let billing = Self {
+            name: non_blank(router_data.get_optional_billing_full_name()),
+            contact: has_contact.then_some(contact),
+            address: has_address.then_some(address),
+        };
+        (billing.name.is_some() || billing.contact.is_some() || billing.address.is_some())
+            .then_some(billing)
+    }
 }
 
 /// Largos que el gateway acepta para `order.tokenCryptogram`.
@@ -881,6 +959,7 @@ impl TryFrom<&FiservemeaRouterData<&PaymentsAuthorizeRouterData>> for Fiservemea
             soft_descriptor,
             // Se completa más abajo, sólo en la rama de network token passthrough.
             token_cryptogram: None,
+            billing: FiservemeaBilling::from_router_data(item.router_data),
         };
         // IPG limita `merchantTransactionId` a 40 caracteres, mientras que
         // `merchant_order_reference_id` acepta hasta 255 en la API de Hyperswitch:
@@ -1181,6 +1260,7 @@ impl TryFrom<&RouterData<SetupMandate, SetupMandateRequestData, PaymentsResponse
                         additional_details: None,
                         soft_descriptor: None,
                         token_cryptogram: None,
+                        billing: None,
                     },
                     payment_method: FiservemeaPaymentMethods::PaymentCard(card),
                     authentication_request: None,
@@ -2830,6 +2910,7 @@ mod tests {
             additional_details: None,
             soft_descriptor: None,
             token_cryptogram: None,
+            billing: None,
         };
         let json = serde_json::to_value(&order).unwrap();
         assert_eq!(json["installmentOptions"]["numberOfInstallments"], 6);
@@ -2887,6 +2968,7 @@ mod tests {
                 dynamic_merchant_name: Secret::new("PXSOL*Reservas".to_string()),
             }),
             token_cryptogram: None,
+            billing: None,
         };
         let json = serde_json::to_value(&order).unwrap();
         assert_eq!(
@@ -3315,6 +3397,7 @@ mod tests {
                 additional_details: None,
                 soft_descriptor: None,
                 token_cryptogram: None,
+                billing: None,
             },
             payment_method: FiservemeaPaymentMethods::PaymentCard(FiservemeaPaymentCard {
                 number: "4111111111111111".parse().unwrap(),
@@ -5414,6 +5497,121 @@ mod tests {
             None,
         );
         assert_eq!(got, expected);
+    }
+
+    /// The cert sale of `cert_case_sale_one_payment_matches_the_accepted_payload`, with the
+    /// given address as the payment's `billing` (the router unifies it into the payment
+    /// method billing the connector reads).
+    fn cert_sale_payload_with_billing(
+        billing: hyperswitch_domain_models::address::Address,
+    ) -> serde_json::Value {
+        let mut router_data: PaymentsAuthorizeRouterData = cert_router_data(
+            CERT_STORE_AR,
+            "PX-1786053416-01-sale",
+            cert_authorize_data(
+                cert_card_data(CERT_CARD),
+                100_000,
+                common_enums::Currency::ARS,
+                None,
+            ),
+        );
+        router_data.address = PaymentAddress::new(None, Some(billing), None, None);
+        authorize_payload(&router_data)
+    }
+
+    /// The same cert sale without billing: the payload the gateway accepted.
+    fn cert_sale_payload_without_billing() -> serde_json::Value {
+        cert_card_sale_payload(
+            CERT_STORE_AR,
+            "PX-1786053416-01-sale",
+            CERT_CARD,
+            100_000,
+            common_enums::Currency::ARS,
+            None,
+        )
+    }
+
+    fn test_email(email: &str) -> common_utils::pii::Email {
+        email.parse().unwrap()
+    }
+
+    #[test]
+    fn authorize_sends_the_payer_billing_in_the_order() {
+        let mut got = cert_sale_payload_with_billing(hyperswitch_domain_models::address::Address {
+            address: Some(hyperswitch_domain_models::address::AddressDetails {
+                first_name: Some(Secret::new("Ana".to_string())),
+                last_name: Some(Secret::new("Gomez".to_string())),
+                line1: Some(Secret::new("Av Test 123".to_string())),
+                city: Some("Buenos Aires".to_string()),
+                state: Some(Secret::new("CABA".to_string())),
+                zip: Some(Secret::new("1000".to_string())),
+                country: Some(common_enums::CountryAlpha2::AR),
+                ..Default::default()
+            }),
+            phone: Some(hyperswitch_domain_models::address::PhoneDetails {
+                number: Some(Secret::new("1144445555".to_string())),
+                country_code: Some("+54".to_string()),
+            }),
+            email: Some(test_email("ana@example.com")),
+        });
+        let billing = got["order"]
+            .as_object_mut()
+            .unwrap()
+            .remove("billing")
+            .expect("the order carries the billing");
+        assert_eq!(
+            billing,
+            serde_json::json!({
+                "name": "Ana Gomez",
+                "contact": { "phone": "1144445555", "email": "ana@example.com" },
+                "address": {
+                    "address1": "Av Test 123",
+                    "city": "Buenos Aires",
+                    "region": "CABA",
+                    "postalCode": "1000",
+                    "country": "ARG"
+                }
+            })
+        );
+        // Everything else is the payload the cert gateway accepted.
+        assert_eq!(got, cert_sale_payload_without_billing());
+    }
+
+    #[test]
+    fn authorize_sends_only_the_billing_fields_present() {
+        let got = cert_sale_payload_with_billing(hyperswitch_domain_models::address::Address {
+            address: Some(hyperswitch_domain_models::address::AddressDetails {
+                line1: Some(Secret::new(String::new())),
+                city: Some("  ".to_string()),
+                country: Some(common_enums::CountryAlpha2::UY),
+                ..Default::default()
+            }),
+            phone: None,
+            email: Some(test_email("ana@example.com")),
+        });
+        assert_eq!(
+            got["order"]["billing"],
+            serde_json::json!({
+                "contact": { "email": "ana@example.com" },
+                "address": { "country": "URY" }
+            })
+        );
+    }
+
+    #[test]
+    fn authorize_without_billing_data_sends_the_same_order_as_before() {
+        let got = cert_sale_payload_with_billing(hyperswitch_domain_models::address::Address {
+            address: Some(hyperswitch_domain_models::address::AddressDetails {
+                line1: Some(Secret::new(" ".to_string())),
+                ..Default::default()
+            }),
+            phone: Some(hyperswitch_domain_models::address::PhoneDetails {
+                number: None,
+                country_code: Some("+54".to_string()),
+            }),
+            email: None,
+        });
+        assert_eq!(got, cert_sale_payload_without_billing());
     }
 
     /// evidencia.jsonl línea 1 — "AR SALE 1 pago USD", HTTP 200 APPROVED.
