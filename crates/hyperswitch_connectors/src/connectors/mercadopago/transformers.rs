@@ -91,8 +91,10 @@ pub struct MercadopagoItemInfo {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category_id: Option<String>,
-    /// When the purchased service happens, sent as given (for lodging, the check-in, e.g.
-    /// `2026-12-20T00:00:00.000Z`). Without it the request timestamp is sent, as before.
+    /// When the purchased service happens (for lodging, the check-in). Either a date
+    /// (`2026-12-20`, sent as noon UTC that day) or a date-time with its offset
+    /// (`2026-12-20T00:00:00.000Z`); see `normalize_event_date`. Without a usable value the
+    /// request timestamp is sent, as before.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -222,6 +224,47 @@ where
 {
     let value: Option<serde_json::Value> = DeDeserialize::deserialize(deserializer)?;
     Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
+
+/// Same encoding as `common_utils::date_time::date_as_yyyymmddthhmmssmmmz` (ISO 8601 with
+/// milliseconds, `2026-12-20T12:00:00.000Z`), the request-timestamp format Mercado Pago
+/// already accepts for `event_date`. That function only formats the current time, so its
+/// configuration is mirrored here to format a given one.
+const EVENT_DATE_FORMAT: time::format_description::well_known::iso8601::EncodedConfig =
+    time::format_description::well_known::iso8601::Config::DEFAULT
+        .set_time_precision(
+            time::format_description::well_known::iso8601::TimePrecision::Second {
+                decimal_digits: std::num::NonZeroU8::new(3),
+            },
+        )
+        .encode();
+
+/// `item.event_date` as Mercado Pago gets it, in the request-timestamp format.
+///
+/// - A date alone (`2026-12-20`, how api2 sends the check-in) becomes noon UTC that day:
+///   noon UTC is still the same calendar day in every time zone of the Americas.
+/// - A date-time with an offset (RFC 3339 or ISO 8601) keeps its instant, written in UTC and
+///   cut to milliseconds (the format rounds, so `59.9999` would otherwise become `60.000`).
+/// - Anything else is `None`, so the caller sends the request timestamp as before.
+fn normalize_event_date(value: &str) -> Option<String> {
+    use time::format_description::well_known::{Iso8601, Rfc3339};
+
+    let value = value.trim();
+    let date_time = time::Date::parse(
+        value,
+        time::macros::format_description!("[year]-[month]-[day]"),
+    )
+    .ok()
+    .and_then(|date| date.with_hms(12, 0, 0).ok())
+    .map(time::PrimitiveDateTime::assume_utc)
+    .or_else(|| time::OffsetDateTime::parse(value, &Rfc3339).ok())
+    .or_else(|| time::OffsetDateTime::parse(value, &Iso8601::PARSING).ok())?
+    .to_offset(time::UtcOffset::UTC);
+    date_time
+        .replace_millisecond(date_time.millisecond())
+        .ok()?
+        .format(&Iso8601::<EVENT_DATE_FORMAT>)
+        .ok()
 }
 
 impl TryFrom<&Option<serde_json::Value>> for MercadopagoMetadata {
@@ -641,8 +684,8 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
                 let event_date = metadata
                     .item
                     .as_ref()
-                    .and_then(|i| i.event_date.clone())
-                    .filter(|date| !date.trim().is_empty())
+                    .and_then(|i| i.event_date.as_deref())
+                    .and_then(normalize_event_date)
                     .or_else(|| common_utils::date_time::date_as_yyyymmddthhmmssmmmz().ok());
 
                 let additional_items = metadata.item.as_ref().map(|i| {
@@ -2947,6 +2990,87 @@ mod tests {
             before.as_str() <= event_date && event_date <= after.as_str(),
             "{before} <= {event_date} <= {after}"
         );
+    }
+
+    /// The `event_date` a card charge sends for the given `item.event_date`.
+    fn event_date_sent_for(event_date: serde_json::Value) -> String {
+        let body = card_charge_body(stay_metadata(json!({
+            "title": "Hotel stay",
+            "event_date": event_date
+        })));
+        body.pointer("/additional_info/items/0/event_date")
+            .and_then(serde_json::Value::as_str)
+            .expect("an item always carries an event_date")
+            .to_string()
+    }
+
+    /// The text with every digit replaced by `9`, to compare two timestamps' formats.
+    fn timestamp_shape(timestamp: &str) -> String {
+        timestamp
+            .chars()
+            .map(|c| if c.is_ascii_digit() { '9' } else { c })
+            .collect()
+    }
+
+    #[test]
+    fn a_date_only_event_date_is_sent_as_noon_utc_of_that_day() {
+        assert_eq!(
+            event_date_sent_for(json!("2026-12-20")),
+            "2026-12-20T12:00:00.000Z"
+        );
+        assert_eq!(
+            event_date_sent_for(json!(" 2027-01-05 ")),
+            "2027-01-05T12:00:00.000Z"
+        );
+    }
+
+    #[test]
+    fn a_normalized_event_date_has_the_request_timestamp_format() {
+        let request_timestamp = common_utils::date_time::date_as_yyyymmddthhmmssmmmz().unwrap();
+        for event_date in ["2026-12-20", "2026-12-20T14:00:00-03:00"] {
+            assert_eq!(
+                timestamp_shape(&event_date_sent_for(json!(event_date))),
+                timestamp_shape(&request_timestamp),
+                "{event_date}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_date_time_event_date_keeps_its_instant_in_utc() {
+        for (given, sent) in [
+            ("2026-12-20T00:00:00.000Z", "2026-12-20T00:00:00.000Z"),
+            ("2026-12-20T14:00:00Z", "2026-12-20T14:00:00.000Z"),
+            ("2026-12-20T14:00:00-03:00", "2026-12-20T17:00:00.000Z"),
+            (
+                "2026-12-20T14:00:00.123456+00:00",
+                "2026-12-20T14:00:00.123Z",
+            ),
+            ("2026-12-20T14:00:59.9999Z", "2026-12-20T14:00:59.999Z"),
+        ] {
+            assert_eq!(event_date_sent_for(json!(given)), sent, "{given}");
+        }
+    }
+
+    #[test]
+    fn an_unusable_event_date_falls_back_to_the_request_timestamp() {
+        for event_date in [
+            "",
+            "   ",
+            "next friday",
+            "2026-13-45",
+            "20/12/2026",
+            // A date-time without an offset names no instant.
+            "2026-12-20T14:00:00",
+        ] {
+            let before = common_utils::date_time::date_as_yyyymmddthhmmssmmmz().unwrap();
+            let sent = event_date_sent_for(json!(event_date));
+            let after = common_utils::date_time::date_as_yyyymmddthhmmssmmmz().unwrap();
+            assert!(
+                before <= sent && sent <= after,
+                "{event_date:?}: {before} <= {sent} <= {after}"
+            );
+        }
     }
 
     #[test]
