@@ -34,6 +34,12 @@ use crate::{
 
 pub(super) const MAX_APPLICATION_FEE_RATIO: f64 = 0.007;
 
+/// Longest card charge `description` sent, in characters. The Payments API documents no limit
+/// for it; 150 is the limit the Orders API documents for its own `description` (see
+/// `orders.rs`). It is a conservative bound, so that a long merchant text cannot turn a card
+/// charge that went through while the description was dropped into a rejection.
+const MAX_CARD_DESCRIPTION_CHARS: usize = 150;
+
 pub struct MercadopagoRouterData<T> {
     pub amount: FloatMajorUnit,
     pub router_data: T,
@@ -727,10 +733,24 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
             _ => None,
         };
 
+        // The payment's own description (api2: "Reserva #<id> - <hotel>"), what Mercado Pago
+        // shows for the charge, as Checkout Pro and QR already send it. Truncated by characters:
+        // a cut by bytes could split a multi-byte character.
+        let description = router_data
+            .description
+            .as_deref()
+            .filter(|description| !description.is_empty())
+            .map(|description| {
+                description
+                    .chars()
+                    .take(MAX_CARD_DESCRIPTION_CHARS)
+                    .collect()
+            });
+
         Ok(Self {
             transaction_amount,
             token,
-            description: None,
+            description,
             installments,
             payment_method_id,
             issuer_id,
@@ -3199,6 +3219,220 @@ mod tests {
         assert_eq!(
             item["category_descriptor"]["passenger"]["first_name"],
             "Ana"
+        );
+    }
+
+    // ---- Card charge: payment description ---------------------------------------------
+
+    /// The card charge body for the given metadata, request email and request description.
+    fn described_card_charge_body(
+        metadata: Option<serde_json::Value>,
+        frm_metadata: Option<serde_json::Value>,
+        email: Option<&str>,
+        description: Option<&str>,
+    ) -> serde_json::Value {
+        let mut router_data = test_support::authorize_router_data(metadata, frm_metadata);
+        router_data.request.email =
+            email.map(|email| common_utils::pii::Email::try_from(email.to_string()).unwrap());
+        router_data.description = description.map(str::to_string);
+        card_charge_body_of(&router_data)
+    }
+
+    fn card_charge_body_of(router_data: &PaymentsAuthorizeRouterData) -> serde_json::Value {
+        let amount = FloatMajorUnitForConnector
+            .convert(
+                router_data.request.minor_amount,
+                router_data.request.currency,
+            )
+            .unwrap();
+        let request = MercadopagoPaymentsRequest::try_from(&MercadopagoRouterData::from((
+            amount,
+            router_data,
+        )))
+        .unwrap();
+        serde_json::to_value(&request).unwrap()
+    }
+
+    /// The top-level `description` a card charge sends for the given request description.
+    fn card_charge_description(description: Option<&str>) -> Option<serde_json::Value> {
+        described_card_charge_body(
+            Some(json!({ "payment_method_id": "visa" })),
+            None,
+            None,
+            description,
+        )
+        .get("description")
+        .cloned()
+    }
+
+    #[test]
+    fn card_charge_sends_the_request_description() {
+        assert_eq!(
+            card_charge_description(Some("Reserva #123 - Hotel X")),
+            Some(json!("Reserva #123 - Hotel X"))
+        );
+    }
+
+    #[test]
+    fn card_charge_without_a_description_sends_none() {
+        assert_eq!(card_charge_description(None), None);
+        // An empty description is no description, as in the QR order.
+        assert_eq!(card_charge_description(Some("")), None);
+    }
+
+    #[test]
+    fn card_charge_truncates_a_long_description_on_a_char_boundary() {
+        // Two-byte characters: a cut by bytes would split one (or panic).
+        assert_eq!(
+            card_charge_description(Some(&"ñ".repeat(151))),
+            Some(json!("ñ".repeat(150)))
+        );
+        assert_eq!(
+            card_charge_description(Some(&"ñ".repeat(150))),
+            Some(json!("ñ".repeat(150)))
+        );
+    }
+
+    /// The body with `items[0].event_date` (the request timestamp, since api2 sends no date)
+    /// replaced by a fixed value, once it is checked to look like one.
+    fn with_event_date_placeholder(mut body: serde_json::Value) -> serde_json::Value {
+        if let Some(event_date) = body.pointer_mut("/additional_info/items/0/event_date") {
+            assert!(
+                event_date.as_str().is_some_and(|date| date.ends_with('Z')),
+                "{event_date}"
+            );
+            *event_date = json!("<request timestamp>");
+        }
+        body
+    }
+
+    #[test]
+    fn api2_card_charges_only_gain_the_description() {
+        // Golden bodies captured from origin/main (9274b22ef6), where the description was
+        // dropped, for api2's two card charge shapes (`MercadoPagoGateway::createTransaction`).
+        // The description is the only key they may gain.
+        let description = Some("Reserva #123 - Hotel X");
+
+        // The full request: `customer_metadata` in metadata, every Mercado Pago key flat in
+        // frm_metadata.
+        let full = described_card_charge_body(
+            Some(json!({
+                "installments": 1,
+                "country": "AR",
+                "city": "Mendoza",
+                "email": "guest@example.com",
+                "first_name": "Ana",
+                "last_name": "Gomez",
+                "phone_number": "5492610000000",
+                "postal_code": "5500",
+                "street1": "Calle 1",
+                "state": "M",
+                "bin": "450995",
+                "psp": { "name": "MercadoPago", "metadata": "mercadopago" },
+                "card_network": "Visa"
+            })),
+            Some(json!({
+                "payment_method_id": "visa",
+                "installments": 1,
+                "identification_type": "DNI",
+                "identification_number": "30111222",
+                "device_id": "device-1",
+                "payer": {
+                    "first_name": "Ana",
+                    "last_name": "Gomez",
+                    "phone": "5492610000000",
+                    "address": "Calle 1",
+                    "zip_code": "5500"
+                },
+                "item": {
+                    "title": "Reserva #123 - Hotel X",
+                    "description": "Alojamiento para la reserva #123 - Hotel X",
+                    "category_id": "services"
+                },
+                "issuer_id": "310",
+                "application_fee": 1.0
+            })),
+            Some("guest@example.com"),
+            description,
+        );
+        assert_eq!(
+            with_event_date_placeholder(full),
+            json!({
+                "transaction_amount": 150.0,
+                "token": "card-token-1",
+                "description": "Reserva #123 - Hotel X",
+                "installments": 1,
+                "payment_method_id": "visa",
+                "issuer_id": 310,
+                "payer": {
+                    "email": "guest@example.com",
+                    "identification": { "type": "DNI", "number": "30111222" }
+                },
+                "capture": true,
+                "external_reference": "pxs_mp_1",
+                "binary_mode": true,
+                "additional_info": {
+                    "payer": {
+                        "first_name": "Ana",
+                        "last_name": "Gomez",
+                        "phone": { "number": "5492610000000" },
+                        "address": { "street_name": "Calle 1", "zip_code": "5500" }
+                    },
+                    "items": [{
+                        "id": "1",
+                        "title": "Reserva #123 - Hotel X",
+                        "description": "Alojamiento para la reserva #123 - Hotel X",
+                        "category_id": "services",
+                        "quantity": 1,
+                        "unit_price": 150.0,
+                        "event_date": "<request timestamp>",
+                        "category_descriptor": {
+                            "passenger": { "first_name": "Ana", "last_name": "Gomez" }
+                        }
+                    }]
+                },
+                "application_fee": 1.0
+            })
+        );
+
+        // `useMinimalRequest`: fewer keys in both metadata objects.
+        let minimal = described_card_charge_body(
+            Some(json!({
+                "email": "guest@example.com",
+                "first_name": "Ana",
+                "last_name": "Gomez",
+                "bin": "450995",
+                "psp": { "name": "MercadoPago", "metadata": "mercadopago" },
+                "card_network": "Visa"
+            })),
+            Some(json!({
+                "payment_method_id": "visa",
+                "installments": 1,
+                "identification_type": "DNI",
+                "identification_number": "30111222",
+                "device_id": "device-1",
+                "application_fee": 1.0
+            })),
+            Some("guest@example.com"),
+            description,
+        );
+        assert_eq!(
+            minimal,
+            json!({
+                "transaction_amount": 150.0,
+                "token": "card-token-1",
+                "description": "Reserva #123 - Hotel X",
+                "installments": 1,
+                "payment_method_id": "visa",
+                "payer": {
+                    "email": "guest@example.com",
+                    "identification": { "type": "DNI", "number": "30111222" }
+                },
+                "capture": true,
+                "external_reference": "pxs_mp_1",
+                "binary_mode": true,
+                "application_fee": 1.0
+            })
         );
     }
 
