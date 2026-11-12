@@ -332,7 +332,8 @@ impl TryFrom<&SetupMandateRouterData> for BankOfAmericaPaymentsRequest {
                 | WalletData::StripeCheckout {}
                 | WalletData::IzipayCheckout {}
                 | WalletData::MercadoPagoCheckoutPro {}
-                | WalletData::MercadoPagoQr {} => Err(errors::ConnectorError::NotImplemented(
+                | WalletData::MercadoPagoQr {}
+                | WalletData::MercadoPagoPoint {} => Err(errors::ConnectorError::NotImplemented(
                     utils::get_unimplemented_payment_method_error_message("BankOfAmerica"),
                 ))?,
             },
@@ -1141,7 +1142,8 @@ impl TryFrom<&BankOfAmericaRouterData<&PaymentsAuthorizeRouterData>>
                         | WalletData::StripeCheckout {}
                         | WalletData::IzipayCheckout {}
                         | WalletData::MercadoPagoCheckoutPro {}
-                        | WalletData::MercadoPagoQr {} => {
+                        | WalletData::MercadoPagoQr {}
+                        | WalletData::MercadoPagoPoint {} => {
                             Err(errors::ConnectorError::NotImplemented(
                                 utils::get_unimplemented_payment_method_error_message(
                                     "Bank of America",

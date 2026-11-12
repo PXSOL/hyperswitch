@@ -324,7 +324,9 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
                 self.base_url(connectors)
             ))
         } else if mercadopago::MercadopagoAuthorizeRequest::is_qr(&req.request.payment_method_data)
+            || mercadopago::MercadopagoAuthorizeRequest::is_point(&req.request.payment_method_data)
         {
+            // QR and Point are both orders; the body tells them apart.
             Ok(format!("{}/v1/orders", self.base_url(connectors)))
         } else {
             Ok(format!("{}/v1/payments", self.base_url(connectors)))
@@ -376,7 +378,11 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         event_builder: Option<&mut ConnectorEvent>,
         res: Response,
     ) -> CustomResult<PaymentsAuthorizeRouterData, errors::ConnectorError> {
-        if mercadopago::MercadopagoAuthorizeRequest::is_qr(&data.request.payment_method_data) {
+        let is_point =
+            mercadopago::MercadopagoAuthorizeRequest::is_point(&data.request.payment_method_data);
+        if is_point
+            || mercadopago::MercadopagoAuthorizeRequest::is_qr(&data.request.payment_method_data)
+        {
             let response: orders::MercadopagoOrderResponse = res
                 .response
                 .parse_struct("MercadopagoOrderResponse")
@@ -388,15 +394,19 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
                 data.request.minor_amount,
                 data.request.currency,
             )?;
-            return orders::authorize_order_response(
-                ResponseRouterData {
-                    response,
-                    data: data.clone(),
-                    http_code: res.status_code,
-                },
-                data.request.currency,
-                requested_amount,
-            );
+            let item = ResponseRouterData {
+                response,
+                data: data.clone(),
+                http_code: res.status_code,
+            };
+            if is_point {
+                return Ok(orders::authorize_point_order_response(
+                    item,
+                    data.request.currency,
+                    requested_amount,
+                ));
+            }
+            return orders::authorize_order_response(item, data.request.currency, requested_amount);
         }
         let response: mercadopago::MercadopagoAuthorizeResponse = res
             .response
@@ -456,7 +466,7 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Mer
             .connector_transaction_id
             .get_connector_transaction_id()
         {
-            // An `ORD` id (QR) syncs the order, a numeric id the payment.
+            // An `ORD` id (QR, Point) syncs the order, a numeric id the payment.
             Ok(connector_payment_id) => Ok(format!(
                 "{base_url}{}",
                 orders::psync_path(&connector_payment_id)
@@ -512,6 +522,9 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Mer
                 data: data.clone(),
                 http_code: res.status_code,
             });
+            // What a Point order returns is added to what its attempt already stores. A QR
+            // order returns nothing, which leaves its stored metadata untouched.
+            utils::keep_stored_metadata(&mut router_data, data.request.connector_meta.as_ref());
             if let Some(reported_activity) = reported_activity {
                 match router_data.connector_response.as_mut() {
                     Some(connector_response) => {
@@ -701,6 +714,12 @@ impl ConnectorIntegration<Void, PaymentsCancelData, PaymentsResponseData> for Me
             "X-Idempotency-Key".to_string(),
             format!("{}_void", req.connector_request_reference_id).into(),
         ));
+        // Only the cancel of a Point order carries it; a QR order is cancelled as before.
+        if let Some((name, value)) =
+            orders::point_cancel_header(req.request.connector_meta.as_ref())
+        {
+            headers.push((name.to_string(), value.to_string().into()));
+        }
         Ok(headers)
     }
 
@@ -771,11 +790,13 @@ impl ConnectorIntegration<Void, PaymentsCancelData, PaymentsResponseData> for Me
                 .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
             event_builder.map(|i| i.set_response_body(&response));
             router_env::logger::info!(connector_response=?response);
-            return Ok(orders::sync_order_response(ResponseRouterData {
+            let mut router_data = orders::sync_order_response(ResponseRouterData {
                 response,
                 data: data.clone(),
                 http_code: res.status_code,
-            }));
+            });
+            utils::keep_stored_metadata(&mut router_data, data.request.connector_meta.as_ref());
+            return Ok(router_data);
         }
         let response: mercadopago::MercadopagoPaymentsResponse = res
             .response
@@ -1575,6 +1596,987 @@ mod tests {
             mercadopago::MercadopagoWebhookNotification::Payment {
                 payment_id: "150211668619".to_string()
             }
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Point (card terminal) through the connector's own entry points. The order bodies keep
+    // the fields recorded from the real N950 tests, with payer data left out.
+    // ------------------------------------------------------------------------
+
+    use common_utils::types::MinorUnit;
+    use hyperswitch_domain_models::{
+        payment_address::PaymentAddress,
+        payment_method_data::{PaymentMethodData, WalletData},
+        router_request_types::ResponseId,
+    };
+    use serde_json::json;
+
+    const POINT_TERMINAL_ID: &str = "NEWLAND_N950__N950NCD600391917";
+    const POINT_ORDER_ID: &str = "ORD01M765NPM84NTSPDZZ2GXEEH4R";
+    const POINT_ORDER_PAYMENT_ID: &str = "PAY01M765NPM84NTSPDZZ2GXEEH4R";
+    /// `transactions.payments[0].reference_id` of the charged order: its `/v1/payments` id.
+    const POINT_PAYMENT_REFERENCE_ID: &str = "189097810220";
+    /// ARS 15.00, the amount of the real charges.
+    const POINT_MINOR_AMOUNT: i64 = 1_500;
+
+    fn connector_response(status_code: u16, body: serde_json::Value) -> Response {
+        Response {
+            headers: None,
+            response: bytes::Bytes::from(body.to_string()),
+            status_code,
+        }
+    }
+
+    fn account_metadata() -> serde_json::Value {
+        json!({
+            "account_name": "hotel",
+            "qr_pos": {"external_pos_id": "PXSOLPOS1"},
+            "point_terminal": {"terminal_id": POINT_TERMINAL_ID, "operating_mode": "PDV"}
+        })
+    }
+
+    /// An in-person charge of ARS 15.00 with the given wallet.
+    fn order_authorize_router_data(
+        wallet: WalletData,
+        metadata: Option<serde_json::Value>,
+        account_metadata: Option<serde_json::Value>,
+    ) -> PaymentsAuthorizeRouterData {
+        let mut router_data = mercadopago::test_support::authorize_router_data(metadata, None);
+        router_data.request.payment_method_data = PaymentMethodData::Wallet(wallet);
+        router_data.request.amount = POINT_MINOR_AMOUNT;
+        router_data.request.minor_amount = MinorUnit::new(POINT_MINOR_AMOUNT);
+        router_data.payment_method = enums::PaymentMethod::Wallet;
+        router_data.description = Some("Reservation 42".to_string());
+        router_data.connector_meta_data = account_metadata.map(hyperswitch_masking::Secret::new);
+        router_data
+    }
+
+    fn point_authorize_router_data(
+        metadata: Option<serde_json::Value>,
+    ) -> PaymentsAuthorizeRouterData {
+        order_authorize_router_data(
+            WalletData::MercadoPagoPoint {},
+            metadata,
+            Some(account_metadata()),
+        )
+    }
+
+    fn authorize_body(
+        router_data: &PaymentsAuthorizeRouterData,
+    ) -> CustomResult<serde_json::Value, errors::ConnectorError> {
+        ConnectorIntegration::<Authorize, PaymentsAuthorizeData, PaymentsResponseData>::get_request_body(
+            Mercadopago::new(),
+            router_data,
+            &Connectors::default(),
+        )
+        .map(|content| {
+            serde_json::from_str(content.get_inner_value().peek()).expect("a JSON body")
+        })
+    }
+
+    fn authorize_response(
+        router_data: &PaymentsAuthorizeRouterData,
+        body: serde_json::Value,
+    ) -> PaymentsAuthorizeRouterData {
+        ConnectorIntegration::<Authorize, PaymentsAuthorizeData, PaymentsResponseData>::handle_response(
+            Mercadopago::new(),
+            router_data,
+            None,
+            connector_response(201, body),
+        )
+        .expect("the created order is handled")
+    }
+
+    /// A Point order in the given state, as `POST` and `GET /v1/orders/{id}` answer it.
+    fn point_order_body(
+        status: &str,
+        status_detail: &str,
+        payment: serde_json::Value,
+    ) -> serde_json::Value {
+        json!({
+            "id": POINT_ORDER_ID,
+            "type": "point",
+            "external_reference": "pxs_mp_1",
+            "status": status,
+            "status_detail": status_detail,
+            "currency": "ARS",
+            "total_amount": "15.00",
+            "integration_data": {"platform_id": PXSOL_PLATFORM_ID},
+            "config": {"point": {"terminal_id": POINT_TERMINAL_ID, "print_on_terminal": "no_ticket"}},
+            "transactions": {"payments": [payment]}
+        })
+    }
+
+    fn point_payment(status: &str, status_detail: &str) -> serde_json::Value {
+        json!({
+            "id": POINT_ORDER_PAYMENT_ID,
+            "amount": "15.00",
+            "status": status,
+            "status_detail": status_detail
+        })
+    }
+
+    fn point_payment_with_reference(
+        status: &str,
+        status_detail: &str,
+        reference_id: &str,
+    ) -> serde_json::Value {
+        let mut payment = point_payment(status, status_detail);
+        payment["reference_id"] = json!(reference_id);
+        payment
+    }
+
+    /// Order 1 once paid: `processed/accredited` with a prepaid Visa.
+    fn charged_point_order_body() -> serde_json::Value {
+        let mut payment =
+            point_payment_with_reference("processed", "accredited", POINT_PAYMENT_REFERENCE_ID);
+        payment["paid_amount"] = json!("15.00");
+        payment["payment_method"] =
+            json!({"id": "visa", "type": "prepaid_card", "installments": 1});
+        let mut order = point_order_body("processed", "accredited", payment);
+        order["total_paid_amount"] = json!("15.00");
+        order
+    }
+
+    fn sync_order(body: serde_json::Value) -> PaymentsSyncRouterData {
+        sync_order_with_stored(body, None)
+    }
+
+    /// Syncs an order whose attempt already stores `connector_meta`.
+    fn sync_order_with_stored(
+        body: serde_json::Value,
+        connector_meta: Option<serde_json::Value>,
+    ) -> PaymentsSyncRouterData {
+        let request = PaymentsSyncData {
+            connector_transaction_id: ResponseId::ConnectorTransactionId(
+                POINT_ORDER_ID.to_string(),
+            ),
+            currency: enums::Currency::ARS,
+            amount: MinorUnit::new(POINT_MINOR_AMOUNT),
+            connector_meta,
+            ..Default::default()
+        };
+        let data: PaymentsSyncRouterData =
+            mercadopago::test_support::router_data(request, None, PaymentAddress::default());
+        ConnectorIntegration::<PSync, PaymentsSyncData, PaymentsResponseData>::handle_response(
+            Mercadopago::new(),
+            &data,
+            None,
+            connector_response(200, body),
+        )
+        .expect("the order is handled")
+    }
+
+    /// The cancel of an order whose attempt stores `connector_meta`.
+    fn void_router_data(connector_meta: Option<serde_json::Value>) -> PaymentsCancelRouterData {
+        let request = PaymentsCancelData {
+            connector_transaction_id: POINT_ORDER_ID.to_string(),
+            connector_meta,
+            ..Default::default()
+        };
+        mercadopago::test_support::router_data(request, None, PaymentAddress::default())
+    }
+
+    /// What the attempt of a Point order stores from its creation.
+    fn point_attempt_metadata() -> serde_json::Value {
+        json!({"mp_order_type": "point"})
+    }
+
+    /// What the attempt of a QR order stores from its creation.
+    fn qr_attempt_metadata() -> serde_json::Value {
+        json!({
+            "image_data_url": "data:image/png;base64,AAAA",
+            "raw_qr_data": "0002010102",
+            "mp_payment_id": "PAY00000000000000000000000001"
+        })
+    }
+
+    /// Name and value of every header of the cancel request, in order.
+    fn void_headers(router_data: &PaymentsCancelRouterData) -> Vec<(String, String)> {
+        ConnectorIntegration::<Void, PaymentsCancelData, PaymentsResponseData>::get_headers(
+            Mercadopago::new(),
+            router_data,
+            &Connectors::default(),
+        )
+        .expect("the cancel headers build")
+        .into_iter()
+        .map(|(name, value)| (name, value.into_inner()))
+        .collect()
+    }
+
+    /// The order id, metadata and reference stored by a successful payments response.
+    fn stored_transaction<F, T>(
+        router_data: &RouterData<F, T, PaymentsResponseData>,
+    ) -> (String, Option<serde_json::Value>, Option<String>, bool) {
+        match router_data.response.as_ref() {
+            Ok(PaymentsResponseData::TransactionResponse {
+                resource_id: ResponseId::ConnectorTransactionId(order_id),
+                connector_metadata,
+                connector_response_reference_id,
+                redirection_data,
+                ..
+            }) => (
+                order_id.clone(),
+                connector_metadata.clone(),
+                connector_response_reference_id.clone(),
+                redirection_data.is_some(),
+            ),
+            other => panic!("expected a transaction response, got {other:?}"),
+        }
+    }
+
+    fn failure<F, T>(router_data: &RouterData<F, T, PaymentsResponseData>) -> &ErrorResponse {
+        router_data
+            .response
+            .as_ref()
+            .expect_err("the order is a failure")
+    }
+
+    fn refund_router_data(
+        connector_metadata: Option<serde_json::Value>,
+        refund_minor_amount: i64,
+    ) -> RefundsRouterData<Execute> {
+        let request = RefundsData {
+            refund_id: "ref_mp_1".to_string(),
+            connector_transaction_id: POINT_ORDER_ID.to_string(),
+            connector_refund_id: None,
+            currency: enums::Currency::ARS,
+            payment_amount: POINT_MINOR_AMOUNT,
+            reason: None,
+            webhook_url: None,
+            refund_amount: refund_minor_amount,
+            connector_metadata,
+            refund_connector_metadata: None,
+            browser_info: None,
+            split_refunds: None,
+            minor_payment_amount: MinorUnit::new(POINT_MINOR_AMOUNT),
+            minor_refund_amount: MinorUnit::new(refund_minor_amount),
+            integrity_object: None,
+            refund_status: enums::RefundStatus::Pending,
+            merchant_account_id: None,
+            merchant_config_currency: None,
+            capture_method: None,
+            additional_payment_method_data: None,
+            payment_method_data: None,
+            mandate_id: None,
+            payment_connector_request_reference_id: None,
+            payment_feature_metadata: None,
+            feature_metadata: None,
+        };
+        mercadopago::test_support::router_data(request, None, PaymentAddress::default())
+    }
+
+    fn refund_body(
+        router_data: &RefundsRouterData<Execute>,
+    ) -> CustomResult<serde_json::Value, errors::ConnectorError> {
+        ConnectorIntegration::<Execute, RefundsData, RefundsResponseData>::get_request_body(
+            Mercadopago::new(),
+            router_data,
+            &Connectors::default(),
+        )
+        .map(|content| serde_json::from_str(content.get_inner_value().peek()).expect("a JSON body"))
+    }
+
+    #[test]
+    fn point_charge_posts_an_order_for_the_terminal_without_a_fee() {
+        let router_data = point_authorize_router_data(None);
+        let url =
+            ConnectorIntegration::<Authorize, PaymentsAuthorizeData, PaymentsResponseData>::get_url(
+                Mercadopago::new(),
+                &router_data,
+                &Connectors::default(),
+            )
+            .expect("the url builds");
+        assert!(url.ends_with("/v1/orders"), "{url}");
+
+        let body = authorize_body(&router_data).expect("the Point order builds");
+        assert_eq!(
+            body,
+            json!({
+                "type": "point",
+                "external_reference": "pxs_mp_1",
+                "description": "Reservation 42",
+                "expiration_time": "PT10M",
+                "integration_data": {"platform_id": "dev_ab8e21775bb211ed88d80242ac130004"},
+                "config": {"point": {
+                    "terminal_id": POINT_TERMINAL_ID,
+                    "print_on_terminal": "no_ticket"
+                }},
+                "transactions": {"payments": [{"amount": "15.00"}]}
+            })
+        );
+        assert!(body.get("marketplace_fee").is_none());
+
+        // The order is created once per attempt: the reference is the idempotency key.
+        let headers =
+            ConnectorIntegration::<Authorize, PaymentsAuthorizeData, PaymentsResponseData>::get_headers(
+                Mercadopago::new(),
+                &router_data,
+                &Connectors::default(),
+            )
+            .expect("authorize headers build");
+        assert!(headers
+            .into_iter()
+            .any(|(name, value)| name == "X-Idempotency-Key" && value.into_inner() == "pxs_mp_1"));
+    }
+
+    #[test]
+    fn point_charge_with_an_application_fee_is_refused_before_reaching_mercado_pago() {
+        for metadata in [
+            json!({"application_fee": 0.1}),
+            json!({"mercadopago": {"application_fee": 0.1}}),
+        ] {
+            let error = authorize_body(&point_authorize_router_data(Some(metadata.clone())))
+                .expect_err("a fee cannot be collected on Point");
+            assert!(
+                matches!(
+                    error.current_context(),
+                    errors::ConnectorError::NotSupported { message, connector }
+                        if message.contains("application_fee") && connector == "mercadopago"
+                ),
+                "{metadata}: {error:?}"
+            );
+        }
+        // Other metadata does not get in the way.
+        let body = authorize_body(&point_authorize_router_data(Some(
+            json!({"mercadopago": {"device_id": "dev-1"}}),
+        )))
+        .expect("a Point order without a fee builds");
+        assert_eq!(body["type"], "point");
+    }
+
+    #[test]
+    fn point_charge_without_a_chosen_terminal_is_a_clear_error() {
+        for account_metadata in [
+            None,
+            Some(json!({"qr_pos": {"external_pos_id": "PXSOLPOS1"}})),
+        ] {
+            let router_data = order_authorize_router_data(
+                WalletData::MercadoPagoPoint {},
+                None,
+                account_metadata,
+            );
+            let error = authorize_body(&router_data).expect_err("there is no terminal");
+            assert!(matches!(
+                error.current_context(),
+                errors::ConnectorError::MissingRequiredField { field_name }
+                    if *field_name == "connector_meta_data.point_terminal.terminal_id"
+            ));
+        }
+    }
+
+    #[test]
+    fn point_charge_with_manual_capture_is_refused() {
+        let mut router_data = point_authorize_router_data(None);
+        router_data.request.capture_method = Some(enums::CaptureMethod::Manual);
+        let error = authorize_body(&router_data).expect_err("a terminal charge is captured");
+        assert!(matches!(
+            error.current_context(),
+            errors::ConnectorError::NotImplemented(message) if message.contains("Point")
+        ));
+    }
+
+    #[test]
+    fn created_point_order_waits_for_the_customer_without_a_qr() {
+        let router_data = point_authorize_router_data(None);
+        // The create response is `created`; with the device idle it can already be `at_terminal`.
+        // The second body has no `type`: the request, not the echo, says it is a Point order.
+        let mut untyped = point_order_body(
+            "at_terminal",
+            "at_terminal",
+            point_payment("at_terminal", "at_terminal"),
+        );
+        untyped.as_object_mut().expect("an object").remove("type");
+        for body in [
+            point_order_body("created", "created", point_payment("created", "created")),
+            untyped,
+        ] {
+            let handled = authorize_response(&router_data, body);
+            assert_eq!(handled.status, enums::AttemptStatus::AuthenticationPending);
+            let (order_id, connector_metadata, reference, has_redirection) =
+                stored_transaction(&handled);
+            assert_eq!(order_id, POINT_ORDER_ID);
+            // Only the marker: no QR to show and no payment id yet.
+            assert_eq!(connector_metadata, Some(point_attempt_metadata()));
+            assert!(
+                serde_json::from_value::<api_models::payments::QrCodeInformation>(
+                    point_attempt_metadata()
+                )
+                .is_err(),
+                "the marker must not read as a QR next action"
+            );
+            assert_eq!(reference.as_deref(), Some("pxs_mp_1"));
+            assert!(!has_redirection);
+        }
+    }
+
+    #[test]
+    fn point_order_created_in_another_currency_fails_the_attempt() {
+        let router_data = point_authorize_router_data(None);
+        let mut body = point_order_body("created", "created", point_payment("created", "created"));
+        body["currency"] = json!("USD");
+        let handled = authorize_response(&router_data, body);
+        assert_eq!(handled.status, enums::AttemptStatus::Failure);
+        let error = failure(&handled);
+        assert_eq!(error.code, "order_mismatch");
+        assert!(error.message.contains("USD") && error.message.contains("ARS"));
+        assert_eq!(
+            error.connector_transaction_id.as_deref(),
+            Some(POINT_ORDER_ID)
+        );
+    }
+
+    #[test]
+    fn qr_charge_still_builds_and_stores_its_qr() {
+        let router_data = order_authorize_router_data(
+            WalletData::MercadoPagoQr {},
+            Some(json!({"application_fee": 0.1})),
+            Some(account_metadata()),
+        );
+        let body = authorize_body(&router_data).expect("the QR order builds");
+        assert_eq!(
+            body,
+            json!({
+                "type": "qr",
+                "total_amount": "15.00",
+                "currency": "ARS",
+                "description": "Reservation 42",
+                "items": [{
+                    "title": "Reservation 42",
+                    "unit_price": "15.00",
+                    "quantity": 1,
+                    "unit_measure": "unit"
+                }],
+                "external_reference": "pxs_mp_1",
+                "expiration_time": "PT30M",
+                "marketplace_fee": "0.10",
+                "integration_data": {"platform_id": "dev_ab8e21775bb211ed88d80242ac130004"},
+                "config": {"qr": {"external_pos_id": "PXSOLPOS1", "mode": "dynamic"}},
+                "transactions": {"payments": [{"amount": "15.00"}]}
+            })
+        );
+
+        let qr_data = "00020101021243650016com.mercadolibre0201306363044D91";
+        let created = json!({
+            "id": "ORDTST00000000000000000000000AAA",
+            "type": "qr",
+            "external_reference": "pxs_mp_1",
+            "total_amount": "15.00",
+            "status": "created",
+            "status_detail": "created",
+            "currency": "ARS",
+            "transactions": {"payments": [
+                {"id": "PAY00000000000000000000000001", "amount": "15.00",
+                 "status": "created", "status_detail": "ready_to_process"}
+            ]},
+            "type_response": {"qr_data": qr_data}
+        });
+        let handled = authorize_response(&router_data, created.clone());
+        assert_eq!(handled.status, enums::AttemptStatus::AuthenticationPending);
+        let (order_id, connector_metadata, reference, _) = stored_transaction(&handled);
+        assert_eq!(order_id, "ORDTST00000000000000000000000AAA");
+        assert_eq!(reference.as_deref(), Some("pxs_mp_1"));
+        let connector_metadata = connector_metadata.expect("the QR is stored");
+        assert_eq!(connector_metadata["raw_qr_data"], qr_data);
+        assert_eq!(
+            connector_metadata["mp_payment_id"],
+            "PAY00000000000000000000000001"
+        );
+
+        // A QR order still needs its `qr_data`, and still fails on a mismatch.
+        let mut without_qr = created.clone();
+        without_qr
+            .as_object_mut()
+            .expect("an object")
+            .remove("type_response");
+        assert!(ConnectorIntegration::<Authorize, PaymentsAuthorizeData, PaymentsResponseData>::handle_response(
+            Mercadopago::new(),
+            &router_data,
+            None,
+            connector_response(201, without_qr),
+        )
+        .is_err());
+        let mut other_currency = created;
+        other_currency["currency"] = json!("USD");
+        let mismatched = authorize_response(&router_data, other_currency);
+        assert_eq!(mismatched.status, enums::AttemptStatus::Failure);
+        assert_eq!(failure(&mismatched).code, "order_mismatch");
+    }
+
+    #[test]
+    fn point_order_at_the_terminal_keeps_waiting_for_the_customer() {
+        let synced = sync_order(point_order_body(
+            "at_terminal",
+            "at_terminal",
+            point_payment("at_terminal", "at_terminal"),
+        ));
+        assert_eq!(synced.status, enums::AttemptStatus::AuthenticationPending);
+        let (order_id, connector_metadata, _, _) = stored_transaction(&synced);
+        assert_eq!(order_id, POINT_ORDER_ID);
+        assert_eq!(connector_metadata, Some(point_attempt_metadata()));
+    }
+
+    #[test]
+    fn charged_point_order_seen_on_a_sync_stores_the_payment_to_refund() {
+        let synced =
+            sync_order_with_stored(charged_point_order_body(), Some(point_attempt_metadata()));
+        assert_eq!(synced.status, enums::AttemptStatus::Charged);
+        let (order_id, connector_metadata, reference, _) = stored_transaction(&synced);
+        assert_eq!(order_id, POINT_ORDER_ID);
+        assert_eq!(reference.as_deref(), Some("pxs_mp_1"));
+        assert_eq!(
+            connector_metadata,
+            Some(json!({
+                "mp_order_type": "point",
+                "mp_payment_id": POINT_PAYMENT_REFERENCE_ID
+            }))
+        );
+
+        // A later answer that no longer names the payment does not lose the stored id.
+        let mut without_reference = charged_point_order_body();
+        without_reference["transactions"]["payments"][0]
+            .as_object_mut()
+            .expect("an object")
+            .remove("reference_id");
+        let synced_again = sync_order_with_stored(without_reference, connector_metadata.clone());
+        assert_eq!(stored_transaction(&synced_again).1, connector_metadata);
+
+        // That stored value is exactly what the refund of the order names.
+        let body = refund_body(&refund_router_data(connector_metadata, 1_000))
+            .expect("a charged order can be refunded");
+        assert_eq!(
+            body,
+            json!({"transactions": [{"id": POINT_PAYMENT_REFERENCE_ID, "amount": "10.00"}]})
+        );
+    }
+
+    #[test]
+    fn rejected_point_payment_is_a_failure_with_a_readable_message() {
+        // Orders 8, 9 and 10: order failed/failed, payment failed with `in_review`.
+        let synced = sync_order(point_order_body(
+            "failed",
+            "failed",
+            point_payment_with_reference("failed", "in_review", "188034059899"),
+        ));
+        assert_eq!(synced.status, enums::AttemptStatus::Failure);
+        let error = failure(&synced);
+        assert_eq!(error.code, "point_payment_rejected");
+        assert_eq!(
+            error.message,
+            "The payment was rejected on the terminal. Start a new charge to try again"
+        );
+        assert_eq!(error.reason.as_deref(), Some(error.message.as_str()));
+        assert_eq!(error.attempt_status, Some(enums::AttemptStatus::Failure));
+        assert_eq!(
+            error.connector_transaction_id.as_deref(),
+            Some(POINT_ORDER_ID)
+        );
+    }
+
+    #[test]
+    fn expired_and_cancelled_point_orders_are_final() {
+        // Order 6: expired/expired, untouched on the device.
+        let expired = sync_order(point_order_body(
+            "expired",
+            "expired",
+            point_payment("expired", "expired"),
+        ));
+        assert_eq!(expired.status, enums::AttemptStatus::Failure);
+        assert_eq!(failure(&expired).code, "expired");
+        assert_eq!(failure(&expired).message, "Payment expired");
+
+        // Order 5: cancelled by the operator on the device.
+        let cancelled = sync_order(point_order_body(
+            "canceled",
+            "canceled",
+            point_payment("canceled", "cancel_by_terminal"),
+        ));
+        assert_eq!(cancelled.status, enums::AttemptStatus::Voided);
+        assert_eq!(
+            stored_transaction(&cancelled).1,
+            Some(point_attempt_metadata())
+        );
+    }
+
+    #[test]
+    fn point_order_in_action_required_is_unresolved_and_not_refundable() {
+        let synced = sync_order(point_order_body(
+            "action_required",
+            "action_required",
+            point_payment_with_reference("action_required", "action_required", "188034059899"),
+        ));
+        assert_eq!(synced.status, enums::AttemptStatus::Unresolved);
+        let (order_id, connector_metadata, _, _) = stored_transaction(&synced);
+        assert_eq!(order_id, POINT_ORDER_ID);
+        assert_eq!(
+            connector_metadata,
+            Some(point_attempt_metadata()),
+            "no payment id to refund against"
+        );
+
+        // Without a stored payment id the refund is refused while building it, before any call.
+        let error = refund_body(&refund_router_data(connector_metadata, 1_500))
+            .expect_err("an order that is not processed cannot be refunded");
+        assert!(
+            matches!(
+                error.current_context(),
+                errors::ConnectorError::NotSupported { message, connector }
+                    if message.contains("without an approved payment") && connector == "mercadopago"
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn refunded_point_order_stays_charged() {
+        // Order 1 after its full refund: refunded/refunded with one processed refund.
+        let mut body = point_order_body(
+            "refunded",
+            "refunded",
+            point_payment_with_reference("refunded", "refunded", POINT_PAYMENT_REFERENCE_ID),
+        );
+        body["transactions"]["refunds"] = json!([{
+            "id": "REF01M765Y8SV4KKFSDTSBDFY3PFG",
+            "transaction_id": POINT_ORDER_PAYMENT_ID,
+            "reference_id": "3567405292",
+            "amount": "15.00",
+            "status": "processed"
+        }]);
+        let synced = sync_order(body);
+        assert_eq!(synced.status, enums::AttemptStatus::Charged);
+        let reported = synced
+            .connector_response
+            .as_ref()
+            .and_then(|connector_response| connector_response.get_reported_activity())
+            .expect("the refund seen on the order is reported");
+        assert_eq!(reported.refunds.len(), 1);
+        assert_eq!(
+            reported.refunds[0].connector_refund_id,
+            "REF01M765Y8SV4KKFSDTSBDFY3PFG"
+        );
+        assert_eq!(reported.refunds[0].amount, MinorUnit::new(1_500));
+    }
+
+    #[test]
+    fn qr_order_sync_is_unchanged_by_point() {
+        // A paid QR keeps its stored metadata (the QR and its `PAY` id) untouched.
+        let paid = sync_order(json!({
+            "id": "ORDTST00000000000000000000000AAA",
+            "type": "qr",
+            "external_reference": "pxs_mp_1",
+            "status": "processed",
+            "status_detail": "accredited",
+            "transactions": {"payments": [{
+                "id": "PAY00000000000000000000000001", "status": "processed",
+                "status_detail": "accredited", "reference_id": "150211668619"
+            }]}
+        }));
+        assert_eq!(paid.status, enums::AttemptStatus::Charged);
+        assert_eq!(stored_transaction(&paid).1, None);
+        let paid_with_stored = sync_order_with_stored(
+            json!({
+                "id": "ORDTST00000000000000000000000AAA",
+                "type": "qr",
+                "status": "processed",
+                "transactions": {"payments": [{
+                    "id": "PAY00000000000000000000000001", "status": "processed",
+                    "reference_id": "150211668619"
+                }]}
+            }),
+            Some(qr_attempt_metadata()),
+        );
+        assert_eq!(stored_transaction(&paid_with_stored).1, None);
+
+        // Statuses only a terminal has stay Pending on an order that is not Point.
+        for status in ["at_terminal", "action_required"] {
+            let synced = sync_order(json!({
+                "id": "ORDTST00000000000000000000000AAA", "type": "qr", "status": status
+            }));
+            assert_eq!(synced.status, enums::AttemptStatus::Pending, "{status}");
+        }
+
+        // `in_review` on a QR keeps the generic message.
+        let failed = sync_order(json!({
+            "id": "ORDTST00000000000000000000000AAA",
+            "type": "qr",
+            "status": "failed",
+            "transactions": {"payments": [
+                {"id": "PAY1", "status": "failed", "status_detail": "in_review"}
+            ]}
+        }));
+        assert_eq!(failed.status, enums::AttemptStatus::Failure);
+        assert_eq!(failure(&failed).code, "in_review");
+        assert_eq!(failure(&failed).message, "Payment rejected: in_review");
+    }
+
+    #[test]
+    fn point_order_cancel_allows_cancelling_at_the_terminal() {
+        let router_data = void_router_data(Some(point_attempt_metadata()));
+        let request =
+            ConnectorIntegration::<Void, PaymentsCancelData, PaymentsResponseData>::build_request(
+                Mercadopago::new(),
+                &router_data,
+                &Connectors::default(),
+            )
+            .expect("the cancel builds")
+            .expect("there is a request");
+        assert_eq!(request.method, Method::Post);
+        assert!(
+            request
+                .url
+                .ends_with(&format!("/v1/orders/{POINT_ORDER_ID}/cancel")),
+            "{}",
+            request.url
+        );
+        assert!(request.body.is_none());
+
+        // The header lets the cancel reach an order the device already shows. The idempotency
+        // key is the one every order cancel sends.
+        let headers = void_headers(&router_data);
+        assert!(headers.contains(&(
+            "x-allow-cancelable-status".to_string(),
+            "at_terminal".to_string()
+        )));
+        assert!(headers.contains(&("X-Idempotency-Key".to_string(), "pxs_mp_1_void".to_string())));
+        // Charged or not, the attempt of a Point order keeps its marker.
+        let charged = void_router_data(Some(json!({
+            "mp_order_type": "point",
+            "mp_payment_id": POINT_PAYMENT_REFERENCE_ID
+        })));
+        assert!(void_headers(&charged)
+            .iter()
+            .any(|(name, _)| name == "x-allow-cancelable-status"));
+
+        // Orders 2 and 3: cancelled by API while still `created`, answered with the order.
+        let cancelled =
+            ConnectorIntegration::<Void, PaymentsCancelData, PaymentsResponseData>::handle_response(
+                Mercadopago::new(),
+                &router_data,
+                None,
+                connector_response(
+                    200,
+                    point_order_body("canceled", "canceled", point_payment("canceled", "canceled")),
+                ),
+            )
+            .expect("the cancelled order is handled");
+        assert_eq!(cancelled.status, enums::AttemptStatus::Voided);
+        let (order_id, connector_metadata, _, _) = stored_transaction(&cancelled);
+        assert_eq!(order_id, POINT_ORDER_ID);
+        assert_eq!(connector_metadata, Some(point_attempt_metadata()));
+    }
+
+    #[test]
+    fn qr_order_cancel_is_sent_as_before_without_the_terminal_header() {
+        // A QR attempt, and one that stores nothing: neither is marked as Point.
+        for connector_meta in [Some(qr_attempt_metadata()), None] {
+            let router_data = void_router_data(connector_meta);
+            assert_eq!(
+                void_headers(&router_data),
+                vec![
+                    ("Content-Type".to_string(), "application/json".to_string()),
+                    (
+                        "Authorization".to_string(),
+                        "Bearer TEST-access-token".to_string()
+                    ),
+                    ("X-Idempotency-Key".to_string(), "pxs_mp_1_void".to_string()),
+                ]
+            );
+
+            let request =
+                ConnectorIntegration::<Void, PaymentsCancelData, PaymentsResponseData>::build_request(
+                    Mercadopago::new(),
+                    &router_data,
+                    &Connectors::default(),
+                )
+                .expect("the cancel builds")
+                .expect("there is a request");
+            assert_eq!(request.method, Method::Post);
+            assert!(request
+                .url
+                .ends_with(&format!("/v1/orders/{POINT_ORDER_ID}/cancel")));
+            assert!(request.body.is_none());
+            assert!(!request
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-allow-cancelable-status")));
+        }
+
+        // The cancelled QR order leaves its stored metadata untouched.
+        let router_data = void_router_data(Some(qr_attempt_metadata()));
+        let cancelled =
+            ConnectorIntegration::<Void, PaymentsCancelData, PaymentsResponseData>::handle_response(
+                Mercadopago::new(),
+                &router_data,
+                None,
+                connector_response(
+                    200,
+                    json!({
+                        "id": POINT_ORDER_ID, "type": "qr", "status": "canceled",
+                        "status_detail": "canceled", "external_reference": "pxs_mp_1"
+                    }),
+                ),
+            )
+            .expect("the cancelled order is handled");
+        assert_eq!(cancelled.status, enums::AttemptStatus::Voided);
+        assert_eq!(stored_transaction(&cancelled).1, None);
+    }
+
+    #[test]
+    fn point_cancel_refused_by_the_terminal_is_a_failed_void_with_mercado_pagos_code() {
+        // Orders 4 and 5: a terminal on firmware older than 12.3.18 answers 409 even with the
+        // header. It is the error of the void, never a cancelled order.
+        let error = ConnectorIntegration::<Void, PaymentsCancelData, PaymentsResponseData>::get_error_response(
+            Mercadopago::new(),
+            connector_response(
+                409,
+                json!({"errors": [{
+                    "code": "cannot_cancel_order",
+                    "message": "The order must be in 'created' status to be canceled"
+                }]}),
+            ),
+            None,
+        )
+        .expect("the refusal parses");
+        assert_eq!(error.status_code, 409);
+        assert_eq!(error.code, "cannot_cancel_order");
+        assert_eq!(
+            error.message,
+            "The order must be in 'created' status to be canceled"
+        );
+        assert_eq!(
+            error.network_decline_code.as_deref(),
+            Some("cannot_cancel_order")
+        );
+        assert_ne!(error.attempt_status, Some(enums::AttemptStatus::Voided));
+    }
+
+    #[test]
+    fn refund_of_a_point_order_names_the_stored_payment() {
+        let stored = Some(json!({"mp_payment_id": POINT_PAYMENT_REFERENCE_ID}));
+        let router_data = refund_router_data(stored, 1_500);
+        let url = ConnectorIntegration::<Execute, RefundsData, RefundsResponseData>::get_url(
+            Mercadopago::new(),
+            &router_data,
+            &Connectors::default(),
+        )
+        .expect("the url builds");
+        assert!(
+            url.ends_with(&format!("/v1/orders/{POINT_ORDER_ID}/refund")),
+            "{url}"
+        );
+        assert_eq!(
+            refund_body(&router_data).expect("the refund builds"),
+            json!({"transactions": [{"id": POINT_PAYMENT_REFERENCE_ID, "amount": "15.00"}]})
+        );
+
+        // Order 1: the full refund answered 201 with the order `refunded/refunded`.
+        let mut body = point_order_body(
+            "refunded",
+            "refunded",
+            point_payment_with_reference("refunded", "refunded", POINT_PAYMENT_REFERENCE_ID),
+        );
+        body["transactions"]["refunds"] = json!([{
+            "id": "REF01M765Y8SV4KKFSDTSBDFY3PFG",
+            "transaction_id": POINT_ORDER_PAYMENT_ID,
+            "reference_id": "3567405292",
+            "amount": "15.00",
+            "status": "processed"
+        }]);
+        let refunded =
+            ConnectorIntegration::<Execute, RefundsData, RefundsResponseData>::handle_response(
+                Mercadopago::new(),
+                &router_data,
+                None,
+                connector_response(201, body),
+            )
+            .expect("the refunded order is handled");
+        let response = refunded.response.expect("the refund succeeded");
+        assert_eq!(
+            response.connector_refund_id,
+            "REF01M765Y8SV4KKFSDTSBDFY3PFG"
+        );
+        assert_eq!(response.refund_status, enums::RefundStatus::Success);
+    }
+
+    #[test]
+    fn refund_of_a_qr_order_still_names_its_stored_payment() {
+        let stored = Some(json!({
+            "image_data_url": "data:image/png;base64,AAAA",
+            "raw_qr_data": "0002010102",
+            "mp_payment_id": "PAY00000000000000000000000001"
+        }));
+        assert_eq!(
+            refund_body(&refund_router_data(stored, 1_000)).expect("the refund builds"),
+            json!({"transactions": [
+                {"id": "PAY00000000000000000000000001", "amount": "10.00"}
+            ]})
+        );
+    }
+
+    #[test]
+    fn refund_mercado_pago_refuses_keeps_its_code_and_message() {
+        // Orders 1, 4 and 7: 422 for an amount the issuer does not let refund.
+        let error =
+            ConnectorIntegration::<Execute, RefundsData, RefundsResponseData>::get_error_response(
+                Mercadopago::new(),
+                connector_response(
+                    422,
+                    json!({"errors": [{
+                        "code": "amount_not_refundable",
+                        "message": "The amount may not be refunded"
+                    }]}),
+                ),
+                None,
+            )
+            .expect("the refusal parses");
+        assert_eq!(error.status_code, 422);
+        assert_eq!(error.code, "amount_not_refundable");
+        assert_eq!(error.message, "The amount may not be refunded");
+    }
+
+    #[test]
+    fn point_order_webhooks_resync_the_order_like_any_other() {
+        // Shape of the production `order.processed` notification of a Point order.
+        let body = json!({
+            "action": "order.processed",
+            "api_version": "v1",
+            "application_id": "1111111111111111",
+            "data": {
+                "external_reference": "pxs_mp_1",
+                "id": POINT_ORDER_ID,
+                "status": "processed",
+                "status_detail": "accredited",
+                "total_paid_amount": "15.00",
+                "transactions": {"payments": [{
+                    "paid_amount": "15.00",
+                    "payment_method": {"id": "visa", "type": "prepaid_card", "installments": 1},
+                    "reference": {"id": POINT_PAYMENT_REFERENCE_ID},
+                    "status": "processed",
+                    "status_detail": "accredited"
+                }]},
+                "type": "point"
+            },
+            "date_created": "2026-11-11T17:16:50.061675458Z",
+            "live_mode": true,
+            "type": "order",
+            "user_id": "2222222222"
+        })
+        .to_string();
+        let notification = classify_body(
+            &body,
+            &format!("data.external_reference=pxs_mp_1&data.id={POINT_ORDER_ID}&type=order"),
+        );
+        assert_eq!(
+            notification,
+            mercadopago::MercadopagoWebhookNotification::Order {
+                order_id: POINT_ORDER_ID.to_string()
+            }
+        );
+        assert_eq!(notification.payment_id_to_sync(), Some(POINT_ORDER_ID));
+        assert_eq!(
+            api_models::webhooks::IncomingWebhookEvent::from(&notification),
+            api_models::webhooks::IncomingWebhookEvent::PaymentIntentProcessing
         );
     }
 }

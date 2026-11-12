@@ -342,6 +342,20 @@ pub(crate) fn merge_pos_into_metadata(
     existing: Option<Value>,
     pos: &MercadopagoQrPos,
 ) -> Result<Value, errors::ApiErrorResponse> {
+    merge_key_into_metadata(
+        existing,
+        QR_POS_METADATA_KEY,
+        serde_json::to_value(pos).map_err(|_| errors::ApiErrorResponse::InternalServerError)?,
+    )
+}
+
+/// Sets one key of the connector account metadata and keeps every other key. Shared by the
+/// setups that save their result there (the QR POS, the Point terminal).
+pub(crate) fn merge_key_into_metadata(
+    existing: Option<Value>,
+    key: &str,
+    value: Value,
+) -> Result<Value, errors::ApiErrorResponse> {
     let mut metadata = match existing {
         None | Some(Value::Null) => serde_json::Map::new(),
         Some(Value::Object(map)) => map,
@@ -351,15 +365,12 @@ pub(crate) fn merge_pos_into_metadata(
             })
         }
     };
-    metadata.insert(
-        QR_POS_METADATA_KEY.to_string(),
-        serde_json::to_value(pos).map_err(|_| errors::ApiErrorResponse::InternalServerError)?,
-    );
+    metadata.insert(key.to_string(), value);
     Ok(Value::Object(metadata))
 }
 
 /// Mercado Pago ids come as numbers or text depending on the endpoint.
-fn id_to_string(value: &Value) -> Option<String> {
+pub(crate) fn id_to_string(value: &Value) -> Option<String> {
     match value {
         Value::String(text) if !text.is_empty() => Some(text.clone()),
         Value::Number(number) => Some(number.to_string()),
@@ -455,20 +466,22 @@ fn find_by_external_id<'a>(results: &'a Value, external_id: &str) -> Option<&'a 
 // Mercado Pago HTTP
 // ============================================================================
 
-struct MpResponse {
-    status: u16,
-    body: Value,
+pub(crate) struct MpResponse {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
-struct MpClient<'a> {
-    state: &'a SessionState,
-    base_url: &'a str,
-    token: Secret<String>,
+/// Calls Mercado Pago as the seller of a connector account. Shared with the Point terminal
+/// setup (`core::mercadopago_terminals`).
+pub(crate) struct MpClient<'a> {
+    pub(crate) state: &'a SessionState,
+    pub(crate) base_url: &'a str,
+    pub(crate) token: Secret<String>,
 }
 
 impl MpClient<'_> {
     /// Never logs the token: it only travels in a masked header.
-    async fn call(
+    pub(crate) async fn call(
         &self,
         method: Method,
         path: &str,
@@ -511,7 +524,7 @@ impl MpClient<'_> {
         Ok(MpResponse { status, body })
     }
 
-    fn success_or_failure(response: MpResponse) -> RouterResult<Value> {
+    pub(crate) fn success_or_failure(response: MpResponse) -> RouterResult<Value> {
         if (200..300).contains(&response.status) {
             Ok(response.body)
         } else {
@@ -695,7 +708,7 @@ impl MpClient<'_> {
 // ============================================================================
 
 /// The connector account and the seller's token, after the checks every call needs.
-async fn load_account(
+pub(crate) async fn load_account(
     state: &SessionState,
     merchant_id: &id_type::MerchantId,
     profile_id: Option<id_type::ProfileId>,
@@ -1031,6 +1044,16 @@ mod tests {
         let merged_again = merge_pos_into_metadata(Some(merged), &other).unwrap();
         assert_eq!(merged_again["account_name"], "hotel");
         assert_eq!(merged_again[QR_POS_METADATA_KEY]["pos_id"], "3003");
+    }
+
+    #[test]
+    fn merging_the_pos_keeps_a_saved_point_terminal() {
+        let terminal =
+            json!({"terminal_id": "NEWLAND_N950__N950NCD600391917", "operating_mode": "PDV"});
+        let merged =
+            merge_pos_into_metadata(Some(json!({"point_terminal": terminal})), &pos()).unwrap();
+        assert_eq!(merged["point_terminal"], terminal);
+        assert_eq!(existing_pos(Some(&merged), SELLER), Some(pos()));
     }
 
     #[test]

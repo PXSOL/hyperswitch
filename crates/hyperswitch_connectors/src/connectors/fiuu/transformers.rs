@@ -602,10 +602,13 @@ impl TryFrom<&FiuuRouterData<&PaymentsAuthorizeRouterData>> for FiuuPaymentReque
                     | WalletData::StripeCheckout {}
                     | WalletData::IzipayCheckout {}
                     | WalletData::MercadoPagoCheckoutPro {}
-                    | WalletData::MercadoPagoQr {} => Err(errors::ConnectorError::NotImplemented(
-                        utils::get_unimplemented_payment_method_error_message("fiuu"),
-                    )
-                    .into()),
+                    | WalletData::MercadoPagoQr {}
+                    | WalletData::MercadoPagoPoint {} => {
+                        Err(errors::ConnectorError::NotImplemented(
+                            utils::get_unimplemented_payment_method_error_message("fiuu"),
+                        )
+                        .into())
+                    }
                 },
                 PaymentMethodData::CardRedirect(_)
                 | PaymentMethodData::PayLater(_)

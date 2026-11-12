@@ -1007,6 +1007,8 @@ pub enum MercadopagoAuthorizeRequest {
     Payment(Box<MercadopagoPaymentsRequest>),
     /// In-person dynamic QR: POST /v1/orders
     Order(Box<super::orders::MercadopagoQrOrderRequest>),
+    /// In-person Point card terminal: POST /v1/orders
+    PointOrder(Box<super::orders::MercadopagoPointOrderRequest>),
 }
 
 impl MercadopagoAuthorizeRequest {
@@ -1019,6 +1021,10 @@ impl MercadopagoAuthorizeRequest {
 
     pub fn is_qr(payment_method_data: &PaymentMethodData) -> bool {
         super::orders::is_qr_wallet(payment_method_data)
+    }
+
+    pub fn is_point(payment_method_data: &PaymentMethodData) -> bool {
+        super::orders::is_point_wallet(payment_method_data)
     }
 }
 
@@ -1035,6 +1041,10 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
         } else if Self::is_qr(&item.router_data.request.payment_method_data) {
             Ok(Self::Order(Box::new(
                 super::orders::MercadopagoQrOrderRequest::try_from(item)?,
+            )))
+        } else if Self::is_point(&item.router_data.request.payment_method_data) {
+            Ok(Self::PointOrder(Box::new(
+                super::orders::MercadopagoPointOrderRequest::try_from(item)?,
             )))
         } else {
             Ok(Self::Payment(Box::new(
@@ -1820,7 +1830,7 @@ pub struct MercadopagoErrorCause {
 
 /// Like `deserialize_code`, but a value that is neither text nor a number is `None` instead of
 /// an error, so an optional informative field can never fail the whole response.
-fn deserialize_lenient_code<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+pub(super) fn deserialize_lenient_code<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

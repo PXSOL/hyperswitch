@@ -1318,6 +1318,7 @@ pub enum WalletData {
     MercadoPagoSdk(MercadoPagoSdkData),
     MercadoPagoCheckoutPro {},
     MercadoPagoQr {},
+    MercadoPagoPoint {},
     WompiCheckout {},
     StripeCheckout {},
     IzipayCheckout {},
@@ -3115,6 +3116,7 @@ impl From<api_models::payments::WalletData> for WalletData {
                 Self::MercadoPagoCheckoutPro {}
             }
             api_models::payments::WalletData::MercadoPagoQr {} => Self::MercadoPagoQr {},
+            api_models::payments::WalletData::MercadoPagoPoint {} => Self::MercadoPagoPoint {},
             api_models::payments::WalletData::WompiCheckout {} => Self::WompiCheckout {},
             api_models::payments::WalletData::StripeCheckout {} => Self::StripeCheckout {},
             api_models::payments::WalletData::IzipayCheckout {} => Self::IzipayCheckout {},
@@ -4112,9 +4114,10 @@ impl GetPaymentMethodType for WalletData {
             Self::MbWayRedirect(_) => api_enums::PaymentMethodType::MbWay,
             Self::MobilePayRedirect(_) => api_enums::PaymentMethodType::MobilePay,
             Self::PaypalRedirect(_) | Self::PaypalSdk(_) => api_enums::PaymentMethodType::Paypal,
-            Self::MercadoPagoSdk(_) | Self::MercadoPagoCheckoutPro {} | Self::MercadoPagoQr {} => {
-                api_enums::PaymentMethodType::MercadoPago
-            }
+            Self::MercadoPagoSdk(_)
+            | Self::MercadoPagoCheckoutPro {}
+            | Self::MercadoPagoQr {}
+            | Self::MercadoPagoPoint {} => api_enums::PaymentMethodType::MercadoPago,
             Self::WompiCheckout {} => api_enums::PaymentMethodType::Wompi,
             Self::StripeCheckout {} => api_enums::PaymentMethodType::StripeCheckout,
             Self::IzipayCheckout {} => api_enums::PaymentMethodType::Izipay,

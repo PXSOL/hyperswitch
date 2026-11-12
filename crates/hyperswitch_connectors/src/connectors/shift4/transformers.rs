@@ -445,6 +445,7 @@ impl TryFrom<&WalletData> for PaymentMethodType {
             | WalletData::IzipayCheckout {}
             | WalletData::MercadoPagoCheckoutPro {}
             | WalletData::MercadoPagoQr {}
+            | WalletData::MercadoPagoPoint {}
             | WalletData::RevolutPay(_) => Err(errors::ConnectorError::NotImplemented(
                 utils::get_unimplemented_payment_method_error_message("Shift4"),
             )
