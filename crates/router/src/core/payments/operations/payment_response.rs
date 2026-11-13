@@ -3383,13 +3383,13 @@ async fn payment_response_update_tracker<F: Clone, T: types::Capturable>(
                 }
                 None => {
                     let sub_flow = core_utils::get_flow_name::<F>()?;
-                    // A void the connector refused for a payment still waiting for the
-                    // customer (a Stripe Checkout session the buyer has just paid) keeps
-                    // it waiting: the next sync, not this error, decides.
-                    let keep_waiting = sub_flow == "Void"
-                        && router_data.status == enums::AttemptStatus::AuthenticationPending
-                        && payment_data.payment_attempt.payment_method_type
-                            == Some(enums::PaymentMethodType::StripeCheckout);
+                    let keep_waiting = refused_void_keeps_waiting(
+                        &sub_flow,
+                        router_data.status,
+                        payment_data.payment_attempt.payment_method_type,
+                        payment_data.payment_attempt.connector.as_deref(),
+                        payment_data.payment_attempt.get_connector_payment_id(),
+                    );
 
                     let card_network = payment_data.payment_attempt.extract_card_network();
 
@@ -4317,6 +4317,28 @@ async fn delete_cvc_after_success(
                 .ok();
         }
     }
+}
+
+/// Whether a void the connector refused keeps the payment waiting for the customer: the next
+/// sync, not this error, decides. `attempt_status` is the one the payment had when the void
+/// was sent.
+///
+/// It applies to a Stripe Checkout session (the buyer may have just paid it) and to a Mercado
+/// Pago order (QR or Point terminal): whatever Mercado Pago answered, an expired seller token
+/// included, the order was not cancelled there and the customer can still pay it, so failing
+/// the payment here would lose that charge.
+#[cfg(feature = "v1")]
+fn refused_void_keeps_waiting(
+    sub_flow: &str,
+    attempt_status: enums::AttemptStatus,
+    payment_method_type: Option<enums::PaymentMethodType>,
+    connector: Option<&str>,
+    connector_transaction_id: Option<&str>,
+) -> bool {
+    sub_flow == "Void"
+        && attempt_status == enums::AttemptStatus::AuthenticationPending
+        && (payment_method_type == Some(enums::PaymentMethodType::StripeCheckout)
+            || crate::core::payments::is_mercadopago_order(connector, connector_transaction_id))
 }
 
 /// Builds the post capture void outcome for a connector error. A 5xx does not tell whether the
@@ -6278,5 +6300,133 @@ impl<F: Clone + Send + Sync>
         }
 
         Ok(payment_data)
+    }
+}
+
+#[cfg(all(test, feature = "v1"))]
+mod refused_void_tests {
+    use super::{
+        enums::{AttemptStatus, PaymentMethodType},
+        refused_void_keeps_waiting,
+    };
+
+    const MERCADOPAGO_ORDER_ID: &str = "ORD01M78BV8NT22CDEKFAZM2AMMER";
+
+    /// A refused void of a payment that was waiting for the customer.
+    fn waiting_void(
+        payment_method_type: Option<PaymentMethodType>,
+        connector: &str,
+        connector_transaction_id: Option<&str>,
+    ) -> bool {
+        refused_void_keeps_waiting(
+            "Void",
+            AttemptStatus::AuthenticationPending,
+            payment_method_type,
+            Some(connector),
+            connector_transaction_id,
+        )
+    }
+
+    #[test]
+    fn a_stripe_checkout_session_keeps_waiting_as_before() {
+        assert!(waiting_void(
+            Some(PaymentMethodType::StripeCheckout),
+            "stripe",
+            Some("cs_test_a1B2c3D4e5F6g7H8i9J0")
+        ));
+        // Only while it was waiting for the customer, and only on a void.
+        assert!(!refused_void_keeps_waiting(
+            "Void",
+            AttemptStatus::Authorized,
+            Some(PaymentMethodType::StripeCheckout),
+            Some("stripe"),
+            Some("cs_test_a1B2c3D4e5F6g7H8i9J0"),
+        ));
+        assert!(!refused_void_keeps_waiting(
+            "Capture",
+            AttemptStatus::AuthenticationPending,
+            Some(PaymentMethodType::StripeCheckout),
+            Some("stripe"),
+            Some("cs_test_a1B2c3D4e5F6g7H8i9J0"),
+        ));
+    }
+
+    #[test]
+    fn a_mercado_pago_order_keeps_waiting() {
+        // QR and Point orders share the payment method type and the shape of the order id.
+        assert!(waiting_void(
+            Some(PaymentMethodType::MercadoPago),
+            "mercadopago",
+            Some(MERCADOPAGO_ORDER_ID)
+        ));
+        assert!(waiting_void(
+            Some(PaymentMethodType::MercadoPago),
+            "mercadopago",
+            Some("ORDTST01M77XTDMRFPKZ9P21B7AY0FXT")
+        ));
+    }
+
+    #[test]
+    fn a_mercado_pago_order_keeps_waiting_only_on_a_void_of_a_waiting_payment() {
+        assert!(!refused_void_keeps_waiting(
+            "Void",
+            AttemptStatus::Authorized,
+            Some(PaymentMethodType::MercadoPago),
+            Some("mercadopago"),
+            Some(MERCADOPAGO_ORDER_ID),
+        ));
+        for sub_flow in ["PSync", "Capture", "Authorize", "Execute"] {
+            assert!(
+                !refused_void_keeps_waiting(
+                    sub_flow,
+                    AttemptStatus::AuthenticationPending,
+                    Some(PaymentMethodType::MercadoPago),
+                    Some("mercadopago"),
+                    Some(MERCADOPAGO_ORDER_ID),
+                ),
+                "{sub_flow}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mercado_pago_card_or_checkout_pro_attempt_fails_as_before() {
+        // A card payment (numeric id) and Checkout Pro (no id until the buyer pays).
+        assert!(!waiting_void(
+            Some(PaymentMethodType::Credit),
+            "mercadopago",
+            Some("150211668619")
+        ));
+        assert!(!waiting_void(
+            Some(PaymentMethodType::MercadoPago),
+            "mercadopago",
+            Some("150211668619")
+        ));
+        assert!(!waiting_void(
+            Some(PaymentMethodType::MercadoPago),
+            "mercadopago",
+            None
+        ));
+    }
+
+    #[test]
+    fn another_connector_fails_as_before() {
+        for connector in ["wompi", "izipay", "stripe"] {
+            assert!(
+                !waiting_void(
+                    Some(PaymentMethodType::Credit),
+                    connector,
+                    Some(MERCADOPAGO_ORDER_ID)
+                ),
+                "{connector}"
+            );
+        }
+        assert!(!refused_void_keeps_waiting(
+            "Void",
+            AttemptStatus::AuthenticationPending,
+            None,
+            None,
+            Some(MERCADOPAGO_ORDER_ID),
+        ));
     }
 }

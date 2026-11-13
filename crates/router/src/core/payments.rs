@@ -11687,9 +11687,20 @@ fn is_mercadopago_order_awaiting_customer(
     connector_transaction_id: Option<&str>,
 ) -> bool {
     intent_status == storage_enums::IntentStatus::RequiresCustomerAction
-        && connector.and_then(|connector| {
-            common_enums::connector_enums::Connector::from_str(connector).ok()
-        }) == Some(common_enums::connector_enums::Connector::Mercadopago)
+        && is_mercadopago_order(connector, connector_transaction_id)
+}
+
+/// Whether an attempt is a Mercado Pago Orders API order (in-person QR or Point terminal),
+/// whatever its status. Shared by the cancel gate above and by the handling of a refused void
+/// in `payment_response`, so both always agree on which attempts are orders.
+#[cfg(feature = "v1")]
+pub(crate) fn is_mercadopago_order(
+    connector: Option<&str>,
+    connector_transaction_id: Option<&str>,
+) -> bool {
+    connector
+        .and_then(|connector| common_enums::connector_enums::Connector::from_str(connector).ok())
+        == Some(common_enums::connector_enums::Connector::Mercadopago)
         && connector_transaction_id
             .is_some_and(hyperswitch_connectors::connectors::mercadopago::orders::is_order_id)
 }
@@ -18725,7 +18736,9 @@ impl PaymentIntentStateMetadataExt {
 
 #[cfg(all(test, feature = "v1"))]
 mod mercadopago_order_cancel_tests {
-    use super::{is_mercadopago_order_awaiting_customer, storage_enums::IntentStatus};
+    use super::{
+        is_mercadopago_order, is_mercadopago_order_awaiting_customer, storage_enums::IntentStatus,
+    };
 
     /// Order ids as Mercado Pago issues them, in production and in sandbox.
     const ORDER_ID: &str = "ORD01M78BV8NT22CDEKFAZM2AMMER";
@@ -18810,6 +18823,34 @@ mod mercadopago_order_cancel_tests {
                 "{status:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_attempt_is_a_mercado_pago_order_by_its_connector_and_order_id_alone() {
+        // No status is involved: by the time a void is answered, the stored one has changed.
+        assert!(is_mercadopago_order(Some("mercadopago"), Some(ORDER_ID)));
+        assert!(is_mercadopago_order(
+            Some("mercadopago"),
+            Some(SANDBOX_ORDER_ID)
+        ));
+        // A card payment, the payment of an order, and Checkout Pro before the buyer pays.
+        assert!(!is_mercadopago_order(
+            Some("mercadopago"),
+            Some("150211668619")
+        ));
+        assert!(!is_mercadopago_order(
+            Some("mercadopago"),
+            Some("PAY01M78BV8P6KJQRQMSFSG2BAWQQ")
+        ));
+        assert!(!is_mercadopago_order(Some("mercadopago"), None));
+        // Another connector, or none.
+        for connector in ["stripe", "wompi", "not_a_connector", ""] {
+            assert!(
+                !is_mercadopago_order(Some(connector), Some(ORDER_ID)),
+                "{connector}"
+            );
+        }
+        assert!(!is_mercadopago_order(None, Some(ORDER_ID)));
     }
 
     #[test]

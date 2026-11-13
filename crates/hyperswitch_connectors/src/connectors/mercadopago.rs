@@ -2499,13 +2499,11 @@ mod tests {
 
     #[test]
     fn any_refusal_of_an_order_cancel_keeps_the_attempt_waiting() {
-        // Whatever the reason, an order Mercado Pago did not cancel can still be paid. Only the
-        // 409 and the 400 are real answers; the other bodies assume the same Orders API shape.
+        // Whatever the reason, an order Mercado Pago did not cancel can still be paid. These
+        // are the refusals the Orders API itself answers, in its own error shape.
         for (status_code, code, message) in [
             (400, "header_value", "Invalid value for header"),
-            (401, "unauthorized", "Invalid access token"),
-            (403, "forbidden", "The seller revoked the authorization"),
-            (404, "order_not_found", "Order not found"),
+            (404, "order_not_found", "Order not found."),
             (
                 409,
                 "cannot_cancel_order",
@@ -2522,6 +2520,37 @@ mod tests {
             assert_eq!(error.code, code);
             assert_eq!(error.message, message);
         }
+    }
+
+    #[test]
+    fn authentication_failures_of_an_order_cancel_carry_no_status_from_the_connector() {
+        // Real answers to `POST /v1/orders/{id}/cancel` with an invalid token and with none.
+        // They come from Mercado Pago's authentication layer, not from the Orders API, so
+        // nothing in them tells an order cancel from the void of a card payment and the
+        // connector returns no status. Core keeps these attempts waiting by itself (it knows
+        // the attempt is an order): see `refused_void_keeps_waiting` in the router.
+        let invalid_token = void_error(connector_response(
+            401,
+            json!({"code": "unauthorized", "message": "user not found"}),
+        ));
+        assert_eq!(invalid_token.attempt_status, None);
+        assert_eq!(invalid_token.status_code, 401);
+        assert!(invalid_token.message.contains("user not found"));
+
+        let no_token = void_error(connector_response(
+            403,
+            json!({
+                "status": 403,
+                "blocked_by": "PolicyAgent",
+                "message": "At least one policy returned UNAUTHORIZED.",
+                "code": "PA_UNAUTHORIZED_RESULT_FROM_POLICIES"
+            }),
+        ));
+        assert_eq!(no_token.attempt_status, None);
+        assert_eq!(no_token.status_code, 403);
+        assert!(no_token
+            .message
+            .contains("At least one policy returned UNAUTHORIZED."));
     }
 
     #[test]
@@ -2551,10 +2580,6 @@ mod tests {
                        "cause": [{"code": 2063, "description": "The action requested is not valid"}]}),
             ),
             (
-                401,
-                json!({"message": "invalid access token", "error": "unauthorized", "status": 401, "cause": []}),
-            ),
-            (
                 404,
                 json!({"message": "Payment not found", "error": "not_found", "status": 404, "cause": []}),
             ),
@@ -2575,8 +2600,7 @@ mod tests {
 
         // The same Orders API bodies outside a void are not a waiting order.
         for (status_code, code, message) in [
-            (401, "unauthorized", "Invalid access token"),
-            (404, "order_not_found", "Order not found"),
+            (404, "order_not_found", "Order not found."),
             (
                 409,
                 "cannot_cancel_order",
