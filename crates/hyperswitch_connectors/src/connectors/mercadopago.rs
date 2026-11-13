@@ -824,11 +824,19 @@ impl ConnectorIntegration<Void, PaymentsCancelData, PaymentsResponseData> for Me
         res: Response,
         event_builder: Option<&mut ConnectorEvent>,
     ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
-        let error = self.build_error_response(res, event_builder)?;
         // An order Mercado Pago refuses to cancel is still alive and can be paid: the attempt
-        // keeps waiting instead of taking the failure core gives a refused void.
+        // keeps waiting instead of taking the failure core gives a refused void. A body that
+        // does not parse is reported by `build_error_response` below.
+        let attempt_status = res
+            .response
+            .parse_struct::<mercadopago::MercadopagoErrorResponse>("MercadopagoErrorResponse")
+            .ok()
+            .and_then(|error| {
+                orders::attempt_status_after_refused_order_cancel(res.status_code, &error)
+            });
+        let error = self.build_error_response(res, event_builder)?;
         Ok(ErrorResponse {
-            attempt_status: orders::attempt_status_after_refused_cancel(&error.code),
+            attempt_status,
             ..error
         })
     }
@@ -2446,17 +2454,29 @@ mod tests {
         )
     }
 
+    fn void_error(response: Response) -> ErrorResponse {
+        ConnectorIntegration::<Void, PaymentsCancelData, PaymentsResponseData>::get_error_response(
+            Mercadopago::new(),
+            response,
+            None,
+        )
+        .expect("the refusal parses")
+    }
+
+    /// An error in the shape the Orders API answers with.
+    fn orders_api_error(status_code: u16, code: &str, message: &str) -> Response {
+        connector_response(
+            status_code,
+            json!({"errors": [{"code": code, "message": message}]}),
+        )
+    }
+
     #[test]
     fn order_cancel_mercado_pago_refuses_keeps_the_attempt_waiting() {
         // The refusal does not say which kind of order it was, so this is what the cancel of a
         // Point order and of a QR order both get: the order was not cancelled and can still be
         // paid, so the attempt keeps waiting for the customer instead of failing.
-        let error = ConnectorIntegration::<Void, PaymentsCancelData, PaymentsResponseData>::get_error_response(
-            Mercadopago::new(),
-            refused_cancel_response(),
-            None,
-        )
-        .expect("the refusal parses");
+        let error = void_error(refused_cancel_response());
         assert_eq!(
             error.attempt_status,
             Some(enums::AttemptStatus::AuthenticationPending)
@@ -2478,45 +2498,120 @@ mod tests {
     }
 
     #[test]
+    fn any_refusal_of_an_order_cancel_keeps_the_attempt_waiting() {
+        // Whatever the reason, an order Mercado Pago did not cancel can still be paid. Only the
+        // 409 and the 400 are real answers; the other bodies assume the same Orders API shape.
+        for (status_code, code, message) in [
+            (400, "header_value", "Invalid value for header"),
+            (401, "unauthorized", "Invalid access token"),
+            (403, "forbidden", "The seller revoked the authorization"),
+            (404, "order_not_found", "Order not found"),
+            (
+                409,
+                "cannot_cancel_order",
+                "The order must be in 'created' status to be canceled",
+            ),
+        ] {
+            let error = void_error(orders_api_error(status_code, code, message));
+            assert_eq!(
+                error.attempt_status,
+                Some(enums::AttemptStatus::AuthenticationPending),
+                "{status_code}"
+            );
+            assert_eq!(error.status_code, status_code);
+            assert_eq!(error.code, code);
+            assert_eq!(error.message, message);
+        }
+    }
+
+    #[test]
+    fn a_server_error_on_an_order_cancel_is_left_to_core() {
+        // A 5xx does not say whether the order was cancelled: core keeps it processing and the
+        // next sync resolves it.
+        for status_code in [500, 502, 503] {
+            let error = ConnectorIntegration::<Void, PaymentsCancelData, PaymentsResponseData>::get_5xx_error_response(
+                Mercadopago::new(),
+                orders_api_error(status_code, "internal_error", "Internal server error"),
+                None,
+            )
+            .expect("the failure is reported");
+            assert_eq!(error.attempt_status, None, "{status_code}");
+            assert_eq!(error.status_code, status_code);
+        }
+    }
+
+    #[test]
     fn other_void_errors_and_other_flows_leave_the_attempt_status_to_core() {
-        // Any other refusal of a void keeps the previous behaviour: no status from the connector.
+        // The void of a card payment (`PUT /v1/payments/{id}`) fails in the Payments API shape,
+        // which is how it is told apart from an order cancel: it keeps core's own handling.
         for (status_code, body) in [
             (
+                400,
+                json!({"message": "Invalid payment status", "error": "bad_request", "status": 400,
+                       "cause": [{"code": 2063, "description": "The action requested is not valid"}]}),
+            ),
+            (
+                401,
+                json!({"message": "invalid access token", "error": "unauthorized", "status": 401, "cause": []}),
+            ),
+            (
                 404,
-                json!({"errors": [{"code": "order_not_found", "message": "Order not found"}]}),
+                json!({"message": "Payment not found", "error": "not_found", "status": 404, "cause": []}),
+            ),
+            // Not an Orders API error either: nothing to read in `errors`.
+            (
+                400,
+                json!({"message": "bad", "error": "bad_request", "errors": []}),
             ),
             (
                 400,
-                json!({"message": "Invalid payment status", "error": "bad_request", "status": 400}),
+                json!({"message": "bad", "error": "bad_request", "errors": "nope"}),
             ),
         ] {
-            let error = ConnectorIntegration::<Void, PaymentsCancelData, PaymentsResponseData>::get_error_response(
-                Mercadopago::new(),
-                connector_response(status_code, body.clone()),
-                None,
-            )
-            .expect("the refusal parses");
+            let error = void_error(connector_response(status_code, body.clone()));
             assert_eq!(error.attempt_status, None, "{body}");
             assert_eq!(error.status_code, status_code);
         }
 
-        // The same body outside a void is not a waiting order.
-        let on_sync = ConnectorIntegration::<PSync, PaymentsSyncData, PaymentsResponseData>::get_error_response(
-            Mercadopago::new(),
-            refused_cancel_response(),
-            None,
-        )
-        .expect("the refusal parses");
-        assert_eq!(on_sync.attempt_status, None);
-        assert_eq!(on_sync.code, "cannot_cancel_order");
-        let on_refund =
-            ConnectorIntegration::<Execute, RefundsData, RefundsResponseData>::get_error_response(
+        // The same Orders API bodies outside a void are not a waiting order.
+        for (status_code, code, message) in [
+            (401, "unauthorized", "Invalid access token"),
+            (404, "order_not_found", "Order not found"),
+            (
+                409,
+                "cannot_cancel_order",
+                "The order must be in 'created' status to be canceled",
+            ),
+        ] {
+            let on_sync = ConnectorIntegration::<PSync, PaymentsSyncData, PaymentsResponseData>::get_error_response(
                 Mercadopago::new(),
-                refused_cancel_response(),
+                orders_api_error(status_code, code, message),
                 None,
             )
             .expect("the refusal parses");
-        assert_eq!(on_refund.attempt_status, None);
+            assert_eq!(on_sync.attempt_status, None, "{status_code}");
+            assert_eq!(on_sync.code, code);
+
+            let on_refund = ConnectorIntegration::<Execute, RefundsData, RefundsResponseData>::get_error_response(
+                Mercadopago::new(),
+                orders_api_error(status_code, code, message),
+                None,
+            )
+            .expect("the refusal parses");
+            assert_eq!(on_refund.attempt_status, None, "{status_code}");
+
+            let on_authorize = ConnectorIntegration::<
+                Authorize,
+                PaymentsAuthorizeData,
+                PaymentsResponseData,
+            >::get_error_response(
+                Mercadopago::new(),
+                orders_api_error(status_code, code, message),
+                None,
+            )
+            .expect("the refusal parses");
+            assert_eq!(on_authorize.attempt_status, None, "{status_code}");
+        }
     }
 
     /// Real answer (HTTP 202) to the cancel of an order the terminal already shows, on firmware

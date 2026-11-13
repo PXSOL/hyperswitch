@@ -1861,6 +1861,12 @@ impl MercadopagoErrorResponse {
         self.errors.as_ref()?.as_array()?.first()
     }
 
+    /// Whether this is an error of the Orders API (`{"errors":[...]}`), as opposed to one of
+    /// the Payments API (`{"message","error","status","cause"}`).
+    pub(super) fn is_orders_api_error(&self) -> bool {
+        self.order_error().is_some()
+    }
+
     fn order_error_text(&self, key: &str) -> Option<String> {
         self.order_error()?
             .get(key)?

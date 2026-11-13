@@ -23,8 +23,8 @@ use hyperswitch_interfaces::errors;
 use serde::{Deserialize, Serialize};
 
 use super::transformers::{
-    get_mercadopago_error_message, MercadopagoMetadata, MercadopagoRouterData,
-    MAX_APPLICATION_FEE_RATIO,
+    get_mercadopago_error_message, MercadopagoErrorResponse, MercadopagoMetadata,
+    MercadopagoRouterData, MAX_APPLICATION_FEE_RATIO,
 };
 use crate::{
     types::{RefundsResponseRouterData, ResponseRouterData},
@@ -65,9 +65,6 @@ pub const MP_ORDER_TYPE_KEY: &str = "mp_order_type";
 /// Mercado Pago accepts no other value, and honours it on terminal firmware 12.3.18 or newer;
 /// an older terminal still answers 409 `cannot_cancel_order`.
 const POINT_CANCEL_HEADER: (&str, &str) = ("x-allow-cancelable-status", "at_terminal");
-/// Error code of an order cancel Mercado Pago refuses (HTTP 409): the order was not cancelled.
-const CANNOT_CANCEL_ORDER_CODE: &str = "cannot_cancel_order";
-
 /// Error code of a card rejected on a Point terminal. Mercado Pago reports it as a failed
 /// order whose payment has the detail `in_review`, which reads like a pending review but is
 /// a final rejection.
@@ -147,14 +144,21 @@ fn is_point_attempt(connector_metadata: Option<&serde_json::Value>) -> bool {
         == Some(ORDER_TYPE_POINT)
 }
 
-/// The status an attempt keeps when Mercado Pago refuses to cancel its order, `None` for any
-/// other error. A refused cancel leaves the order alive (it can still be paid on the terminal
-/// or by scanning the QR), so the attempt goes on waiting for the customer instead of failing;
-/// the next sync decides. The refusal does not say whether the order is a QR or a Point one.
-pub(crate) fn attempt_status_after_refused_cancel(
-    error_code: &str,
+/// The status an attempt keeps when Mercado Pago refuses the cancel of its order, `None` for
+/// any other failed void. Whatever the reason of a 4xx (the order is already on the terminal,
+/// the seller's token expired, the order was not found), the order was not cancelled and can
+/// still be paid on the terminal or by scanning the QR, so the attempt goes on waiting for
+/// the customer instead of failing; the next sync decides.
+///
+/// The error handler of a void only sees the response, so an order cancel is told apart from
+/// the void of a card payment by the shape of the error: only the Orders API answers with
+/// `{"errors":[...]}`. The refusal does not say whether the order is a QR or a Point one.
+pub(crate) fn attempt_status_after_refused_order_cancel(
+    status_code: u16,
+    error: &MercadopagoErrorResponse,
 ) -> Option<enums::AttemptStatus> {
-    (error_code == CANNOT_CANCEL_ORDER_CODE).then_some(enums::AttemptStatus::AuthenticationPending)
+    ((400..500).contains(&status_code) && error.is_orders_api_error())
+        .then_some(enums::AttemptStatus::AuthenticationPending)
 }
 
 /// The store and POS of a seller, as saved in the connector account metadata by the
