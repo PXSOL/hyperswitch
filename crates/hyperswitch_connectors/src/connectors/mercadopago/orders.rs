@@ -23,8 +23,8 @@ use hyperswitch_interfaces::errors;
 use serde::{Deserialize, Serialize};
 
 use super::transformers::{
-    deserialize_lenient_code, get_mercadopago_error_message, MercadopagoMetadata,
-    MercadopagoRouterData, MAX_APPLICATION_FEE_RATIO,
+    get_mercadopago_error_message, MercadopagoMetadata, MercadopagoRouterData,
+    MAX_APPLICATION_FEE_RATIO,
 };
 use crate::{
     types::{RefundsResponseRouterData, ResponseRouterData},
@@ -53,10 +53,9 @@ pub const QR_POS_METADATA_KEY: &str = "qr_pos";
 /// Key under which the terminal chosen by the terminal setup endpoint lives in the connector
 /// account metadata (`connector_meta_data`).
 pub const POINT_TERMINAL_METADATA_KEY: &str = "point_terminal";
-/// Key of the Mercado Pago payment id in the attempt's `connector_metadata`, which refunds
-/// need. A QR stores the order's payment (`PAY...`) next to its QR fields, where
-/// `QrCodeInformation` ignores unknown keys; a Point order stores the payment's
-/// `reference_id` once it is charged.
+/// Key of the id of the order's payment (`PAY...`) in the attempt's `connector_metadata`,
+/// which is what a refund of the order names. A QR stores it next to its QR fields, where
+/// `QrCodeInformation` ignores unknown keys; a Point order stores it once it is charged.
 pub const MP_PAYMENT_ID_KEY: &str = "mp_payment_id";
 /// Key that marks the attempt of a Point order in its `connector_metadata`, stored when the
 /// order is created. An order id does not tell a Point order from a QR one, and the cancel
@@ -66,6 +65,8 @@ pub const MP_ORDER_TYPE_KEY: &str = "mp_order_type";
 /// Mercado Pago accepts no other value, and honours it on terminal firmware 12.3.18 or newer;
 /// an older terminal still answers 409 `cannot_cancel_order`.
 const POINT_CANCEL_HEADER: (&str, &str) = ("x-allow-cancelable-status", "at_terminal");
+/// Error code of an order cancel Mercado Pago refuses (HTTP 409): the order was not cancelled.
+const CANNOT_CANCEL_ORDER_CODE: &str = "cannot_cancel_order";
 
 /// Error code of a card rejected on a Point terminal. Mercado Pago reports it as a failed
 /// order whose payment has the detail `in_review`, which reads like a pending review but is
@@ -135,11 +136,25 @@ pub fn is_point_wallet(payment_method_data: &PaymentMethodData) -> bool {
 pub(crate) fn point_cancel_header(
     connector_metadata: Option<&serde_json::Value>,
 ) -> Option<(&'static str, &'static str)> {
-    let is_point_attempt = connector_metadata
+    is_point_attempt(connector_metadata).then_some(POINT_CANCEL_HEADER)
+}
+
+/// Whether the attempt was marked as a Point order when its order was created.
+fn is_point_attempt(connector_metadata: Option<&serde_json::Value>) -> bool {
+    connector_metadata
         .and_then(|metadata| metadata.get(MP_ORDER_TYPE_KEY))
         .and_then(serde_json::Value::as_str)
-        == Some(ORDER_TYPE_POINT);
-    is_point_attempt.then_some(POINT_CANCEL_HEADER)
+        == Some(ORDER_TYPE_POINT)
+}
+
+/// The status an attempt keeps when Mercado Pago refuses to cancel its order, `None` for any
+/// other error. A refused cancel leaves the order alive (it can still be paid on the terminal
+/// or by scanning the QR), so the attempt goes on waiting for the customer instead of failing;
+/// the next sync decides. The refusal does not say whether the order is a QR or a Point one.
+pub(crate) fn attempt_status_after_refused_cancel(
+    error_code: &str,
+) -> Option<enums::AttemptStatus> {
+    (error_code == CANNOT_CANCEL_ORDER_CODE).then_some(enums::AttemptStatus::AuthenticationPending)
 }
 
 /// The store and POS of a seller, as saved in the connector account metadata by the
@@ -581,9 +596,6 @@ pub struct MercadopagoOrderPayment {
     pub status: Option<String>,
     #[serde(default)]
     pub status_detail: Option<String>,
-    /// Id of the payment in `/v1/payments`, present once a card was presented.
-    #[serde(default, deserialize_with = "deserialize_lenient_code")]
-    pub reference_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -672,10 +684,10 @@ impl MercadopagoOrderResponse {
     }
 
     /// The attempt's `connector_metadata` for a Point order: the marker that says it is one
-    /// (the cancel needs it) and, once it is charged, the id of its payment, which is what a
-    /// refund names. A Point order without an approved payment never gets that id, so it
-    /// cannot be refunded. `None` for a QR order leaves its stored metadata (the QR and its
-    /// payment id) untouched.
+    /// (the cancel needs it) and, once it is charged, the id of the order's payment (`PAY...`),
+    /// which is what a refund names, exactly as for a QR. A Point order without an approved
+    /// payment never gets that id, so it cannot be refunded. `None` for a QR order leaves its
+    /// stored metadata (the QR and its payment id) untouched.
     fn point_connector_metadata(&self) -> Option<serde_json::Value> {
         if !self.is_point() {
             return None;
@@ -690,14 +702,14 @@ impl MercadopagoOrderResponse {
                 self.transactions
                     .as_ref()
                     .and_then(|transactions| transactions.payments.first())
-                    .and_then(|payment| payment.reference_id.as_deref())
-                    .filter(|reference_id| !reference_id.is_empty())
+                    .map(|payment| payment.id.as_str())
+                    .filter(|payment_id| !payment_id.is_empty())
             })
             .flatten();
-        if let Some(reference_id) = charged_payment_id {
+        if let Some(payment_id) = charged_payment_id {
             metadata.insert(
                 MP_PAYMENT_ID_KEY.to_string(),
-                serde_json::Value::String(reference_id.to_string()),
+                serde_json::Value::String(payment_id.to_string()),
             );
         }
         Some(serde_json::Value::Object(metadata))
@@ -999,19 +1011,29 @@ pub(crate) fn authorize_point_order_response<F, T>(
     order_payments_response(&order, item.data, item.http_code, connector_metadata)
 }
 
-/// Psync and void. A QR order leaves the stored metadata (QR, payment id) untouched by
-/// returning none; a Point order returns its marker and, once charged, the id of its payment,
-/// which is first seen here, so it can be refunded.
+/// Psync and void: the attempt follows the status of the order in the answer. The answer to
+/// a cancel is the order as it is at that moment, which for an order the terminal already
+/// shows is still `at_terminal` (HTTP 202, the cancellation only requested): the attempt keeps
+/// waiting, and the next sync or the `order.canceled` webhook voids it.
+///
+/// `stored_metadata` is the attempt's own: an attempt marked as a Point order is read as one
+/// even if the answer does not echo its `type`. A QR order leaves the stored metadata (QR,
+/// payment id) untouched by returning none; a Point order returns its marker and, once
+/// charged, the id of its payment, which is first seen here, so it can be refunded.
 pub(crate) fn sync_order_response<F, T>(
     item: ResponseRouterData<F, MercadopagoOrderResponse, T, PaymentsResponseData>,
+    stored_metadata: Option<&serde_json::Value>,
 ) -> RouterData<F, T, PaymentsResponseData> {
-    let connector_metadata = item.response.point_connector_metadata();
-    order_payments_response(
-        &item.response,
-        item.data,
-        item.http_code,
-        connector_metadata,
-    )
+    let order = if is_point_attempt(stored_metadata) {
+        MercadopagoOrderResponse {
+            order_type: Some(ORDER_TYPE_POINT.to_string()),
+            ..item.response
+        }
+    } else {
+        item.response
+    };
+    let connector_metadata = order.point_connector_metadata();
+    order_payments_response(&order, item.data, item.http_code, connector_metadata)
 }
 
 // ============================================================================
@@ -1863,24 +1885,28 @@ mod tests {
     }
 
     #[test]
-    fn a_charged_point_order_stores_its_payment_reference_for_refunds() {
-        // Order 1: processed/accredited with reference_id 189097810220.
+    fn a_charged_point_order_stores_its_own_payment_id_for_refunds() {
+        // The refund of an order names the order's payment (`PAY...`), as on the real terminal:
+        // `{"transactions":[{"id":"PAY01M7661JPGX14PD0YKDC5VKBTM","amount":"10.00"}]}` -> 201.
+        // The `reference_id` (the `/v1/payments` id) is never what gets stored.
+        let expected = serde_json::json!({
+            "mp_order_type": "point",
+            "mp_payment_id": "PAY01M765NPM84NTSPDZZ2GXEEH4R"
+        });
         for reference_id in [
-            serde_json::json!("189097810220"),
-            serde_json::json!(189097810220_i64),
+            Some(serde_json::json!("189097810220")),
+            Some(serde_json::json!(189097810220_i64)),
+            None,
         ] {
-            let charged = point_order("processed", "processed", "accredited", Some(reference_id));
+            let charged = point_order("processed", "processed", "accredited", reference_id);
             let stored = charged
                 .point_connector_metadata()
                 .expect("a charged Point order stores its payment");
+            assert_eq!(stored, expected);
             assert_eq!(
-                stored,
-                serde_json::json!({
-                    "mp_order_type": "point",
-                    "mp_payment_id": "189097810220"
-                })
+                stored_mp_payment_id(Some(&stored)).unwrap(),
+                "PAY01M765NPM84NTSPDZZ2GXEEH4R"
             );
-            assert_eq!(stored_mp_payment_id(Some(&stored)).unwrap(), "189097810220");
         }
         let refunded = point_order(
             "refunded",
@@ -1888,22 +1914,16 @@ mod tests {
             "refunded",
             Some(serde_json::json!("189097810220")),
         );
-        assert_eq!(
-            refunded.point_connector_metadata(),
-            Some(serde_json::json!({
-                "mp_order_type": "point",
-                "mp_payment_id": "189097810220"
-            }))
-        );
+        assert_eq!(refunded.point_connector_metadata(), Some(expected));
     }
 
     #[test]
     fn a_point_order_without_an_approved_payment_stores_only_its_marker() {
         let reference = || Some(serde_json::json!("188034059899"));
-        for (status, payment_status, detail, reference_id) in [
+        let mut not_refundable: Vec<MercadopagoOrderResponse> = [
             ("created", "created", "created", None),
             ("at_terminal", "at_terminal", "at_terminal", None),
-            // A rejected card leaves its payment id on the order: it must not become refundable.
+            // A rejected card leaves its payment on the order: it must not become refundable.
             ("failed", "failed", "in_review", reference()),
             (
                 "action_required",
@@ -1913,31 +1933,36 @@ mod tests {
             ),
             ("canceled", "canceled", "cancel_by_terminal", None),
             ("expired", "expired", "expired", None),
-            // Charged, but the order does not name the payment.
-            ("processed", "processed", "accredited", None),
-            (
-                "processed",
-                "processed",
-                "accredited",
-                Some(serde_json::json!("")),
-            ),
-            (
-                "processed",
-                "processed",
-                "accredited",
-                Some(serde_json::json!({"id": 1})),
-            ),
-        ] {
-            let stored = point_order(status, payment_status, detail, reference_id)
+        ]
+        .into_iter()
+        .map(|(status, payment_status, detail, reference_id)| {
+            point_order(status, payment_status, detail, reference_id)
+        })
+        .collect();
+        // Charged, but the order does not name its payment.
+        not_refundable.push(order(
+            r#"{"id":"ORD1","type":"point","status":"processed","transactions":{"payments":[]}}"#,
+        ));
+        not_refundable.push(order(
+            r#"{"id":"ORD1","type":"point","status":"processed",
+                "transactions":{"payments":[{"id":"","status":"processed"}]}}"#,
+        ));
+        not_refundable.push(order(
+            r#"{"id":"ORD1","type":"point","status":"processed"}"#,
+        ));
+
+        for order in not_refundable {
+            let stored = order
                 .point_connector_metadata()
                 .expect("a Point order is always marked");
             assert_eq!(
                 stored,
                 serde_json::json!({"mp_order_type": "point"}),
-                "{status}"
+                "{:?}",
+                order.status
             );
             // Without the payment id there is nothing a refund could name.
-            assert!(stored_mp_payment_id(Some(&stored)).is_err(), "{status}");
+            assert!(stored_mp_payment_id(Some(&stored)).is_err());
         }
     }
 
@@ -1950,8 +1975,10 @@ mod tests {
             point_cancel_header(Some(&marked)),
             Some(("x-allow-cancelable-status", "at_terminal"))
         );
-        let charged =
-            serde_json::json!({"mp_order_type": "point", "mp_payment_id": "189097810220"});
+        let charged = serde_json::json!({
+            "mp_order_type": "point",
+            "mp_payment_id": "PAY01M765NPM84NTSPDZZ2GXEEH4R"
+        });
         assert!(point_cancel_header(Some(&charged)).is_some());
 
         // A QR attempt (its QR and `PAY` id), an empty one, and anything that is not the marker.

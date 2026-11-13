@@ -1830,7 +1830,7 @@ pub struct MercadopagoErrorCause {
 
 /// Like `deserialize_code`, but a value that is neither text nor a number is `None` instead of
 /// an error, so an optional informative field can never fail the whole response.
-pub(super) fn deserialize_lenient_code<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+fn deserialize_lenient_code<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
