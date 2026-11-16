@@ -9,6 +9,8 @@ pub mod cards_info;
 #[cfg(feature = "v2")]
 pub mod client_secret;
 pub mod conditional_configs;
+// TEMPORARY: remove after the processor account identity backfill (odd/tasks/processor-account-identity.md)
+pub mod connector_account_identity;
 pub mod connector_enums;
 pub mod connector_onboarding;
 pub mod consts;
