@@ -713,10 +713,16 @@ impl ConnectorIntegration<Void, PaymentsCancelData, PaymentsResponseData> for Me
     ) -> CustomResult<Vec<(String, hyperswitch_masking::Maskable<String>)>, errors::ConnectorError>
     {
         let mut headers = self.build_headers(req, connectors)?;
-        headers.push((
-            "X-Idempotency-Key".to_string(),
-            format!("{}_void", req.connector_request_reference_id).into(),
-        ));
+        // Every cancel of an order is a new request: with a fixed key a retry would be answered
+        // with the stored result of the earlier one (the refusal of an order that was on the
+        // terminal) instead of reaching Mercado Pago again. The void of a card payment keeps
+        // its fixed key.
+        let idempotency_key = if orders::is_order_id(&req.request.connector_transaction_id) {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            format!("{}_void", req.connector_request_reference_id)
+        };
+        headers.push(("X-Idempotency-Key".to_string(), idempotency_key.into()));
         // Only the cancel of a Point order carries it; a QR order is cancelled as before.
         if let Some((name, value)) =
             orders::point_cancel_header(req.request.connector_meta.as_ref())
@@ -825,8 +831,9 @@ impl ConnectorIntegration<Void, PaymentsCancelData, PaymentsResponseData> for Me
         event_builder: Option<&mut ConnectorEvent>,
     ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
         // An order Mercado Pago refuses to cancel is still alive and can be paid: the attempt
-        // keeps waiting instead of taking the failure core gives a refused void. A body that
-        // does not parse is reported by `build_error_response` below.
+        // keeps waiting instead of taking the failure core gives a refused void (an order it
+        // does not have is voided). A body that does not parse is reported by
+        // `build_error_response` below.
         let attempt_status = res
             .response
             .parse_struct::<mercadopago::MercadopagoErrorResponse>("MercadopagoErrorResponse")
@@ -1799,6 +1806,24 @@ mod tests {
         mercadopago::test_support::router_data(request, None, PaymentAddress::default())
     }
 
+    /// The void of a card payment: a numeric `/v1/payments` id.
+    fn card_void_router_data() -> PaymentsCancelRouterData {
+        let request = PaymentsCancelData {
+            connector_transaction_id: "150211668619".to_string(),
+            ..Default::default()
+        };
+        mercadopago::test_support::router_data(request, None, PaymentAddress::default())
+    }
+
+    /// The idempotency key of a cancel request.
+    fn void_idempotency_key(router_data: &PaymentsCancelRouterData) -> String {
+        void_headers(router_data)
+            .into_iter()
+            .find(|(name, _)| name == "X-Idempotency-Key")
+            .map(|(_, value)| value)
+            .expect("every cancel carries an idempotency key")
+    }
+
     /// What the attempt of a Point order stores from its creation.
     fn point_attempt_metadata() -> serde_json::Value {
         json!({"mp_order_type": "point"})
@@ -2033,19 +2058,41 @@ mod tests {
     }
 
     #[test]
-    fn point_order_created_in_another_currency_fails_the_attempt() {
+    fn point_order_created_differently_keeps_waiting_so_it_can_be_cancelled() {
+        // The order is already on the terminal and can be paid for ten minutes, so the attempt
+        // is not final: it keeps the order id for the sync and the void.
         let router_data = point_authorize_router_data(None);
-        let mut body = point_order_body("created", "created", point_payment("created", "created"));
-        body["currency"] = json!("USD");
-        let handled = authorize_response(&router_data, body);
-        assert_eq!(handled.status, enums::AttemptStatus::Failure);
-        let error = failure(&handled);
-        assert_eq!(error.code, "order_mismatch");
-        assert!(error.message.contains("USD") && error.message.contains("ARS"));
-        assert_eq!(
-            error.connector_transaction_id.as_deref(),
-            Some(POINT_ORDER_ID)
-        );
+        let mut other_currency =
+            point_order_body("created", "created", point_payment("created", "created"));
+        other_currency["currency"] = json!("USD");
+        let mut other_amount =
+            point_order_body("created", "created", point_payment("created", "created"));
+        other_amount["total_amount"] = json!("150.00");
+
+        for (body, expected) in [
+            (other_currency, ["USD", "ARS"]),
+            (other_amount, ["150.00", "15.00"]),
+        ] {
+            let handled = authorize_response(&router_data, body);
+            assert_eq!(handled.status, enums::AttemptStatus::AuthenticationPending);
+            let error = failure(&handled);
+            assert_eq!(
+                error.attempt_status,
+                Some(enums::AttemptStatus::AuthenticationPending)
+            );
+            assert_eq!(error.code, "order_mismatch");
+            for text in expected {
+                assert!(error.message.contains(text), "{}", error.message);
+            }
+            assert!(error.message.contains("cancel"), "{}", error.message);
+            assert_eq!(error.reason.as_deref(), Some(error.message.as_str()));
+            assert_eq!(
+                error.connector_transaction_id.as_deref(),
+                Some(POINT_ORDER_ID)
+            );
+            // Core does not store the metadata of an error: the marker comes with the next sync.
+            assert!(error.connector_metadata.is_none());
+        }
     }
 
     #[test]
@@ -2123,6 +2170,12 @@ mod tests {
         let mismatched = authorize_response(&router_data, other_currency);
         assert_eq!(mismatched.status, enums::AttemptStatus::Failure);
         assert_eq!(failure(&mismatched).code, "order_mismatch");
+        assert_eq!(
+            failure(&mismatched).attempt_status,
+            Some(enums::AttemptStatus::Failure)
+        );
+        assert!(failure(&mismatched).connector_metadata.is_none());
+        assert!(!failure(&mismatched).message.contains("cancel"));
     }
 
     #[test]
@@ -2351,14 +2404,12 @@ mod tests {
         );
         assert!(request.body.is_none());
 
-        // The header lets the cancel reach an order the device already shows. The idempotency
-        // key is the one every order cancel sends.
+        // The header lets the cancel reach an order the device already shows.
         let headers = void_headers(&router_data);
         assert!(headers.contains(&(
             "x-allow-cancelable-status".to_string(),
             "at_terminal".to_string()
         )));
-        assert!(headers.contains(&("X-Idempotency-Key".to_string(), "pxs_mp_1_void".to_string())));
         // Charged or not, the attempt of a Point order keeps its marker.
         let charged = void_router_data(Some(json!({
             "mp_order_type": "point",
@@ -2387,10 +2438,25 @@ mod tests {
     }
 
     #[test]
-    fn qr_order_cancel_is_sent_as_before_without_the_terminal_header() {
-        // A QR attempt, and one that stores nothing: neither is marked as Point.
-        for connector_meta in [Some(qr_attempt_metadata()), None] {
+    fn each_order_cancel_has_its_own_idempotency_key() {
+        // A retried cancel must reach Mercado Pago again instead of being answered with the
+        // cached result of the earlier one (a 409 from before the terminal was updated).
+        for connector_meta in [Some(point_attempt_metadata()), Some(qr_attempt_metadata())] {
             let router_data = void_router_data(connector_meta);
+            let first = void_idempotency_key(&router_data);
+            let second = void_idempotency_key(&router_data);
+            assert_ne!(first, second);
+            for key in [first, second] {
+                assert_ne!(key, "pxs_mp_1_void");
+                assert!((1..=64).contains(&key.len()), "{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn card_void_keeps_its_fixed_idempotency_key() {
+        let router_data = card_void_router_data();
+        for _ in 0..2 {
             assert_eq!(
                 void_headers(&router_data),
                 vec![
@@ -2400,6 +2466,32 @@ mod tests {
                         "Bearer TEST-access-token".to_string()
                     ),
                     ("X-Idempotency-Key".to_string(), "pxs_mp_1_void".to_string()),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn qr_order_cancel_is_sent_as_before_without_the_terminal_header() {
+        // A QR attempt, and one that stores nothing: neither is marked as Point.
+        for connector_meta in [Some(qr_attempt_metadata()), None] {
+            let router_data = void_router_data(connector_meta);
+            let headers = void_headers(&router_data);
+            assert_eq!(
+                headers
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["Content-Type", "Authorization", "X-Idempotency-Key"]
+            );
+            assert_eq!(
+                headers[..2],
+                [
+                    ("Content-Type".to_string(), "application/json".to_string()),
+                    (
+                        "Authorization".to_string(),
+                        "Bearer TEST-access-token".to_string()
+                    ),
                 ]
             );
 
@@ -2503,12 +2595,12 @@ mod tests {
         // are the refusals the Orders API itself answers, in its own error shape.
         for (status_code, code, message) in [
             (400, "header_value", "Invalid value for header"),
-            (404, "order_not_found", "Order not found."),
             (
                 409,
                 "cannot_cancel_order",
                 "The order must be in 'created' status to be canceled",
             ),
+            (422, "some_other_refusal", "Any other refusal"),
         ] {
             let error = void_error(orders_api_error(status_code, code, message));
             assert_eq!(
@@ -2520,6 +2612,17 @@ mod tests {
             assert_eq!(error.code, code);
             assert_eq!(error.message, message);
         }
+    }
+
+    #[test]
+    fn cancel_of_an_order_mercado_pago_does_not_have_voids_the_attempt() {
+        // Real answer for an unknown order. There is no order left to pay, and a sync would
+        // get the same 404, so waiting would leave the attempt stuck: it is voided.
+        let error = void_error(orders_api_error(404, "order_not_found", "Order not found."));
+        assert_eq!(error.attempt_status, Some(enums::AttemptStatus::Voided));
+        assert_eq!(error.status_code, 404);
+        assert_eq!(error.code, "order_not_found");
+        assert_eq!(error.message, "Order not found.");
     }
 
     #[test]
@@ -2803,6 +2906,30 @@ mod tests {
                 {"id": "PAY00000000000000000000000001", "amount": "10.00"}
             ]})
         );
+    }
+
+    #[test]
+    fn refund_of_a_qr_attempt_without_a_stored_payment_keeps_the_missing_field_error() {
+        // Only a Point attempt gets the "not processed" refusal: for anything else the stored
+        // id is simply missing, as before Point.
+        for stored in [
+            None,
+            Some(
+                json!({"image_data_url": "data:image/png;base64,AAAA", "raw_qr_data": "0002010102"}),
+            ),
+            Some(json!({"mp_order_type": "qr"})),
+        ] {
+            let error = refund_body(&refund_router_data(stored.clone(), 1_000))
+                .expect_err("there is no payment id to refund");
+            assert!(
+                matches!(
+                    error.current_context(),
+                    errors::ConnectorError::MissingRequiredField { field_name }
+                        if *field_name == "connector_metadata.mp_payment_id"
+                ),
+                "{stored:?}: {error:?}"
+            );
+        }
     }
 
     #[test]

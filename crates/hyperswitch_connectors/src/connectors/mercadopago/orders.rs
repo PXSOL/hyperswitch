@@ -57,6 +57,13 @@ pub const POINT_TERMINAL_METADATA_KEY: &str = "point_terminal";
 /// which is what a refund of the order names. A QR stores it next to its QR fields, where
 /// `QrCodeInformation` ignores unknown keys; a Point order stores it once it is charged.
 pub const MP_PAYMENT_ID_KEY: &str = "mp_payment_id";
+/// Error code of an order created for something else than what the request asked to charge.
+const ORDER_MISMATCH_CODE: &str = "order_mismatch";
+/// What to do about a Point order that does not match the request: it is on the terminal.
+const POINT_ORDER_MISMATCH_ADVICE: &str =
+    "The order is on the terminal and can still be paid: cancel it before charging again";
+/// Error code of the Orders API for an order it does not have.
+const ORDER_NOT_FOUND_CODE: &str = "order_not_found";
 /// Key that marks the attempt of a Point order in its `connector_metadata`, stored when the
 /// order is created. An order id does not tell a Point order from a QR one, and the cancel
 /// of a Point order is sent differently.
@@ -144,21 +151,33 @@ fn is_point_attempt(connector_metadata: Option<&serde_json::Value>) -> bool {
         == Some(ORDER_TYPE_POINT)
 }
 
-/// The status an attempt keeps when Mercado Pago refuses the cancel of its order, `None` for
-/// any other failed void. Whatever the reason of a 4xx (the order is already on the terminal,
-/// the seller's token expired, the order was not found), the order was not cancelled and can
-/// still be paid on the terminal or by scanning the QR, so the attempt goes on waiting for
-/// the customer instead of failing; the next sync decides.
+/// The status of an attempt after the Orders API refuses the cancel of its order, `None` for
+/// any other failed void.
+///
+/// A refused cancel (the order is already on the terminal, a header is not accepted) leaves
+/// the order alive: it can still be paid on the terminal or by scanning the QR, so the attempt
+/// goes on waiting for the customer instead of failing, and the next sync decides. The one
+/// exception is an order Mercado Pago does not have (404 `order_not_found`): there is nothing
+/// left to pay and a sync would get the same 404, so the attempt is voided.
 ///
 /// The error handler of a void only sees the response, so an order cancel is told apart from
 /// the void of a card payment by the shape of the error: only the Orders API answers with
 /// `{"errors":[...]}`. The refusal does not say whether the order is a QR or a Point one.
+/// An authentication failure (an expired or revoked seller token) is not answered in that
+/// shape and gets no status here: core keeps the attempt of an order waiting on its own.
 pub(crate) fn attempt_status_after_refused_order_cancel(
     status_code: u16,
     error: &MercadopagoErrorResponse,
 ) -> Option<enums::AttemptStatus> {
-    ((400..500).contains(&status_code) && error.is_orders_api_error())
-        .then_some(enums::AttemptStatus::AuthenticationPending)
+    if !((400..500).contains(&status_code) && error.is_orders_api_error()) {
+        return None;
+    }
+    let order_is_gone = status_code == 404 && error.get_error_code() == ORDER_NOT_FOUND_CODE;
+    Some(if order_is_gone {
+        enums::AttemptStatus::Voided
+    } else {
+        enums::AttemptStatus::AuthenticationPending
+    })
 }
 
 /// The store and POS of a seller, as saved in the connector account metadata by the
@@ -876,12 +895,30 @@ fn order_failure(
     code: String,
     message: String,
 ) -> ErrorResponse {
+    order_error(
+        order,
+        http_code,
+        code,
+        message,
+        enums::AttemptStatus::Failure,
+    )
+}
+
+/// The error of an order, with the status its attempt takes. The order id is always kept, so
+/// the attempt can still be synced and voided.
+fn order_error(
+    order: &MercadopagoOrderResponse,
+    http_code: u16,
+    code: String,
+    message: String,
+    attempt_status: enums::AttemptStatus,
+) -> ErrorResponse {
     ErrorResponse {
         code: code.clone(),
         message: message.clone(),
         reason: Some(message.clone()),
         status_code: http_code,
-        attempt_status: Some(enums::AttemptStatus::Failure),
+        attempt_status: Some(attempt_status),
         connector_transaction_id: Some(order.id.clone()),
         connector_metadata: None,
         network_advice_code: None,
@@ -935,7 +972,7 @@ fn order_mismatch_failure(
 ) -> Option<ErrorResponse> {
     order
         .charge_mismatch(requested_currency, &format_amount(requested_amount))
-        .map(|mismatch| order_failure(order, http_code, "order_mismatch".to_string(), mismatch))
+        .map(|mismatch| order_failure(order, http_code, ORDER_MISMATCH_CODE.to_string(), mismatch))
 }
 
 /// Authorize: the order was just created, so its QR is stored as the attempt's next action.
@@ -990,8 +1027,12 @@ pub(crate) fn authorize_order_response<F, T>(
 /// Authorize of a Point order: the terminal shows the charge, so the attempt waits for the
 /// customer with nothing to display and no next action. The order id is stored like a QR's,
 /// and the attempt is marked as a Point order.
-/// An order that does not match the request fails here, but unlike a QR it stays on the
-/// terminal until it expires or is cancelled there.
+///
+/// An order that does not match the request is already on its way to the terminal, where it
+/// can be paid until it expires: unlike a QR nobody gets to scan, it is not a final failure.
+/// The attempt keeps waiting with the mismatch as its error and the order id stored, so the
+/// order can be cancelled and a charge made on the terminal is still seen by the next sync
+/// (which also stores the Point marker; core does not keep the metadata of an error).
 pub(crate) fn authorize_point_order_response<F, T>(
     item: ResponseRouterData<F, MercadopagoOrderResponse, T, PaymentsResponseData>,
     requested_currency: enums::Currency,
@@ -1002,12 +1043,19 @@ pub(crate) fn authorize_point_order_response<F, T>(
         order_type: Some(ORDER_TYPE_POINT.to_string()),
         ..item.response
     };
-    if let Some(failure) =
-        order_mismatch_failure(&order, item.http_code, requested_currency, requested_amount)
+    if let Some(mismatch) =
+        order.charge_mismatch(requested_currency, &format_amount(requested_amount))
     {
+        let status = enums::AttemptStatus::AuthenticationPending;
         return RouterData {
-            status: enums::AttemptStatus::Failure,
-            response: Err(failure),
+            status,
+            response: Err(order_error(
+                &order,
+                item.http_code,
+                ORDER_MISMATCH_CODE.to_string(),
+                format!("{mismatch}. {POINT_ORDER_MISMATCH_ADVICE}"),
+                status,
+            )),
             ..item.data
         };
     }
@@ -1058,17 +1106,24 @@ pub struct MercadopagoOrderRefundTransaction {
 impl<F> TryFrom<&MercadopagoRouterData<&RefundsRouterData<F>>> for MercadopagoOrderRefundRequest {
     type Error = error_stack::Report<errors::ConnectorError>;
 
-    /// The amount is always explicit, including for a full refund. An order without a stored
-    /// payment id has no approved payment (a Point order that is not processed, for instance
-    /// one left in `action_required`): it is refused here, before any call to Mercado Pago.
+    /// The amount is always explicit, including for a full refund. A Point order without a
+    /// stored payment id has no approved payment (it is not processed, for instance one left
+    /// in `action_required`): it is refused here, before any call to Mercado Pago. For any
+    /// other attempt the id is simply missing.
     fn try_from(item: &MercadopagoRouterData<&RefundsRouterData<F>>) -> Result<Self, Self::Error> {
-        let payment_id = stored_mp_payment_id(item.router_data.request.connector_metadata.as_ref())
-            .change_context(errors::ConnectorError::NotSupported {
-                message: "Refunding a Mercado Pago order without an approved payment \
+        let stored_metadata = item.router_data.request.connector_metadata.as_ref();
+        let payment_id = stored_mp_payment_id(stored_metadata).map_err(|missing| {
+            if is_point_attempt(stored_metadata) {
+                missing.change_context(errors::ConnectorError::NotSupported {
+                    message: "Refunding a Mercado Pago order without an approved payment \
                               (the order is not processed)"
-                    .to_string(),
-                connector: "mercadopago".into(),
-            })?;
+                        .to_string(),
+                    connector: "mercadopago".into(),
+                })
+            } else {
+                missing
+            }
+        })?;
         Ok(Self {
             transactions: vec![MercadopagoOrderRefundTransaction {
                 id: payment_id,
