@@ -29,10 +29,11 @@ use storage_impl::behaviour::ForeignInto;
 
 use crate::{
     core::{
+        api_locking,
         errors::{self, RouterResponse, RouterResult, StorageErrorExt},
         utils as core_utils,
     },
-    routes::SessionState,
+    routes::{lock_utils, SessionState},
     services::ApplicationResponse,
 };
 
@@ -342,6 +343,20 @@ pub(crate) fn merge_pos_into_metadata(
     existing: Option<Value>,
     pos: &MercadopagoQrPos,
 ) -> Result<Value, errors::ApiErrorResponse> {
+    merge_key_into_metadata(
+        existing,
+        QR_POS_METADATA_KEY,
+        serde_json::to_value(pos).map_err(|_| errors::ApiErrorResponse::InternalServerError)?,
+    )
+}
+
+/// Sets one key of the connector account metadata and keeps every other key. Shared by the
+/// setups that save their result there (the QR POS, the Point terminal).
+pub(crate) fn merge_key_into_metadata(
+    existing: Option<Value>,
+    key: &str,
+    value: Value,
+) -> Result<Value, errors::ApiErrorResponse> {
     let mut metadata = match existing {
         None | Some(Value::Null) => serde_json::Map::new(),
         Some(Value::Object(map)) => map,
@@ -351,15 +366,12 @@ pub(crate) fn merge_pos_into_metadata(
             })
         }
     };
-    metadata.insert(
-        QR_POS_METADATA_KEY.to_string(),
-        serde_json::to_value(pos).map_err(|_| errors::ApiErrorResponse::InternalServerError)?,
-    );
+    metadata.insert(key.to_string(), value);
     Ok(Value::Object(metadata))
 }
 
 /// Mercado Pago ids come as numbers or text depending on the endpoint.
-fn id_to_string(value: &Value) -> Option<String> {
+pub(crate) fn id_to_string(value: &Value) -> Option<String> {
     match value {
         Value::String(text) if !text.is_empty() => Some(text.clone()),
         Value::Number(number) => Some(number.to_string()),
@@ -455,20 +467,22 @@ fn find_by_external_id<'a>(results: &'a Value, external_id: &str) -> Option<&'a 
 // Mercado Pago HTTP
 // ============================================================================
 
-struct MpResponse {
-    status: u16,
-    body: Value,
+pub(crate) struct MpResponse {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
-struct MpClient<'a> {
-    state: &'a SessionState,
-    base_url: &'a str,
-    token: Secret<String>,
+/// Calls Mercado Pago as the seller of a connector account. Shared with the Point terminal
+/// setup (`core::mercadopago_terminals`).
+pub(crate) struct MpClient<'a> {
+    pub(crate) state: &'a SessionState,
+    pub(crate) base_url: &'a str,
+    pub(crate) token: Secret<String>,
 }
 
 impl MpClient<'_> {
     /// Never logs the token: it only travels in a masked header.
-    async fn call(
+    pub(crate) async fn call(
         &self,
         method: Method,
         path: &str,
@@ -511,7 +525,7 @@ impl MpClient<'_> {
         Ok(MpResponse { status, body })
     }
 
-    fn success_or_failure(response: MpResponse) -> RouterResult<Value> {
+    pub(crate) fn success_or_failure(response: MpResponse) -> RouterResult<Value> {
         if (200..300).contains(&response.status) {
             Ok(response.body)
         } else {
@@ -694,8 +708,39 @@ impl MpClient<'_> {
 // Core
 // ============================================================================
 
+/// The lock of the two setups that write the metadata of a connector account: the QR POS and
+/// the Point terminal. Each one reads the metadata, calls Mercado Pago and saves the whole
+/// metadata back, so two of them at once on the same account would lose the write of one.
+/// Both flows have the same API identifier, so with the account as the key they wait for each
+/// other. The list endpoints write nothing and take no lock.
+pub(crate) fn setup_lock(
+    merchant_connector_id: &id_type::MerchantConnectorAccountId,
+    flow: router_env::Flow,
+) -> api_locking::LockAction {
+    api_locking::LockAction::Hold {
+        input: api_locking::LockingInput {
+            unique_locking_key: merchant_connector_id.get_string_repr().to_owned(),
+            api_identifier: lock_utils::ApiIdentifier::from(flow),
+            override_lock_retries: None,
+        },
+    }
+}
+
+/// Only a Mercado Pago connector account has a seller to set up.
+pub(crate) fn ensure_mercadopago_account(
+    connector_name: &str,
+) -> Result<(), errors::ApiErrorResponse> {
+    if connector_name == CONNECTOR_NAME {
+        Ok(())
+    } else {
+        Err(errors::ApiErrorResponse::InvalidRequestData {
+            message: "The connector account is not a Mercado Pago account".to_string(),
+        })
+    }
+}
+
 /// The connector account and the seller's token, after the checks every call needs.
-async fn load_account(
+pub(crate) async fn load_account(
     state: &SessionState,
     merchant_id: &id_type::MerchantId,
     profile_id: Option<id_type::ProfileId>,
@@ -722,12 +767,7 @@ async fn load_account(
             id: merchant_connector_id.get_string_repr().to_string(),
         })?;
     core_utils::validate_profile_id_from_auth_layer(profile_id, &mca)?;
-
-    if mca.connector_name != CONNECTOR_NAME {
-        return Err(report!(errors::ApiErrorResponse::InvalidRequestData {
-            message: "The connector account is not a Mercado Pago account".to_string(),
-        }));
-    }
+    ensure_mercadopago_account(&mca.connector_name).map_err(|error| report!(error))?;
 
     let token = match mca
         .get_connector_account_details()
@@ -769,6 +809,8 @@ pub async fn list_mercadopago_pos(
     }))
 }
 
+/// The route holds a lock per connector account for this and for the Point terminal setup
+/// (see [`setup_lock`]), so the metadata read here is the one that gets saved.
 pub async fn setup_mercadopago_pos(
     state: SessionState,
     merchant_id: &id_type::MerchantId,
@@ -1031,6 +1073,16 @@ mod tests {
         let merged_again = merge_pos_into_metadata(Some(merged), &other).unwrap();
         assert_eq!(merged_again["account_name"], "hotel");
         assert_eq!(merged_again[QR_POS_METADATA_KEY]["pos_id"], "3003");
+    }
+
+    #[test]
+    fn merging_the_pos_keeps_a_saved_point_terminal() {
+        let terminal =
+            json!({"terminal_id": "NEWLAND_N950__N950NCD600391917", "operating_mode": "PDV"});
+        let merged =
+            merge_pos_into_metadata(Some(json!({"point_terminal": terminal})), &pos()).unwrap();
+        assert_eq!(merged["point_terminal"], terminal);
+        assert_eq!(existing_pos(Some(&merged), SELLER), Some(pos()));
     }
 
     #[test]
@@ -1317,5 +1369,54 @@ mod tests {
             merged[QR_POS_METADATA_KEY]["qr_image"],
             "https://mp.test/qr.png"
         );
+    }
+
+    #[test]
+    fn the_two_setups_of_a_connector_account_wait_for_each_other() {
+        let lock_of = |account: &str, flow: router_env::Flow| {
+            let account =
+                id_type::MerchantConnectorAccountId::wrap(account.to_string()).expect("a valid id");
+            match setup_lock(&account, flow) {
+                api_locking::LockAction::Hold { input } => (
+                    input.api_identifier.to_string(),
+                    input.unique_locking_key,
+                    input.override_lock_retries,
+                ),
+                other => panic!("the setup holds a lock, got {other:?}"),
+            }
+        };
+        let qr = lock_of(
+            "mca_hotel_1",
+            router_env::Flow::MerchantConnectorMercadopagoPosSetup,
+        );
+        let point = lock_of(
+            "mca_hotel_1",
+            router_env::Flow::MerchantConnectorMercadopagoTerminalSetup,
+        );
+        // Same identifier and key: the QR POS and the terminal of one account are serialized.
+        assert_eq!(qr, point);
+        assert_eq!(qr.1, "mca_hotel_1");
+        // Another account is not held back.
+        let other = lock_of(
+            "mca_hotel_2",
+            router_env::Flow::MerchantConnectorMercadopagoTerminalSetup,
+        );
+        assert_eq!(other.0, point.0);
+        assert_ne!(other.1, point.1);
+    }
+
+    #[test]
+    fn only_a_mercado_pago_connector_account_is_set_up() {
+        assert!(ensure_mercadopago_account("mercadopago").is_ok());
+        for other in ["stripe", "mercadopago_test", "Mercadopago", ""] {
+            assert!(
+                matches!(
+                    ensure_mercadopago_account(other),
+                    Err(errors::ApiErrorResponse::InvalidRequestData { ref message })
+                        if message == "The connector account is not a Mercado Pago account"
+                ),
+                "{other}"
+            );
+        }
     }
 }

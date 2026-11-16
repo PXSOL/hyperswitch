@@ -1216,6 +1216,9 @@ pub async fn mercadopago_pos_setup(
 ) -> HttpResponse {
     let flow = Flow::MerchantConnectorMercadopagoPosSetup;
     let (merchant_id, merchant_connector_id) = path.into_inner();
+    // One setup at a time per connector account: both write its metadata.
+    let lock_action =
+        crate::core::mercadopago_pos::setup_lock(&merchant_connector_id, flow.clone());
 
     Box::pin(api::server_wrap(
         flow,
@@ -1241,7 +1244,7 @@ pub async fn mercadopago_pos_setup(
             },
             req.headers(),
         ),
-        api_locking::LockAction::NotApplicable,
+        lock_action,
     ))
     .await
 }
@@ -1269,6 +1272,102 @@ pub async fn mercadopago_pos_list(
         (),
         |state, auth, _, _| {
             crate::core::mercadopago_pos::list_mercadopago_pos(
+                state,
+                &merchant_id,
+                auth.profile.map(|profile| profile.get_id().clone()),
+                &merchant_connector_id,
+            )
+        },
+        auth::auth_type(
+            &auth::ApiKeyAuthWithMerchantIdFromRoute(merchant_id.clone()),
+            &auth::JWTAuthMerchantFromRoute {
+                merchant_id: merchant_id.clone(),
+                required_permission: Permission::ProfileConnectorWrite,
+                allow_connected: true,
+                allow_platform: false,
+            },
+            req.headers(),
+        ),
+        api_locking::LockAction::NotApplicable,
+    ))
+    .await
+}
+
+/// Mercado Pago Point - choose the terminal
+///
+/// Switches one of the seller's Point terminals to integrated mode at Mercado Pago with the
+/// connector account token and saves it in the connector account metadata. The device has to
+/// be restarted for the mode to apply.
+#[cfg(feature = "v1")]
+#[instrument(skip_all, fields(flow = ?Flow::MerchantConnectorMercadopagoTerminalSetup))]
+pub async fn mercadopago_terminal_setup(
+    state: web::Data<AppState>,
+    req: HttpRequest,
+    path: web::Path<(
+        common_utils::id_type::MerchantId,
+        common_utils::id_type::MerchantConnectorAccountId,
+    )>,
+    json_payload: web::Json<api_models::mercadopago_terminals::MercadopagoTerminalSetupRequest>,
+) -> HttpResponse {
+    let flow = Flow::MerchantConnectorMercadopagoTerminalSetup;
+    let (merchant_id, merchant_connector_id) = path.into_inner();
+    // One setup at a time per connector account: both write its metadata.
+    let lock_action =
+        crate::core::mercadopago_pos::setup_lock(&merchant_connector_id, flow.clone());
+
+    Box::pin(api::server_wrap(
+        flow,
+        state,
+        &req,
+        json_payload.into_inner(),
+        |state, auth, req, _| {
+            crate::core::mercadopago_terminals::setup_mercadopago_terminal(
+                state,
+                &merchant_id,
+                auth.profile.map(|profile| profile.get_id().clone()),
+                &merchant_connector_id,
+                req,
+            )
+        },
+        auth::auth_type(
+            &auth::ApiKeyAuthWithMerchantIdFromRoute(merchant_id.clone()),
+            &auth::JWTAuthMerchantFromRoute {
+                merchant_id: merchant_id.clone(),
+                required_permission: Permission::ProfileConnectorWrite,
+                allow_connected: true,
+                allow_platform: false,
+            },
+            req.headers(),
+        ),
+        lock_action,
+    ))
+    .await
+}
+
+/// Mercado Pago Point - list the seller's terminals
+///
+/// Reads the Point terminals of the seller from Mercado Pago and tells which one the
+/// connector account charges on. Changes nothing.
+#[cfg(feature = "v1")]
+#[instrument(skip_all, fields(flow = ?Flow::MerchantConnectorMercadopagoTerminalList))]
+pub async fn mercadopago_terminal_list(
+    state: web::Data<AppState>,
+    req: HttpRequest,
+    path: web::Path<(
+        common_utils::id_type::MerchantId,
+        common_utils::id_type::MerchantConnectorAccountId,
+    )>,
+) -> HttpResponse {
+    let flow = Flow::MerchantConnectorMercadopagoTerminalList;
+    let (merchant_id, merchant_connector_id) = path.into_inner();
+
+    Box::pin(api::server_wrap(
+        flow,
+        state,
+        &req,
+        (),
+        |state, auth, _, _| {
+            crate::core::mercadopago_terminals::list_mercadopago_terminals(
                 state,
                 &merchant_id,
                 auth.profile.map(|profile| profile.get_id().clone()),

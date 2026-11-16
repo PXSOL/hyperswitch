@@ -45,6 +45,10 @@ use crate::{
     mercadopago_pos::{
         MercadopagoPosListResponse, MercadopagoPosSetupRequest, MercadopagoPosSetupResponse,
     },
+    mercadopago_terminals::{
+        MercadopagoTerminalListResponse, MercadopagoTerminalSetupRequest,
+        MercadopagoTerminalSetupResponse,
+    },
     merchant_connector_webhook_management::*,
     organization::{
         ConvertOrganizationToPlatformRequest, ConvertOrganizationToPlatformResponse,
@@ -100,6 +104,9 @@ impl_api_event_type!(
         MercadopagoPosSetupRequest,
         MercadopagoPosSetupResponse,
         MercadopagoPosListResponse,
+        MercadopagoTerminalSetupRequest,
+        MercadopagoTerminalSetupResponse,
+        MercadopagoTerminalListResponse,
         ProfileResponse,
         ProfileUpdate,
         ProfileCreate,

@@ -110,6 +110,10 @@ pub enum Flow {
     MerchantConnectorMercadopagoPosSetup,
     /// Mercado Pago POS list flow.
     MerchantConnectorMercadopagoPosList,
+    /// Mercado Pago Point terminal setup flow.
+    MerchantConnectorMercadopagoTerminalSetup,
+    /// Mercado Pago Point terminal list flow.
+    MerchantConnectorMercadopagoTerminalList,
     // TEMPORARY: remove after the processor account identity backfill (odd/tasks/processor-account-identity.md)
     /// Processor account identity of a connector account flow.
     MerchantConnectorAccountIdentity,

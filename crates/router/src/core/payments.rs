@@ -11606,6 +11606,16 @@ where
                         storage_enums::IntentStatus::RequiresCustomerAction
                     ) && payment_data.get_payment_attempt().payment_method_type
                         == Some(storage_enums::PaymentMethodType::StripeCheckout))
+                    // A Mercado Pago order stays payable at Mercado Pago (by scanning the QR or
+                    // on the Point terminal) until it is cancelled there, so cancelling it only
+                    // in Hyperswitch would let the customer pay a cancelled payment. The
+                    // connector's void cancels the order (and keeps the payment waiting if
+                    // Mercado Pago refuses).
+                    || is_mercadopago_order_awaiting_customer(
+                        payment_data.get_payment_intent().status,
+                        payment_data.get_payment_attempt().connector.as_deref(),
+                        payment_data.get_payment_attempt().get_connector_payment_id(),
+                    )
                 }
                 "PreAuthorizeVoid" => matches!(
                     payment_data.get_payment_intent().status,
@@ -11665,6 +11675,34 @@ where
         ),
         _ => false,
     }
+}
+
+/// Whether a payment is a Mercado Pago Orders API order (in-person QR or Point terminal) still
+/// waiting for the customer. Card payments and Checkout Pro attempts of Mercado Pago are not:
+/// their connector transaction id is not an order id, or they have none yet.
+#[cfg(feature = "v1")]
+fn is_mercadopago_order_awaiting_customer(
+    intent_status: storage_enums::IntentStatus,
+    connector: Option<&str>,
+    connector_transaction_id: Option<&str>,
+) -> bool {
+    intent_status == storage_enums::IntentStatus::RequiresCustomerAction
+        && is_mercadopago_order(connector, connector_transaction_id)
+}
+
+/// Whether an attempt is a Mercado Pago Orders API order (in-person QR or Point terminal),
+/// whatever its status. Shared by the cancel gate above and by the handling of a refused void
+/// in `payment_response`, so both always agree on which attempts are orders.
+#[cfg(feature = "v1")]
+pub(crate) fn is_mercadopago_order(
+    connector: Option<&str>,
+    connector_transaction_id: Option<&str>,
+) -> bool {
+    connector
+        .and_then(|connector| common_enums::connector_enums::Connector::from_str(connector).ok())
+        == Some(common_enums::connector_enums::Connector::Mercadopago)
+        && connector_transaction_id
+            .is_some_and(hyperswitch_connectors::connectors::mercadopago::orders::is_order_id)
 }
 
 pub fn is_operation_confirm<Op: Debug>(operation: &Op) -> bool {
@@ -18693,5 +18731,134 @@ impl PaymentIntentStateMetadataExt {
             .attach_printable("Failed to update payment_intent.state metadata")?;
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "v1"))]
+mod mercadopago_order_cancel_tests {
+    use super::{
+        is_mercadopago_order, is_mercadopago_order_awaiting_customer, storage_enums::IntentStatus,
+    };
+
+    /// Order ids as Mercado Pago issues them, in production and in sandbox.
+    const ORDER_ID: &str = "ORD01M78BV8NT22CDEKFAZM2AMMER";
+    const SANDBOX_ORDER_ID: &str = "ORDTST01M77XTDMRFPKZ9P21B7AY0FXT";
+
+    fn waiting(connector: Option<&str>, connector_transaction_id: Option<&str>) -> bool {
+        is_mercadopago_order_awaiting_customer(
+            IntentStatus::RequiresCustomerAction,
+            connector,
+            connector_transaction_id,
+        )
+    }
+
+    #[test]
+    fn a_qr_order_waiting_for_the_customer_is_cancelled_at_mercado_pago() {
+        assert!(waiting(Some("mercadopago"), Some(SANDBOX_ORDER_ID)));
+        assert!(waiting(Some("mercadopago"), Some(ORDER_ID)));
+    }
+
+    #[test]
+    fn a_point_order_waiting_for_the_customer_is_cancelled_at_mercado_pago() {
+        // A Point order id has the same shape as a QR one: the gate does not tell them apart.
+        assert!(waiting(
+            Some("mercadopago"),
+            Some("ORD01M765NPM84NTSPDZZ2GXEEH4R")
+        ));
+    }
+
+    #[test]
+    fn a_mercado_pago_payment_that_is_not_an_order_keeps_the_local_cancel() {
+        // A card payment or a paid Checkout Pro attempt: a numeric `/v1/payments` id.
+        assert!(!waiting(Some("mercadopago"), Some("150211668619")));
+        // The id of an order's payment is not an order id either.
+        assert!(!waiting(
+            Some("mercadopago"),
+            Some("PAY01M78BV8P6KJQRQMSFSG2BAWQQ")
+        ));
+        assert!(!waiting(Some("mercadopago"), Some("")));
+    }
+
+    #[test]
+    fn a_mercado_pago_attempt_without_a_connector_transaction_id_keeps_the_local_cancel() {
+        // Checkout Pro before the buyer pays.
+        assert!(!waiting(Some("mercadopago"), None));
+    }
+
+    #[test]
+    fn another_connector_with_an_order_looking_id_keeps_the_local_cancel() {
+        for connector in [
+            "stripe",
+            "wompi",
+            "izipay",
+            "not_a_connector",
+            "Mercado Pago",
+            "",
+        ] {
+            assert!(!waiting(Some(connector), Some(ORDER_ID)), "{connector}");
+        }
+        assert!(!waiting(None, Some(ORDER_ID)));
+    }
+
+    #[test]
+    fn a_mercado_pago_order_in_any_other_status_is_left_to_the_previous_rules() {
+        // Only `RequiresCustomerAction` is new: every other status is decided as before.
+        for status in [
+            IntentStatus::RequiresCapture,
+            IntentStatus::PartiallyCapturedAndCapturable,
+            IntentStatus::RequiresMerchantAction,
+            IntentStatus::Processing,
+            IntentStatus::RequiresPaymentMethod,
+            IntentStatus::RequiresConfirmation,
+            IntentStatus::Succeeded,
+            IntentStatus::Failed,
+            IntentStatus::Cancelled,
+        ] {
+            assert!(
+                !is_mercadopago_order_awaiting_customer(
+                    status,
+                    Some("mercadopago"),
+                    Some(ORDER_ID)
+                ),
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_attempt_is_a_mercado_pago_order_by_its_connector_and_order_id_alone() {
+        // No status is involved: by the time a void is answered, the stored one has changed.
+        assert!(is_mercadopago_order(Some("mercadopago"), Some(ORDER_ID)));
+        assert!(is_mercadopago_order(
+            Some("mercadopago"),
+            Some(SANDBOX_ORDER_ID)
+        ));
+        // A card payment, the payment of an order, and Checkout Pro before the buyer pays.
+        assert!(!is_mercadopago_order(
+            Some("mercadopago"),
+            Some("150211668619")
+        ));
+        assert!(!is_mercadopago_order(
+            Some("mercadopago"),
+            Some("PAY01M78BV8P6KJQRQMSFSG2BAWQQ")
+        ));
+        assert!(!is_mercadopago_order(Some("mercadopago"), None));
+        // Another connector, or none.
+        for connector in ["stripe", "wompi", "not_a_connector", ""] {
+            assert!(
+                !is_mercadopago_order(Some(connector), Some(ORDER_ID)),
+                "{connector}"
+            );
+        }
+        assert!(!is_mercadopago_order(None, Some(ORDER_ID)));
+    }
+
+    #[test]
+    fn a_stripe_checkout_session_is_not_decided_by_the_mercado_pago_rule() {
+        // Its own clause keeps forwarding the cancel; this rule adds nothing to it.
+        assert!(!waiting(
+            Some("stripe"),
+            Some("cs_test_a1B2c3D4e5F6g7H8i9J0")
+        ));
     }
 }

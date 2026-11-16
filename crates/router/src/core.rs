@@ -42,6 +42,8 @@ pub mod health_check;
 pub mod mandate;
 #[cfg(feature = "v1")]
 pub mod mercadopago_pos;
+#[cfg(feature = "v1")]
+pub mod mercadopago_terminals;
 pub mod merchant_connector_webhook_management;
 pub mod metrics;
 pub mod offer_engine;

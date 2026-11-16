@@ -595,7 +595,8 @@ impl TryFrom<&SetupMandateRouterData> for CreateCustomerPaymentProfileRequest {
                 | WalletData::StripeCheckout {}
                 | WalletData::IzipayCheckout {}
                 | WalletData::MercadoPagoCheckoutPro {}
-                | WalletData::MercadoPagoQr {} => Err(errors::ConnectorError::NotImplemented(
+                | WalletData::MercadoPagoQr {}
+                | WalletData::MercadoPagoPoint {} => Err(errors::ConnectorError::NotImplemented(
                     utils::get_unimplemented_payment_method_error_message("authorizedotnet"),
                 )),
             },
@@ -2543,7 +2544,8 @@ fn get_wallet_data(
         | WalletData::StripeCheckout {}
         | WalletData::IzipayCheckout {}
         | WalletData::MercadoPagoCheckoutPro {}
-        | WalletData::MercadoPagoQr {} => Err(errors::ConnectorError::NotImplemented(
+        | WalletData::MercadoPagoQr {}
+        | WalletData::MercadoPagoPoint {} => Err(errors::ConnectorError::NotImplemented(
             utils::get_unimplemented_payment_method_error_message("authorizedotnet"),
         ))?,
     }

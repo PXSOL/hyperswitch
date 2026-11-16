@@ -2262,6 +2262,13 @@ impl MerchantConnectorAccount {
                     .route(web::get().to(mercadopago_pos_list))
                     .route(web::post().to(mercadopago_pos_setup)),
                 )
+                .service(
+                    web::resource(
+                        "/{merchant_id}/connectors/mercadopago/terminals/{merchant_connector_id}",
+                    )
+                    .route(web::get().to(mercadopago_terminal_list))
+                    .route(web::post().to(mercadopago_terminal_setup)),
+                )
                 // TEMPORARY: remove after the processor account identity backfill (odd/tasks/processor-account-identity.md)
                 .service(
                     web::resource(

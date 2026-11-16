@@ -1027,6 +1027,8 @@ pub enum MercadopagoAuthorizeRequest {
     Payment(Box<MercadopagoPaymentsRequest>),
     /// In-person dynamic QR: POST /v1/orders
     Order(Box<super::orders::MercadopagoQrOrderRequest>),
+    /// In-person Point card terminal: POST /v1/orders
+    PointOrder(Box<super::orders::MercadopagoPointOrderRequest>),
 }
 
 impl MercadopagoAuthorizeRequest {
@@ -1039,6 +1041,10 @@ impl MercadopagoAuthorizeRequest {
 
     pub fn is_qr(payment_method_data: &PaymentMethodData) -> bool {
         super::orders::is_qr_wallet(payment_method_data)
+    }
+
+    pub fn is_point(payment_method_data: &PaymentMethodData) -> bool {
+        super::orders::is_point_wallet(payment_method_data)
     }
 }
 
@@ -1055,6 +1061,10 @@ impl TryFrom<&MercadopagoRouterData<&PaymentsAuthorizeRouterData>> for Mercadopa
         } else if Self::is_qr(&item.router_data.request.payment_method_data) {
             Ok(Self::Order(Box::new(
                 super::orders::MercadopagoQrOrderRequest::try_from(item)?,
+            )))
+        } else if Self::is_point(&item.router_data.request.payment_method_data) {
+            Ok(Self::PointOrder(Box::new(
+                super::orders::MercadopagoPointOrderRequest::try_from(item)?,
             )))
         } else {
             Ok(Self::Payment(Box::new(
@@ -1869,6 +1879,12 @@ where
 impl MercadopagoErrorResponse {
     fn order_error(&self) -> Option<&serde_json::Value> {
         self.errors.as_ref()?.as_array()?.first()
+    }
+
+    /// Whether this is an error of the Orders API (`{"errors":[...]}`), as opposed to one of
+    /// the Payments API (`{"message","error","status","cause"}`).
+    pub(super) fn is_orders_api_error(&self) -> bool {
+        self.order_error().is_some()
     }
 
     fn order_error_text(&self, key: &str) -> Option<String> {

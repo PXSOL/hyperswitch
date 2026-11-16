@@ -693,6 +693,7 @@ impl TryFrom<&PaysafeRouterData<&TokenizationRouterData>> for PaysafePaymentHand
                     | WalletData::MercadoPagoSdk(_)
                     | WalletData::MercadoPagoCheckoutPro {}
                     | WalletData::MercadoPagoQr {}
+                    | WalletData::MercadoPagoPoint {}
                     | WalletData::WompiCheckout {}
                     | WalletData::StripeCheckout {}
                     | WalletData::IzipayCheckout {}
