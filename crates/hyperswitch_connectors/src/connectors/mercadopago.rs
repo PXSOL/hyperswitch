@@ -718,7 +718,7 @@ impl ConnectorIntegration<Void, PaymentsCancelData, PaymentsResponseData> for Me
         // terminal) instead of reaching Mercado Pago again. The void of a card payment keeps
         // its fixed key.
         let idempotency_key = if orders::is_order_id(&req.request.connector_transaction_id) {
-            uuid::Uuid::new_v4().to_string()
+            common_utils::generate_uuid_v4().to_string()
         } else {
             format!("{}_void", req.connector_request_reference_id)
         };
