@@ -18,9 +18,6 @@ pub mod card_testing_guard;
 pub mod cards_info;
 pub mod conditional_config;
 pub mod configs;
-// TEMPORARY: remove after the processor account identity backfill (odd/tasks/processor-account-identity.md)
-#[cfg(all(feature = "olap", feature = "v1"))]
-pub mod connector_account_identity;
 #[cfg(feature = "olap")]
 pub mod connector_onboarding;
 pub mod connector_validation;
