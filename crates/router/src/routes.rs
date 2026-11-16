@@ -12,6 +12,9 @@ pub mod cards_info;
 #[cfg(feature = "v2")]
 pub mod client_secret;
 pub mod configs;
+// TEMPORARY: remove after the processor account identity backfill (odd/tasks/processor-account-identity.md)
+#[cfg(all(feature = "olap", feature = "v1"))]
+pub mod connector_account_identity;
 #[cfg(feature = "olap")]
 pub mod connector_onboarding;
 #[cfg(any(feature = "olap", feature = "oltp"))]
