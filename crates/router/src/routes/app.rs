@@ -2261,6 +2261,16 @@ impl MerchantConnectorAccount {
                     )
                     .route(web::get().to(mercadopago_pos_list))
                     .route(web::post().to(mercadopago_pos_setup)),
+                )
+                // TEMPORARY: remove after the processor account identity backfill (odd/tasks/processor-account-identity.md)
+                .service(
+                    web::resource(
+                        "/{merchant_id}/connectors/{merchant_connector_id}/account_identity",
+                    )
+                    .route(
+                        web::get()
+                            .to(super::connector_account_identity::connector_account_identity),
+                    ),
                 );
         }
         #[cfg(feature = "oltp")]

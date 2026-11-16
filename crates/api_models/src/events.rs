@@ -294,3 +294,10 @@ impl ApiEventMetric for tokenization::DeleteTokenDataRequest {
         })
     }
 }
+
+// TEMPORARY: remove after the processor account identity backfill (odd/tasks/processor-account-identity.md)
+impl ApiEventMetric for crate::connector_account_identity::ConnectorAccountIdentityResponse {
+    fn get_api_event_type(&self) -> Option<ApiEventsType> {
+        Some(ApiEventsType::Miscellaneous)
+    }
+}
