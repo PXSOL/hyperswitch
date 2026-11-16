@@ -125,8 +125,6 @@ impl From<Flow> for ApiIdentifier {
             | Flow::MerchantConnectorMercadopagoPosList
             | Flow::MerchantConnectorMercadopagoTerminalSetup
             | Flow::MerchantConnectorMercadopagoTerminalList
-            // TEMPORARY: remove after the processor account identity backfill (odd/tasks/processor-account-identity.md)
-            | Flow::MerchantConnectorAccountIdentity
             | Flow::MerchantConnectorsList => Self::MerchantConnector,
             Flow::ConfigKeyCreate
             | Flow::ConfigKeyFetch
