@@ -279,7 +279,11 @@ jobs:
       matrix:
         # `publish` expects one digest per flow (EXPECTED_DIGESTS there).
         scheduler_flow: [consumer, producer]
-    needs: registry_access
+    # The Dockerfile compiles the whole workspace in one layer, before it picks the
+    # binary, so every image shares it. Compiling it once in `router` and reading its
+    # cache here turns an hour of compilation at the edge of the runner's memory
+    # (where these jobs used to lose their runner) into a download.
+    needs: [registry_access, router]
     env:
       DOCKER_TAG: ${{ inputs.docker_tag || (github.event_name == 'release' && github.event.release.tag_name) || github.ref_name }}
       VERSION_FEATURE_SET: ${{ inputs.version_feature_set || 'v1' }}
@@ -292,6 +296,8 @@ jobs:
           VAR_IMAGE: ${{ vars.SCHEDULER_IMAGE_NAME }}
           SHARED_IMAGE: ${{ vars.IMAGE_NAME }}
           DEFAULT_REPO: mithras-hyper-scheduler
+          ROUTER_INPUT_IMAGE: ${{ inputs.router_image }}
+          ROUTER_VAR_IMAGE: ${{ vars.ROUTER_IMAGE_NAME }}
           NAMESPACE: ${{ inputs.docker_namespace || vars.DOCKER_NAMESPACE || 'lucasdpxsol' }}
         run: |
           resolve_image() {
@@ -323,14 +329,18 @@ jobs:
           }
 
           DOCKER_IMAGE=$(pick_image "$INPUT_IMAGE" "$VAR_IMAGE" "$SHARED_IMAGE" "$DEFAULT_REPO" "$NAMESPACE")
-          CACHE_REF="${DOCKER_IMAGE}:buildcache"
+          # The build cache the `router` job of this run exported: same name its own
+          # "Resolve router image" step gives it.
+          ROUTER_IMAGE=$(pick_image "$ROUTER_INPUT_IMAGE" "$ROUTER_VAR_IMAGE" "$SHARED_IMAGE" "mithras-hyper-router" "$NAMESPACE")
+          WORKSPACE_CACHE_REF="${ROUTER_IMAGE}:buildcache"
 
           {
             printf 'DOCKER_IMAGE=%s\n' "$DOCKER_IMAGE"
-            printf 'DOCKER_CACHE_REF=%s\n' "$CACHE_REF"
+            printf 'WORKSPACE_CACHE_REF=%s\n' "$WORKSPACE_CACHE_REF"
           } >> "$GITHUB_ENV"
 
           echo "Scheduler image -> $DOCKER_IMAGE"
+          echo "Compiled workspace from -> $WORKSPACE_CACHE_REF"
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -371,8 +381,9 @@ jobs:
             SCHEDULER_FLOW=${{ matrix.scheduler_flow }}
             VERSION_FEATURE_SET=${{ env.VERSION_FEATURE_SET }}
             EXTRA_FEATURES=${{ env.EXTRA_FEATURES }}
-          cache-from: type=registry,ref=${{ env.DOCKER_CACHE_REF }}
-          cache-to: type=registry,ref=${{ env.DOCKER_CACHE_REF }},mode=max
+          # The workspace the `router` job compiled. Nothing is exported from here:
+          # this job adds no layer worth caching.
+          cache-from: type=registry,ref=${{ env.WORKSPACE_CACHE_REF }}
           provenance: false
 
       - name: Record scheduler image digest
@@ -407,7 +418,8 @@ jobs:
   drainer:
     name: Build drainer image (${{ inputs.docker_tag || (github.event_name == 'release' && github.event.release.tag_name) || github.ref_name }})
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
-    needs: registry_access
+    # Reads the workspace `router` compiled, like `scheduler`.
+    needs: [registry_access, router]
     env:
       DOCKER_TAG: ${{ inputs.docker_tag || (github.event_name == 'release' && github.event.release.tag_name) || github.ref_name }}
       VERSION_FEATURE_SET: ${{ inputs.version_feature_set || 'v1' }}
@@ -420,6 +432,8 @@ jobs:
           VAR_IMAGE: ${{ vars.DRAINER_IMAGE_NAME }}
           SHARED_IMAGE: ${{ vars.IMAGE_NAME }}
           DEFAULT_REPO: mithras-hyper-drainer
+          ROUTER_INPUT_IMAGE: ${{ inputs.router_image }}
+          ROUTER_VAR_IMAGE: ${{ vars.ROUTER_IMAGE_NAME }}
           NAMESPACE: ${{ inputs.docker_namespace || vars.DOCKER_NAMESPACE || 'lucasdpxsol' }}
         run: |
           resolve_image() {
@@ -451,14 +465,18 @@ jobs:
           }
 
           DOCKER_IMAGE=$(pick_image "$INPUT_IMAGE" "$VAR_IMAGE" "$SHARED_IMAGE" "$DEFAULT_REPO" "$NAMESPACE")
-          CACHE_REF="${DOCKER_IMAGE}:buildcache"
+          # The build cache the `router` job of this run exported: same name its own
+          # "Resolve router image" step gives it.
+          ROUTER_IMAGE=$(pick_image "$ROUTER_INPUT_IMAGE" "$ROUTER_VAR_IMAGE" "$SHARED_IMAGE" "mithras-hyper-router" "$NAMESPACE")
+          WORKSPACE_CACHE_REF="${ROUTER_IMAGE}:buildcache"
 
           {
             printf 'DOCKER_IMAGE=%s\n' "$DOCKER_IMAGE"
-            printf 'DOCKER_CACHE_REF=%s\n' "$CACHE_REF"
+            printf 'WORKSPACE_CACHE_REF=%s\n' "$WORKSPACE_CACHE_REF"
           } >> "$GITHUB_ENV"
 
           echo "Drainer image -> $DOCKER_IMAGE"
+          echo "Compiled workspace from -> $WORKSPACE_CACHE_REF"
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -498,8 +516,9 @@ jobs:
             BINARY=drainer
             VERSION_FEATURE_SET=${{ env.VERSION_FEATURE_SET }}
             EXTRA_FEATURES=${{ env.EXTRA_FEATURES }}
-          cache-from: type=registry,ref=${{ env.DOCKER_CACHE_REF }}
-          cache-to: type=registry,ref=${{ env.DOCKER_CACHE_REF }},mode=max
+          # The workspace the `router` job compiled. Nothing is exported from here:
+          # this job adds no layer worth caching.
+          cache-from: type=registry,ref=${{ env.WORKSPACE_CACHE_REF }}
           provenance: false
 
       - name: Record drainer image digest
