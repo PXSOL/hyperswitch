@@ -1216,6 +1216,9 @@ pub async fn mercadopago_pos_setup(
 ) -> HttpResponse {
     let flow = Flow::MerchantConnectorMercadopagoPosSetup;
     let (merchant_id, merchant_connector_id) = path.into_inner();
+    // One setup at a time per connector account: both write its metadata.
+    let lock_action =
+        crate::core::mercadopago_pos::setup_lock(&merchant_connector_id, flow.clone());
 
     Box::pin(api::server_wrap(
         flow,
@@ -1241,7 +1244,7 @@ pub async fn mercadopago_pos_setup(
             },
             req.headers(),
         ),
-        api_locking::LockAction::NotApplicable,
+        lock_action,
     ))
     .await
 }
@@ -1308,6 +1311,9 @@ pub async fn mercadopago_terminal_setup(
 ) -> HttpResponse {
     let flow = Flow::MerchantConnectorMercadopagoTerminalSetup;
     let (merchant_id, merchant_connector_id) = path.into_inner();
+    // One setup at a time per connector account: both write its metadata.
+    let lock_action =
+        crate::core::mercadopago_pos::setup_lock(&merchant_connector_id, flow.clone());
 
     Box::pin(api::server_wrap(
         flow,
@@ -1333,7 +1339,7 @@ pub async fn mercadopago_terminal_setup(
             },
             req.headers(),
         ),
-        api_locking::LockAction::NotApplicable,
+        lock_action,
     ))
     .await
 }
