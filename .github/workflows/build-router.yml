@@ -147,12 +147,12 @@ jobs:
             fi
           done
 
-  # One job builds every image. The Dockerfile compiles the whole workspace in a
-  # single layer before it picks the binary, so after the router image the other
-  # three reuse that layer from the builder's local cache and only copy their
-  # binary. With one job per image each one compiled the workspace again, at the
-  # edge of the runner's memory, and the run kept losing a runner an hour in. The
-  # layer cannot be shared between jobs through the registry cache: `COPY . .`
+  # One job builds every image. The Dockerfile compiles the three binaries in a
+  # single layer before it picks one, so after the router image the other three
+  # reuse that layer from the builder's local cache and only copy their binary.
+  # With one job per image each one compiled everything again, at the edge of
+  # the runner's memory, and the run kept losing a runner an hour in. The layer
+  # cannot be shared between jobs through the registry cache: `COPY . .`
   # includes `.git`, which differs on every checkout.
   images:
     name: Build images (${{ inputs.docker_tag || (github.event_name == 'release' && github.event.release.tag_name) || github.ref_name }})
@@ -238,7 +238,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
-          # The next builds of this job read the compiled workspace from this
+          # The next builds of this job read the compiled binaries from this
           # builder's cache: garbage collection must not evict it in between.
           buildkitd-config-inline: |
             [worker.oci]
@@ -266,7 +266,7 @@ jobs:
           cache-to: type=registry,ref=${{ env.DOCKER_CACHE_REF }},mode=max
           provenance: false
 
-      # From here on the workspace is already compiled: same builder, same build
+      # From here on the binaries are already compiled: same builder, same build
       # context, so the layer is a local cache hit and each build only copies its
       # binary into the runtime image.
       - name: Build and push scheduler image (consumer)
