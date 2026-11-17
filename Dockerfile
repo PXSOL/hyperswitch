@@ -43,13 +43,23 @@ ENV RUSTUP_MAX_RETRIES=10
 ENV RUST_BACKTRACE="short"
 
 COPY . .
-RUN cargo build \
-    --profile ${CARGO_BUILD_PROFILE} \
-    --no-default-features \
-    --features release \
-    --features ${VERSION_FEATURE_SET} \
-    --features ${REDIS_BACKEND} \
-    ${EXTRA_FEATURES}
+# Only the binaries the images run, one at a time. A plain `cargo build` also
+# builds the workspace's other five binaries (openapi, hsdev, test_utils, ...)
+# and links all eight with thin LTO in parallel, which is more memory than a
+# 16 GB CI runner has. Package selection and features are the same as for the
+# whole workspace, so each binary is built from exactly the same units; the
+# second and third builds reuse everything the first one compiled.
+RUN for binary in router scheduler drainer; do \
+        cargo build \
+            --profile ${CARGO_BUILD_PROFILE} \
+            --no-default-features \
+            --features release \
+            --features ${VERSION_FEATURE_SET} \
+            --features ${REDIS_BACKEND} \
+            ${EXTRA_FEATURES} \
+            --bin "${binary}" \
+        || exit 1; \
+    done
 
 # Stage the binary at a profile-independent path for the runtime stage
 # (cargo places the `dev` profile under `target/debug`). BINARY is consumed
