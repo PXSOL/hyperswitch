@@ -172,7 +172,7 @@ pub(crate) fn check_pos_owner(pos: &Value, seller_id: &str) -> Result<(), MpFail
 /// The `external_id` the adopted POS ends up with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExternalPosId {
-    /// The POS has one: it is not touched.
+    /// The POS has one: the id is kept as it is.
     Keep(String),
     /// The POS has none: this deterministic id is set with `PUT /pos/{id}`.
     Assign(String),
@@ -187,6 +187,16 @@ impl ExternalPosId {
         {
             Some(existing) => Self::Keep(existing.to_string()),
             None => Self::Assign(external_pos_id(merchant_connector_id)),
+        }
+    }
+
+    /// The `PUT /pos/{id}` body the adoption sends. Both shapes close the amount: a POS that keeps
+    /// its `external_id` gets no other write, and left open-amount it lets a buyer type any amount
+    /// on the counter's QR while no order is loaded.
+    fn adoption_write(&self) -> Value {
+        match self {
+            Self::Keep(_) => closed_amount_body(),
+            Self::Assign(id) => adoption_body(id),
         }
     }
 
@@ -569,16 +579,12 @@ impl MpClient<'_> {
         )
     }
 
-    /// Adopts a POS made by hand. Mercado Pago does not clear the id afterwards.
-    async fn assign_pos_external_id(&self, pos_id: &str, external_id: &str) -> RouterResult<()> {
+    /// Adopts a POS made by hand with the write `ExternalPosId::adoption_write` chose. Mercado
+    /// Pago does not clear an `external_id` afterwards.
+    async fn adopt_pos(&self, pos_id: &str, write: Value) -> RouterResult<()> {
         Self::success_or_failure(
-            self.call(
-                Method::Put,
-                &format!("/pos/{pos_id}"),
-                None,
-                Some(adoption_body(external_id)),
-            )
-            .await?,
+            self.call(Method::Put, &format!("/pos/{pos_id}"), None, Some(write))
+                .await?,
         )
         .map(|_| ())
     }
@@ -844,9 +850,9 @@ pub async fn setup_mercadopago_pos(
             check_pos_owner(&body, &user_id)
                 .map_err(|failure| report!(failure.into_api_error()))?;
             let external_pos_id = ExternalPosId::choose(&body, connector_account_id);
-            if let ExternalPosId::Assign(id) = &external_pos_id {
-                client.assign_pos_external_id(&pos_id, id).await?;
-            }
+            client
+                .adopt_pos(&pos_id, external_pos_id.adoption_write())
+                .await?;
             let store_id = body.get("store_id").and_then(id_to_string).ok_or_else(|| {
                 report!(errors::ApiErrorResponse::InternalServerError)
                     .attach_printable("The Mercado Pago POS has no store")
@@ -1046,6 +1052,20 @@ mod tests {
     fn adoption_sets_the_external_id_and_closes_the_amount() {
         assert_eq!(
             adoption_body("PXSOLPOSmcaabc"),
+            json!({"external_id": "PXSOLPOSmcaabc", "fixed_amount": true})
+        );
+    }
+
+    #[test]
+    fn an_adopted_pos_that_keeps_its_external_id_still_gets_its_amount_closed() {
+        // A POS another system already tagged: its id stays, and the amount is closed anyway.
+        assert_eq!(
+            ExternalPosId::Keep("HANDMADE1".to_string()).adoption_write(),
+            json!({"fixed_amount": true})
+        );
+        // A POS nobody tagged: unchanged, the id and the closed amount travel together.
+        assert_eq!(
+            ExternalPosId::Assign("PXSOLPOSmcaabc".to_string()).adoption_write(),
             json!({"external_id": "PXSOLPOSmcaabc", "fixed_amount": true})
         );
     }
