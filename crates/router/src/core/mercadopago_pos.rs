@@ -23,6 +23,7 @@ use hyperswitch_domain_models::{
     merchant_connector_account::MerchantConnectorAccountUpdate, router_data::ConnectorAuthType,
 };
 use hyperswitch_masking::{ExposeInterface, Mask, PeekInterface, Secret};
+use router_env::logger;
 use serde::Serialize;
 use serde_json::Value;
 use storage_impl::behaviour::ForeignInto;
@@ -40,6 +41,8 @@ use crate::{
 const CONNECTOR_NAME: &str = "mercadopago";
 /// A POS `external_id` takes at most 40 characters; the ids built here stay below it.
 const MAX_EXTERNAL_ID_LENGTH: usize = 40;
+/// A refusal is logged whole up to this length: enough for any JSON error, not an HTML page.
+const MAX_LOGGED_REFUSAL_CHARS: usize = 4096;
 
 // ============================================================================
 // Pure logic
@@ -390,13 +393,15 @@ pub(crate) fn id_to_string(value: &Value) -> Option<String> {
 }
 
 /// What Mercado Pago answered with when it refused a call. Both of its error shapes are read:
-/// `{error, message, status, causes[{code, description}]}` and `{errors[{code, message}]}`.
+/// `{error, message, status, causes[{code, description}]}` (`cause` in older endpoints) and
+/// `{errors[{code, message}]}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MpFailure {
     pub status: u16,
     pub code: String,
     pub message: String,
-    /// `causes[].description` joined: for an invalid city these list the valid values.
+    /// Each cause's description (else its message, else its code) joined: for an invalid city
+    /// these list the valid values.
     pub reason: Option<String>,
 }
 
@@ -418,16 +423,22 @@ impl MpFailure {
         let message = text(body.get("message"))
             .or_else(|| text(first_error.and_then(|error| error.get("message"))))
             .unwrap_or_else(|| format!("Mercado Pago answered with status {status}"));
-        let descriptions: Vec<String> = body
-            .get("causes")
-            .and_then(Value::as_array)
-            .map(|causes| {
-                causes
-                    .iter()
-                    .filter_map(|cause| text(cause.get("description")))
-                    .collect()
+        // `causes` in the newer endpoints, `cause` (a list or a single object) in older ones such
+        // as the stores API. A cause without a description still names what was refused.
+        let descriptions: Vec<String> = ["causes", "cause"]
+            .iter()
+            .filter_map(|key| body.get(*key))
+            .flat_map(|causes| match causes {
+                Value::Array(items) => items.iter().collect(),
+                Value::Object(_) => vec![causes],
+                _ => Vec::new(),
             })
-            .unwrap_or_default();
+            .filter_map(|cause| {
+                text(cause.get("description"))
+                    .or_else(|| text(cause.get("message")))
+                    .or_else(|| cause.get("code").and_then(id_to_string))
+            })
+            .collect();
         Self {
             status,
             code,
@@ -525,11 +536,32 @@ impl MpClient<'_> {
             .change_context(errors::ApiErrorResponse::InternalServerError)
             .attach_printable("Failed to send a request to Mercado Pago")?;
         let status = response.status().as_u16();
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let bytes = response
             .bytes()
             .await
             .change_context(errors::ApiErrorResponse::InternalServerError)
             .attach_printable("Failed to read the Mercado Pago response")?;
+        if !(200..300).contains(&status) {
+            // The whole refusal, so a failed setup tells which call was refused and why: the
+            // caller only gets a summary. Neither the path nor the answer carries the token.
+            let answer: String = String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(MAX_LOGGED_REFUSAL_CHARS)
+                .collect();
+            logger::warn!(
+                mp_method = %method,
+                mp_path = path,
+                mp_status = status,
+                mp_request_id = ?request_id,
+                mp_answer = %answer,
+                "Mercado Pago refused a call"
+            );
+        }
         // A body that is not JSON only loses its detail: the status still tells the outcome.
         let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         Ok(MpResponse { status, body })
@@ -1187,6 +1219,66 @@ mod tests {
         );
         assert_eq!(failure.code, "pos_already_exists");
         assert_eq!(failure.message, "POS already exists for the external_id");
+    }
+
+    #[test]
+    fn the_singular_cause_list_is_read() {
+        let body = json!({
+            "error": "bad_request",
+            "message": "error validating payload",
+            "status": 400,
+            "cause": [{
+                "code": "invalid_street_number",
+                "description": "location.street_number must be numeric"
+            }]
+        });
+        let failure = MpFailure::from_response(400, &body);
+        assert_eq!(failure.code, "bad_request");
+        assert_eq!(failure.message, "error validating payload");
+        assert_eq!(
+            failure.reason.as_deref(),
+            Some("location.street_number must be numeric")
+        );
+        assert!(matches!(
+            failure.into_api_error(),
+            errors::ApiErrorResponse::ExternalConnectorError { status_code: 400, reason: Some(reason), .. }
+                if reason == "location.street_number must be numeric"
+        ));
+    }
+
+    #[test]
+    fn a_single_cause_object_is_read() {
+        let failure = MpFailure::from_response(
+            400,
+            &json!({
+                "error": "bad_request",
+                "message": "error validating payload",
+                "cause": {"code": "invalid_name", "description": "name is too long"}
+            }),
+        );
+        assert_eq!(failure.reason.as_deref(), Some("name is too long"));
+    }
+
+    #[test]
+    fn causes_without_a_description_fall_back_to_their_message_then_code() {
+        let failure = MpFailure::from_response(
+            400,
+            &json!({
+                "error": "bad_request",
+                "message": "error validating payload",
+                "causes": [
+                    {"code": "a", "description": "first", "message": "ignored"},
+                    {"code": "invalid_name", "message": "name is too long"},
+                    {"code": "invalid_category"},
+                    {"code": 2001},
+                    {}
+                ]
+            }),
+        );
+        assert_eq!(
+            failure.reason.as_deref(),
+            Some("first; name is too long; invalid_category; 2001")
+        );
     }
 
     #[test]
