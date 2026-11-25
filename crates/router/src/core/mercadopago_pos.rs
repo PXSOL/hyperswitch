@@ -394,23 +394,21 @@ pub(crate) fn id_to_string(value: &Value) -> Option<String> {
 
 /// What Mercado Pago answered with when it refused a call. Both of its error shapes are read:
 /// `{error, message, status, causes[{code, description}]}` (`cause` in older endpoints) and
-/// `{errors[{code, message}]}`.
+/// `{errors[{code, message, details}]}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MpFailure {
     pub status: u16,
     pub code: String,
     pub message: String,
-    /// Each cause's description (else its message, else its code) joined: for an invalid city
-    /// these list the valid values.
+    /// Each cause's description (else its message, else its code), then each error's details,
+    /// joined: for an invalid city these list the valid values.
     pub reason: Option<String>,
 }
 
 impl MpFailure {
     pub(crate) fn from_response(status: u16, body: &Value) -> Self {
-        let first_error = body
-            .get("errors")
-            .and_then(Value::as_array)
-            .and_then(|errors| errors.first());
+        let errors = body.get("errors").and_then(Value::as_array);
+        let first_error = errors.and_then(|errors| errors.first());
         let text = |value: Option<&Value>| {
             value
                 .and_then(Value::as_str)
@@ -425,7 +423,7 @@ impl MpFailure {
             .unwrap_or_else(|| format!("Mercado Pago answered with status {status}"));
         // `causes` in the newer endpoints, `cause` (a list or a single object) in older ones such
         // as the stores API. A cause without a description still names what was refused.
-        let descriptions: Vec<String> = ["causes", "cause"]
+        let mut reasons: Vec<String> = ["causes", "cause"]
             .iter()
             .filter_map(|key| body.get(*key))
             .flat_map(|causes| match causes {
@@ -439,11 +437,24 @@ impl MpFailure {
                     .or_else(|| cause.get("code").and_then(id_to_string))
             })
             .collect();
+        // The `errors[]` shape names what was refused in each error's `details` (a list, or a
+        // single text), after the causes.
+        reasons.extend(
+            errors
+                .into_iter()
+                .flatten()
+                .filter_map(|error| error.get("details"))
+                .flat_map(|details| match details {
+                    Value::Array(items) => items.iter().collect(),
+                    _ => vec![details],
+                })
+                .filter_map(|detail| text(Some(detail))),
+        );
         Self {
             status,
             code,
             message,
-            reason: (!descriptions.is_empty()).then(|| descriptions.join("; ")),
+            reason: (!reasons.is_empty()).then(|| reasons.join("; ")),
         }
     }
 
@@ -1219,6 +1230,59 @@ mod tests {
         );
         assert_eq!(failure.code, "pos_already_exists");
         assert_eq!(failure.message, "POS already exists for the external_id");
+    }
+
+    #[test]
+    fn the_details_of_an_errors_array_refusal_are_its_reason() {
+        let body = json!({"errors": [{
+            "message": "error validating payload",
+            "code": "bad_request",
+            "details": ["name does not meet the expected format. Please refer to the documentation for guidance."]
+        }]});
+        let failure = MpFailure::from_response(400, &body);
+        assert_eq!(failure.code, "bad_request");
+        assert_eq!(failure.message, "error validating payload");
+        assert_eq!(
+            failure.reason.as_deref(),
+            Some("name does not meet the expected format. Please refer to the documentation for guidance.")
+        );
+        assert_eq!(failure.client_status(), 400);
+        assert!(matches!(
+            failure.into_api_error(),
+            errors::ApiErrorResponse::ExternalConnectorError { status_code: 400, reason: Some(reason), .. }
+                if reason == "name does not meet the expected format. Please refer to the documentation for guidance."
+        ));
+    }
+
+    #[test]
+    fn an_errors_array_entry_without_details_has_no_reason() {
+        let failure = MpFailure::from_response(
+            400,
+            &json!({"errors": [{"message": "error validating payload", "code": "bad_request"}]}),
+        );
+        assert_eq!(failure.code, "bad_request");
+        assert_eq!(failure.reason, None);
+    }
+
+    #[test]
+    fn errors_array_details_follow_the_causes_in_order() {
+        let body = json!({
+            "error": "bad_request",
+            "message": "error validating payload",
+            "causes": [{"code": "invalid_city", "description": "city is invalid"}],
+            "errors": [
+                {"code": "a", "message": "first", "details": ["name is too long", "name has symbols"]},
+                {"code": "b", "message": "second"},
+                {"code": "c", "message": "third", "details": "store is closed"}
+            ]
+        });
+        let failure = MpFailure::from_response(400, &body);
+        assert_eq!(failure.code, "bad_request");
+        assert_eq!(failure.message, "error validating payload");
+        assert_eq!(
+            failure.reason.as_deref(),
+            Some("city is invalid; name is too long; name has symbols; store is closed")
+        );
     }
 
     #[test]
