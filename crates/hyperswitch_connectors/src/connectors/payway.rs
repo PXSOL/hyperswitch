@@ -378,6 +378,24 @@ impl ConnectorCommon for Payway {
         }
 
         if res.status_code == 402 {
+            // A charge CyberSource rejected (`send_to_cs`): its own code and result. Any other
+            // decline keeps the mapping below.
+            if let Some(error) = res
+                .response
+                .parse_struct::<payway::PaywayPaymentsResponse>("PaywayPaymentsResponse")
+                .ok()
+                .and_then(|response| response.cybersource_error(res.status_code))
+            {
+                router_env::logger::info!(
+                    status_code = res.status_code,
+                    error_code = %error.code,
+                    error_message = %error.message,
+                    cybersource = ?error.network_error_message,
+                    transaction_id = ?error.connector_transaction_id,
+                    "Payway payment rejected by CyberSource (402)"
+                );
+                return Ok(error);
+            }
             if let Ok(err_json) = res
                 .response
                 .parse_struct::<serde_json::Value>("PaywayAuthRejectedJson")
@@ -1970,5 +1988,375 @@ mod payment_sync_tests {
         >::get_error_response(Payway::new(), error_body(500, ""), None)
         .unwrap();
         assert_eq!(error.attempt_status, Some(AttemptStatus::Failure));
+    }
+
+    /// Payway's 402 for a charge CyberSource rejected because `POST /tokens` carried no device
+    /// fingerprint (production, site 93024169, payment 1073388273).
+    fn cybersource_black_body() -> serde_json::Value {
+        json!({
+            "id": 1073388273,
+            "site_transaction_id": "pay_cs_1",
+            "payment_method_id": 31,
+            "amount": 10000,
+            "currency": "ars",
+            "status": "rejected",
+            "status_details": {
+                "ticket": "0",
+                "card_authorization_code": "",
+                "address_validation_code": null,
+                "error": {"type": "cybersource_error", "reason": {"id": -1, "description": ""}}
+            },
+            "fraud_detection": {
+                "status": {
+                    "decision": "black",
+                    "request_id": null,
+                    "reason_code": 10150,
+                    "description": "validation",
+                    "review": null,
+                    "details": {
+                        "error_type": "invalid_request_error",
+                        "validation_errors": [
+                            {"code": "10150", "param": "Request Message DeviceFingerprintID is required"}
+                        ]
+                    }
+                }
+            }
+        })
+    }
+
+    /// Payway's 201 for the same charge once `POST /tokens` carried the device fingerprint
+    /// (production, payment 1073425467, annulled right after).
+    fn cybersource_green_body() -> serde_json::Value {
+        json!({
+            "id": 1073425467,
+            "site_transaction_id": "pay_cs_2",
+            "payment_method_id": 31,
+            "amount": 10000,
+            "currency": "ars",
+            "status": "approved",
+            "status_details": {
+                "ticket": "12",
+                "card_authorization_code": "123456",
+                "address_validation_code": "VTE0011",
+                "error": null
+            },
+            "fraud_detection": {
+                "status": {
+                    "decision": "green",
+                    "request_id": "7957971206326340104897",
+                    "reason_code": 100,
+                    "description": "Approved by Manager processing",
+                    "review": null
+                }
+            }
+        })
+    }
+
+    fn authorize_error(status_code: u16, body: &serde_json::Value) -> ErrorResponse {
+        ConnectorIntegration::<Authorize, PaymentsAuthorizeData, PaymentsResponseData>::get_error_response(
+            Payway::new(),
+            error_body(status_code, &body.to_string()),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// What a 2xx authorize response turns the attempt into: its status and the payment checks
+    /// it stores on the card.
+    fn authorize_success(body: serde_json::Value) -> (AttemptStatus, Option<serde_json::Value>) {
+        let response: payway::PaywayAuthorizeResponse = serde_json::from_value(body).unwrap();
+        let router_data = RouterData::try_from(ResponseRouterData {
+            response,
+            data: sync_router_data(AttemptStatus::Pending),
+            http_code: 201,
+        })
+        .unwrap();
+        assert!(router_data.response.is_ok());
+        (router_data.status, payment_checks_of(&router_data))
+    }
+
+    /// The payment checks a response stores on the card.
+    fn payment_checks_of(router_data: &PaymentsSyncRouterData) -> Option<serde_json::Value> {
+        router_data
+            .connector_response
+            .as_ref()
+            .and_then(|response| response.additional_payment_method_data.as_ref())
+            .and_then(|data| match data {
+                hyperswitch_domain_models::router_data::AdditionalPaymentMethodConnectorResponse::Card {
+                    payment_checks,
+                    ..
+                } => payment_checks.clone(),
+                _ => None,
+            })
+    }
+
+    /// A payment sync of `body` for a pending attempt, before `finish_payment_sync`.
+    fn synced(body: serde_json::Value) -> PaymentsSyncRouterData {
+        RouterData::try_from(ResponseRouterData {
+            response: parse(body),
+            data: sync_router_data(AttemptStatus::Pending),
+            http_code: 200,
+        })
+        .unwrap()
+    }
+
+    /// The CyberSource result an error carries as its issuer message.
+    fn cybersource_result_of(error: &ErrorResponse) -> serde_json::Value {
+        serde_json::from_str(error.network_error_message.as_deref().unwrap()).unwrap()
+    }
+
+    /// `cybersource_black_body()` with another `fraud_detection.status`.
+    fn cybersource_rejected_body(status: serde_json::Value) -> serde_json::Value {
+        let mut body = cybersource_black_body();
+        body["fraud_detection"]["status"] = status;
+        body
+    }
+
+    #[test]
+    fn a_cybersource_black_rejection_is_a_cs_error_with_its_validation_params() {
+        let error = authorize_error(402, &cybersource_black_body());
+        assert_eq!(error.status_code, 402);
+        assert_eq!(error.code, "CS_10150");
+        assert_eq!(
+            error.message,
+            "CyberSource black: validation: Request Message DeviceFingerprintID is required"
+        );
+        // The same reason as every other decline.
+        assert_eq!(error.reason.as_deref(), Some(payway::DECLINED_REASON));
+        assert_eq!(error.attempt_status, Some(AttemptStatus::Failure));
+        assert_eq!(
+            error.connector_transaction_id.as_deref(),
+            Some("1073388273")
+        );
+        // CyberSource is not the issuer: no network decline code.
+        assert_eq!(error.network_decline_code, None);
+        assert_eq!(error.network_advice_code, None);
+        // The CyberSource result reaches the payment response as the issuer error message.
+        assert_eq!(
+            cybersource_result_of(&error),
+            json!({"cybersource": {"decision": "black", "reason_code": 10150, "request_id": null}})
+        );
+    }
+
+    #[test]
+    fn a_cybersource_red_or_blue_rejection_is_a_cs_error_with_its_decision() {
+        let red = authorize_error(
+            402,
+            &cybersource_rejected_body(json!({
+                "decision": "red",
+                "request_id": "7957971206326340100000",
+                "reason_code": 481,
+                "description": "Rejected by Decision Manager",
+                "review": null
+            })),
+        );
+        assert_eq!(red.code, "CS_481");
+        assert_eq!(red.message, "CyberSource red: Rejected by Decision Manager");
+        assert_eq!(red.network_decline_code, None);
+        assert_eq!(
+            cybersource_result_of(&red),
+            json!({"cybersource": {
+                "decision": "red",
+                "reason_code": 481,
+                "request_id": "7957971206326340100000"
+            }})
+        );
+
+        // CyberSource unavailable; the reason code may come as text.
+        let blue = authorize_error(
+            402,
+            &cybersource_rejected_body(json!({
+                "decision": "BLUE",
+                "request_id": 795797120632634010_u64,
+                "reason_code": "150",
+                "description": "General system failure",
+                "review": null
+            })),
+        );
+        assert_eq!(blue.code, "CS_150");
+        assert_eq!(blue.message, "CyberSource blue: General system failure");
+        assert_eq!(blue.network_decline_code, None);
+        assert_eq!(
+            cybersource_result_of(&blue),
+            json!({"cybersource": {
+                "decision": "blue",
+                "reason_code": 150,
+                "request_id": "795797120632634010"
+            }})
+        );
+    }
+
+    #[test]
+    fn a_cybersource_error_without_a_reason_code_keeps_todays_decline() {
+        // Without a reason code there is no `CS_` code to give: the 402 maps as before.
+        for status in [
+            json!(null),
+            json!({"decision": "black", "reason_code": null}),
+        ] {
+            let error = authorize_error(402, &cybersource_rejected_body(status.clone()));
+            assert_eq!(error.code, "PD_-1", "{status}");
+            assert_eq!(error.message, "cybersource_error", "{status}");
+            assert_eq!(
+                error.network_decline_code.as_deref(),
+                Some("-1"),
+                "{status}"
+            );
+            assert_eq!(
+                error.network_error_message.as_deref(),
+                Some("cybersource_error"),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_sync_with_a_cybersource_error_is_the_same_cs_error() {
+        let response = parse(cybersource_black_body());
+        let error = response.rejection(200);
+        assert_eq!(error.code, "CS_10150");
+        assert_eq!(
+            error.message,
+            "CyberSource black: validation: Request Message DeviceFingerprintID is required"
+        );
+        assert_eq!(error.network_decline_code, None);
+        let (status, id, _) = sync(&response, AttemptStatus::Pending);
+        assert_eq!(status, AttemptStatus::Failure);
+        assert_eq!(id, Err("CS_10150".to_string()));
+    }
+
+    #[test]
+    fn a_cybersource_approval_reaches_the_payment_checks() {
+        let green = json!({"cybersource": {
+            "decision": "green",
+            "reason_code": 100,
+            "request_id": "7957971206326340104897"
+        }});
+        let (status, payment_checks) = authorize_success(cybersource_green_body());
+        assert_eq!(status, AttemptStatus::Charged);
+        assert_eq!(payment_checks, Some(green.clone()));
+
+        // The payment sync reports it the same way, on an approval and on a rejection.
+        let approved = synced(cybersource_green_body());
+        assert_eq!(approved.status, AttemptStatus::Charged);
+        assert_eq!(payment_checks_of(&approved), Some(green));
+        let rejected = synced(cybersource_black_body());
+        assert!(rejected.response.is_err());
+        assert_eq!(
+            payment_checks_of(&rejected),
+            Some(
+                json!({"cybersource": {"decision": "black", "reason_code": 10150, "request_id": null}})
+            )
+        );
+    }
+
+    #[test]
+    fn an_approval_without_cybersource_stores_no_payment_checks() {
+        for fraud_detection in [json!(null), json!({"status": null}), json!("oops")] {
+            let mut body = cybersource_green_body();
+            body["fraud_detection"] = fraud_detection.clone();
+            let (status, payment_checks) = authorize_success(body.clone());
+            assert_eq!(status, AttemptStatus::Charged, "{fraud_detection}");
+            assert_eq!(payment_checks, None, "{fraud_detection}");
+            // The sync neither: it keeps whatever the attempt had.
+            let sync_data = synced(body);
+            assert_eq!(
+                sync_data.status,
+                AttemptStatus::Charged,
+                "{fraud_detection}"
+            );
+            assert!(sync_data.connector_response.is_none(), "{fraud_detection}");
+        }
+    }
+
+    #[test]
+    fn a_cybersource_review_is_pending_unless_the_status_says_otherwise() {
+        let review = json!({
+            "decision": "yellow",
+            "request_id": "7957971206326340100001",
+            "reason_code": 480,
+            "description": "Decision Manager review",
+            "review": null
+        });
+        let authorize_with = |status: &str, cybersource: serde_json::Value| {
+            let mut body = cybersource_green_body();
+            body["status"] = json!(status);
+            body["fraud_detection"]["status"] = cybersource;
+            authorize_success(body).0
+        };
+        assert_eq!(
+            authorize_with("review", review.clone()),
+            AttemptStatus::Pending
+        );
+        assert_eq!(
+            authorize_with("in_review", review.clone()),
+            AttemptStatus::Pending
+        );
+        let reason_480_only = json!({"decision": null, "reason_code": 480});
+        assert_eq!(
+            authorize_with("review", reason_480_only),
+            AttemptStatus::Pending
+        );
+        // A status we already know keeps its mapping.
+        assert_eq!(
+            authorize_with("approved", review.clone()),
+            AttemptStatus::Charged
+        );
+        assert_eq!(
+            authorize_with("rejected", review.clone()),
+            AttemptStatus::Failure
+        );
+        // Without a CyberSource review, an unknown authorize status still fails, as before.
+        assert_eq!(
+            authorize_with("review", json!({"decision": "green", "reason_code": 100})),
+            AttemptStatus::Failure
+        );
+
+        // The sync: an unknown status with a review is pending, not the attempt's status.
+        let mut body = cybersource_green_body();
+        body["status"] = json!("in_review");
+        body["fraud_detection"]["status"] = review;
+        let (status, _, _) = sync(&parse(body), AttemptStatus::Authorizing);
+        assert_eq!(status, AttemptStatus::Pending);
+    }
+
+    #[test]
+    fn a_plain_issuer_decline_keeps_todays_codes() {
+        let error = authorize_error(
+            402,
+            &json!({
+                "id": 1073000001,
+                "status": "rejected",
+                "status_details": {
+                    "error": {"type": "invalid_card", "reason": {"id": 43, "description": "TARJETA ROBADA"}}
+                },
+                "fraud_detection": null
+            }),
+        );
+        assert_eq!(error.code, "PD_43");
+        assert_eq!(error.message, "[Code: 43] invalid_card: TARJETA ROBADA");
+        assert_eq!(error.reason.as_deref(), Some(payway::DECLINED_REASON));
+        assert_eq!(error.network_decline_code.as_deref(), Some("43"));
+        assert_eq!(
+            error.network_error_message.as_deref(),
+            Some("TARJETA ROBADA")
+        );
+        assert_eq!(
+            error.connector_transaction_id.as_deref(),
+            Some("1073000001")
+        );
+        assert_eq!(error.attempt_status, Some(AttemptStatus::Failure));
+    }
+
+    #[test]
+    fn a_minus_one_decline_of_another_type_keeps_todays_cyber_source_text() {
+        let mut body = cybersource_black_body();
+        body["status_details"]["error"]["type"] = json!("payment_error");
+        let error = authorize_error(402, &body);
+        assert_eq!(error.code, "PD_-1");
+        assert_eq!(
+            error.message,
+            "[Code: -1] payment_error: cyber_source {status = black} {code = 10150} {desc = validation}"
+        );
+        assert_eq!(error.network_decline_code.as_deref(), Some("-1"));
     }
 }

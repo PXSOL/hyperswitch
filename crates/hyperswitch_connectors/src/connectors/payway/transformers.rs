@@ -6,8 +6,8 @@ use common_utils::{
 use hyperswitch_domain_models::{
     payment_method_data::PaymentMethodData,
     router_data::{
-        ConnectorAuthType, ConnectorReportedActivity, ConnectorReportedRefund,
-        ConnectorResponseData, ErrorResponse, RouterData,
+        AdditionalPaymentMethodConnectorResponse, ConnectorAuthType, ConnectorReportedActivity,
+        ConnectorReportedRefund, ConnectorResponseData, ErrorResponse, RouterData,
     },
     router_flow_types::{
         payments,
@@ -107,6 +107,37 @@ pub struct PaywayCustomerInSite {
     pub num_of_transactions: i32,
 }
 
+impl PaywayCustomerInSite {
+    /// The guest history from `metadata.customer_in_site`; each value missing or unusable
+    /// keeps the constant every charge sent before (1 day, guest, no transactions).
+    fn from_metadata(metadata: Option<&PaywayCustomerInSiteMetadata>) -> Self {
+        let count = |value: Option<i64>| {
+            value
+                .filter(|value| *value >= 0)
+                .and_then(|value| i32::try_from(value).ok())
+        };
+        Self {
+            days_in_site: count(metadata.and_then(|metadata| metadata.days_in_site)).unwrap_or(1),
+            is_guest: metadata
+                .and_then(|metadata| metadata.is_guest)
+                .unwrap_or(true),
+            num_of_transactions: count(metadata.and_then(|metadata| metadata.num_of_transactions))
+                .unwrap_or(0),
+        }
+    }
+}
+
+/// Top-level `customer` of `POST /payments`. Sent only with CyberSource (`send_to_cs`).
+#[derive(Debug, Serialize)]
+pub struct PaywayCustomer {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<Secret<String>>,
+    /// The guest's IP, from the authorize request's `browser_info`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip_address: Option<Secret<String>>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PaywayFraudDetectionAuth {
     pub channel: String,
@@ -131,6 +162,8 @@ pub struct PaywayPaymentsRequest {
     pub payment_type: String,
     pub installments: i32,
     pub sub_payments: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub customer: Option<PaywayCustomer>,
     pub fraud_detection: PaywayFraudDetectionAuth,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub establishment_name: Option<String>,
@@ -149,6 +182,11 @@ fn valid_establishment_name(statement_descriptor: Option<&str>) -> Option<String
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ');
     is_valid.then(|| name.to_string())
 }
+
+/// `service_type` and item `name` of a charge sent through CyberSource (`send_to_cs`): the
+/// values of the charge CyberSource approved in production (2026-11-27). Without CyberSource
+/// the charge keeps "payment" and "Payment service".
+const CYBERSOURCE_SERVICE: &str = "Alojamiento";
 
 /// Country sent in `bill_to` and `ship_to` when the payer's is not usable (and for every
 /// charge before the payer's country was read).
@@ -196,13 +234,47 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
                     field_name: "metadata.bill_to".into(),
                 })?;
 
-        let device_id = item.router_data.connector_request_reference_id.clone();
+        let reference_id = item.router_data.connector_request_reference_id.clone();
 
-        let customer_id = if let Some(stripped) = device_id.strip_prefix("pay_") {
+        let reference_customer_id = if let Some(stripped) = reference_id.strip_prefix("pay_") {
             format!("customer_{}", stripped)
         } else {
-            device_id.clone()
+            reference_id.clone()
         };
+
+        // CyberSource only with `send_to_cs`. Without it every value below is the one each
+        // charge sent before, so the request is unchanged; with it, a missing value keeps it.
+        let send_to_cs = meta.send_to_cs.unwrap_or(false);
+        let (customer_id, device_id, customer_in_site) = if send_to_cs {
+            (
+                bill_to_meta
+                    .customer_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|customer_id| !customer_id.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or(reference_customer_id),
+                meta.device_id.clone().unwrap_or(reference_id),
+                PaywayCustomerInSite::from_metadata(meta.customer_in_site.as_ref()),
+            )
+        } else {
+            (
+                reference_customer_id,
+                reference_id,
+                PaywayCustomerInSite::from_metadata(None),
+            )
+        };
+        let customer = send_to_cs.then(|| PaywayCustomer {
+            id: customer_id.clone(),
+            email: bill_to_meta.email.clone().map(Secret::new),
+            ip_address: item
+                .router_data
+                .request
+                .browser_info
+                .as_ref()
+                .and_then(|browser_info| browser_info.ip_address)
+                .map(|ip_address| Secret::new(ip_address.to_string())),
+        });
 
         let country = payway_country(&bill_to_meta.country);
 
@@ -259,22 +331,24 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
             street1: bill_to_meta.street1.clone(),
         };
 
+        let (service_type, service_name) = if send_to_cs {
+            (CYBERSOURCE_SERVICE, CYBERSOURCE_SERVICE)
+        } else {
+            ("payment", "Payment service")
+        };
+
         let fraud_detection = PaywayFraudDetectionAuth {
             channel: "Web".to_string(),
-            send_to_cs: false,
+            send_to_cs,
             device_unique_identifier: device_id,
             purchase_totals: PaywayPurchaseTotals {
                 currency: currency.clone(),
                 amount,
             },
             bill_to,
-            customer_in_site: PaywayCustomerInSite {
-                days_in_site: 1,
-                is_guest: true,
-                num_of_transactions: 0,
-            },
+            customer_in_site,
             services_transaction_data: PaywayServicesTransactionData {
-                service_type: "payment".to_string(),
+                service_type: service_type.to_string(),
                 items: vec![PaywayServicesItem {
                     code: "SERVICE".to_string(),
                     description: item
@@ -282,7 +356,7 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
                         .description
                         .clone()
                         .unwrap_or_else(|| "Payment".to_string()),
-                    name: "Payment service".to_string(),
+                    name: service_name.to_string(),
                     sku: "SERVICE".to_string(),
                     total_amount: amount,
                     quantity: 1,
@@ -298,7 +372,7 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
                         .description
                         .clone()
                         .unwrap_or_else(|| "Payment".to_string()),
-                    name: "Payment service".to_string(),
+                    name: service_name.to_string(),
                     sku: "SERVICE".to_string(),
                     total_amount: amount,
                     quantity: 1,
@@ -326,6 +400,7 @@ impl TryFrom<&PaywayRouterData<&PaymentsAuthorizeRouterData>> for PaywayPayments
             payment_type: "single".to_string(),
             installments,
             sub_payments: vec![],
+            customer,
             fraud_detection,
             establishment_name: valid_establishment_name(
                 item.router_data
@@ -438,6 +513,148 @@ pub struct PaywayPaymentsResponse {
     #[serde(deserialize_with = "lenient_amount")]
     amount: Option<i64>,
     currency: Option<String>,
+    #[serde(deserialize_with = "lenient")]
+    fraud_detection: Option<PaywayFraudDetectionResult>,
+}
+
+/// `fraud_detection` of a payment response: the CyberSource result of a charge sent with
+/// `send_to_cs`.
+#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PaywayFraudDetectionResult {
+    #[serde(deserialize_with = "lenient")]
+    status: Option<PaywayCyberSourceStatus>,
+}
+
+/// `fraud_detection.status`. Payway's CyberSource reason codes: 100 accept (green), 480 review
+/// (yellow), 481, 101, 102, 202 and 231 reject (red), 150 to 153 CyberSource unavailable
+/// (blue), 10XXX data missing or invalid (black).
+#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PaywayCyberSourceStatus {
+    #[serde(deserialize_with = "lenient_text")]
+    decision: Option<String>,
+    #[serde(deserialize_with = "lenient_text")]
+    request_id: Option<String>,
+    #[serde(deserialize_with = "lenient_amount")]
+    reason_code: Option<i64>,
+    #[serde(deserialize_with = "lenient_text")]
+    description: Option<String>,
+    #[serde(deserialize_with = "lenient")]
+    details: Option<PaywayCyberSourceDetails>,
+}
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PaywayCyberSourceDetails {
+    #[serde(deserialize_with = "lenient")]
+    validation_errors: Option<Vec<serde_json::Value>>,
+}
+
+/// `status_details.error.type` of a charge CyberSource rejected.
+const CYBERSOURCE_ERROR_TYPE: &str = "cybersource_error";
+/// Prefix of the error code of a charge CyberSource rejected (`CS_<reason code>`).
+pub const CYBERSOURCE_CODE_PREFIX: &str = "CS_";
+/// CyberSource's review reason code (decision yellow).
+const CYBERSOURCE_REVIEW_REASON_CODE: i64 = 480;
+
+impl PaywayFraudDetectionResult {
+    /// The CyberSource result, when Payway reported a decision or a reason code.
+    fn cybersource(&self) -> Option<&PaywayCyberSourceStatus> {
+        self.status
+            .as_ref()
+            .filter(|status| status.decision.is_some() || status.reason_code.is_some())
+    }
+}
+
+impl PaywayCyberSourceStatus {
+    fn decision(&self) -> Option<String> {
+        self.decision.as_deref().map(str::to_ascii_lowercase)
+    }
+
+    /// Decision Manager sent the charge to manual review.
+    fn is_review(&self) -> bool {
+        self.decision().as_deref() == Some("yellow")
+            || self.reason_code == Some(CYBERSOURCE_REVIEW_REASON_CODE)
+    }
+
+    /// What the caller stores: `{"cybersource": {decision, reason_code, request_id}}`.
+    fn result(&self) -> serde_json::Value {
+        serde_json::json!({
+            "cybersource": {
+                "decision": self.decision(),
+                "reason_code": self.reason_code,
+                "request_id": self.request_id,
+            }
+        })
+    }
+
+    /// `CyberSource <decision>: <description>: <validation params>`, leaving out what Payway
+    /// did not send.
+    fn message(&self) -> String {
+        let params: Vec<&str> = self
+            .details
+            .as_ref()
+            .and_then(|details| details.validation_errors.as_ref())
+            .into_iter()
+            .flatten()
+            .filter_map(|error| error.get("param").and_then(serde_json::Value::as_str))
+            .map(str::trim)
+            .filter(|param| !param.is_empty())
+            .collect();
+        let mut parts = vec![match self.decision() {
+            Some(decision) => format!("CyberSource {decision}"),
+            None => "CyberSource".to_string(),
+        }];
+        parts.extend(self.description.clone());
+        if !params.is_empty() {
+            parts.push(params.join("; "));
+        }
+        parts.join(": ")
+    }
+}
+
+/// The CyberSource result in `payment_checks`, where the payment response shows it as
+/// `payment_method_data.card.payment_checks`.
+fn cybersource_payment_checks(
+    result: serde_json::Value,
+) -> AdditionalPaymentMethodConnectorResponse {
+    AdditionalPaymentMethodConnectorResponse::Card {
+        authentication_data: None,
+        payment_checks: Some(result),
+        card_network: None,
+        domestic_network: None,
+        auth_code: None,
+        processor_card_network: None,
+        card_subtype: None,
+        card_segment_type: None,
+        funding_source: None,
+        card_type: None,
+        issuer_name: None,
+        issuer_country: None,
+    }
+}
+
+/// Attaches the CyberSource result of a response, if any, to the router data.
+fn attach_cybersource_result<F, T>(
+    router_data: &mut RouterData<F, T, PaymentsResponseData>,
+    cybersource: Option<&PaywayCyberSourceStatus>,
+) {
+    let Some(checks) =
+        cybersource.map(|cybersource| cybersource_payment_checks(cybersource.result()))
+    else {
+        return;
+    };
+    match router_data.connector_response.as_mut() {
+        Some(connector_response) => {
+            connector_response.additional_payment_method_data = Some(checks);
+        }
+        None => {
+            router_data.connector_response = Some(
+                ConnectorResponseData::with_additional_payment_method_data(checks),
+            );
+        }
+    }
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -512,6 +729,44 @@ where
     }
     .filter(|text| !text.is_empty())
     .map(Secret::new))
+}
+
+/// Trimmed non-blank text, or a number rendered as text; anything else is `None`.
+fn lenient_text<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(lenient_secret_text(deserializer)?.map(|text| text.peek().clone()))
+}
+
+/// Trimmed non-blank text; anything else (a number included) is `None`.
+fn lenient_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::String(text)) => Some(text.trim().to_owned()),
+        _ => None,
+    }
+    .filter(|text| !text.is_empty()))
+}
+
+/// A boolean, or the text `true` / `false` (any case, trimmed); anything else is `None`.
+fn lenient_flag<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::Bool(flag)) => Some(flag),
+        Some(serde_json::Value::String(text)) => match text.trim().to_ascii_lowercase().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    })
 }
 
 /// Integer, float (rounded to the nearest unit) or numeric string; anything else is `None`.
@@ -589,8 +844,54 @@ impl PaywayPaymentsResponse {
         PaywayStatus::parse(self.status.as_deref())
     }
 
+    /// The CyberSource result of the payment, if it went through CyberSource.
+    fn cybersource(&self) -> Option<&PaywayCyberSourceStatus> {
+        self.fraud_detection
+            .as_ref()
+            .and_then(PaywayFraudDetectionResult::cybersource)
+    }
+
+    /// Error of a payment CyberSource rejected (`status_details.error.type` is
+    /// `cybersource_error`): code `CS_<reason code>`, the decision, description and validation
+    /// params as the message, and the CyberSource result as the issuer message (there is no
+    /// issuer, so no network decline code). `None` for any other error, or when Payway gave
+    /// no reason code, which keeps the error of a declined payment.
+    pub fn cybersource_error(&self, http_code: u16) -> Option<ErrorResponse> {
+        let error_type = self
+            .status_details
+            .as_ref()?
+            .error
+            .as_ref()?
+            .error_type
+            .as_deref()?;
+        if !error_type
+            .trim()
+            .eq_ignore_ascii_case(CYBERSOURCE_ERROR_TYPE)
+        {
+            return None;
+        }
+        let cybersource = self.cybersource()?;
+        let reason_code = cybersource.reason_code?;
+        Some(ErrorResponse {
+            status_code: http_code,
+            code: format!("{CYBERSOURCE_CODE_PREFIX}{reason_code}"),
+            message: cybersource.message(),
+            reason: Some(DECLINED_REASON.to_string()),
+            attempt_status: Some(enums::AttemptStatus::Failure),
+            connector_transaction_id: self.payment_id(),
+            network_advice_code: None,
+            network_decline_code: None,
+            network_error_message: Some(cybersource.result().to_string()),
+            connector_metadata: None,
+            connector_response_reference_id: None,
+        })
+    }
+
     /// Error of a rejected payment, built like the one of a declined authorize (402).
     pub(super) fn rejection(&self, http_code: u16) -> ErrorResponse {
+        if let Some(error) = self.cybersource_error(http_code) {
+            return error;
+        }
         let error = self
             .status_details
             .as_ref()
@@ -715,7 +1016,18 @@ impl<F, T> TryFrom<ResponseRouterData<F, PaywayPaymentsResponse, T, PaymentsResp
         item: ResponseRouterData<F, PaywayPaymentsResponse, T, PaymentsResponseData>,
     ) -> Result<Self, Self::Error> {
         let payway_status = item.response.payway_status();
-        let status = payway_status.attempt_status(item.data.status);
+        let cybersource = item.response.cybersource().cloned();
+        // A CyberSource review (yellow, 480) under a status Payway does not document is
+        // still undecided: pending. Assumed, no production sample of a review yet.
+        let status = if payway_status == PaywayStatus::Unknown
+            && cybersource
+                .as_ref()
+                .is_some_and(PaywayCyberSourceStatus::is_review)
+        {
+            enums::AttemptStatus::Pending
+        } else {
+            payway_status.attempt_status(item.data.status)
+        };
         let response = if payway_status == PaywayStatus::Rejected {
             Err(item.response.rejection(item.http_code))
         } else {
@@ -737,11 +1049,13 @@ impl<F, T> TryFrom<ResponseRouterData<F, PaywayPaymentsResponse, T, PaymentsResp
                 authentication_data: None,
             })
         };
-        Ok(Self {
+        let mut router_data = Self {
             status,
             response,
             ..item.data
-        })
+        };
+        attach_cybersource_result(&mut router_data, cybersource.as_ref());
+        Ok(router_data)
     }
 }
 
@@ -977,6 +1291,23 @@ fn card_holder_identification(
     })
 }
 
+/// Key of the device fingerprint session id in `frm_metadata`, for `POST /tokens`.
+const TOKEN_DEVICE_ID_KEY: &str = "device_unique_identifier";
+
+/// The device fingerprint session id for `POST /tokens`: `frm_metadata`
+/// `payway.device_unique_identifier`, then the flat key. The token request sees no payment
+/// metadata, so it comes from `frm_metadata`. CyberSource rejects the charge (reason 10150,
+/// "DeviceFingerprintID is required") unless the token carries the same id as the payment.
+/// `None` when neither is non-blank text.
+fn token_device_unique_identifier(frm_metadata: Option<&serde_json::Value>) -> Option<String> {
+    let metadata = frm_metadata?;
+    metadata
+        .get(PAYWAY_METADATA_SCOPE)
+        .and_then(|scoped| metadata_text(scoped, TOKEN_DEVICE_ID_KEY))
+        .or_else(|| metadata_text(metadata, TOKEN_DEVICE_ID_KEY))
+        .map(str::to_string)
+}
+
 #[derive(Debug, Serialize)]
 pub struct FraudDetection {
     device_unique_identifier: String,
@@ -987,8 +1318,33 @@ pub struct PaywayMetadataObject {
     pub token: Option<String>,
     pub installments: Option<i32>,
     pub payment_method_id: Option<i32>,
+    /// `true` sends the charge through CyberSource (and the anti-fraud values below). Also
+    /// the text "true" / "false"; anything else is off. The flat `customer_id` key is read
+    /// through `bill_to`.
+    #[serde(default, deserialize_with = "lenient_flag")]
+    pub send_to_cs: Option<bool>,
+    /// The device fingerprint session id, for the payment's
+    /// `fraud_detection.device_unique_identifier`.
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub device_id: Option<String>,
+    /// The guest history for `fraud_detection.customer_in_site`.
+    #[serde(default, deserialize_with = "lenient")]
+    pub customer_in_site: Option<PaywayCustomerInSiteMetadata>,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub bill_to: Option<PaywayBillTo>,
+}
+
+/// `metadata.customer_in_site`. Every value is optional and read leniently (numbers also as
+/// numeric text, `is_guest` also as "true" / "false").
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PaywayCustomerInSiteMetadata {
+    #[serde(deserialize_with = "lenient_amount")]
+    pub days_in_site: Option<i64>,
+    #[serde(deserialize_with = "lenient_flag")]
+    pub is_guest: Option<bool>,
+    #[serde(deserialize_with = "lenient_amount")]
+    pub num_of_transactions: Option<i64>,
 }
 
 /// Key of the connector-scoped object inside the payment metadata.
@@ -1044,7 +1400,9 @@ impl TryFrom<&Option<serde_json::Value>> for PaywayMetadataObject {
 impl TryFrom<&types::TokenizationRouterData> for PaywayTokenRequest {
     type Error = error_stack::Report<errors::ConnectorError>;
     fn try_from(item: &types::TokenizationRouterData) -> Result<Self, Self::Error> {
-        let device_id = item.connector_request_reference_id.clone();
+        let frm_metadata = item.frm_metadata.as_ref().map(|metadata| metadata.peek());
+        let device_id = token_device_unique_identifier(frm_metadata)
+            .unwrap_or_else(|| item.connector_request_reference_id.clone());
 
         match item.request.payment_method_data.clone() {
             PaymentMethodData::Card(card) => Ok(Self {
@@ -1057,9 +1415,7 @@ impl TryFrom<&types::TokenizationRouterData> for PaywayTokenRequest {
                     .clone()
                     .unwrap_or_else(|| Secret::new("".to_string())),
                 security_code: card.card_cvc,
-                card_holder_identification: card_holder_identification(
-                    item.frm_metadata.as_ref().map(|metadata| metadata.peek()),
-                ),
+                card_holder_identification: card_holder_identification(frm_metadata),
                 fraud_detection: FraudDetection {
                     device_unique_identifier: device_id,
                 },
@@ -1113,6 +1469,8 @@ pub struct PaywayAuthorizeResponse {
     pub status: Option<String>,
     #[serde(default, deserialize_with = "lenient")]
     pub status_details: Option<PaywayStatusDetails>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub fraud_detection: Option<PaywayFraudDetectionResult>,
 }
 
 impl<F, T> TryFrom<ResponseRouterData<F, PaywayAuthorizeResponse, T, PaymentsResponseData>>
@@ -1122,12 +1480,32 @@ impl<F, T> TryFrom<ResponseRouterData<F, PaywayAuthorizeResponse, T, PaymentsRes
     fn try_from(
         item: ResponseRouterData<F, PaywayAuthorizeResponse, T, PaymentsResponseData>,
     ) -> Result<Self, Self::Error> {
+        let cybersource = item
+            .response
+            .fraud_detection
+            .as_ref()
+            .and_then(PaywayFraudDetectionResult::cybersource)
+            .cloned();
         let status = match item.response.status.as_deref() {
             Some("approved") => common_enums::AttemptStatus::Charged,
+            // A CyberSource review (yellow, 480) under a pending or undocumented status is
+            // still undecided: pending, to be settled by the payment sync. Assumed, no
+            // production sample of a review yet.
+            Some(status)
+                if cybersource
+                    .as_ref()
+                    .is_some_and(PaywayCyberSourceStatus::is_review)
+                    && matches!(
+                        PaywayStatus::parse(Some(status)),
+                        PaywayStatus::Pending | PaywayStatus::Unknown
+                    ) =>
+            {
+                common_enums::AttemptStatus::Pending
+            }
             Some(_) => common_enums::AttemptStatus::Failure,
             None => common_enums::AttemptStatus::Failure,
         };
-        Ok(Self {
+        let mut router_data = Self {
             status,
             response: Ok(PaymentsResponseData::TransactionResponse {
                 resource_id: ResponseId::ConnectorTransactionId(item.response.id.to_string()),
@@ -1147,12 +1525,17 @@ impl<F, T> TryFrom<ResponseRouterData<F, PaywayAuthorizeResponse, T, PaymentsRes
                 authentication_data: None,
             }),
             ..item.data
-        })
+        };
+        attach_cybersource_result(&mut router_data, cybersource.as_ref());
+        Ok(router_data)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    // The tests read the serialized requests by key, as `payment_sync_tests` reads responses.
+    #![allow(clippy::indexing_slicing)]
+
     use common_utils::types::{AmountConvertor, StringMinorUnitForConnector};
 
     use super::*;
@@ -1288,6 +1671,7 @@ mod tests {
             payment_type: "single".to_string(),
             installments: 1,
             sub_payments: vec![],
+            customer: None,
             fraud_detection: PaywayFraudDetectionAuth {
                 channel: "Web".to_string(),
                 send_to_cs: false,
@@ -1554,6 +1938,318 @@ mod tests {
                 "card_holder_identification": [],
                 "fraud_detection": { "device_unique_identifier": "pxs_mp_1" }
             })
+        );
+    }
+
+    /// The charge built from `metadata`, serialized as it goes on the wire, with the guest IP
+    /// the router reads from `browser_info` (if any).
+    fn charge_sent(metadata: serde_json::Value, ip_address: Option<&str>) -> String {
+        let mut router_data = test_support::authorize_router_data(Some(metadata), None);
+        router_data.request.browser_info = ip_address.map(|ip| {
+            hyperswitch_domain_models::router_request_types::BrowserInformation {
+                ip_address: Some(ip.parse().unwrap()),
+                ..Default::default()
+            }
+        });
+        let amount = charge_amount(&router_data);
+        serde_json::to_string(
+            &PaywayPaymentsRequest::try_from(&PaywayRouterData::from((amount, &router_data)))
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn charge_sent_json(
+        metadata: serde_json::Value,
+        ip_address: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::from_str(&charge_sent(metadata, ip_address)).unwrap()
+    }
+
+    /// `billing_metadata("AR")` plus the given extra keys.
+    fn billing_metadata_with(extra: serde_json::Value) -> serde_json::Value {
+        let mut metadata = billing_metadata(serde_json::json!("AR"));
+        let object = metadata.as_object_mut().unwrap();
+        for (key, value) in extra.as_object().unwrap() {
+            object.insert(key.clone(), value.clone());
+        }
+        metadata
+    }
+
+    /// The anti-fraud keys api2 sends for a motor charge, without `send_to_cs`.
+    fn antifraud_keys() -> serde_json::Value {
+        serde_json::json!({
+            "customer_id": "g_0123456789abcdef0123456789abcdef",
+            "device_id": "tmx-session-1",
+            "customer_in_site": { "days_in_site": 0, "is_guest": true, "num_of_transactions": 0 }
+        })
+    }
+
+    fn with_send_to_cs(send_to_cs: serde_json::Value) -> serde_json::Value {
+        let mut keys = antifraud_keys();
+        keys.as_object_mut()
+            .unwrap()
+            .insert("send_to_cs".to_string(), send_to_cs);
+        billing_metadata_with(keys)
+    }
+
+    /// `POST /payments` byte for byte as origin/main (273229ddf0) serializes the charge of
+    /// `billing_metadata("AR")`. Captured by running this test on that commit.
+    const ORIGIN_MAIN_CHARGE: &str = concat!(
+        r#"{"site_transaction_id":"pxs_mp_1","token":"card-token-1","payment_method_id":1,"#,
+        r#""bin":"450995","amount":15000,"currency":"ARS","description":null,"#,
+        r#""payment_type":"single","installments":1,"sub_payments":[],"fraud_detection":{"channel":"Web","#,
+        r#""send_to_cs":false,"device_unique_identifier":"pxs_mp_1","purchase_totals":{"currency":"ARS","#,
+        r#""amount":15000},"bill_to":{"country":"AR","city":"Mendoza","customer_id":"pxs_mp_1","#,
+        r#""email":"guest@example.com","first_name":"Ana","last_name":"Gomez","#,
+        r#""phone_number":"5492610000000","postal_code":"5500","state":"M","#,
+        r#""street1":"Calle 1"},"customer_in_site":{"days_in_site":1,"is_guest":true,"#,
+        r#""num_of_transactions":0},"services_transaction_data":{"service_type":"payment","#,
+        r#""items":[{"code":"SERVICE","description":"Payment","name":"Payment service","#,
+        r#""sku":"SERVICE","total_amount":15000,"quantity":1,"unit_price":15000}]},"#,
+        r#""retail_transaction_data":{"ship_to":{"country":"AR","city":"Mendoza","#,
+        r#""email":"guest@example.com","first_name":"Ana","last_name":"Gomez","#,
+        r#""phone_number":"5492610000000","postal_code":"5500","state":"M","#,
+        r#""street1":"Calle 1"},"items":[{"code":"SERVICE","description":"Payment","#,
+        r#""name":"Payment service","sku":"SERVICE","total_amount":15000,"#,
+        r#""quantity":1,"unit_price":15000}]}}}"#,
+    );
+
+    /// `POST /tokens` byte for byte as origin/main (273229ddf0) serializes it without a
+    /// cardholder document. Captured by running this test on that commit.
+    const ORIGIN_MAIN_TOKEN: &str = concat!(
+        r#"{"card_number":"4509953566233704","card_expiration_month":"11","#,
+        r#""card_expiration_year":"30","card_holder_name":"ANA GOMEZ","security_code":"123","#,
+        r#""card_holder_identification":[],"fraud_detection":{"device_unique_identifier":"pxs_mp_1"}}"#,
+    );
+
+    #[test]
+    fn charge_without_send_to_cs_is_byte_identical_to_origin_main() {
+        let variants = vec![
+            (billing_metadata(serde_json::json!("AR")), None),
+            (billing_metadata(serde_json::json!("AR")), Some("190.2.3.4")),
+            (billing_metadata_with(antifraud_keys()), Some("190.2.3.4")),
+            (with_send_to_cs(serde_json::json!(false)), Some("190.2.3.4")),
+            (with_send_to_cs(serde_json::json!("false")), None),
+            (with_send_to_cs(serde_json::json!(null)), None),
+            (with_send_to_cs(serde_json::json!("yes")), None),
+            (with_send_to_cs(serde_json::json!(1)), None),
+            (
+                billing_metadata_with(serde_json::json!({ "payway": { "send_to_cs": false } })),
+                None,
+            ),
+            // The scoped key wins over the flat one, as for every other key.
+            (
+                billing_metadata_with(serde_json::json!({
+                    "send_to_cs": true,
+                    "payway": { "send_to_cs": false }
+                })),
+                Some("190.2.3.4"),
+            ),
+        ];
+        let sent: Vec<String> = variants
+            .into_iter()
+            .map(|(metadata, ip)| charge_sent(metadata, ip))
+            .collect();
+        for charge in &sent {
+            assert_eq!(charge, ORIGIN_MAIN_CHARGE, "every variant: {sent:#?}");
+        }
+    }
+
+    #[test]
+    fn token_request_without_a_device_id_is_byte_identical_to_origin_main() {
+        let sent: Vec<String> = [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({ "device_id": "tmx-session-1" })),
+            Some(serde_json::json!({ "device_unique_identifier": "  " })),
+            Some(serde_json::json!({ "device_unique_identifier": 12345 })),
+            Some(serde_json::json!({ "payway": { "device_unique_identifier": null } })),
+        ]
+        .into_iter()
+        .map(|frm_metadata| {
+            let router_data = test_support::tokenization_router_data(
+                Some("ANA GOMEZ"),
+                hyperswitch_domain_models::payment_address::PaymentAddress::default(),
+                frm_metadata,
+            );
+            serde_json::to_string(&PaywayTokenRequest::try_from(&router_data).unwrap()).unwrap()
+        })
+        .collect();
+        for token in &sent {
+            assert_eq!(token, ORIGIN_MAIN_TOKEN, "every variant: {sent:#?}");
+        }
+    }
+
+    #[test]
+    fn charge_with_send_to_cs_sends_the_customer_the_device_and_the_guest_history() {
+        for metadata in [
+            with_send_to_cs(serde_json::json!(true)),
+            with_send_to_cs(serde_json::json!("true")),
+            with_send_to_cs(serde_json::json!(" TRUE ")),
+            billing_metadata_with({
+                let mut keys = antifraud_keys();
+                keys.as_object_mut().unwrap().insert(
+                    "payway".to_string(),
+                    serde_json::json!({ "send_to_cs": true }),
+                );
+                keys
+            }),
+        ] {
+            let request = charge_sent_json(metadata.clone(), Some("190.2.3.4"));
+            assert_eq!(
+                request.get("customer"),
+                Some(&serde_json::json!({
+                    "id": "g_0123456789abcdef0123456789abcdef",
+                    "email": "guest@example.com",
+                    "ip_address": "190.2.3.4"
+                })),
+                "{metadata}"
+            );
+            let fraud_detection = &request["fraud_detection"];
+            assert_eq!(fraud_detection["send_to_cs"], true, "{metadata}");
+            assert_eq!(
+                fraud_detection["device_unique_identifier"], "tmx-session-1",
+                "{metadata}"
+            );
+            assert_eq!(
+                fraud_detection["bill_to"]["customer_id"], "g_0123456789abcdef0123456789abcdef",
+                "{metadata}"
+            );
+            assert_eq!(
+                fraud_detection["customer_in_site"],
+                serde_json::json!({ "days_in_site": 0, "is_guest": true, "num_of_transactions": 0 }),
+                "{metadata}"
+            );
+
+            // Nothing else changes: the rest is the charge origin/main sends.
+            let mut expected: serde_json::Value = serde_json::from_str(ORIGIN_MAIN_CHARGE).unwrap();
+            let object = expected.as_object_mut().unwrap();
+            object.insert("customer".to_string(), request["customer"].clone());
+            let expected_fraud_detection = &mut expected["fraud_detection"];
+            expected_fraud_detection["send_to_cs"] = serde_json::json!(true);
+            expected_fraud_detection["device_unique_identifier"] =
+                serde_json::json!("tmx-session-1");
+            expected_fraud_detection["bill_to"]["customer_id"] =
+                serde_json::json!("g_0123456789abcdef0123456789abcdef");
+            expected_fraud_detection["customer_in_site"] = serde_json::json!({ "days_in_site": 0, "is_guest": true, "num_of_transactions": 0 });
+            expected_fraud_detection["services_transaction_data"]["service_type"] =
+                serde_json::json!("Alojamiento");
+            expected_fraud_detection["services_transaction_data"]["items"][0]["name"] =
+                serde_json::json!("Alojamiento");
+            expected_fraud_detection["retail_transaction_data"]["items"][0]["name"] =
+                serde_json::json!("Alojamiento");
+            assert_eq!(request, expected, "{metadata}");
+        }
+    }
+
+    #[test]
+    fn charge_with_send_to_cs_sends_the_lodging_service_that_passed_cybersource() {
+        // L20: the charge CyberSource approved in production sent "Alojamiento".
+        let request = charge_sent_json(with_send_to_cs(serde_json::json!(true)), None);
+        let fraud_detection = &request["fraud_detection"];
+        assert_eq!(
+            fraud_detection["services_transaction_data"]["service_type"],
+            "Alojamiento"
+        );
+        for items in ["services_transaction_data", "retail_transaction_data"] {
+            assert_eq!(
+                fraud_detection[items]["items"],
+                serde_json::json!([{
+                    "code": "SERVICE",
+                    "description": "Payment",
+                    "name": "Alojamiento",
+                    "sku": "SERVICE",
+                    "total_amount": 15000,
+                    "quantity": 1,
+                    "unit_price": 15000
+                }]),
+                "{items}"
+            );
+        }
+    }
+
+    #[test]
+    fn charge_with_send_to_cs_and_missing_values_keeps_todays_values() {
+        let request = charge_sent_json(
+            billing_metadata_with(serde_json::json!({
+                "send_to_cs": true,
+                "customer_id": "  ",
+                "device_id": null,
+                "customer_in_site": "not an object"
+            })),
+            None,
+        );
+        // Without an IP the key is omitted rather than sent empty.
+        assert_eq!(
+            request.get("customer"),
+            Some(&serde_json::json!({ "id": "pxs_mp_1", "email": "guest@example.com" }))
+        );
+        let fraud_detection = &request["fraud_detection"];
+        assert_eq!(fraud_detection["send_to_cs"], true);
+        assert_eq!(fraud_detection["device_unique_identifier"], "pxs_mp_1");
+        assert_eq!(fraud_detection["bill_to"]["customer_id"], "pxs_mp_1");
+        assert_eq!(
+            fraud_detection["customer_in_site"],
+            serde_json::json!({ "days_in_site": 1, "is_guest": true, "num_of_transactions": 0 })
+        );
+
+        // A partial guest history keeps today's constant for each missing or unusable value.
+        let request = charge_sent_json(
+            billing_metadata_with(serde_json::json!({
+                "send_to_cs": true,
+                "customer_in_site": { "days_in_site": 0, "num_of_transactions": "3" }
+            })),
+            None,
+        );
+        assert_eq!(
+            request["fraud_detection"]["customer_in_site"],
+            serde_json::json!({ "days_in_site": 0, "is_guest": true, "num_of_transactions": 3 })
+        );
+        let request = charge_sent_json(
+            billing_metadata_with(serde_json::json!({
+                "send_to_cs": true,
+                "customer_in_site": { "days_in_site": -2, "is_guest": "false", "num_of_transactions": "many" }
+            })),
+            None,
+        );
+        assert_eq!(
+            request["fraud_detection"]["customer_in_site"],
+            serde_json::json!({ "days_in_site": 1, "is_guest": false, "num_of_transactions": 0 })
+        );
+    }
+
+    #[test]
+    fn token_request_sends_the_device_id_from_frm_metadata() {
+        let device_sent = |frm_metadata: serde_json::Value| {
+            token_request_sent_for(Some(frm_metadata))["fraud_detection"]
+                ["device_unique_identifier"]
+                .clone()
+        };
+        assert_eq!(
+            device_sent(serde_json::json!({ "device_unique_identifier": " tmx-session-1 " })),
+            "tmx-session-1"
+        );
+        assert_eq!(
+            device_sent(serde_json::json!({
+                "device_unique_identifier": "flat",
+                "payway": { "device_unique_identifier": "tmx-session-2" }
+            })),
+            "tmx-session-2"
+        );
+        // The cardholder document still goes out next to it.
+        let request = token_request_sent_for(Some(serde_json::json!({
+            "doc_type": "DNI",
+            "doc_number": "30111222",
+            "device_unique_identifier": "tmx-session-1"
+        })));
+        assert_eq!(
+            request["card_holder_identification"],
+            serde_json::json!({ "type": "dni", "number": "30111222" })
+        );
+        assert_eq!(
+            request["fraud_detection"]["device_unique_identifier"],
+            "tmx-session-1"
         );
     }
 }
